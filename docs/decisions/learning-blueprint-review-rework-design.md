@@ -187,6 +187,10 @@ JSON they were written for, and add new testids (`inbox-bp-intent`, `inbox-bp-te
 
 **The model edits the `parameterization` array. It never emits SQL.**
 
+> ⚠ **AMENDED BY §C.5.** The second sentence now holds only for the default path. With an explicit
+> per-request reviewer opt-in the model may return a complete replacement **accepted SQL** — never
+> a template, which is still derived. Read §C.5 before relying on anything below.
+
 `sql_template` is not authored — it is *derived*, by AST rewrite from the accepted SQL that
 actually ran (`generalize/rewrite.py::rewrite_sql_to_template`), with the parameterization array
 saying which literals become holes. That derivation is what makes `explain_ok`,
@@ -315,6 +319,72 @@ is why the snapshot lives in the access-controlled store), and it drags the re-r
 and leakage with different routing consequences. **Deferred, named here so it is not re-derived.**
 
 The first cut covers the queue where the need is sharpest and the machinery already exists.
+
+### C.5 SQL rewrite, opt-in — ⚠ this reverses §C.1 and §H.1
+
+**Decided later, deliberately, and with a different safety argument rather than none.**
+
+§C.1 said the model edits the `parameterization` array and never emits SQL, and §H.1 rejected the
+alternative outright. What that left a reviewer with was a candidate whose SQL is simply *wrong* —
+a missing predicate, a join that answers a neighbouring question — and exactly one action:
+`reject`. The whole point of this deliverable was to stop the queue being a place good work goes to
+die, and "the query needs one more `AND`" was still a dead end.
+
+So `POST /inbox/{id}/revise` takes `allow_sql: bool = False`. When a reviewer ticks it, the tool
+gains a top-level `sql` field and the system prompt swaps one paragraph: the model *may* return a
+complete replacement query, is told to prefer not to, and is given the conditions (one read-only
+SELECT, only the tables and columns in the brief, every literal predicate covered by an entry,
+`replace=true`, and **never a run-date literal** — the one check a rewrite can fail that re-roling
+never could).
+
+**Why the provenance argument does not have to be replaced by nothing.** §C.1 is still correct
+about what is lost: the five static checks stop describing a query the warehouse answered. But
+that exact loss is already priced elsewhere. `learning/mint` has been admitting hand-authored SQL
+since the minting page shipped, and its argument — read `mint/engine.py`'s module docstring — is:
+
+* the SQL enters the **same** `ParameterizationCompleter`, faces the **same** `to_candidate` D97
+  totality walk, and runs the **same** write-router stages (`_provenance_uses`,
+  `check_read_only_select`, `check_no_frozen_date_literal`, `decide_outcome`, leakage, dedup,
+  routing);
+* the totality walk is **stronger** here than on the mined path, not weaker: the accepted SQL came
+  from *outside* the entries, so unlike `generalize/reconstruct.py`'s circular case the first walk
+  can genuinely fail;
+* the `ValidationSnapshot` is stamped `authored=True`, which `writer/routing.py::_is_authored`
+  turns into a forced `in_review` with reason `hand_authored`. **It can never auto-land**, even
+  when all five checks pass.
+
+A rewritten candidate *is* that object — an accepted SQL nobody observed a session produce — so it
+gets that treatment rather than a new one. The reversal is therefore narrower than it looks: it
+does not weaken a gate, it moves a candidate from the "mined" provenance class into the
+"authored" one, which the system already knows how to be careful about.
+
+**What is NOT licensed.** `sql_template` / `template` / `canonical_ast_norm` stay forbidden at
+every depth in both modes, and `sql` stays forbidden anywhere but the top level. A rewrite authors
+the **accepted SQL**; the template is still *derived* from it by the AST rewrite. §C.1's core
+sentence survives intact — a model-authored template would leave all five checks passing about a
+subject nobody chose.
+
+**The consequences, and where each one is visible:**
+
+| consequence | where |
+|---|---|
+| the reviewer is warned in words | `revise` 200 carries `caution` (non-empty only when `sql_changed`), shown verbatim beside apply |
+| `replace` is forced true | proposal, and again at `complete`/`apply_revision` — every old entry describes the old query |
+| the row carries a durable badge | `payload["sql_rewrite"] = {by, applied_at, previous_sql_sha256}`, registered on `BlueprintPayload` so `to_candidate` cannot drop it; the previous query is a **digest**, because `payload_view` reaches a browser and the old SQL is entity-bearing |
+| it can never auto-land | `authored=True` ⇒ `hand_authored` ⇒ `in_review` |
+| trial-run before approving | the existing trial-run control, which is the only thing that will ever have *run* this query |
+| a decline keeps the new SQL | the snapshot is persisted on **both** outcomes, so the form and its own error message describe the same query |
+
+**Composite is deferred.** A composite blueprint's SQL lives on its nodes — one query per step,
+wired by a DAG the expert declared — so "the SQL" is not a single string a reviser could return.
+`allow_sql=True` on a `kind="composite"` candidate is a 422 before any model call, naming the
+fallback ("untick the option to revise roles only"). `mint/schema.py` refuses the identical shape
+for the identical reason.
+
+**The one prompt gap this found in minting.** `mint/prompt.py`'s DRAFT and COMPOSITE prompts — the
+other two places a model writes SQL — had no date guidance at all, while the extractor's rule 5
+does and `check_no_frozen_date_literal` enforces it downstream. The rule is now stated once
+(`revise/prompt.py::DATE_RULE`) and imported by both.
 
 ---
 
@@ -653,6 +723,13 @@ working tree) covers the deterministic date check and needs no change — it is 
 
 1. **Let the model rewrite `sql_template` directly.** Destroys the provenance chain the five
    static checks validate (§C.1). The checks would still pass — against a different subject.
+   ⚠ **PARTIALLY REVERSED — see §C.5.** The model may now rewrite the **accepted SQL**, behind an
+   explicit per-request reviewer opt-in, because the alternative was leaving `reject` as the only
+   action available on a candidate whose query is wrong. What this entry rejected is still
+   rejected: the *template* is never model-authored, it is derived from the accepted SQL by the
+   AST rewrite. What changed is that the provenance argument is replaced by `learning/mint`'s —
+   same completer, same totality walk (stricter, not looser), `authored=True`, never auto-lands —
+   rather than by nothing.
 2. **Give the frozen-date rule to the judge.** Already deterministic, already routed, already
    tagged (§A). Two enforcers for one rule disagree eventually.
 3. **A judge that proposes new slots for predicates the accepted SQL never had.** Structurally

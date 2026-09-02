@@ -43,7 +43,7 @@ from ..promotion.mcp_export import PromotionEmit, build_promotion_emit
 from ..promotion.models import ProbeResult, PromotionPolicy
 from ..promotion.scheduler import PromotionScheduler
 from ..revise import BlueprintReviser, ReviseProposal, ReviserUnavailableError
-from .completion import CompletionResult, ParameterizationCompleter
+from .completion import CompletionResult, ParameterizationCompleter, sql_rewrite_of
 from .models import InboxItem, _leakage_cleared
 from .ranking import rank_key
 
@@ -460,6 +460,7 @@ class ReviewInbox:
         *,
         entries: list,
         replace_all: bool = False,
+        rewritten_sql: str = "",
     ) -> CompletionResult:
         """FILL IN the form of a `needs_parameterization` candidate and re-run the pipeline.
 
@@ -475,6 +476,14 @@ class ReviewInbox:
         makes that unreachable. Editing an `in_review` candidate is a DIFFERENT operation with
         a different safety argument: see `apply_revision`, which is replace-only and therefore
         idempotent.
+
+        ⚠ A `rewritten_sql` (§C.5) FORCES `replace_all`, whatever the request asked for, and that
+        is not the surface being lenient — it is the surface agreeing with the completer, which
+        refuses a rewrite without it. Every existing entry describes the OLD query, so appending
+        to them can only produce a parameterization half about a string nobody has. Forcing it
+        also restores the idempotence the append mode costs this verb, so the double-click the
+        equality guard above protects against is harmless on this path for the ordinary reason
+        rather than by luck.
         """
         env = await self._require(candidate_id, CandidateStatus.NEEDS_PARAMETERIZATION)
         if self._completer is None:
@@ -484,13 +493,23 @@ class ReviewInbox:
                 "re-validated against the accepted SQL"
             )
         return await self._completer.complete(
-            env, entries=entries, replace_all=replace_all
+            env,
+            entries=entries,
+            replace_all=replace_all or bool(sql_rewrite_of(env, rewritten_sql)),
+            rewritten_sql=rewritten_sql,
         )
 
     async def propose_revision(
-        self, candidate_id: str, *, feedback: str
+        self, candidate_id: str, *, feedback: str, allow_sql: bool = False
     ) -> ReviseProposal:
         """Ask the reviser for parameterization entries. WRITES NOTHING.
+
+        `allow_sql` is the reviewer's §C.5 opt-in, passed straight through. It changes what the
+        assistant may RETURN, never what this method does with it: the proposal still comes back
+        for the reviewer to apply, and the caution the engine attaches is what tells them the
+        result can no longer auto-land. The leakage refusal below stays IN FRONT of it — a
+        candidate whose scan did not clear cannot have its literals quoted at a model whether or
+        not the model would be allowed to rewrite them.
 
         Guarded on `REVISABLE_STATUSES` — the SAME guard as `complete_parameterization`, so the
         assistant is never offered toward an operation the completer would then refuse.
@@ -569,10 +588,10 @@ class ReviewInbox:
                     "re-extracted." + supply
                 ),
             )
-        return await self._reviser.propose(env, feedback=feedback)
+        return await self._reviser.propose(env, feedback=feedback, allow_sql=allow_sql)
 
     async def apply_revision(
-        self, candidate_id: str, *, entries: list
+        self, candidate_id: str, *, entries: list, rewritten_sql: str = ""
     ) -> CompletionResult:
         """Apply a revision to a candidate ALREADY under review (`in_review`).
 
@@ -598,6 +617,12 @@ class ReviewInbox:
         payload whose leakage scan still fails routes back to review, and one whose dedup
         verdict changes re-routes on the writer's rules. Nothing here moves a candidate
         FORWARD; `approve` remains the only thing that does, and it stays `in_review`-only.
+
+        `rewritten_sql` (§C.5) needs no special handling here for once: this verb is already
+        replace-only, which is exactly what a rewrite requires. What it does change is the
+        SUBJECT of the re-adjudication — the accepted SQL becomes assistant-authored, the
+        snapshot is stamped `authored=True`, and the router's `hand_authored` rule holds the
+        result at `in_review` rather than letting the writer's other rules decide.
         """
         env = await self._require(candidate_id, CandidateStatus.IN_REVIEW)
         if self._completer is None:
@@ -606,7 +631,9 @@ class ReviewInbox:
                 f"{candidate_id!r}, so the revised parameterization cannot be "
                 "re-validated against the accepted SQL"
             )
-        return await self._completer.complete(env, entries=entries, replace_all=True)
+        return await self._completer.complete(
+            env, entries=entries, replace_all=True, rewritten_sql=rewritten_sql
+        )
 
     def mint_schema(self) -> dict[str, Any]:
         """What the minting form offers: the tables an expert may pick, and their columns.

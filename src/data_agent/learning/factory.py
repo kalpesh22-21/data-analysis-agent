@@ -290,11 +290,11 @@ def build_learning_consumer(
         prior_art=prior_art,
     )
 
-    judge = _build_judge(
+    judge = build_coverage_judge(
         settings,
         model_client=judge_model_client if judge_model_client is not None else model_client,
         # The recorded model id must describe the client that will actually answer, not
-        # the one an operator configured. See `_build_judge`.
+        # the one an operator configured. See `build_coverage_judge`.
         judge_client_injected=judge_model_client is not None,
         audit_store=audit_store,
         prior_art=prior_art,
@@ -452,7 +452,7 @@ def build_param_judge(
 ) -> ParameterizationJudge | None:
     """Build the S4 parameterization judge (design §D), or `None` when a precondition is missing.
 
-    PUBLIC, unlike `_build_judge`, because TWO composition roots need it: the consumer here and
+    PUBLIC, like `build_coverage_judge`, because TWO composition roots need it: the consumer and
     the inbox service's completion plane. A form a human completed must face the same observation
     an extracted candidate does, or the phase-D-1 dataset is a biased sample of the population it
     exists to measure.
@@ -530,7 +530,7 @@ def _param_judge_model_id(settings: LearningSettings) -> str:
     return answering
 
 
-def _build_judge(
+def build_coverage_judge(
     settings: LearningSettings,
     *,
     model_client: object | None,
@@ -540,6 +540,14 @@ def _build_judge(
     tracer: object | None,
 ) -> CoverageJudge | None:
     """Build the coverage judge, or `None` when any precondition is missing.
+
+    PUBLIC for the same reason `build_param_judge` is: TWO composition roots need it. The
+    consumer builds one to screen sessions, and the inbox service's COMPLETION plane needs the
+    same instance-shaped collaborator for `DedupStage` — without it the S6 layer-3b judged
+    near-miss never runs for a completed, minted or REWRITTEN candidate, so a blueprint a human
+    finished would be adjudicated on strictly less evidence than one the loop mined. That is the
+    parity `build_write_router_stages` exists to protect, and it is only half-kept if the two
+    callers assemble the same stages around different collaborators.
 
     THREE preconditions, each absence logged separately so an operator knows which of three
     things to fix: the kill-switch is off (INFO), there is no prior-art index (INFO — nothing

@@ -70,7 +70,7 @@ def test_the_completion_posts_the_entries_as_a_json_body() -> None:
     sent the entries as a query string, or forgot `replace`, would leave the reviewer's
     work in the browser while the candidate declined for entries it never received."""
     assert '"/api/inbox/" + encodeURIComponent(candidateId) + "/complete"' in _HTML
-    assert 'JSON.stringify({ entries: entries, replace: replaceAll })' in _HTML
+    assert "JSON.stringify(withProposedSql({ entries: entries, replace: replaceAll }, sql))" in _HTML
     assert '"Content-Type": "application/json"' in _HTML
 
 
@@ -245,7 +245,7 @@ def test_the_revise_proposal_opens_a_modal_rather_than_applying_on_trust() -> No
     assert "function openReviseModal(" in _HTML
     assert 'data-testid", "inbox-revise-modal"' in _HTML
     assert 'apply.textContent = "Review the change…"' in _HTML
-    assert "openReviseModal(item, parsed, node, function (entries, replace)" in _HTML
+    assert "openReviseModal(item, parsed, node, function (entries, replace, sql)" in _HTML
 
 
 def test_the_modal_shows_the_sql_and_offers_no_way_to_edit_it() -> None:
@@ -264,7 +264,7 @@ def test_the_modal_writes_nothing_until_apply_and_goes_through_the_same_validati
     """It is a better keyboard, not a second write path: apply posts to `apply_revision`,
     which re-validates exactly as a hand-typed array does."""
     assert "Nothing is written until you apply." in _HTML
-    assert "performRevisionApply(item.candidate_id, entries, node, apply)" in _HTML
+    assert "performRevisionApply(item.candidate_id, entries, node, apply, sql)" in _HTML
 
 
 def test_the_modal_drops_fields_the_chosen_role_does_not_use() -> None:
@@ -286,7 +286,7 @@ def test_the_modal_commits_through_the_verb_its_surface_owns() -> None:
     """The review queue REPLACES (`apply_revision` — idempotent, which is what lets it be
     offered on a status whose guard cannot protect an append); the form APPENDS what the
     reviewer was missing (`complete`). Same modal, same edits, different commit."""
-    assert "performRevisionApply(item.candidate_id, entries, node, apply)" in _HTML
+    assert "performRevisionApply(item.candidate_id, entries, node, apply, sql)" in _HTML
     assert "performCompletion(item.candidate_id, area.value, replace, node," in _HTML
 
 
@@ -295,3 +295,163 @@ def test_the_form_modal_writes_back_through_the_visible_textarea() -> None:
     posted — the reviewer can still see and edit exactly what will be sent, and
     `performCompletion` stays the one submit path."""
     assert "area.value = JSON.stringify(entries, null, 2)" in _HTML
+
+
+# --- the SQL rewrite opt-in ---------------------------------------------------------------
+#
+# The assistant may now be allowed to REPLACE the query, not just re-classify its predicates.
+# That breaks the one property every static check leans on — that the template was derived
+# from a query the session actually ran — so what is pinned here is that the page never lets
+# it happen quietly: the option is opt-in, the consequence is written beside it, the proposal
+# announces itself, and the artifact carries the fact permanently.
+
+
+def _fn_source(name: str) -> str:
+    """The source of one top-level function in the page, for "only inside this branch" checks."""
+    start = _HTML.index("  function " + name + "(")
+    end = _HTML.index("\n  function ", start + 1)
+    return _HTML[start:end]
+
+
+def test_the_rewrite_is_opt_in_and_says_what_it_costs() -> None:
+    """DEFAULT-OFF with the consequence next to the box, not in a doc. A reviewer ticking this
+    is choosing to keep a blueprint whose SQL no longer matches the session it came from, and
+    that sentence has to be readable at the moment of the choice."""
+    assert 'data-testid", "inbox-revise-allow-sql"' in _HTML
+    assert 'data-testid", "inbox-revise-allow-sql-caution"' in _HTML
+    assert "Let the assistant rewrite the SQL" in _HTML
+    assert "allowSql.checked = false;" in _HTML
+    # The caution, once, as a constant — so the box, the proposal fallback and the modal
+    # cannot drift into three different accounts of the same risk.
+    assert "A rewritten query is no longer the one the session ran." in _HTML
+    assert "cannot auto-land, and should be trial-run before approval." in _HTML
+
+
+def test_the_revise_request_carries_the_opt_in_explicitly() -> None:
+    """`allow_sql` is SENT on every ask, false when untouched. A server that had to read an
+    absent field as "no" would be one default away from rewriting a query nobody asked it to
+    touch — and the BFF forwards this body verbatim, so this is the shape the reviser sees."""
+    assert (
+        "JSON.stringify({ feedback: feedback.value, allow_sql: allowSql.checked === true })"
+        in _HTML
+    )
+
+
+def test_a_composite_candidate_is_not_offered_the_rewrite() -> None:
+    """The server 422s a rewrite asked for on a composite — it composes other blueprints and
+    has no single query to replace. The page disables the box and says why, so the reviewer
+    learns the reason instead of collecting an error."""
+    assert 'item.payload_view.kind === "composite"' in _HTML
+    assert "allowSql.disabled = true;" in _HTML
+    assert "SQL rewrite is not offered for composite blueprints yet." in _HTML
+
+
+def test_the_rewrite_panes_exist_only_on_the_sql_changed_branch() -> None:
+    """The warning and the before/after panes are reachable ONLY through `sql_changed`. A
+    proposal that only re-roles entries must look exactly as it did before this existed —
+    otherwise the alarm is on every proposal, which is the same as being on none of them."""
+    source = _fn_source("renderSqlRewrite")
+    assert 'if (!isObject(payload) || payload.sql_changed !== true) return null;' in source
+    for testid in (
+        "inbox-revise-sql-warning",
+        "inbox-revise-sql-before",
+        "inbox-revise-sql-after",
+    ):
+        assert testid in source, testid
+        assert _HTML.count(testid) == 1, f"{testid} is referenced outside the rewrite branch"
+    # The alarm is announced, not just coloured.
+    assert 'warn.setAttribute("role", "alert");' in source
+    # And it quotes the SERVER's caution, falling back to the page's own only when none came.
+    assert "payload.caution || SQL_REWRITE_CAUTION" in source
+
+
+def test_the_proposed_sql_reaches_the_dom_as_text() -> None:
+    """Contract §4, at the one new place a server string is rendered: the proposed query is a
+    model-authored blob and goes in through `textContent` like everything else. `el()` sets
+    `textContent`, and the panes are `<pre>` — never an input, which would invite a hand edit
+    the static checks cannot see."""
+    source = _fn_source("renderSqlRewrite")
+    assert 'el("pre", "", String(payload.sql || ""))' in source
+    assert "createElement(\"input\")" not in source
+    assert "innerHTML" not in source
+
+
+def test_the_modal_shows_the_rewritten_sql_and_labels_it() -> None:
+    """The modal's `<pre>` is the query the reviewer is about to commit to. Showing the OLD
+    template above entries written against a NEW one would be the worst version of this
+    screen — an approval of a change that was never read."""
+    source = _fn_source("openReviseModal")
+    assert "var rewritten = payload.sql_changed === true;" in source
+    assert "var template = rewritten ? proposedSql : currentTemplateText(item);" in source
+    assert 'data-testid", "inbox-revise-modal-sql-rewritten"' in source
+    assert "Rewritten by the assistant" in source
+    # The caution is repeated where the commit happens, and the button names what it applies.
+    assert 'data-testid", "inbox-revise-modal-sql-caution"' in source
+    assert '"Apply, including the rewritten SQL"' in source
+
+
+def test_the_sql_is_sent_only_when_the_proposal_rewrote_it() -> None:
+    """Both write verbs treat an ABSENT `sql` as "keep the query the session ran". So the
+    field is attached only for a proposal the server itself marked `sql_changed` — sending
+    `""` on every apply would ask the server to tell "no rewrite" from "rewrite to nothing",
+    and one of those readings deletes the query."""
+    source = _fn_source("withProposedSql")
+    assert 'if (typeof sql === "string" && sql) body.sql = sql;' in source
+    # Both senders route through the one guard rather than composing a body each.
+    assert "JSON.stringify(withProposedSql({ entries: entries }, sql))" in _HTML
+    assert (
+        "JSON.stringify(withProposedSql({ entries: entries, replace: replaceAll }, sql))"
+        in _HTML
+    )
+    # ...and the string that goes back is the server's own, carried unedited from the modal.
+    assert "commit(entries, payload.replace === true, proposedSql);" in _HTML
+
+
+def test_a_rewritten_card_says_so_permanently() -> None:
+    """⚠ THE BADGE OUTLIVES THE SESSION THAT MADE IT. The modal's caution is seen once, by the
+    person who chose the rewrite; every reviewer afterwards would otherwise read the card as a
+    faithful record of a query that ran. `payload_view.sql_rewrite` is the server's stamp, and
+    the card renders it wherever a decision is taken — the header, and beside Approve."""
+    source = _fn_source("renderSqlRewriteBadge")
+    assert 'data-testid", "inbox-card-sql-rewritten"' in source
+    assert "SQL rewritten by the assistant on " in source
+    assert "formatWhen(record.applied_at)" in source
+    assert "not the session's query. Trial-run before approving." in source
+    # Read through ONE accessor, so the badge and the approve-side line can never disagree
+    # about whether this artifact is still the session's query.
+    assert "view.sql_rewrite" in _fn_source("sqlRewriteRecord")
+    assert "if (sqlRewriteRecord(item)) {" in _HTML
+    assert 'data-testid", "inbox-approve-sql-rewritten"' in _HTML
+
+
+def test_the_rewrite_caution_never_disables_approve() -> None:
+    """A caution, not a gate. A reviewer who has trial-run the rewrite is exactly the person
+    who should be able to approve it, and a page that blocked them would push the decision to
+    someone with less context."""
+    branch = _HTML[_HTML.index('makeActionButton(id, "approve", "Approve", li, actions, state.offline)') :]
+    branch = branch[: branch.index('makeActionButton(id, "reject"')]
+    assert "sqlRewriteRecord(item)" in branch
+    # The only thing the branch does is append a line — no disable, no removal.
+    assert "disabled" not in branch
+
+
+def test_a_rewrite_with_no_entries_is_still_applicable() -> None:
+    """⚠ AN EMPTY ENTRIES ARRAY IS A VALID ANSWER FOR A REWRITE. D97's totality walk passes a
+    query with no literal predicates to classify — a plain aggregate with no WHERE is the
+    ordinary case — so the server can legitimately return `sql_changed: true` with
+    `entries: []`. Gating the apply button and the modal on `entries` alone would render that
+    proposal, warning and all, and leave the reviewer no way to take it.
+
+    The early return survives for the OTHER case: an entries-only proposal with no entries has
+    nothing to apply, and a modal over it would be an empty dialog."""
+    assert (
+        "apply.hidden = !(proposed.length || (parsed && parsed.sql_changed === true));" in _HTML
+    )
+    source = _fn_source("openReviseModal")
+    assert "if (!proposed.length && !rewritten) return;" in source
+    # The empty parameterization is stated, not left as a blank modal body — applying it
+    # CLEARS the array the old query needed.
+    assert 'data-testid", "inbox-revise-modal-no-entries"' in source
+    assert "becomes an empty array." in source
+    # ...and the on-card note stops calling a real proposal "no suggestion".
+    assert "the rewritten query has no literal predicates to classify" in _HTML

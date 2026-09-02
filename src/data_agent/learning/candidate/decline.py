@@ -272,9 +272,32 @@ class ValidationSnapshot:
         )
 
 
+def last_sql(sql_by_ref: dict[str, tuple[str, ...]]) -> str:
+    """The accepted SQL to reason about: the last query the snapshot resolved.
+
+    "Latest wins" matches the builder's rule, and this deliberately does NOT borrow S4's
+    `_collapse_designations` refusal. That function refuses when it cannot prove one designation
+    subsumes the others, because it feeds a REWRITE that would silently drop a constraint.
+    Nothing is rewritten from this string — it is context for a model, and the answer to "which
+    query is the reviewer looking at" — and the proposal a model produces goes through the real
+    rewrite afterwards, where that refusal still stands.
+
+    LIVES HERE, beside `ValidationSnapshot`, because it is now read by three callers with one
+    question between them: the reviser (what SQL to show the model), the completer (what a
+    rewrite would REPLACE) and the inbox (whether a submitted `sql` is a rewrite at all). Two of
+    those decide whether a candidate becomes hand-authored, so a second copy that answered
+    "latest" differently would make the same request a rewrite on one path and a no-op on another.
+    """
+    for sqls in reversed(list(sql_by_ref.values())):
+        if sqls:
+            return sqls[-1]
+    return ""
+
+
 __all__ = [
     "QUOTE_WITHHELD",
     "DeclineBlock",
     "EvidencePointer",
     "ValidationSnapshot",
+    "last_sql",
 ]

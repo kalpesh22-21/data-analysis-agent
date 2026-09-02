@@ -520,6 +520,7 @@ def revise_span(
     replace: bool = False,
     conflicts: int = 0,
     model: str = "",
+    allow_sql: bool = False,
     verbose: bool = False,
     feedback: str | None = None,
     rationale: str | None = None,
@@ -536,7 +537,20 @@ def revise_span(
     `outcome` separates the ways it can produce nothing, because they need different fixes:
     `proposed`, `no_snapshot` (the candidate predates the stamp — a MIGRATION signal, not a
     model failure), `withheld_scan` (the leakage gate refused to quote the SQL), `unusable`,
-    `timeout`, `failed`, `refused_template_edit` (the model tried to write SQL).
+    `timeout`, `failed`, `refused_template_edit` (the model wrote a field this request had no
+    contract for).
+
+    Three more belong to the §C.5 SQL-rewrite opt-in, and they are kept apart from the four
+    above because none of them is a model failure in the same sense: `proposed_sql_rewrite` is a
+    SUCCESS whose blast radius is different (the candidate becomes hand-authored and can no
+    longer auto-land, so a rate worth watching on its own); `sql_rewrite_unusable` is a query
+    that came back and could not be parsed as a read-only SELECT — a PROMPT signal; and
+    `sql_rewrite_unsupported` never reached a model at all, because the candidate was composite.
+
+    `allow_sql` records whether the reviewer opted in. Worth an attribute rather than an
+    inference from the outcome: "the assistant was offered the SQL field and chose not to use
+    it" and "it was never offered one" are different facts about the same `proposed` span, and
+    only one of them says the prompt's PREFER-NOT-TO is working.
 
     `conflicts` counts diff rows that append cannot apply — the case a reviewer must resolve by
     switching to replace, and worth watching because a high rate means the PROMPT is steering
@@ -554,6 +568,7 @@ def revise_span(
         "learning.revise.replace": replace,
         "learning.revise.conflicts": conflicts,
         "learning.revise.model": model,
+        "learning.revise.allow_sql": allow_sql,
     }
     attrs.update(
         _verbose_attrs(

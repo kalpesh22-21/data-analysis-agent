@@ -245,9 +245,22 @@ class BlueprintPayload:
     composes: tuple[ComposeNodePlan, ...] = ()  # kind=composite only
     result_signature: ResultSignature | None = None
     notes: str = ""
+    # ⚠ THERE IS DELIBERATELY NO `sql_rewrite` FIELD HERE, and its absence is load-bearing.
+    #
+    # §C.5's rewrite badge (`payload["sql_rewrite"]`) is an attestation about PROVENANCE — "the
+    # assistant wrote this query, not the session". Registering it here would make it a field a
+    # MODEL can set, because everything in this class is rehydrated from model-authored JSON: a
+    # mined candidate could then render "the assistant rewrote this SQL" on a review card while
+    # `authored=False` let it auto-land, a claim and a routing decision disagreeing about one
+    # row. The first cut of this slice did register it, which is exactly how that was found.
+    #
+    # So the badge is stamped by `inbox/completion.py::_stamped` onto the validated DOC, after
+    # `to_candidate` has run, from a record derived from the `ValidationSnapshot`. `to_doc`
+    # being a CLOSED key set is then the mechanism rather than the obstacle: it is what drops an
+    # inbound claim on the way through.
 
     def to_doc(self) -> dict[str, Any]:
-        return {
+        doc: dict[str, Any] = {
             "intent": self.intent,
             "kind": self.kind,
             "resolves": dict(self.resolves),
@@ -260,6 +273,7 @@ class BlueprintPayload:
             ),
             "notes": self.notes,
         }
+        return doc
 
 
 # --- the extractor's in-flight output ------------------------------------------

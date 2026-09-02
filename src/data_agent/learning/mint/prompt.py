@@ -9,10 +9,18 @@ exactly the kind of conditional instruction models drop.
 Both inherit the reviser's hard-won content. The three role-classification traps in
 `revise/prompt.py` were learned from six repeated failures on live candidates, and a minter that
 did not repeat them would rediscover them. They are stated once here, in `_ROLES`.
+
+⚠ THE DATE RULE IS IMPORTED, not restated. Every prompt in this system that lets a model WRITE
+SQL owes it the same warning — a run date frozen into the body makes the blueprint answer a
+different question every day it ages, and `check_no_frozen_date_literal` refuses it downstream.
+The minting prompts had no date guidance at all until §C.5 went looking for the gap. It lives in
+`learning/prompts/sql_rules.py` rather than in either package: minting importing it from revising
+would read as one peer depending on the other, when what they actually share is a CHECK.
 """
 
 from __future__ import annotations
 
+from ..prompts.sql_rules import DATE_RULE
 from .models import MintRequest
 
 _ROLES = """\
@@ -88,6 +96,8 @@ WRITE THE SQL FIRST, then classify what you wrote. Constraints on the query:
   * Follow the expert's steps. Where a step cannot be expressed against these tables, say which
     one in your rationale rather than quietly dropping it.
 
+{DATE_RULE}
+
 {_ROLES}
 
 Call the tool exactly once. Do not emit free text."""
@@ -123,6 +133,8 @@ Never re-derive an earlier step's value by repeating its query inside a later on
 the DAG exists to avoid.
 
 Each step is ONE read-only SELECT, ClickHouse dialect, reading only the tables you were shown.
+
+{DATE_RULE}
 
 {_ROLES}
 
@@ -246,4 +258,4 @@ def mint_brief(
     return "\n".join(lines)
 
 
-__all__ = ["CLASSIFY_SYSTEM_PROMPT", "DRAFT_SYSTEM_PROMPT", "mint_brief"]
+__all__ = ["CLASSIFY_SYSTEM_PROMPT", "COMPOSITE_SYSTEM_PROMPT", "DRAFT_SYSTEM_PROMPT", "mint_brief"]

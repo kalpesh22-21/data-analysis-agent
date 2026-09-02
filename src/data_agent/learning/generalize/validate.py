@@ -238,6 +238,27 @@ def check_no_frozen_date_literal(template: str) -> bool:
     SQL). An UNPARSEABLE template passes here: the parse is already `_check_rewritten`'s
     failure to report, and double-reporting it would move the reason tag S7 routes on.
     """
+    return not frozen_date_literals(template)
+
+
+def frozen_date_literals(template: str) -> tuple[str, ...]:
+    """Every date-shaped literal in *template* that NO recognized comparison adjudicated.
+
+    THE WALK ITSELF — `check_no_frozen_date_literal` is `not this`, so there is exactly one
+    implementation of "which literal is frozen" and the boolean cannot drift from the list. Read
+    that function's docstring for the two conditions and why each is load-bearing; this one only
+    records what it is FOR.
+
+    It exists because a reason a reviewer reads has to NAME the offender. "Your query froze the
+    run date" sends someone diffing two queries by eye; "`2026-09-01 00:00:00` is frozen into the
+    query" is a string they can find. The §C.5 reviser refuses a dated rewrite at propose time
+    with this list in the sentence, and the check that will re-read the derived template later is
+    this same walk — so the early refusal and the late `fail_to_review` can never disagree about
+    what is wrong.
+
+    Returns EVERY offender rather than the first: a model that froze one date usually froze two,
+    and a reason naming one of them invites a second round trip for the other.
+    """
     # STRING-AWARE: a `{word}` inside a string constant is data, not a bind site.
     colon_form = sub_slot_tokens(template, lambda name: f":{name}")
     try:
@@ -245,9 +266,10 @@ def check_no_frozen_date_literal(template: str) -> bool:
             colon_form, dialect="clickhouse", error_level=sqlglot.ErrorLevel.RAISE
         )
     except Exception:
-        return True
+        return ()
     if ast is None:
-        return True
+        return ()
+    frozen: list[str] = []
     for literal in ast.find_all(exp.Literal):
         if not literal.is_string:
             continue
@@ -259,12 +281,13 @@ def check_no_frozen_date_literal(template: str) -> bool:
                 # (b) `child` is the literal's whole SIDE of this predicate. A column in it
                 # means the constant S3 adjudicated came from the OTHER side, not from here.
                 if list(child.find_all(exp.Column)):
-                    return False
+                    frozen.append(str(literal.this))
                 break
             child, node = node, node.parent
         else:  # (a) no predicate the enumerator recognizes, anywhere above it
-            return False
-    return True
+            frozen.append(str(literal.this))
+    # ORDER-PRESERVING DE-DUP: the same run date pasted into two places is one fault to fix.
+    return tuple(dict.fromkeys(frozen))
 
 
 def decide_outcome(

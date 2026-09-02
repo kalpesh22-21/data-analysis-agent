@@ -168,7 +168,7 @@ class LeakageGateStage:
         return await self._apply(env, ctx, verdict, text_by_field)
 
     async def scan(
-        self, env: CandidateEnvelope
+        self, env: CandidateEnvelope, *, extra_fields: dict[str, str] | None = None
     ) -> tuple[LeakageVerdict, dict[str, str]]:
         """SCAN ONLY: both layers, the decision, the span — and NOTHING that writes.
 
@@ -184,8 +184,16 @@ class LeakageGateStage:
 
         `env.type` is NOT re-checked: a non-global type simply scans no fields and comes back `pass`,
         which is the same answer `process` gives by skipping.
+
+        `extra_fields` are surfaces that are NOT in the payload's own scanned set but are about to
+        be persisted beside it. There is one caller and one reason: a DECLINED completion has no
+        `generalization.sql_template` — the stages never ran — so the surface through which an
+        inline literal normally reaches this scanner does not exist yet. See
+        `inbox/completion.py::_inline_literal_fields` for what it passes and why that is the one
+        honest substitute. Merged UNDER the payload's own fields, so a caller cannot shadow a real
+        surface with a fabricated one.
         """
-        text_by_field = _scanned_fields(env.type, env.payload)
+        text_by_field = {**(extra_fields or {}), **_scanned_fields(env.type, env.payload)}
         regex_hits = entities.scan_fields(text_by_field)
 
         semantic = await self.semantic_scanner.scan(
@@ -312,7 +320,11 @@ PENDING_ENTITY_SCAN: dict = {
 
 
 async def settle_entity_scan(
-    stages: tuple, env: CandidateEnvelope, ctx: StageContext
+    stages: tuple,
+    env: CandidateEnvelope,
+    ctx: StageContext,
+    *,
+    extra_fields: dict[str, str] | None = None,
 ) -> dict:
     """The `entity_scan` doc for an envelope on a NON-LANDING path.
 
@@ -324,11 +336,13 @@ async def settle_entity_scan(
     be a second definition of what a leak is. NO GATE WIRED ⇒ the sentinel, never a fabricated
     `pass`: the resulting row is degraded (detail withheld at the wire, approvable by nobody),
     which is the correct shape for a deployment that scanned nothing.
+
+    `extra_fields` is passed straight through — see `LeakageGateStage.scan`.
     """
     stage = next((s for s in stages if getattr(s, "stage_id", "") == "leakage"), None)
     if stage is None:
         return dict(PENDING_ENTITY_SCAN)
-    verdict, _text_by_field = await stage.scan(env)
+    verdict, _text_by_field = await stage.scan(env, extra_fields=extra_fields)
     return verdict.to_doc()
 
 

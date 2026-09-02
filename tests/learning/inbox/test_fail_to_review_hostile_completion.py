@@ -540,14 +540,29 @@ async def test_a_still_declined_completion_re_settles_the_scan_over_what_it_stor
     assert resp.json()["decline"]["detail_withheld"] is True
 
 
-async def test_the_reviewers_own_entries_are_not_a_scanned_surface(enabled) -> None:
-    """The margin of the rule above, stated so it stays deliberate: what a completion
-    merges is `parameterization`, and the gate does NOT scan it — those are
-    pre-generalization slot values by design, and scanning them would quarantine every
-    candidate that ever filtered on a department. So a reviewer typing an entity into a
-    locator does not move the verdict, and the re-scan's value is that the stamp is a
-    measurement of the stored payload rather than a leftover. If the scanned surfaces ever
-    grow to include parameterization, this test is the one that should start failing."""
+async def test_an_inline_literal_is_scanned_but_a_slot_one_is_not(enabled) -> None:
+    """⚠ THIS TEST PREDICTED ITS OWN FLIP AND HAS NOW FLIPPED. It used to say the gate scans no
+    part of `parameterization`, and ended: "if the scanned surfaces ever grow to include
+    parameterization, this test is the one that should start failing." They have grown, by
+    exactly one field, and the reason is the correspondence the old rule missed.
+
+    The rule is not "scan the entries" — it is scan WHAT SURVIVES INTO THE TEMPLATE. On the
+    success path the gate reads `generalization.sql_template`, where every `slot` literal has
+    already become a token and only the `inline` ones remain, because those are the values that
+    ride into the landed global artifact verbatim. A DECLINED row has no template, so that
+    surface does not exist and the old re-scan settled `pass` having read none of them.
+
+    An `inline` entry is a DECLARATION that a value stays frozen for ever, and it is knowable
+    from the payload before any template exists. So a declined row now gets the same verdict it
+    will get a round later when it completes, rather than one that differs by an accident of
+    which stages happened to have run.
+
+    THE OTHER HALF IS WHY THE OLD RULE EXISTED, and it still holds: a SLOT literal is not
+    scanned. `department = '0420'` is the caller's question, it becomes a token, it never reaches
+    a global store — and scanning it would quarantine every candidate that ever filtered on a
+    department, withholding the decline detail and locking the assistant on the queue whose
+    whole purpose is helping with that row.
+    """
     client, store = await _client()
     entity_in_a_locator = [
         {
@@ -564,8 +579,35 @@ async def test_the_reviewers_own_entries_are_not_a_scanned_surface(enabled) -> N
     assert resp.json()["outcome"] == "declined", resp.text
     parked = await store.get(CID)
     assert parked.payload["parameterization"][-1]["locator"]["value"] == "EMEA"
-    assert parked.entity_scan["result"] == "pass"
-    assert "parameterization" not in parked.entity_scan["scanned_fields"]
+    # FROZEN ⇒ SCANNED ⇒ caught, one round earlier than the template would have caught it.
+    assert parked.entity_scan["result"] == "quarantine"
+    scanned = parked.entity_scan["scanned_fields"]
+    assert any(f.endswith(".locator.value") for f in scanned), scanned
+
+    # ...and the complement: the SAME value as a SLOT is not a scanned surface at all.
+    slot_entry = [
+        {
+            "locator": {"table": "payroll.payroll_fact", "column": "region", "value": "EMEA"},
+            "role": "slot",
+            "slot": {
+                "name": "region",
+                "type": "entity",
+                "binds_to": "payroll.payroll_fact.region",
+                "required": True,
+            },
+        }
+    ]
+    # `replace` so the inline entry above is GONE — appending would leave it in the payload and
+    # the assertion would be measuring the first half of this test over again.
+    client.post(
+        f"/inbox/{CID}/complete",
+        json={"entries": slot_entry, "replace": True},
+        headers=AUTH,
+    )
+    reparked = await store.get(CID)
+    assert not any(
+        f.endswith(".locator.value") for f in reparked.entity_scan["scanned_fields"]
+    )
     # ...and it is going nowhere on that pass: approve is in_review-only.
     assert client.post(f"/inbox/{CID}/approve", headers=AUTH).status_code == 409
 

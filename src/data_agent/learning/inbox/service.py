@@ -22,6 +22,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -78,6 +79,17 @@ class CompleteParameterizationRequest(BaseModel):
 
     entries: list[dict[str, Any]] = []
     replace: bool = False
+    # §C.5 — the ACCEPTED SQL, when the reviewer is applying an assistant REWRITE of it. Empty
+    # (or equal to the query already on the candidate) means the ordinary path: this field is
+    # additive, and a client that never sends it behaves exactly as before.
+    #
+    # Non-empty and DIFFERENT switches the whole operation: the accepted SQL is replaced, the
+    # snapshot is stamped `authored=True`, `replace` is forced true (every old entry describes
+    # the old query), and the candidate can never auto-land. Typed as loosely as `entries` and
+    # for the same reason — the checks that decide whether this is a usable query are the ones
+    # downstream that will READ it, and a second vocabulary here would give the reviewer two
+    # error messages for one mistake.
+    sql: str = ""
 
 
 class TrialRunRequest(BaseModel):
@@ -122,9 +134,15 @@ class ReviseParameterizationRequest(BaseModel):
     would say to a colleague ("the register_type predicate spans two rules — inline it") and the
     reviser turns it into entries. Nothing here reaches a store; the proposal comes back for the
     reviewer to apply through `complete`, which stays the only write path.
+
+    `allow_sql` is the §C.5 opt-in and the ONE reason there is a second field. DEFAULT FALSE and
+    never inferred from the feedback text: it licenses the assistant to return a replacement
+    query, which costs the candidate its provenance and its ability to auto-land, and a licence
+    like that has to be something a reviewer TICKED rather than something a sentence implied.
     """
 
     feedback: str = ""
+    allow_sql: bool = False
 
 
 class MintBlueprintRequest(BaseModel):
@@ -288,6 +306,11 @@ def _completion_result(result: CompletionResult) -> dict[str, Any]:
         "reason": None,
         "outcome": result.outcome,
         "decline": item.decline_view(),
+        # §C.5 — whether THIS request replaced the accepted SQL. Off the result, not derived
+        # from the payload: a candidate rewritten yesterday carries the same `sql_rewrite`
+        # record as one rewritten just now, and what the surface has to confirm is what the
+        # reviewer just did.
+        "sql_rewritten": result.sql_rewritten,
     }
 
 
@@ -342,7 +365,71 @@ def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     return HTTPException(status_code=409, detail=message)
 
 
-def _build_completion_param_judge(learning_settings: Any) -> Any:
+@dataclass(frozen=True)
+class _JudgeDeps:
+    """The two collaborators the completion plane's judges share: a model client and an audit store.
+
+    ⚠ BUILT ONCE, PASSED IN. Each judge used to construct its own, which meant a deployment with
+    both switched on opened TWO Couchbase audit connections and TWO model clients in a process
+    that needs one of each — and, worse, wrote its two kinds of verdict about the same candidate
+    through two different store objects. The consumer has always shared them (`build_learning_
+    consumer` builds one of each and hands them to both `build_coverage_judge` and
+    `build_param_judge`); this is the same shape at the second composition root.
+
+    LAZY: `build` returns `None` when nothing needs them, so a deployment with both judges off —
+    the default — opens neither connection.
+    """
+
+    model_client: Any
+    audit_store: Any
+
+    @classmethod
+    def build(cls, learning_settings: Any) -> _JudgeDeps | None:
+        """The pair, or `None` when they cannot be made. Never raises."""
+        api_key = getattr(learning_settings, "learning_extractor_api_key", "")
+        if not api_key:
+            _logger.warning(
+                "inbox service: a completion-path judge is enabled but no extractor API key is "
+                "configured — human-completed, minted and SQL-rewritten candidates will skip it"
+            )
+            return None
+        try:
+            from data_agent.runtime.model.openai_client import build_openai_model_client
+
+            from ..audit.couchbase_audit_store import CouchbaseAuditStore
+
+            return cls(
+                model_client=build_openai_model_client(
+                    api_key=api_key,
+                    model=getattr(learning_settings, "learning_extractor_model", ""),
+                    base_url=getattr(learning_settings, "learning_extractor_base_url", ""),
+                ),
+                audit_store=CouchbaseAuditStore(learning_settings),
+            )
+        except Exception:  # noqa: BLE001 — a judge may not break the completion plane
+            _logger.warning(
+                "inbox service: the completion-path judges could not be built; completions "
+                "still re-validate and re-run the write router without them",
+                exc_info=True,
+            )
+            return None
+
+
+def _judge_deps_if_needed(learning_settings: Any) -> _JudgeDeps | None:
+    """`_JudgeDeps` when EITHER completion-path judge is switched on, else `None`.
+
+    The `if needed` is what keeps `build` lazy without either judge having to know about the
+    other's switch.
+    """
+    wanted = getattr(learning_settings, "learning_param_judge_enabled", False) or getattr(
+        learning_settings, "learning_judge_enabled", False
+    )
+    return _JudgeDeps.build(learning_settings) if wanted else None
+
+
+def _build_completion_param_judge(
+    learning_settings: Any, deps: _JudgeDeps | None = None
+) -> Any:
     """The S4 parameterization judge for the COMPLETION path, or `None`.
 
     ⚠ THE COMPLETION PATH NEEDS ITS OWN, and leaving it out is not a small omission. Design
@@ -359,37 +446,21 @@ def _build_completion_param_judge(learning_settings: Any) -> Any:
     """
     if not getattr(learning_settings, "learning_param_judge_enabled", False):
         return None
-    api_key = getattr(learning_settings, "learning_extractor_api_key", "")
-    if not api_key:
+    deps = deps if deps is not None else _JudgeDeps.build(learning_settings)
+    if deps is None:
         _logger.warning(
-            "inbox service: the parameterization judge is enabled but no extractor API key "
-            "is configured — human-completed candidates will be MISSING from the phase-D-1 "
-            "dataset"
+            "inbox service: the parameterization judge is enabled but its model client and "
+            "audit store could not be built — human-completed candidates will be MISSING "
+            "from the phase-D-1 dataset"
         )
         return None
-    try:
-        from data_agent.runtime.model.openai_client import build_openai_model_client
+    from ..factory import build_param_judge
 
-        from ..audit.couchbase_audit_store import CouchbaseAuditStore
-        from ..factory import build_param_judge
-
-        return build_param_judge(
-            learning_settings,
-            model_client=build_openai_model_client(
-                api_key=api_key,
-                model=getattr(learning_settings, "learning_extractor_model", ""),
-                base_url=getattr(learning_settings, "learning_extractor_base_url", ""),
-            ),
-            audit_store=CouchbaseAuditStore(learning_settings),
-        )
-    except Exception:  # noqa: BLE001 — an observation may not break the completion plane
-        _logger.warning(
-            "inbox service: the parameterization judge could not be built for the "
-            "completion path; completions still re-validate and re-run the write router, "
-            "but they will be missing from the phase-D-1 dataset",
-            exc_info=True,
-        )
-        return None
+    return build_param_judge(
+        learning_settings,
+        model_client=deps.model_client,
+        audit_store=deps.audit_store,
+    )
 
 
 def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
@@ -584,8 +655,32 @@ def _build_completer(
     candidate_store: Any,
     corpus: Any,
     embedding_client: Any,
+    prior_art: Any = None,
+    judge: Any = None,
+    semantic_scanner: Any = None,
+    param_judge_deps: Any = None,
 ) -> ParameterizationCompleter | None:
     """Build the fail-to-review completion plane, or `None` when the catalog cannot be read.
+
+    ⚠ THE COLLABORATORS ARE PART OF THE PARITY, NOT DECORATION ON IT. The stage ORDER has been
+    shared with the consumer since `build_write_router_stages` was extracted, but the objects
+    handed to those stages were not, and the same pipeline built around different collaborators
+    is a different pipeline. Two checks were missing on every completed, minted and (now)
+    REWRITTEN candidate:
+
+      * `prior_art` — `dedup/stage.py`'s CROSS-TIER layer returns early without it, so the MCP
+        canon and the landed learning tier are invisible and a blueprint a human just finished is
+        adjudicated against the `learning_corpus` bucket alone, which this loop seeds itself;
+      * `judge` — the S6 layer-3b judged near-miss, which is the one that decides whether a
+        soft-similar artifact is a genuine duplicate rather than a neighbour.
+
+    A human-finished blueprint faced STRICTLY LESS evidence than a mined one, which is exactly
+    backwards for the path where hand-authored SQL enters. Both are optional and both degrade
+    LOUDLY (see `_completion_collaborator_log`) — a completion that re-validates is worth more
+    than one refused for want of a graph — but neither degrades silently.
+
+    `semantic_scanner` is passed through for the same reason even though nothing wires a real one
+    on either side today: the parity has to be structural, not a coincidence of two `None`s.
 
     THE CATALOG COMES FROM THE SAME PLACE THE CONSUMER'S DOES — the frozen `GET /catalog/export`
     snapshot — and that is the load-bearing detail: the completer re-runs the extractor's own
@@ -617,6 +712,7 @@ def _build_completer(
 
     from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
 
+    _completion_collaborator_log(prior_art=prior_art, judge=judge)
     return ParameterizationCompleter(
         store=candidate_store,
         known_rules=known_rule_ids_from_catalog(catalog),
@@ -631,12 +727,98 @@ def _build_completer(
             blueprint_corpus=corpus,
             catalog_schema=build_sqlglot_schema_from_catalog(catalog),
             embedder=embedding_client,
+            # THE SAME THREE the consumer passes, so the two callers assemble one pipeline
+            # rather than two that happen to share an order.
+            prior_art=prior_art,
+            judge=judge,
+            semantic_scanner=semantic_scanner,
             # The SECOND composition root design §D.1 names. See
             # `_build_completion_param_judge` for why the completion path needs one of its
             # own rather than inheriting the consumer's.
-            param_judge=_build_completion_param_judge(learning_settings),
+            param_judge=_build_completion_param_judge(learning_settings, param_judge_deps),
             include_target_specific=False,
         ),
+    )
+
+
+def _completion_collaborator_log(*, prior_art: Any, judge: Any) -> None:
+    """Say, at build time, which dedup layers this completion plane will actually run.
+
+    SEPARATE LINES for the two absences because they need different fixes and have different
+    consequences, and NEITHER is an error: a deployment with no graph must still be able to
+    complete a form. What must not happen is the degrade being invisible — the symptom of a
+    missing cross-tier layer is a duplicate blueprint landing weeks later, which points nowhere
+    near the cause.
+    """
+    if prior_art is None:
+        _logger.warning(
+            "inbox service: the completion plane has NO prior-art index — S6's CROSS-TIER "
+            "layer cannot run, so a completed, minted or SQL-REWRITTEN blueprint is deduped "
+            "against the `learning_corpus` bucket ONLY (which this loop seeds itself). The MCP "
+            "canon and the landed learning tier are INVISIBLE to it, and the soft layer falls "
+            "back to the O(corpus) brute-force scan. The consumer's pipeline has one; this is "
+            "the parity gap."
+        )
+    if judge is None:
+        _logger.warning(
+            "inbox service: the completion plane has NO coverage judge — S6's layer-3b judged "
+            "near-miss cannot run, so a soft-similar artifact is adjudicated on thresholds "
+            "alone. A human-finished blueprint therefore faces less evidence than a mined one, "
+            "which is backwards for the path hand-authored and rewritten SQL enters."
+        )
+    if prior_art is not None and judge is not None:
+        _logger.info(
+            "inbox service: the completion plane runs the FULL write-router evidence set "
+            "(cross-tier prior art + the layer-3b coverage judge), matching the consumer's"
+        )
+
+
+def _build_completion_coverage_judge(
+    learning_settings: Any, prior_art: Any, deps: _JudgeDeps | None = None
+) -> Any:
+    """The S6 layer-3b judge for the COMPLETION path, or `None`.
+
+    ⚠ THE SAME ARGUMENT `_build_completion_param_judge` MAKES, for a stage that DECIDES rather
+    than observes. The dedup judge is what separates "a genuine duplicate of something the corpus
+    already holds" from "a neighbour", and a completion plane without one adjudicates that on
+    similarity thresholds alone. A blueprint a human finished — or one whose SQL the assistant
+    rewrote — must not be admitted on weaker evidence than one the loop mined.
+
+    LAZY AND FAIL-SOFT, exactly like the param judge: nothing is constructed unless the
+    kill-switch is on, and every missing precondition degrades to `None` with a log line, because
+    a completion that re-validates is worth strictly more than the extra dedup evidence.
+    `build_coverage_judge` owns the preconditions themselves (kill-switch, prior art, audit
+    store) so the two composition roots cannot disagree about what "wired" means.
+    """
+    if not getattr(learning_settings, "learning_judge_enabled", False):
+        return None
+    if prior_art is None:
+        _logger.info(
+            "inbox service: the coverage judge is enabled but the completion plane has no "
+            "prior-art index — there is nothing for a candidate to be covered BY"
+        )
+        return None
+    deps = deps if deps is not None else _JudgeDeps.build(learning_settings)
+    if deps is None:
+        _logger.warning(
+            "inbox service: the coverage judge is enabled but its model client and audit store "
+            "could not be built — completed and rewritten candidates will skip S6's layer-3b"
+        )
+        return None
+    from opentelemetry import trace as _otel_trace
+
+    from ..factory import build_coverage_judge
+
+    return build_coverage_judge(
+        learning_settings,
+        model_client=deps.model_client,
+        judge_client_injected=False,
+        audit_store=deps.audit_store,
+        prior_art=prior_art,
+        # THE GLOBAL PROVIDER the daemon preamble installed, read the same way `_build_reviser`
+        # reads it. With no OTLP endpoint that is a NO-OP provider, so an untraced deployment is
+        # unchanged rather than special-cased.
+        tracer=get_learning_tracer(_otel_trace.get_tracer_provider()),
     )
 
 
@@ -740,6 +922,21 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         connection_acquisition_timeout=runtime_settings.neo4j_timeout_seconds,
         max_transaction_retry_time=runtime_settings.neo4j_timeout_seconds,
     )
+    # ONE index, THREE readers: the minter's duplicate check, the completion plane's S6
+    # cross-tier layer, and the coverage judge that adjudicates its near-misses. Hoisted for the
+    # reason the completer below is — two instances would open two neo4j pools and could
+    # disagree about what the corpus contains within one candidate's lifetime.
+    prior_art = Neo4jPriorArtIndex(
+        driver=neo4j_driver,
+        embedding_client=embedding_client,
+        expected_model=runtime_settings.embedding_model,
+        database=runtime_settings.neo4j_database,
+    )
+    # ONE model client and ONE audit store for BOTH completion-path judges — built lazily, so a
+    # deployment with both switched off (the default) opens neither. Two judges constructing
+    # their own meant two Couchbase connections in a process that needs one, and two kinds of
+    # verdict about the same candidate written through different store objects.
+    judge_deps = _judge_deps_if_needed(learning_settings)
     # HOISTED so the minter can share the EXACT instance rather than build a second one.
     # Two completers would mean two copies of the write-router stages over one store, and a
     # minted candidate adjudicated by a different instance than a reviewed one is a difference
@@ -750,6 +947,12 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         candidate_store=candidate_store,
         corpus=corpus,
         embedding_client=embedding_client,
+        # ⚠ THE PARITY WITH THE CONSUMER'S PIPELINE. Without these two the completion plane
+        # assembled the same stage ORDER around a strictly weaker evidence set — no cross-tier
+        # dedup, no layer-3b judge — for every completed, minted and SQL-REWRITTEN candidate.
+        prior_art=prior_art,
+        judge=_build_completion_coverage_judge(learning_settings, prior_art, judge_deps),
+        param_judge_deps=judge_deps,
     )
     # Same recipe as the scheduler entrypoint; we hold the returned INBOX (the
     # scheduler is wired into it and shares the one candidate store).
@@ -788,14 +991,10 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
             learning_settings,
             runtime_settings,
             completer=completer,
-            # The SAME neo4j driver and embedding client the rest of this process holds, so
-            # the duplicate check reads the corpus the promotion path writes.
-            prior_art=Neo4jPriorArtIndex(
-                driver=neo4j_driver,
-                embedding_client=embedding_client,
-                expected_model=runtime_settings.embedding_model,
-                database=runtime_settings.neo4j_database,
-            ),
+            # The SAME instance the completion plane's dedup stage and coverage judge hold,
+            # built from the SAME neo4j driver and embedding client the rest of this process
+            # uses, so the duplicate check reads the corpus the promotion path writes.
+            prior_art=prior_art,
         ),
         # PriorArt Slice 2 — THE process where humans actually reject. `reject` and
         # `retract` reach the scheduler through THIS service, not through
@@ -1009,11 +1208,20 @@ def create_inbox_app(
         would put the one sentence that names the fix into an error banner. The other codes keep
         their usual meanings: 404 unknown id, 409 wrong status, 422 an `entries` value that is not a
         parameterization array at all, 503 no validation plane in this deployment.
+
+        §C.5: a non-empty `sql` that DIFFERS from the candidate's accepted SQL applies an
+        assistant REWRITE. `replace` is then forced true whatever the body said — a rewrite
+        invalidates every existing entry — the candidate becomes hand-authored and can never
+        auto-land, and the response carries `sql_rewritten: true`. A `sql` equal to the query
+        already on the candidate is not a rewrite and changes nothing.
         """
         req = body or CompleteParameterizationRequest()
         try:
             result = await inbox.complete_parameterization(
-                candidate_id, entries=req.entries, replace_all=req.replace
+                candidate_id,
+                entries=req.entries,
+                replace_all=req.replace,
+                rewritten_sql=req.sql,
             )
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
@@ -1045,11 +1253,22 @@ def create_inbox_app(
         "The assistant had no suggestion" is a 200 with empty `entries` and a `reason`, for the
         same reason a still-incomplete completion is a 200: the reviewer did nothing wrong, and
         the useful next step belongs on the page rather than in an error banner. 404 unknown id,
-        409 wrong status, 422 the model tried to write SQL, 503 no reviser in this deployment.
+        409 wrong status, 422 the model wrote a field this request had no contract for, 503 no
+        reviser in this deployment.
+
+        §C.5: with `allow_sql: true` the assistant MAY return a complete replacement query. The
+        200 then carries `sql_changed: true`, the `sql` itself, a `caution` to render verbatim,
+        and `replace: true` (forced). Still a proposal — nothing is written, and the reviewer
+        applies it through `complete`/`apply_revision` with the same `sql`. A rewrite the system
+        cannot parse as a read-only SELECT is a 200 with a `reason` and no `sql`, like every
+        other "the assistant had no suggestion". A COMPOSITE candidate is a 422 naming the
+        reason: its SQL lives on its nodes, so there is no single query to replace.
         """
         req = body or ReviseParameterizationRequest()
         try:
-            proposal = await inbox.propose_revision(candidate_id, feedback=req.feedback)
+            proposal = await inbox.propose_revision(
+                candidate_id, feedback=req.feedback, allow_sql=req.allow_sql
+            )
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         except ReviserUnavailableError as exc:
@@ -1073,7 +1292,9 @@ def create_inbox_app(
         Distinct from `complete`, which fills a FORM and appends. This REPLACES, which is both
         the right semantics for correcting a role and idempotent — see
         `ReviewInbox.apply_revision`. The request body's `replace` field is IGNORED here; the
-        operation has only one mode by design.
+        operation has only one mode by design. The body's `sql` is NOT ignored: a §C.5 rewrite
+        applies here exactly as it does on `complete`, and needs no forcing because this verb is
+        already replace-only.
 
         Same outcome vocabulary as `complete`: a revision that still does not validate answers
         200 with `outcome="declined"` and the fresh reason, because that is the result the
@@ -1081,7 +1302,9 @@ def create_inbox_app(
         """
         req = body or CompleteParameterizationRequest()
         try:
-            result = await inbox.apply_revision(candidate_id, entries=req.entries)
+            result = await inbox.apply_revision(
+                candidate_id, entries=req.entries, rewritten_sql=req.sql
+            )
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         except CompletionUnavailableError as exc:

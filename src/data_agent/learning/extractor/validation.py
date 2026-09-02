@@ -1294,6 +1294,19 @@ def _blueprint_payload(raw: dict[str, Any]) -> BlueprintPayload:
     )
 
 
+# ⚠ `sql_rewrite` IS DROPPED HERE, and silently, which is the right handling for exactly this
+# key. It is §C.5's badge saying "the assistant rewrote this query, not the session" — an
+# attestation about PROVENANCE — and everything this function reads is model-authored JSON. A
+# mined candidate that emitted one would render that claim on a review card while `authored=False`
+# let it auto-land: the card and the router disagreeing about one row.
+#
+# `BlueprintPayload` therefore has no such field, so the key simply does not survive
+# `payload_to_doc()`. The badge is stamped SERVER-SIDE after this function returns
+# (`inbox/completion.py::_stamped`), from a record derived from the `ValidationSnapshot` — the
+# one structure a model cannot write to. Dropped rather than DECLINED because the key is inert
+# junk, not a lie a blueprint should die for: the rest of the payload may be perfectly good.
+
+
 # --- the NON-blueprint payloads (§3.3) ----------------------------------------------
 #
 # WHY THESE EXIST. Until this branch checked anything, `to_candidate` asked of a

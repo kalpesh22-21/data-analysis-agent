@@ -62,9 +62,40 @@ touched are outlined and badged. Adjust anything, then apply. Escape or clicking
 a hand-typed array does. On the review queue it **replaces** the parameterization; on the form it
 **appends** what was missing. The assistant is a typing aid, not a second write path.
 
-It cannot change the SQL. There is no field for it, in the tool or the modal. The template is
-derived from the accepted query by AST rewrite, so a model that wants a different template gets one
-by classifying literals differently — the only kind of change the provenance chain survives.
+By default it cannot change the SQL: there is no field for it, in the tool or the modal. The
+template is derived from the accepted query by AST rewrite, so a model that wants a different
+template gets one by classifying literals differently — the only kind of change the provenance
+chain survives.
+
+#### Letting it rewrite the query (opt-in)
+
+Sometimes the parameterization is not the problem — the query is. A missing predicate, or a join
+that answers a neighbouring question, cannot be fixed by re-roling anything, and without this your
+only option was **reject**. Tick **"let the assistant rewrite the SQL"** before asking, and it may
+return a complete replacement query.
+
+What that costs, and what you should do about it:
+
+- **It is no longer the query the session ran.** Every check — the totality walk, `explain_ok`,
+  `binds_to_subset_uses`, `read_only_select`, the frozen-date check — now validates SQL the
+  assistant wrote. They all still run; they are just checking a different thing. The card shows a
+  caution saying exactly this, and a badge that stays on the row afterwards.
+- **`replace` is forced.** Every existing entry describes the old query, so a rewrite comes with a
+  complete new set of entries and discards the old ones. You cannot append onto a rewrite.
+- **It can never land on its own.** The candidate is stamped *hand-authored* and held at
+  `in_review` even if every check passes — the same rule a blueprint written at the minting page
+  gets. A human approves it or nothing happens.
+- **Trial-run it before approving.** This is the one query on the queue that has never been run
+  by anybody. The checks are static; the trial is the only thing that executes it.
+- **Not offered for multi-step (composite) blueprints.** Their SQL lives on the individual steps —
+  one query per node — so a single replacement query is not a thing they can hold. Untick the box
+  to revise the roles instead, or re-mint the blueprint.
+
+The assistant refuses to offer a rewrite it can already tell you will not survive: anything that is
+not a single read-only SELECT, anything over the size limit, and anything that freezes today's date
+into the query (a blueprint that hard-codes a run date answers a different question every day it
+ages). You get a sentence saying which, instead of a candidate that fails later. The same checks run
+again when you apply, because the assistant is a typing aid and the apply route is the gate.
 
 > ⚠ **The modal shows the query only on the review queue.** A `needs_parameterization` row has no
 > template yet — that is *why* it is a form — and the accepted SQL lives in the re-validation

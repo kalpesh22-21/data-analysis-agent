@@ -774,6 +774,84 @@
     padding: var(--space-2);
   }
 
+  /* --- The SQL rewrite opt-in (design §C.5) ---------------------------------
+     Styled as a WARNING wherever it appears, never as a neutral option: ticking it
+     lets the assistant replace the query the session actually ran, which is the one
+     thing on this surface that breaks the provenance chain the static checks stand on. */
+
+  .revise-allow-sql {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.8rem;
+  }
+
+  .revise-allow-sql input[disabled] + span {
+    color: var(--color-text-dim);
+  }
+
+  .revise-allow-sql-caution,
+  .revise-allow-sql-unavailable {
+    margin: 0;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--color-text-dim);
+  }
+
+  .revise-sql {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .revise-sql-panes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+  }
+
+  .revise-sql-pane {
+    flex: 1 1 320px;
+    min-width: 0;
+  }
+
+  .revise-sql-pane pre {
+    margin: var(--space-1) 0 0;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .revise-sql-pane.is-after pre {
+    border-color: var(--color-warn-border);
+  }
+
+  /* The persistent card badge and the line beside Approve. Both say the same thing,
+     in the two places a reviewer decides: reading the card, and clicking the button. */
+  .item-sql-rewritten {
+    display: block;
+    flex: 1 1 100%;
+    font-size: 0.75rem;
+    color: var(--color-warn-text);
+    background: var(--color-warn-bg);
+    border: 1px solid var(--color-warn-border);
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-2);
+    line-height: 1.5;
+  }
+
+  .approve-caution {
+    font-size: 0.75rem;
+    color: var(--color-warn-text);
+    line-height: 1.5;
+  }
+
   .item-evidence,
   .item-scan,
   .item-dedup {
@@ -1037,6 +1115,10 @@
     padding: 4px 6px; font-size: 12px; font-family: inherit;
   }
   .modal-note { font-size: 12px; color: var(--color-text-dim); line-height: 1.5; }
+  .modal-sql-tag {
+    margin: 0 0 var(--space-1); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--color-warn-text); font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -1223,6 +1305,42 @@
     return pre;
   }
 
+  // The template as a PLAIN STRING, for the places that compare it against another
+  // string rather than render it with slot chips (the revise modal, and the before/after
+  // panes of a proposed SQL rewrite). Same two sources as `renderTemplate`, same order of
+  // preference — one accessor, so a card and its comparison can never disagree about what
+  // the current query is.
+  function currentTemplateText(item) {
+    var gen = isObject(item && item.payload_view) ? item.payload_view.generalization : null;
+    var raw = isObject(gen) ? gen.sql_template : null;
+    if (typeof raw === "string" && raw) return raw;
+    var parts = Array.isArray(item && item.template_parts) ? item.template_parts : [];
+    return parts.map(function (part) {
+      if (!isObject(part)) return "";
+      if (typeof part.slot === "string") return "{" + part.slot + "}";
+      return typeof part.text === "string" ? part.text : "";
+    }).join("");
+  }
+
+  // An ISO stamp, in UTC, to the minute. UTC rather than the reviewer's locale on purpose:
+  // the same string appears in the candidate record and the audit log, and a badge the
+  // reviewer cannot line up against those is a worse badge. An unparseable value is shown
+  // VERBATIM rather than as "Invalid Date" — a server that sent something unexpected should
+  // be legible, not swallowed.
+  function formatWhen(value) {
+    if (typeof value !== "string" || !value.trim()) return "an unrecorded time";
+    var when = new Date(value);
+    if (isNaN(when.getTime())) return value;
+    return when.toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  }
+
+  // The caution shown wherever a rewrite is offered or has happened. One sentence, one
+  // definition — the server sends its own for a live proposal, and this is the fallback and
+  // the text used where there is no server sentence to quote.
+  var SQL_REWRITE_CAUTION =
+    "A rewritten query is no longer the one the session ran. It will be re-checked from " +
+    "scratch, cannot auto-land, and should be trial-run before approval.";
+
   function paramEntries(view) {
     var entries = isObject(view) ? view.parameterization : null;
     return Array.isArray(entries) ? entries.filter(isObject) : [];
@@ -1364,6 +1482,31 @@
       );
     }
     return wrap;
+  }
+
+  // The rewrite record the server stamps on a candidate whose SQL was replaced
+  // (`{by, applied_at, previous_sql_sha256}`). Read through one accessor because two places
+  // ask the same question — the header badge and the line beside Approve — and they must
+  // never disagree about whether this artifact is still the session's query.
+  function sqlRewriteRecord(item) {
+    var view = isObject(item) ? item.payload_view : null;
+    var record = isObject(view) ? view.sql_rewrite : null;
+    return isObject(record) ? record : null;
+  }
+
+  // PERSISTENT, on the card, for every reviewer after the one who applied it.
+  //
+  // The modal's caution is seen once, by the person who chose the rewrite. This badge is for
+  // everyone who arrives later and would otherwise read the card as a faithful record of a
+  // query that ran — which, after a rewrite, it is not.
+  function renderSqlRewriteBadge(item) {
+    var record = sqlRewriteRecord(item);
+    if (!record) return null;
+    var badge = el("span", "item-sql-rewritten",
+      "SQL rewritten by the assistant on " + formatWhen(record.applied_at) +
+      " — not the session's query. Trial-run before approving.");
+    badge.setAttribute("data-testid", "inbox-card-sql-rewritten");
+    return badge;
   }
 
   function renderChips(values, testid) {
@@ -2614,6 +2757,45 @@
       "register_type spans two catalog rules, so it cannot cite one.";
     block.appendChild(feedback);
 
+    // THE SQL REWRITE OPT-IN, off by default.
+    //
+    // Everything else the assistant proposes is a re-reading of a query that really ran: the
+    // template is derived from it, so `explain_ok`, `binds_to_subset_uses` and
+    // `read_only_select` mean something because they check a provenance chain. A rewrite
+    // CUTS that chain — the artifact stops being the session's query — so it is a deliberate
+    // tick, with the consequence stated next to it rather than in a doc.
+    var composite = isObject(item.payload_view) && item.payload_view.kind === "composite";
+    var cautionId = "revise-allow-sql-caution-" +
+      String(item.candidate_id || "").replace(/[^A-Za-z0-9_-]/g, "-");
+
+    var allowWrap = el("label", "revise-allow-sql");
+    var allowSql = document.createElement("input");
+    allowSql.type = "checkbox";
+    allowSql.checked = false;
+    allowSql.setAttribute("data-testid", "inbox-revise-allow-sql");
+    allowSql.setAttribute("aria-describedby", cautionId);
+    allowWrap.appendChild(allowSql);
+    allowWrap.appendChild(el("span", "", "Let the assistant rewrite the SQL"));
+    block.appendChild(allowWrap);
+
+    var allowCaution = el("p", "revise-allow-sql-caution", SQL_REWRITE_CAUTION);
+    allowCaution.id = cautionId;
+    allowCaution.setAttribute("data-testid", "inbox-revise-allow-sql-caution");
+    block.appendChild(allowCaution);
+
+    // A composite blueprint composes other blueprints rather than carrying one query, so
+    // there is no single template to replace. DISABLED rather than removed: a reviewer who
+    // cannot find the option learns nothing, and the server 422s this case anyway — the box
+    // says why before the round trip does.
+    if (composite) {
+      allowSql.disabled = true;
+      allowWrap.title = "SQL rewrite is not offered for composite blueprints yet.";
+      var unavailable = el("p", "revise-allow-sql-unavailable",
+        "Not offered for composite blueprints yet — a composite has no single query to rewrite.");
+      unavailable.setAttribute("data-testid", "inbox-revise-allow-sql-unavailable");
+      block.appendChild(unavailable);
+    }
+
     var ask = document.createElement("button");
     ask.type = "button";
     ask.className = "action-complete";
@@ -2652,7 +2834,11 @@
       fetch("/api/inbox/" + encodeURIComponent(item.candidate_id) + "/revise", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ feedback: feedback.value })
+        // `allow_sql` is always sent, explicitly false when untouched: a server that had
+        // to read an absent field as "no" would be one default away from rewriting on a
+        // request that never asked. A disabled box cannot be checked, so a composite sends
+        // false without a second guard here.
+        body: JSON.stringify({ feedback: feedback.value, allow_sql: allowSql.checked === true })
       })
         .then(function (response) {
           return response.text().then(function (text) {
@@ -2669,9 +2855,18 @@
               // was shown with — not a re-read of the card — so what the reviewer approved
               // is exactly what is posted.
               var proposed = (parsed && parsed.entries) || [];
-              apply.hidden = !proposed.length;
+              // ⚠ A REWRITE WITH NO ENTRIES IS APPLICABLE. D97's totality walk passes an
+              // EMPTY array for a query that has no literal predicates to classify — a plain
+              // aggregate with no WHERE is the ordinary case — so gating this button on
+              // `entries` alone would render that proposal, warning and all, and leave the
+              // reviewer no way to take it. An entries-only proposal with nothing in it still
+              // has nothing to apply.
+              apply.hidden = !(proposed.length || (parsed && parsed.sql_changed === true));
               apply.onclick = function () {
-                openReviseModal(item, parsed, node, function (entries, replace) {
+                // *sql* is non-empty ONLY for a proposal the server marked `sql_changed`, and
+                // it is the server's own string, passed through unedited — the page never
+                // composes SQL, it only carries what it was offered and showed.
+                openReviseModal(item, parsed, node, function (entries, replace, sql) {
                   if (area) {
                     // THE FORM. Route through the textarea the reviewer can still see and edit,
                     // so the modal never becomes a hidden second source of truth for what is
@@ -2679,9 +2874,9 @@
                     area.value = JSON.stringify(entries, null, 2);
                     if (replaceBox) replaceBox.checked = replace;
                     performCompletion(item.candidate_id, area.value, replace, node,
-                                      node, apply);
+                                      node, apply, sql);
                   } else {
-                    performRevisionApply(item.candidate_id, entries, node, apply);
+                    performRevisionApply(item.candidate_id, entries, node, apply, sql);
                   }
                 });
               };
@@ -2697,6 +2892,46 @@
     return block;
   }
 
+  // The proposed SQL, when the assistant was allowed to rewrite it and did.
+  //
+  // Two panes rather than a line-level diff: the reviewer's question here is not "which
+  // characters moved" but "is this still the query I asked about", and that is read by
+  // looking at both queries whole. Both are `<pre>` + textContent — the proposed SQL is
+  // server data like any other (contract §4).
+  //
+  // Returns null when nothing was rewritten, so the caller appends unconditionally and a
+  // proposal that only touched entries looks exactly as it did before this existed.
+  function renderSqlRewrite(payload, item) {
+    if (!isObject(payload) || payload.sql_changed !== true) return null;
+    var wrap = el("div", "revise-sql");
+    wrap.setAttribute("data-testid", "inbox-revise-sql");
+
+    // The server's OWN sentence, not a re-worded one: it knows why this particular rewrite
+    // is being cautioned about. The constant is a fallback for a server that sent none.
+    var warn = el("p", "revise-warning", payload.caution || SQL_REWRITE_CAUTION);
+    warn.setAttribute("data-testid", "inbox-revise-sql-warning");
+    warn.setAttribute("role", "alert");
+    wrap.appendChild(warn);
+
+    var panes = el("div", "revise-sql-panes");
+    var before = el("div", "revise-sql-pane is-before");
+    before.appendChild(el("p", "item-field-label", "current template"));
+    var beforePre = el("pre", "", currentTemplateText(item) || "(this candidate carries no template)");
+    beforePre.setAttribute("data-testid", "inbox-revise-sql-before");
+    before.appendChild(beforePre);
+    panes.appendChild(before);
+
+    var after = el("div", "revise-sql-pane is-after");
+    after.appendChild(el("p", "item-field-label", "proposed SQL"));
+    var afterPre = el("pre", "", String(payload.sql || ""));
+    afterPre.setAttribute("data-testid", "inbox-revise-sql-after");
+    after.appendChild(afterPre);
+    panes.appendChild(after);
+
+    wrap.appendChild(panes);
+    return wrap;
+  }
+
   // Show the proposal and LOAD IT INTO THE FORM. The reviewer reads the diff, edits the
   // entries if they want, and applies with the button they would have used anyway — so an
   // assistant that proposed something wrong costs a glance, not a bad write.
@@ -2704,9 +2939,18 @@
     clearNode(out);
     if (!isObject(payload)) return;
     var entries = Array.isArray(payload.entries) ? payload.entries : [];
+    // ABOVE the empty-proposal note as well as above the entries: a rewrite that arrived
+    // with no entry changes still changed the artifact, and a page that showed nothing for
+    // it would be hiding the biggest thing the assistant did.
+    var rewrite = renderSqlRewrite(payload, item);
+    if (rewrite) out.appendChild(rewrite);
     if (!entries.length) {
+      // "No suggestion" is the wrong sentence for a rewrite that classified nothing because
+      // there was nothing to classify — the proposal above is real and applicable.
       out.appendChild(
-        el("p", "card-empty", payload.reason || "the assistant had no suggestion")
+        el("p", "card-empty", payload.reason || (rewrite
+          ? "no parameterization entries — the rewritten query has no literal predicates to classify"
+          : "the assistant had no suggestion"))
       );
       return;
     }
@@ -2774,6 +3018,17 @@
         el("p", "card-empty", "loaded into the entries box above — review, edit, then complete")
       );
     }
+  }
+
+  // Attach the proposed SQL to a write body — and ONLY when there is one.
+  //
+  // Both write verbs take an optional `sql`, and both treat its ABSENCE as "keep the query
+  // the session ran". So the field is added only for a proposal the server itself marked
+  // `sql_changed`; every hand-typed completion and every entries-only revision posts the
+  // body it always posted.
+  function withProposedSql(body, sql) {
+    if (typeof sql === "string" && sql) body.sql = sql;
+    return body;
   }
 
   // POST an accepted proposal for a candidate already under review. Same three outcomes as
@@ -2902,7 +3157,15 @@
     var host = document.getElementById("revise-modal-host");
     clearNode(host);
     var proposed = Array.isArray(payload.entries) ? payload.entries.filter(isObject) : [];
-    if (!proposed.length) return;
+    // WHICH query is in the pre depends on whether this proposal rewrites it. Showing the
+    // OLD template above entries that were written against a new one would be the worst
+    // version of this screen: the reviewer would approve a change they never read.
+    var rewritten = payload.sql_changed === true;
+    var proposedSql = rewritten ? String(payload.sql || "") : "";
+    // The early return survives for the NON-REWRITE case only: an entries-only proposal with
+    // no entries has nothing to apply, and a modal over it would be an empty dialog. A
+    // rewrite is a change to the artifact whether or not any entry moved.
+    if (!proposed.length && !rewritten) return;
     var changedKeys = (Array.isArray(payload.diff) ? payload.diff : [])
       .filter(isObject)
       .map(function (d) { return entryLocatorKey(d); });
@@ -2924,15 +3187,35 @@
     if (payload.rationale) {
       body.appendChild(el("p", "modal-note", payload.rationale));
     }
-    var template = ((item.payload_view || {}).generalization || {}).sql_template ||
-      (item.template_parts || []).map(function (p) {
-        return p.slot ? "{" + p.slot + "}" : (p.text || "");
-      }).join("");
+    var template = rewritten ? proposedSql : currentTemplateText(item);
     if (template) {
-      body.appendChild(el("p", "modal-sub",
-        "The query this classifies. Not editable — the template is derived from it by rewrite, " +
-        "which is what makes the static checks mean anything."));
+      if (rewritten) {
+        var tag = el("p", "modal-sql-tag", "Rewritten by the assistant");
+        tag.setAttribute("data-testid", "inbox-revise-modal-sql-rewritten");
+        body.appendChild(tag);
+        var modalCaution = el("p", "revise-warning", payload.caution || SQL_REWRITE_CAUTION);
+        modalCaution.setAttribute("data-testid", "inbox-revise-modal-sql-caution");
+        modalCaution.setAttribute("role", "alert");
+        body.appendChild(modalCaution);
+        body.appendChild(el("p", "modal-sub",
+          "The SQL the assistant proposes IN PLACE OF the session's query. Still not editable " +
+          "here — applying sends this exact text, and every check re-runs against it."));
+      } else {
+        body.appendChild(el("p", "modal-sub",
+          "The query this classifies. Not editable — the template is derived from it by rewrite, " +
+          "which is what makes the static checks mean anything."));
+      }
       body.appendChild(el("pre", "modal-sql", template));
+    }
+    if (!proposed.length) {
+      // Reachable only on the rewrite path (the early return above covers the other). Said
+      // out loud because an empty modal body would read as a rendering fault, and because
+      // applying it CLEARS the array the old query needed.
+      var noEntries = el("p", "modal-note",
+        "No parameterization entries: the rewritten query has no literal predicates to " +
+        "classify, so the blueprint's parameterization becomes an empty array.");
+      noEntries.setAttribute("data-testid", "inbox-revise-modal-no-entries");
+      body.appendChild(noEntries);
     }
     proposed.forEach(function (entry) {
       body.appendChild(renderModalEntry(entry, changedKeys));
@@ -2940,7 +3223,8 @@
     modal.appendChild(body);
 
     var foot = el("div", "modal-foot");
-    var apply = el("button", "action-btn", "Apply to the blueprint");
+    var apply = el("button", "action-btn",
+      rewritten ? "Apply, including the rewritten SQL" : "Apply to the blueprint");
     apply.type = "button";
     apply.setAttribute("data-testid", "inbox-revise-modal-apply");
     var cancel = el("button", "action-btn action-cancel", "Cancel");
@@ -2950,7 +3234,10 @@
     apply.addEventListener("click", function () {
       var entries = readModalEntries(body);
       closeReviseModal();
-      commit(entries, payload.replace === true);
+      // The SQL goes back VERBATIM — the string the server proposed and the reviewer just
+      // read, never a re-derivation. Empty when nothing was rewritten, and the senders drop
+      // the field entirely in that case.
+      commit(entries, payload.replace === true, proposedSql);
     });
     foot.appendChild(apply);
     foot.appendChild(cancel);
@@ -2969,14 +3256,17 @@
     host.appendChild(backdrop);
   }
 
-  function performRevisionApply(candidateId, entries, node, button) {
+  function performRevisionApply(candidateId, entries, node, button, sql) {
     clearError();
     button.disabled = true;
     button.textContent = "Re-validating…";
     fetch("/api/inbox/" + encodeURIComponent(candidateId) + "/apply_revision", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entries: entries })
+      // `sql` is sent ONLY when this proposal rewrote it. Sending "" on every apply would
+      // ask the server to distinguish "no rewrite" from "rewrite to nothing", and one of
+      // those readings deletes the query.
+      body: JSON.stringify(withProposedSql({ entries: entries }, sql))
     })
       .then(function (response) {
         return response.text().then(function (text) {
@@ -3062,7 +3352,7 @@
   //   declined  — the form is still incomplete; show the FRESH detail in place, and
   //               leave the row (and the reviewer's text) exactly where they are.
   //   HTTP err  — the usual banner (503 = this deployment cannot re-validate).
-  function performCompletion(candidateId, raw, replaceAll, node, form, submit) {
+  function performCompletion(candidateId, raw, replaceAll, node, form, submit, sql) {
     clearError();
     var entries;
     try {
@@ -3079,7 +3369,7 @@
     fetch("/api/inbox/" + encodeURIComponent(candidateId) + "/complete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entries: entries, replace: replaceAll }),
+      body: JSON.stringify(withProposedSql({ entries: entries, replace: replaceAll }, sql)),
     })
       .then(function (response) {
         return response.text().then(function (text) {
@@ -3190,6 +3480,11 @@
         : "awaiting verify";
       header.appendChild(verified);
     }
+    // A rewritten query is a fact about the ARTIFACT, so it rides the card rather than a
+    // transient banner — it has to still be there for the next reviewer, who never saw the
+    // modal that made it.
+    var rewriteBadge = renderSqlRewriteBadge(item);
+    if (rewriteBadge) header.appendChild(rewriteBadge);
     li.appendChild(header);
 
     // Body: summary.
@@ -3311,6 +3606,15 @@
       actions.appendChild(
         makeActionButton(id, "approve", "Approve", li, actions, state.offline)
       );
+      // Said AGAIN beside the button: the badge sits at the top of a long card and the
+      // decision is made at the bottom of it. It does not block approve — a reviewer who has
+      // trial-run the rewrite is exactly the person who should be able to approve it.
+      if (sqlRewriteRecord(item)) {
+        var approveCaution = el("span", "approve-caution",
+          "The SQL was rewritten by the assistant — trial-run it before approving.");
+        approveCaution.setAttribute("data-testid", "inbox-approve-sql-rewritten");
+        actions.appendChild(approveCaution);
+      }
       actions.appendChild(
         makeActionButton(id, "reject", "Reject", li, actions, false)
       );

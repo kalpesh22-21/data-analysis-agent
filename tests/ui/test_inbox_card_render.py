@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import pathlib
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -972,3 +973,301 @@ def test_the_changed_rows_are_marked_on_both_sides(render: Any) -> None:
     card.locator('[data-testid="inbox-revise"]').click()
     page.wait_for_selector('[data-testid="inbox-preview"]')
     assert card.locator(".is-preview-changed").count() >= 2
+
+
+# --- the SQL rewrite opt-in, driven ---------------------------------------------------------
+
+_REWRITTEN_SQL = (
+    "SELECT sum(gross_pay) AS total_earnings FROM payroll.payroll_fact "
+    "WHERE department = {department} AND record_type = 'EARNING' AND gross_pay > 0"
+)
+
+_CAUTION = (
+    "This replaces the query the session ran. It will be re-checked from scratch and "
+    "cannot auto-land."
+)
+
+
+def _rewrite_proposal(**over: Any) -> tuple:
+    status, body = _proposal()
+    body.update(
+        {
+            "replace": True,
+            "sql_changed": True,
+            "sql": _REWRITTEN_SQL,
+            "caution": _CAUTION,
+        }
+    )
+    body.update(over)
+    return (status, body)
+
+
+def _queue_card(page: Any) -> Any:
+    return page.locator('[data-testid="inbox-item"]:visible')
+
+
+def _next_post(timeout: float = 5.0) -> dict:
+    """The next POST body the stub receives, decoded.
+
+    Polled rather than inferred from a DOM change: a write POST is fired AFTER the modal
+    closes, and both asks in a row leave the same selector attached — so keying on the page
+    would make these tests pass or fail on timing rather than on the body that was sent.
+    Callers clear `last_post` first.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = _SERVED["last_post"]
+        if body:
+            return json.loads(body)
+        time.sleep(0.02)
+    raise AssertionError("no POST arrived within the timeout")
+
+
+def test_the_rewrite_option_is_off_until_a_reviewer_asks_for_it(render: Any) -> None:
+    """⚠ DEFAULT-OFF, with the cost written beside the box. Every other thing the assistant
+    proposes is a re-reading of a query that really ran; this one REPLACES it, which is the
+    only action on this surface that cuts the provenance chain the static checks stand on."""
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+    box = card.locator('[data-testid="inbox-revise-allow-sql"]')
+    assert box.count() == 1
+    assert box.is_checked() is False
+    caution = card.locator('[data-testid="inbox-revise-allow-sql-caution"]').inner_text()
+    assert "no longer the one the session ran" in caution
+    assert "trial-run before approval" in caution
+
+
+def test_the_ask_tells_the_server_whether_a_rewrite_was_allowed(render: Any) -> None:
+    """`allow_sql` rides every ask, explicitly false when untouched — the BFF forwards this
+    body verbatim, so an omitted field would leave the reviser to guess, and the guess that
+    costs something is the permissive one."""
+    _SERVED["revise"] = _proposal()
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+
+    _SERVED["last_post"] = ""
+    card.locator('[data-testid="inbox-revise"]').click()
+    assert _next_post()["allow_sql"] is False
+
+    _SERVED["last_post"] = ""
+    card.locator('[data-testid="inbox-revise-allow-sql"]').check()
+    card.locator('[data-testid="inbox-revise"]').click()
+    assert _next_post()["allow_sql"] is True
+
+
+def test_a_composite_candidate_is_told_why_it_cannot_have_one(render: Any) -> None:
+    """A composite composes other blueprints and has no single query to replace — the server
+    422s the attempt. The box is disabled and says so, which teaches the reason instead of
+    handing back an error the reviewer has to interpret."""
+    composite = json.loads(json.dumps(_HEALTHY_PAYLOAD))
+    composite["kind"] = "composite"
+    page = render([_item(payload_view=composite, template_parts=_PARTS)])
+    card = _queue_card(page)
+    assert card.locator('[data-testid="inbox-revise-allow-sql"]').is_disabled() is True
+    assert "composite" in card.locator(
+        '[data-testid="inbox-revise-allow-sql-unavailable"]'
+    ).inner_text()
+
+
+def test_the_server_refusal_for_a_composite_reaches_the_reviewer(render: Any) -> None:
+    """The 422 says something true about this system's design. It goes to the banner verbatim
+    rather than becoming "the assistant failed"."""
+    _SERVED["revise"] = (
+        422,
+        {"detail": "SQL rewrite is not offered for composite blueprints (they compose)."},
+    )
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    _queue_card(page).locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector("#error-banner:not([hidden])")
+    assert "not offered for composite blueprints" in page.locator("#error-banner").inner_text()
+
+
+def test_a_rewritten_proposal_shows_both_queries_under_a_warning(render: Any) -> None:
+    """⚠ The reviewer's question is not "which characters moved" but "is this still the query
+    I asked about" — which is read by looking at both queries whole. The server's own caution
+    leads, because it knows why THIS rewrite is being cautioned about."""
+    _SERVED["revise"] = _rewrite_proposal()
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+    card.locator('[data-testid="inbox-revise-allow-sql"]').check()
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-sql-warning"]')
+
+    warning = card.locator('[data-testid="inbox-revise-sql-warning"]')
+    assert _CAUTION in warning.inner_text()
+    assert warning.get_attribute("role") == "alert"
+    # The current template is the card's own, from the SAME accessor the card renders with.
+    assert "gross_pay > 0" not in (
+        card.locator('[data-testid="inbox-revise-sql-before"]').text_content() or ""
+    )
+    assert "total_earnings" in (
+        card.locator('[data-testid="inbox-revise-sql-before"]').text_content() or ""
+    )
+    assert "gross_pay > 0" in (
+        card.locator('[data-testid="inbox-revise-sql-after"]').text_content() or ""
+    )
+
+
+def test_a_proposal_that_left_the_sql_alone_raises_no_alarm(render: Any) -> None:
+    """The alarm has to mean something. A proposal that only re-roles entries looks exactly as
+    it did before the rewrite existed — an alarm on every proposal is an alarm on none."""
+    _SERVED["revise"] = _proposal()
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-diff"]', state="attached")
+    assert card.locator('[data-testid="inbox-revise-sql-warning"]').count() == 0
+    assert card.locator('[data-testid="inbox-revise-sql-before"]').count() == 0
+    assert card.locator('[data-testid="inbox-revise-sql-after"]').count() == 0
+
+
+def test_the_modal_shows_the_proposed_sql_and_sends_it_verbatim(render: Any) -> None:
+    """⚠ The `<pre>` in the modal is the query being committed to, so it must be the NEW one —
+    the old template above entries written against a new one is an approval of something never
+    read. What is posted is the server's own string, unedited: the page never composes SQL."""
+    _SERVED["revise"] = _rewrite_proposal()
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+    card.locator('[data-testid="inbox-revise-allow-sql"]').check()
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-apply"]:not([hidden])')
+    card.locator('[data-testid="inbox-revise-apply"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-modal"]')
+
+    modal = page.locator('[data-testid="inbox-revise-modal"]')
+    assert modal.locator('[data-testid="inbox-revise-modal-sql-rewritten"]').count() == 1
+    assert _CAUTION in modal.locator('[data-testid="inbox-revise-modal-sql-caution"]').inner_text()
+    assert "gross_pay > 0" in (modal.locator(".modal-sql").text_content() or "")
+    # The button names what it is applying — "Apply to the blueprint" would understate it.
+    apply_label = modal.locator('[data-testid="inbox-revise-modal-apply"]').inner_text()
+    assert "rewritten SQL" in apply_label
+    # There is still no way to EDIT the query by hand: a box here would invalidate the checks.
+    assert modal.locator("textarea").count() == 0
+
+    _SERVED["last_post"] = ""
+    modal.locator('[data-testid="inbox-revise-modal-apply"]').click()
+    assert _next_post()["sql"] == _REWRITTEN_SQL
+
+
+def test_an_entries_only_apply_sends_no_sql_at_all(render: Any) -> None:
+    """Absence means "keep the query the session ran". Sending `""` on every apply would ask
+    the server to tell no-rewrite from rewrite-to-nothing, and one of those readings deletes
+    the query."""
+    _SERVED["revise"] = _proposal()
+    page = render([_item(payload_view=_over_slotted(), template_parts=_PARTS)])
+    card = _queue_card(page)
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-apply"]:not([hidden])')
+    card.locator('[data-testid="inbox-revise-apply"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-modal"]')
+    _SERVED["last_post"] = ""
+    page.locator('[data-testid="inbox-revise-modal-apply"]').click()
+    assert "sql" not in _next_post()
+
+
+def test_a_rewritten_card_carries_the_fact_permanently(render: Any) -> None:
+    """⚠ THE BADGE OUTLIVES THE REVIEW THAT MADE IT. The modal's caution is seen once, by the
+    reviewer who chose the rewrite; everyone after them would otherwise read the card as a
+    faithful record of a query that ran. It says so in both places a decision is taken — the
+    header, and beside Approve — and it blocks neither."""
+    rewritten = json.loads(json.dumps(_HEALTHY_PAYLOAD))
+    rewritten["sql_rewrite"] = {
+        "by": "assistant",
+        "applied_at": "2026-08-30T14:05:00Z",
+        "previous_sql_sha256": "9f2b" + "0" * 60,
+    }
+    page = render([_item(payload_view=rewritten, template_parts=_PARTS)])
+    card = _queue_card(page)
+    badge = card.locator('[data-testid="inbox-card-sql-rewritten"]').inner_text()
+    assert "SQL rewritten by the assistant" in badge
+    assert "2026-08-30 14:05 UTC" in badge
+    assert "Trial-run before approving" in badge
+
+    assert card.locator('[data-testid="inbox-approve-sql-rewritten"]').count() == 1
+    # A CAUTION, not a gate: the reviewer who has trial-run the rewrite is exactly the person
+    # who should be able to approve it.
+    assert card.locator('[data-testid="inbox-approve"]').is_disabled() is False
+
+
+def test_an_untouched_card_carries_no_badge(render: Any) -> None:
+    """The badge means something only if a card without a rewrite never shows it."""
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+    assert card.locator('[data-testid="inbox-card-sql-rewritten"]').count() == 0
+    assert card.locator('[data-testid="inbox-approve-sql-rewritten"]').count() == 0
+
+
+def test_a_rewrite_with_no_entries_can_still_be_applied(render: Any) -> None:
+    """⚠ THE ZERO-ENTRIES REWRITE. A rewritten query with no literal predicates at all — a
+    plain aggregate with no WHERE — passes the server's totality walk with an EMPTY entries
+    array. That proposal must be applicable: the alternative is a warning the reviewer can
+    read and cannot act on, which is the worst of both.
+
+    What is posted from the QUEUE is the empty array and the proposed SQL — `apply_revision`
+    is replace-only, so the verb carries what `replace` says on the form (asserted below)."""
+    _SERVED["revise"] = _rewrite_proposal(entries=[], diff=[], rationale="drop the guard entirely")
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+    card.locator('[data-testid="inbox-revise-allow-sql"]').check()
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-sql-warning"]')
+
+    # The panes are there even though no entry moved...
+    assert "gross_pay > 0" in (
+        card.locator('[data-testid="inbox-revise-sql-after"]').text_content() or ""
+    )
+    # ...and so is the button, which "no suggestion" would have hidden.
+    apply_btn = card.locator('[data-testid="inbox-revise-apply"]')
+    assert apply_btn.is_visible() is True
+    apply_btn.click()
+    page.wait_for_selector('[data-testid="inbox-revise-modal"]')
+
+    modal = page.locator('[data-testid="inbox-revise-modal"]')
+    assert modal.locator('[data-testid="inbox-revise-modal-sql-rewritten"]').count() == 1
+    # The empty parameterization is SAID, not left as a blank body: applying clears the array.
+    assert "empty array" in modal.locator('[data-testid="inbox-revise-modal-no-entries"]').inner_text()
+    assert "rewritten SQL" in modal.locator('[data-testid="inbox-revise-modal-apply"]').inner_text()
+
+    _SERVED["last_post"] = ""
+    modal.locator('[data-testid="inbox-revise-modal-apply"]').click()
+    posted = _next_post()
+    assert posted["entries"] == []
+    assert posted["sql"] == _REWRITTEN_SQL
+
+
+def test_the_form_applies_a_zero_entries_rewrite_as_a_replace(render: Any) -> None:
+    """The same proposal on the FORM, where `replace` is an explicit field rather than the
+    verb's own meaning. It must be TRUE: appending an empty array onto entries written for the
+    old query would leave the blueprint parameterized against predicates the rewritten SQL no
+    longer has."""
+    _SERVED["revise"] = _rewrite_proposal(entries=[], diff=[], rationale="no predicates left")
+    page = render([_form_item()])
+    page.locator('[data-testid="inbox-revise-allow-sql"]').check()
+    page.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-sql-warning"]')
+    page.locator('[data-testid="inbox-revise-apply"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-modal"]')
+
+    _SERVED["last_post"] = ""
+    page.locator('[data-testid="inbox-revise-modal-apply"]').click()
+    posted = _next_post()
+    assert posted["entries"] == []
+    assert posted["replace"] is True
+    assert posted["sql"] == _REWRITTEN_SQL
+    # The textarea is left holding exactly what was sent — the modal never becomes a hidden
+    # second source of truth for a body the reviewer cannot see.
+    assert json.loads(page.locator('[data-testid="inbox-complete-entries"]').input_value()) == []
+
+
+def test_an_entries_only_proposal_with_nothing_in_it_still_offers_nothing(render: Any) -> None:
+    """The other half of the same rule. No rewrite and no entries is genuinely empty — no
+    button, no modal, and the reviewer's own typing left alone."""
+    _SERVED["revise"] = (200, {"entries": [], "replace": False, "rationale": "",
+                               "reason": "try rephrasing", "diff": [],
+                               "sql_changed": False, "sql": "", "caution": ""})
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)])
+    card = _queue_card(page)
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-revise-output"] .card-empty')
+    assert card.locator('[data-testid="inbox-revise-apply"]').is_visible() is False
+    assert card.locator('[data-testid="inbox-revise-sql-warning"]').count() == 0

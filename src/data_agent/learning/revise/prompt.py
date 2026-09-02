@@ -13,13 +13,22 @@ actually exhibited is a model repeatedly offering fixes the validator cannot acc
 across three runs on the same two predicates, per `learning-declined-candidate-review.md`. Both
 of those predicates had exactly one legal classification, and nothing in the hint text the model
 was shown said so.
+
+TWO SYSTEM PROMPTS, chosen by `system_prompt(allow_sql=...)`, differing in exactly ONE paragraph.
+The default still says YOU CANNOT CHANGE THE SQL, because on that path there is no field to write
+any and a model told otherwise would spend its turn on an edit that gets refused. The §C.5 REWRITE
+variant replaces that paragraph with the licence and its conditions. They are composed from shared
+parts rather than written twice: the three role traps and the two transcription rules were learned
+from live failures, and a second copy would keep only one of them current.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-SYSTEM_PROMPT = """\
+from ..prompts.sql_rules import DATE_RULE
+
+_HEAD = """\
 You are helping a human reviewer finish the PARAMETERIZATION of a SQL blueprint.
 
 A blueprint is a SQL query that really ran and really answered a user's question, generalized \
@@ -34,12 +43,38 @@ with exactly one role:
 
 A validator has REJECTED this blueprint because one or more predicates have no entry, or have \
 one it cannot accept. You will be shown its complaint verbatim. Your job is to propose the \
-entries that satisfy it.
+entries that satisfy it."""
 
+_NO_REWRITE = """\
 YOU CANNOT CHANGE THE SQL. The template is regenerated from your entries by a deterministic \
 rewrite of the original query. You have no way to add, remove or edit a predicate, and no \
-field in which to write SQL. If a predicate looks wrong, classify it honestly anyway.
+field in which to write SQL. If a predicate looks wrong, classify it honestly anyway."""
 
+_REWRITE = f"""\
+YOU MAY CHANGE THE SQL, BUT PREFER NOT TO. The reviewer has explicitly enabled it for this \
+request, so the tool has a top-level `sql` field. Use it ONLY when their feedback cannot be met \
+by re-roling literals — a predicate that must be ADDED, REMOVED or CORRECTED, which no \
+classification can do. If the feedback is about what a literal MEANS, leave `sql` out.
+
+If you do return a query, ALL of the following must hold or it will be refused:
+
+  * it is a COMPLETE replacement — ONE read-only SELECT, ClickHouse dialect. No DDL, no DML, no
+    multiple statements, no `SELECT *`.
+  * it reads ONLY the tables and columns listed for you below. A column not on that list does not
+    exist; if you cannot answer without one, say so in your rationale and leave `sql` out.
+  * literals are written PLAINLY (`department = '0420'`), never as placeholders. The template is
+    generated from your entries, not from braces you type.
+  * EVERY literal predicate in the NEW query has an entry. A validator walks the query YOU wrote
+    and refuses the blueprint if even one is unaccounted for.
+  * `replace` is TRUE. Every existing entry describes the OLD query, and none of them survive.
+
+{DATE_RULE}
+
+What you write is the ACCEPTED SQL, not the template — the template is still derived from it by \
+the deterministic rewrite. A human reviews and trial-runs what you return before anything is \
+promoted, and it can never be landed automatically."""
+
+_TAIL = """\
 THE THREE CASES THAT REPEATEDLY GO WRONG — read these before proposing anything:
 
 1. A predicate on a DERIVED VALUE (an alias computed in the query itself, like a ratio's own \
@@ -71,6 +106,21 @@ replace=true when an existing entry is itself wrong — including when you are C
 of a predicate that already has an entry, because appending cannot change one.
 
 Call the tool exactly once. Do not emit free text."""
+
+
+SYSTEM_PROMPT = f"{_HEAD}\n\n{_NO_REWRITE}\n\n{_TAIL}"
+REWRITE_SYSTEM_PROMPT = f"{_HEAD}\n\n{_REWRITE}\n\n{_TAIL}"
+
+
+def system_prompt(*, allow_sql: bool) -> str:
+    """The reviser's system prompt for this request.
+
+    A FUNCTION rather than two exported constants the engine picks between, so the choice is made
+    in one place: the mode is a per-request opt-in, and a caller that read the wrong constant
+    would offer a `sql` field while telling the model it has none — the exact contradiction the
+    two-prompt split exists to avoid.
+    """
+    return REWRITE_SYSTEM_PROMPT if allow_sql else SYSTEM_PROMPT
 
 
 def _entry_line(index: int, entry: dict[str, Any]) -> str:
