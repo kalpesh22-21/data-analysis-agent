@@ -95,6 +95,7 @@ config:
   RERANKER_API_URL: "http://reranker.ml.svc.cluster.local:8080/rerank"
   RERANKER_MODEL: "rerank-english-v3"
   RETRIEVAL_ENABLED: "true"
+  RETRIEVAL_PREFETCH_TOOL_ENABLED: "false"
   SESSION_TTL_SECONDS: "3600"
 
   # Hydrator daemon (singleton neo4j seeder). HYDRATOR_ENABLED is the kill-switch

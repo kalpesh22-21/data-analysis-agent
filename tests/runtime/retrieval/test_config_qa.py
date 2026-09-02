@@ -40,6 +40,7 @@ HEADERS = {"Authorization": "Bearer test-jwt", "X-Session-Id": SESSION_ID}
 def test_retrieval_defaults() -> None:
     s = RuntimeSettings(_env_file=None)
     assert s.retrieval_enabled is True  # master switch on by default
+    assert s.retrieval_prefetch_tool_enabled is False
     assert s.retrieval_recall_k == 30
     assert s.retrieval_top_k_blueprints == 3  # 03 fixes 3
     assert s.retrieval_top_k_knowledge == 3

@@ -112,6 +112,9 @@ def build_real_app():
     model = pick_openai_model(api_key, label=_PREFLIGHT_LABEL)
 
     retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
+    retrieval_prefetch_tool_on = os.environ.get(
+        "RETRIEVAL_PREFETCH_TOOL_ENABLED", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
     # LLM progress summaries (docs/08-ui.md): ON by default for THIS dev launcher
     # (production RuntimeSettings default stays False). Relaxes D25 for the progress
     # channel only — the streamed line may carry business values from tool args.
@@ -173,6 +176,7 @@ def build_real_app():
         # scratch-join blueprint has to be FOUND by retrieval before it can
         # materialize anything.
         retrieval_enabled=retrieval_on,
+        retrieval_prefetch_tool_enabled=retrieval_prefetch_tool_on,
         scratch_enabled=retrieval_on,
         neo4j_url=_NEO4J_URL if retrieval_on else "",
         neo4j_username=_NEO4J_USERNAME,
@@ -198,6 +202,10 @@ def build_real_app():
             "REAL tool calls (SQL+values), results, and LLM Q/A. ACCESS-CONTROL this server."
         )
     print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
+    print(
+        "[run_ui_runtime_real] retrieval_context = "
+        f"{'prefetchContext tool pair' if retrieval_prefetch_tool_on else 'user message'}"
+    )
     print(
         f"[run_ui_runtime_real] progress_summaries = "
         f"{'ON (' + settings.openai_summary_model + ')' if progress_summaries_on else 'OFF'}"

@@ -519,6 +519,7 @@ def create_app(
         session_store,
         preview_row_count=settings.preview_row_count,
         retrieval=active_retrieval,
+        retrieval_prefetch_tool_enabled=settings.retrieval_prefetch_tool_enabled,
         base_system_prompt=settings.effective_agent_system_prompt(),
         tracer=tracer,
     )

@@ -251,6 +251,9 @@ config:
   RERANKER_MODEL: "rerank-english-v3"
   # -- Enable retrieval-augmented planning.
   RETRIEVAL_ENABLED: "true"
+  # -- Render retrieved context as a hidden synthetic assistant/tool prefetch pair
+  #    rather than an application-authored user message.
+  RETRIEVAL_PREFETCH_TOOL_ENABLED: "false"
   # -- Session TTL in seconds.
   SESSION_TTL_SECONDS: "3600"
 

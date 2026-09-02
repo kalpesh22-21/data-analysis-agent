@@ -576,6 +576,8 @@ def _tool_trail_entry_to_canonical(
             }
         ],
     }
+    if entry.get("prefetch_context"):
+        assistant_message["context_kind"] = "retrieval"
     # D94 Part 1: an entry flagged `withheld_sentinel` is a synthetic,
     # non-data-bearing sentinel injected by `context/assembly.py` for a
     # current-turn `ok`+`None` stranded result — its `content` is used verbatim as
@@ -583,7 +585,14 @@ def _tool_trail_entry_to_canonical(
     # tool_call's required slot to break the retry-until-budget-cap loop. The
     # explicit flag (not a bare `content` key) keeps a future `_render_entry` field
     # from ever silently rerouting a normal tool entry to verbatim rendering.
-    if entry.get("withheld_sentinel"):
+    if entry.get("prefetch_context"):
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": entry["content"],
+            "context_kind": "retrieval",
+        }
+    elif entry.get("withheld_sentinel"):
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call_id,

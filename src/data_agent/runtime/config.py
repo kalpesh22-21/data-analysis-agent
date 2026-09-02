@@ -846,6 +846,13 @@ class RuntimeSettings(BaseSettings):
     retrieval_enabled: bool = Field(
         True, description="Master switch; False => empty RetrievedContext (Phase-0 parity)."
     )
+    retrieval_prefetch_tool_enabled: bool = Field(
+        False,
+        description=(
+            "When True, inject per-question retrieved context as a synthetic "
+            "prefetchContext assistant/tool exchange instead of a user-role message."
+        ),
+    )
 
     # --- Emulated-discovery injection (context/discovery_emulation.py) ---
     # Emulate `listDatabases`+`listTables` once per budget window (through the

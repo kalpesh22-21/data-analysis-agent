@@ -181,6 +181,17 @@ def _tool_pair(call_id: str, sql: str, result: str) -> list[dict]:
     ]
 
 
+def _retrieval_prefetch_pair(content: str) -> list[dict]:
+    pair = _tool_pair("prefetched-retrieval-context-1", "", content)
+    for message in pair:
+        message["context_kind"] = "retrieval"
+    pair[0]["tool_calls"][0]["function"] = {
+        "name": "prefetchContext",
+        "arguments": "{}",
+    }
+    return pair
+
+
 def _assert_pairing_intact(messages: list[dict]) -> None:
     """Every `tool` message has an immediately-announcing assistant `tool_calls`,
     and no assistant `tool_calls` message is left without its `tool` result(s)."""
@@ -358,6 +369,22 @@ def test_fit_pins_current_turn_retrieval_and_summary_even_under_heavy_pressure()
     assert result.dropped_by_kind.get("trail") == 1
     assert "retrieval" not in result.dropped_by_kind
     assert "summary" not in result.dropped_by_kind
+
+
+def test_fit_pins_prefetch_retrieval_pair_after_current_question() -> None:
+    """The explicit retrieval marker keeps the post-question pair pinned."""
+    base = _sys("base")
+    old_trail = _tool_pair("old", "SELECT " + "x" * 1000, "r" * 1000)
+    prefetch = _retrieval_prefetch_pair("candidate blueprint " + "k" * 400)
+    question = _user("current question?")
+    messages = [base, *old_trail, question, *prefetch]
+    budget = estimate_message_tokens(base) + estimate_message_tokens(question) + 2
+
+    result = fit_request_to_budget(messages, token_budget=budget)
+
+    assert result.messages == [base, question, *prefetch]
+    _assert_pairing_intact(result.messages)
+    assert result.dropped_by_kind == {"trail": 1}
 
 
 def test_fit_current_turn_older_tool_pairs_are_last_resort_droppable_tier2() -> None:

@@ -4,8 +4,10 @@ Load both streams (`tool_trail` + `messages`) -> D44 scope-filter each independe
 interleave by a STABLE sort on `(turn_index, ts, stream_rank)`, where `stream_rank`
 (user=0, trail=1, assistant=2) is only a tie-break for an identical `ts` -> insert the
 date anchor, the retrieval block and the `analysisState` block at the SAME index, just
-before the current question, so the frame reads `anchor -> retrieval -> state ->
-question` -> insert the base prompt at index 0 as the SOLE `role:"system"` message.
+around the current question. The established path reads `anchor -> retrieval -> state ->
+question`; behind the feature flag it reads `anchor -> state -> question -> prefetch
+tool pair`, matching a valid user-then-assistant/tool exchange. Finally insert the base
+prompt at index 0 as the SOLE `role:"system"` message.
 
 Compaction is deliberately bypassed: every in-scope turn interleaves verbatim and
 `fit_request_to_budget` is the only size bound. Each current-turn `ok` entry with `None`
@@ -27,7 +29,10 @@ from data_agent.runtime.dispatch.denial_mapping import (
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
 )
 from data_agent.runtime.observability import tracing
-from data_agent.runtime.retrieval.render import render_retrieved_context
+from data_agent.runtime.retrieval.render import (
+    render_retrieved_context,
+    render_retrieved_context_tool_entry,
+)
 from data_agent.runtime.sanitize import MAX_FIELD_CHARS, sanitize_text
 from data_agent.runtime.session.models import live_analysis_state
 from data_agent.runtime.session.store import SessionStore
@@ -126,6 +131,7 @@ class ContextAssembler:
         *,
         preview_row_count: int = 20,
         retrieval: RetrievalPipeline | None = None,
+        retrieval_prefetch_tool_enabled: bool = False,
         base_system_prompt: str | None = None,
         tracer: Tracer | None = None,
     ) -> None:
@@ -150,6 +156,9 @@ class ContextAssembler:
         # retrieval branch below is gated on both `retrieval is not None` AND a
         # non-`None` `user_message`, so no existing caller observes any change.
         self._retrieval = retrieval
+        # Feature-flagged representation only; retrieval behavior and lifetime are
+        # unchanged. False preserves the established byte-for-byte user-message path.
+        self._retrieval_prefetch_tool_enabled = retrieval_prefetch_tool_enabled
         # B5: optional — when wired (app.py's composition root), assemble()
         # emits one CHAIN span per call recording only non-sensitive shape
         # counters (trail entries loaded, dropped-by-scope count — design §7's
@@ -176,10 +185,10 @@ class ContextAssembler:
 
                 *user_message*/*user_id*: with a `retrieval` pipeline injected AND a
                 *user_message* given, the retrieved thin-cards/knowledge/user-memory block is
-                inserted as ONE `user`-role message immediately before the LAST `user` message —
-                never a system message, so the base prompt stays the sole leading
-                `role:"system"` message. The block sits inside the current turn, which
-                `fit_request_to_budget` pins as a whole. Absent either, no retrieval runs.
+                associated with the LAST `user` message. The default representation is inserted
+                before it as one `user` message; the feature-flagged assistant/tool prefetch pair
+                is inserted after it. Neither adds a system message. Absent either input, no
+                retrieval runs.
 
                 *retrieval_memo* is a caller-owned dict memoizing the `RetrievedContext` by
                 `(user_message, scope_hash)`, so the D45 per-round-trip rebuild recalls at most
@@ -256,6 +265,7 @@ class ContextAssembler:
             if self._retrieval is not None and user_message is not None:
                 retrieved_counts = await self._insert_retrieval(
                     messages,
+                    current_turn_index=current_turn_index,
                     user_message=user_message,
                     user_id=user_id,
                     column_scope=column_scope,
@@ -416,6 +426,7 @@ class ContextAssembler:
         self,
         messages: list[dict[str, Any]],
         *,
+        current_turn_index: int | None,
         user_message: str,
         user_id: str | None,
         column_scope: frozenset[str],
@@ -445,9 +456,20 @@ class ContextAssembler:
             if retrieval_memo is not None:
                 retrieval_memo[key] = retrieved
 
-        rendered = render_retrieved_context(retrieved)
-        if rendered is not None:
-            messages.insert(_last_user_index(messages), rendered)
+        question_index = _last_user_index(messages)
+        if self._retrieval_prefetch_tool_enabled:
+            entry = render_retrieved_context_tool_entry(
+                retrieved, turn_index=current_turn_index if current_turn_index is not None else 0
+            )
+            if entry is not None:
+                # A synthetic tool result must follow the user request that caused
+                # the application prefetch. Canonicalization later expands this one
+                # render item to assistant(tool_call) -> tool(result).
+                messages.insert(min(question_index + 1, len(messages)), entry)
+        else:
+            rendered = render_retrieved_context(retrieved)
+            if rendered is not None:
+                messages.insert(question_index, rendered)
         return (len(retrieved.thin_cards), len(retrieved.knowledge_hits))
 
     def _emit_withheld_provenance_event(

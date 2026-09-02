@@ -10,7 +10,7 @@ from __future__ import annotations
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.loop.agent_loop import AgentLoop
+from data_agent.runtime.loop.agent_loop import AgentLoop, _assembled_to_canonical
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
@@ -22,7 +22,7 @@ from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
-from data_agent.runtime.session.models import ResultPreview, TrailEntry
+from data_agent.runtime.session.models import ResultPreview, TrailEntry, TurnMessage
 
 _Q = "sales overtime"
 _COL = ("dbpcm_warehouse.employee", "Department")
@@ -97,6 +97,50 @@ async def test_assemble_prepends_retrieval_user_message() -> None:
     assert assembled.messages[0]["role"] == "user"
     assert "sales overtime rollup" in assembled.messages[0]["content"]
     assert assembled.retrieved_counts == (1, 0)
+
+
+async def test_feature_flag_renders_retrieval_as_prefetch_tool_pair() -> None:
+    store = InMemorySessionStore()
+    await store.append_message(
+        SESSION_ID,
+        TurnMessage(
+            turn_index=4,
+            role="user",
+            content=_Q,
+            ts="2026-09-02T12:00:00+00:00",
+        ),
+    )
+    assembler = ContextAssembler(
+        store,
+        retrieval=_pipeline(FakeEmbeddingClient()),
+        retrieval_prefetch_tool_enabled=True,
+    )
+    assembled = await assembler.assemble(
+        SESSION_ID,
+        frozenset(),
+        current_turn_index=4,
+        user_message=_Q,
+        retrieval_memo={},
+    )
+    assert [message["role"] for message in assembled.messages] == ["user", "user", "tool"]
+    assert assembled.messages[-2]["content"] == _Q
+    entry = assembled.messages[-1]
+    assert entry["tool_name"] == "prefetchContext"
+    assert entry["tool_call_id"] == "prefetched-retrieval-context-4"
+    assert entry["prefetch_context"] is True
+    assert "sales overtime rollup" in entry["content"]
+    assert assembled.retrieved_counts == (1, 0)
+    canonical = _assembled_to_canonical(assembled.messages)
+    assert [message["role"] for message in canonical] == [
+        "user",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    call = canonical[-2]["tool_calls"][0]
+    assert call["function"]["name"] == "prefetchContext"
+    assert canonical[-1]["tool_call_id"] == call["id"]
+    assert canonical[-2]["context_kind"] == canonical[-1]["context_kind"] == "retrieval"
 
 
 async def test_unconfigured_retrieval_is_byte_identical() -> None:

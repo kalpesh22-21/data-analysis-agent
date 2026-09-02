@@ -12,7 +12,9 @@ from data_agent.runtime.retrieval.models import (
 from data_agent.runtime.retrieval.render import (
     _MAX_FIELD_CHARS,
     _USER_CONTEXT_PREFIX,
+    PREFETCH_CONTEXT_TOOL_NAME,
     render_retrieved_context,
+    render_retrieved_context_tool_entry,
 )
 
 
@@ -42,6 +44,20 @@ def test_renders_single_user_message() -> None:
 def test_render_is_deterministic() -> None:
     # Same block -> byte-identical string (design §6 resume determinism).
     assert render_retrieved_context(_ctx()) == render_retrieved_context(_ctx())
+
+
+def test_renders_prefetch_tool_entry_for_canonical_expansion() -> None:
+    entry = render_retrieved_context_tool_entry(_ctx(), turn_index=7)
+    assert entry is not None
+    assert entry["role"] == "tool"
+    assert entry["tool_name"] == PREFETCH_CONTEXT_TOOL_NAME
+    assert entry["tool_call_id"] == "prefetched-retrieval-context-7"
+    assert entry["prefetch_context"] is True
+    assert entry["content"].startswith(_USER_CONTEXT_PREFIX)
+
+
+def test_empty_context_renders_no_prefetch_tool_exchange() -> None:
+    assert render_retrieved_context_tool_entry(RetrievedContext.empty(), turn_index=7) is None
 
 
 def test_render_includes_all_sections() -> None:

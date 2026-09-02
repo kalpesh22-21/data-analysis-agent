@@ -1,13 +1,11 @@
-"""render.py — `RetrievedContext` -> one model-facing user message.
+"""render.py — `RetrievedContext` -> model-facing context messages.
 
-Pure formatting over an already-cut, already-ordered block, producing the single
-`{"role": "user", "content": ...}` message the assembler prepends before history.
-Deterministic (same block, same string), so a D45 resume renders byte-identically.
+Pure formatting over an already-cut, already-ordered block. The established path
+produces one `user` message; the feature-flagged path wraps that same deterministic
+content in a paired synthetic `prefetchContext` assistant/tool exchange.
 
-`role: "user"`, not `system`, so the base prompt stays the SOLE `role: "system"` message: a
-second system message would compete with the base instructions on the OpenAI-compatible
-endpoints that honor only the first-or-last one. A leading prefix marks the block as
-retrieved prior-context so the model never mistakes it for the current question.
+Neither path adds a system message, so the base prompt stays the SOLE `role: "system"`
+message. A leading prefix also marks the payload as retrieved prior-context.
 
 Trust boundary (H2): even though the corpus is written offline and passes the write-time
 leakage gate — so its CONTENT is trusted — the retrieved TEXT must not be able to forge the
@@ -32,6 +30,12 @@ from .models import RetrievedContext, ThinCard
 # Marks the block as retrieved prior-context under the `user` role, so the model
 # reads it as candidate reference material rather than the current question.
 _USER_CONTEXT_PREFIX = "[Retrieved context — candidate blueprints/knowledge for this question]\n\n"
+
+# The synthetic call is application-initiated prefetch, not a claim that the model
+# chose to invoke a tool. The provider adapters already translate canonical paired
+# assistant/tool messages to both Responses and Chat-Completions shapes.
+PREFETCH_CONTEXT_TOOL_NAME = "prefetchContext"
+PREFETCH_CONTEXT_CALL_ID_PREFIX = "prefetched-retrieval-context-"
 
 _HEADER = (
     "Relevant context retrieved for this request "
@@ -134,4 +138,26 @@ def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None
     return {"role": "user", "content": _USER_CONTEXT_PREFIX + "\n".join(lines)}
 
 
-__all__ = ["render_retrieved_context"]
+def render_retrieved_context_tool_entry(
+    context: RetrievedContext, *, turn_index: int
+) -> dict[str, Any] | None:
+    """Render retrieval as one prefetch trail item for canonical expansion.
+
+    ``ContextAssembler`` carries tool results as render items, not canonical API
+    messages. The loop expands this marker into the valid assistant/tool exchange.
+    """
+    rendered = render_retrieved_context(context)
+    if rendered is None:
+        return None
+    call_id = f"{PREFETCH_CONTEXT_CALL_ID_PREFIX}{turn_index}"
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "tool_name": PREFETCH_CONTEXT_TOOL_NAME,
+        "args": {},
+        "prefetch_context": True,
+        "content": rendered["content"],
+    }
+
+
+__all__ = ["render_retrieved_context", "render_retrieved_context_tool_entry"]

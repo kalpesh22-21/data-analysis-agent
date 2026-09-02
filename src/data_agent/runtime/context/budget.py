@@ -233,6 +233,12 @@ def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
           * `conversation` — anything else (a prior-turn user/assistant exchange).
     """
     first = messages[start]
+    if (
+        first.get("role") == "assistant"
+        and first.get("tool_calls")
+        and first.get("context_kind") == "retrieval"
+    ):
+        return _UNIT_KIND_RETRIEVAL
     if first.get("role") == "assistant" and first.get("tool_calls"):
         return _UNIT_KIND_TRAIL
     if first.get("role") == "user" and end - start == 1:
@@ -360,6 +366,11 @@ def fit_request_to_budget(
             messages[k].get("tool_call_id") in pinned_ids for k in range(s, e)
         ):
             pinned[u] = True  # invariant 7 — emulated discovery, never dropped.
+        elif kinds[u] == _UNIT_KIND_RETRIEVAL:
+            # The current question's prefetch pair replaces the formerly pinned
+            # retrieval user block. Its marker makes that pin independent of
+            # positional/current-turn heuristics.
+            pinned[u] = True
         elif is_current and not is_tool_pair:
             # Current-turn question / retrieval block / askUser answer — pinned.
             pinned[u] = True
