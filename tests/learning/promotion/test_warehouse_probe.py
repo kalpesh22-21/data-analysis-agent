@@ -148,6 +148,31 @@ async def test_minted_scope_equals_generalization_uses() -> None:
     assert mcp.calls[0].session_id == minter.minted_sessions[0]
 
 
+async def test_supplied_reviewer_token_runs_without_an_invented_session_header() -> None:
+    """A token the reviewer already holds cannot be rebound to the probe's UUID.
+
+    Sending that UUID as X-Session-Id makes the hardened MCP reject an otherwise valid,
+    unbound token with SESSION_BINDING_REQUIRED, so UI trials must be session-less.
+    """
+    from data_agent.learning.promotion.token_minter import SuppliedTokenMinter
+
+    mcp = FakeMCPClient(
+        scripted={"runQuery": [_runquery_result(["total_earnings"], [[1.0]])]}
+    )
+    probe = MCPWarehouseProbe(
+        mcp_client=mcp, token_minter=SuppliedTokenMinter("reviewer-jwt")
+    )
+
+    await probe.run(
+        "SELECT sum(x) AS total_earnings FROM db.t",
+        grain_columns=(),
+        column_scope=("db.t.x",),
+    )
+
+    assert mcp.calls[0].jwt == "reviewer-jwt"
+    assert mcp.calls[0].session_id == ""
+
+
 # --- fail-closed: any mint / MCP failure RAISES → probe_unavailable HOLD ---------
 
 

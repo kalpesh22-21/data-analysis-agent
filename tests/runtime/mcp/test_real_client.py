@@ -78,6 +78,13 @@ def test_unwrap_fastmcp_result(structured: object, expected: object) -> None:
     assert _unwrap_fastmcp_result(structured) == expected
 
 
+def test_sessionless_headers_omit_x_session_id() -> None:
+    client = RealMCPClient("http://mcp.invalid/mcp")
+    assert client._headers("reviewer-jwt", "") == {
+        "Authorization": "Bearer reviewer-jwt"
+    }
+
+
 @pytest.mark.parametrize(
     ("raw_text", "expected_code", "expected_message"),
     [

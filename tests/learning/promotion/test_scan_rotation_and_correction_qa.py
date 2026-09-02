@@ -15,7 +15,7 @@ Five things are pinned here that the slice's own tests do not cover:
      document and an injected clock. Every neighbouring type is fuzzed for a crash site,
      and the ISO-8601 offset-format hazard in the sort key is pinned as behaviour.
   4. THE RETENTION CLOCK. The Guard-3 verdict write must NOT be a `put`, or a parked
-     candidate's 90-day TTL is renewed on a schedule and it becomes immortal — a new
+     candidate's 180-day TTL is renewed on a schedule and it becomes immortal — a new
      unbounded-growth vector in exchange for the one the slice removed.
   5. A PRE-EXISTING DEFECT the rate limit did not fix: a user correction was undone by
      the very next cron cycle. FIXED by plan §4's routing change, and re-pointed here to
@@ -607,7 +607,7 @@ async def test_a_parked_candidate_never_has_its_90_day_ttl_renewed():
 
     Persisting the Guard-3 verdict is what makes the rate limit real, but `put` sets the
     candidate TTL FRESH on every write ("Set fresh per write" —
-    `learning_candidates_ttl_seconds`, 90 days). A verdict write issued through `put`
+    `learning_candidates_ttl_seconds`, 180 days). A verdict write issued through `put`
     every 12h would renew that clock for ever, so a candidate that can never clear Guard
     4 would never expire either — trading the warehouse-query cost for an unbounded
     storage cost.

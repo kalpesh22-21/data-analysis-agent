@@ -542,10 +542,10 @@ Row-count rejection happens at **analyze**, before you render a mapping UI. Uplo
 | `GET /inbox/user_knowledge?user_id=` | one named user's private facts (§8.4). `user_id` is REQUIRED |
 | `POST /inbox/user_knowledge/promote` | promote one private fact into a `global_knowledge` candidate (§8.4) |
 
-⚠ This table is not exhaustive: `complete`, `revise`, `apply_revision`, `attest_scan`, `trial_run`
-and the `/inbox/mint/*` surface also exist and are documented in their own design docs
+⚠ This table is not exhaustive: `complete`, `revise`, `apply_revision`, `attest_scan` and the
+`/inbox/mint/*` surface also exist and are documented in their own design docs
 (`learning-blueprint-review-rework-design.md`, `learning-loop-*`). Pre-existing drift, recorded
-rather than fixed here.
+rather than fixed here. `POST /inbox/{id}/trial_run` is documented in §8.5.
 
 Ordering: the terminal archives `rejected` and `promoted` list **newest-first** (they are unbounded, so the limit caps old history — and a just-promoted row is the one whose YAML you are most likely to want back); `in_review`, `validated` and `needs_parameterization` list **oldest-first** (FIFO drain). Limit is 100, not configurable, **no pagination**.
 
@@ -568,9 +568,10 @@ interface InboxItem {
   verified: boolean;                    // human-vouched (Phase-3); false for auto-landed
 }
 
-type InboxReason =
+type InboxReason =                       // mirrors learning/inbox/models.py::InboxReason
   | "knowledge_pre_gate" | "schema_edit" | "leakage_near_miss"
-  | "blueprint_sampled" | "dedup_conflict" | "fail_to_review";
+  | "blueprint_sampled" | "dedup_conflict" | "suppressed_duplicate"
+  | "fail_to_review" | "needs_parameterization" | "hand_authored";
 
 interface LeakageVerdict {
   result: "pass" | "reroute" | "quarantine" | "reject";
@@ -593,6 +594,18 @@ interface DedupVerdict {
   layer: string;
 }
 ```
+
+**Two dedup reasons, and they are not interchangeable.** `dedup_conflict` is the SOFT near-miss
+(`dedup.action` is `conflict` or `merge`) — something similar exists and the reviewer decides which
+one wins. `suppressed_duplicate` is the DETERMINISTIC match (`action: "increment"`) against a **live**
+learning-corpus artifact: the row is byte-equivalent to an artifact that already exists, the matched
+artifact's `hit_count` was incremented, and the candidate is kept in review only so a human can look
+at the match and revise a genuine delta out of it. Approving one as-is adds nothing to the corpus.
+A duplicate of a **terminal** (rejected / retired) artifact, and a candidate structurally identical to
+an MCP canon blueprint, never reach this surface at all — S6 drops them. A `suppressed_duplicate` card should render the matched
+artifact (`dedup.matched_id`) alongside `dedup.canonical_key` — without it the reviewer cannot tell
+what the row collided with. **Today's reference card renders only `canonical_key`**; treat
+`matched_id` as an open UI item, not as already-shipped.
 
 **Redaction rule the UI must honor:** `payload_view` has entity-bearing spans replaced with `"[redacted]"`, `summary` is run through the same strip, and `entity_scan.hits[].span` is blanked. The inbox surface **never** re-exposes a value the leakage gate flagged — do not build a "show raw value" affordance; the data is not on the wire.
 
@@ -705,6 +718,64 @@ the next step. A `404` covers both an unknown record and one owned by a differen
 
 **Route order matters.** `/inbox/user_knowledge*` must be matched before `/inbox/{candidate_id}/…`
 in both the service and any proxy, or a promote is read as a candidate named `user_knowledge`.
+
+### 8.5 Trial run — `POST /inbox/{id}/trial_run`
+
+Runs the candidate's SQL against the warehouse with reviewer-supplied slot values, under a token
+**the reviewer pastes** (§"you need a warehouse token" in `learning-reviewer-guide.md`). Allowed on
+`in_review` and `validated`. **Structure only — no rows ever cross this surface.**
+
+A run that could not happen still answers **200** with `ok: false` and a machine `reason` — the
+reviewer did nothing wrong, so render the reason as the next step, not as an error banner. Only a
+wrong status (409) or a missing/unknown candidate (404/401/403/503 per §8.2) is an HTTP error.
+
+```ts
+// body { bindings?: Record<string, unknown>, token?: string }   — both default to empty
+interface TrialRunResult {               // learning/inbox/inbox.py::TrialRunResult.to_wire
+  ok: boolean;                           // false ⇒ it never reached the warehouse verdict
+  reason: string;                        // "" when ok; a refusal code otherwise (below)
+  detail: string;                        // human-readable, already scrubbed of the token and of
+                                         //   any upstream cell value; may be ""
+  missing: string[];                     // "missing_bindings" only — the slot names still needed
+  columns: string[];                     // the result's column names
+  row_count: number;                     // MEANINGLESS unless row_count_measured is true
+  row_count_measured: boolean;           // see below
+  distinct_grain_count: number | null;   // null when the grain was not probed
+  verify_passed: boolean;                // the D56 grain + signature gate
+  verify_reason: string | null;          // why it failed, when it did
+  inconclusive: boolean;                 // ok && row_count === 0 && columns.length === 0
+}
+```
+
+**`row_count_measured` is the honesty flag on `row_count`.** It is `true` only when the grain was
+actually probed **and** a distinct-grain count came back. It is `false` everywhere else — on every
+refusal path (`ok: false`), and on a blueprint that declares a grain the probe could not read. When
+it is `false` the card must show **"row count: not checked"** rather than a number: `row_count`'s
+default is `0`, and rendering that would tell a reviewer the query returned nothing when nobody
+counted.
+
+**`inconclusive` is not a pass and not a failure.** The D56 gate is satisfied *vacuously* by zero
+rows (the grain teeth hold and the signature check is skipped when the candidate declares no
+`result_signature.shape`), so `verify_passed: true` with `inconclusive: true` proves only that the
+SQL parses and the scoped token may run it. Render it as its own third state — the dev warehouse's
+row-level grant returns zero rows to a replay tenant, which looks exactly like this.
+
+| `reason` (when `ok: false`) | Meaning |
+|---|---|
+| `missing_bindings` | `missing[]` names the slots with no value — re-prompt, do not retry |
+| `bind_failed` | the values could not be bound into the template. A single-template run appends the binder's message to the reason itself (`bind_failed:<message>`); a **composite** returns a bare `bind_failed` and names only the step in `detail` — the offending value may be a warehouse cell read from an earlier step, and this surface returns structure, never values. Match this code with a prefix test, not equality |
+| `no_uses_scope` | the candidate declares no column footprint, so no scoped token can be minted. **Not retryable by the reviewer** |
+| `no_token` | no warehouse token was supplied |
+| `warehouse_error` | the query failed at the warehouse; `detail` is the scrubbed message (or a withheld-whole notice) |
+| `no_template` | nothing to run — a `needs_parameterization` row, or a payload with neither `sql_template` nor `node_templates` |
+| `malformed_composite` | the DAG's SQL and its `composes` wiring disagree; `detail` names the step |
+| `table_intermediate_unsupported` | a step passes a whole table downstream — outside what a trial can run today |
+| `scalar_shape` | a consumed step did not return exactly one cell, or is consumed as several scalars |
+| `no_scalar_probe` | this deployment's probe cannot read an intermediate value, so a multi-step blueprint cannot be trialled here |
+
+A trial proves *"this SQL runs and returns this shape for this principal"*. It does **not** prove the
+declared `uses` footprint is honest — that is re-checked statically at landing, where no pasted token
+can influence it.
 
 ---
 

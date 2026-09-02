@@ -210,7 +210,7 @@ async def test_touch_scanned_is_not_counted_as_a_put():
 
 
 async def test_touch_scanned_unknown_id_is_a_silent_no_op():
-    """The document expired (90-day TTL) or was superseded between the scan read and
+    """The document expired (180-day TTL) or was superseded between the scan read and
     the stamp. There is nothing left to rotate — never an error that would poison the
     cycle's decision for a candidate that no longer exists."""
     store = InMemoryCandidateStore()
@@ -430,7 +430,7 @@ async def test_touch_scanned_is_a_subdoc_write_that_preserves_expiry():
       * SUB-DOCUMENT, not `upsert` — it writes the single cursor path server-side, so
         it can never revert a concurrent inbox transition the way re-putting a stale
         scanned envelope would.
-      * `preserve_expiry=True` — `put` sets the 90-day candidate TTL fresh on every
+      * `preserve_expiry=True` — `put` sets the 180-day candidate TTL fresh on every
         write, so stamping the cursor through `put` every 5 minutes would make a
         permanently-held candidate immortal. The cursor is bookkeeping and must not
         restart the retention clock.

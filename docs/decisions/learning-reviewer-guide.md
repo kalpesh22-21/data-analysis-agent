@@ -28,9 +28,10 @@ Every row carries a **reason** — why it is in front of you, not what is wrong 
 
 | reason | what it means | your job |
 |---|---|---|
-| `needs_parameterization` | a literal in the SQL has no classification | **complete the form** |
+| `needs_parameterization` | a literal in the SQL has no classification | **complete the form** — but read the judge verdict on the card first (below) |
 | `fail_to_review` | a static check failed | judge whether it is fixable |
-| `dedup_conflict` | it looks like something already in the corpus | decide which one wins |
+| `dedup_conflict` | it looks *like* something already in the corpus | decide which one wins |
+| `suppressed_duplicate` | it **is** something already in the corpus — a deterministic match against a live artifact | **revise it into a real delta, or reject it** — see below |
 | `leakage_near_miss` | the entity scan flagged something | inspect, then attest or reject |
 | `hand_authored` | an expert wrote it at `/mint` | ordinary review — this is not a defect |
 | `blueprint_sampled` | clean, and sampling picked it for a spot-check | ordinary review |
@@ -38,6 +39,52 @@ Every row carries a **reason** — why it is in front of you, not what is wrong 
 
 Content is **withheld until the entity scan settles**. A blank intent means "nobody has scanned
 this yet", not "this is empty.".
+
+### `needs_parameterization` — check the judge verdict before you fill in the form
+
+These rows carry the coverage judge's verdict and the artifact it named (`judge_verdict`,
+`judge_covered_by`), and they are shown to you ungated because a verdict word and an artifact id
+say nothing about the session.
+
+Read them, because the judge no longer stops anything: shadow mode is the **default**, so a session
+the judge believed the corpus already covers is *recorded* as covered and then extracted anyway. If
+its extraction declines on parameterization, the form lands here. That is deliberate — a wrong drop
+would be invisible, and a wrong keep costs you one glance — but it means "there is a form to fill
+in" is not by itself a reason to fill it in. If the named artifact really covers the question,
+**reject**.
+
+### `suppressed_duplicate` — the one where "approve" is the wrong answer
+
+The row matched an existing **live** learning artifact deterministically: same resolved rules, same
+`uses`, same result grain, same normalized SQL. That artifact's hit count has already been
+incremented, so the sighting is recorded whatever you do here. The candidate is in front of you
+instead of in the bin because a duplicate is often a *near*-duplicate carrying something the
+original does not — an extra predicate, a better intent, a slot where the original hard-codes a
+literal.
+
+So the useful actions are:
+
+- **Revise it into a genuine delta** (`revise`, or edit the parameterization) until it is no longer
+  the same artifact, then approve. That is the whole reason the row was kept. Applying a revision
+  re-runs the write-router stages, so the dedup verdict is re-adjudicated on the new payload — if
+  the delta is real the row comes back with a different reason, and if it is not, it comes back
+  `suppressed_duplicate` again.
+- **Reject it** if there is no delta. This costs nothing — the corpus already has the artifact, and
+  the rejection is retained as a negative signal.
+
+**Approving it as-is adds nothing** and is not a neutral act: the landing id is derived from
+`dedup.canonical_key`, so an unchanged approval lands on the matched artifact's *own* node.
+
+The card shows the **dedup key** it matched on. The matched artifact's id is on the wire
+(`dedup.matched_id`) but is **not rendered yet** — until it is, use the key to find the artifact
+before deciding.
+
+Two duplicates never reach you at all, deliberately:
+
+- a match against a **terminal** (rejected or retired) artifact — a human already said no to exactly
+  this thing, and re-surfacing it would relitigate a settled decision. Rejection is memory.
+- a candidate **structurally identical to an MCP canon blueprint** — canon is the stronger tier;
+  there is nothing to add and no learning artifact to increment.
 
 ---
 

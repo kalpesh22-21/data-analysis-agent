@@ -325,6 +325,13 @@ class TrialRunResult:
     distinct_grain_count: int | None = None
     verify_passed: bool = False
     verify_reason: str | None = None
+    # Was `row_count` above actually READ from the warehouse, or is it the 0 placeholder?
+    # DEFAULTS FALSE, because every field on this dataclass except `ok` defaults to the
+    # "nothing was established" value and every REFUSAL path builds the result without
+    # touching this one. Defaulting True made a refusal claim it had measured a row count
+    # it never went near — observed live, a `scalar_shape` refusal reported
+    # `row_count: 0, row_count_measured: true`.
+    row_count_measured: bool = False
 
     @property
     def inconclusive(self) -> bool:
@@ -352,6 +359,7 @@ class TrialRunResult:
             "missing": list(self.missing),
             "columns": list(self.columns),
             "row_count": self.row_count,
+            "row_count_measured": self.row_count_measured,
             "distinct_grain_count": self.distinct_grain_count,
             "verify_passed": self.verify_passed,
             "verify_reason": self.verify_reason,
@@ -400,6 +408,17 @@ def _trial_verdict(
         ok=True,
         columns=tuple(result.columns),
         row_count=result.row_count,
+        # DERIVED FROM THE MEASUREMENT, not from the declaration. The two candidate
+        # sources are both untruthful here: `bool(grain)` and `VerifyOutcome.grain_checked`
+        # (which is `bool(result_grain.columns) and verifiable`, i.e. the same thing given
+        # the `verifiable=bool(grain)` above) say only that a grain was DECLARED. A grain
+        # can be declared and still unprobeable — `map_grain_columns` finds no matching
+        # output column, or `unpack_grain_probe` cannot read the counts — and on both of
+        # those `MCPWarehouseProbe.run` returns `row_count=0, distinct_grain_count=None`
+        # while the declaration still says True. `distinct_grain_count is not None` is the
+        # one signal that only the COUNT(DISTINCT) round-trip can set: every path in the
+        # probe that leaves it None also returns the `row_count=0` placeholder.
+        row_count_measured=result.distinct_grain_count is not None,
         distinct_grain_count=result.distinct_grain_count,
         verify_passed=verdict.passed,
         verify_reason=verdict.reason,
@@ -867,25 +886,25 @@ class ReviewInbox:
         leaves the candidate `in_review`. That is NOT a success, so a held approve surfaces as an
         `InboxTransitionError` carrying the hold reason rather than as an unchanged envelope.
 
-        ⚠ THE REVIEWER'S OWN TOKEN, REQUIRED. Approving runs the golden replay — a real query
-        against the live warehouse — and this surface never mints authority for that. It is the
-        same posture the trial already has, extended to the gate that actually promotes: if
-        reaching the inbox could produce a warehouse token, "allowed to review candidates" would
-        silently mean "allowed to query the warehouse".
+        ⚠ THE REVIEWER'S OWN TOKEN IS REQUIRED FOR BLUEPRINTS. Their approval runs the golden
+        replay against the live warehouse, and this surface never mints authority for that.
+        Global knowledge and schema edits do not query the warehouse, so asking those reviewers
+        for a warehouse credential would expand authority without using it — those types are
+        approved with NO probe at all, rather than with the deployment principal's, because
+        handing them that one would re-create exactly the fallback `_probe_for` refuses.
 
         NO FALLBACK to the deployment principal on a blank token, for the reason the trial gives:
         both paths return the same shape, so a reviewer would believe the blueprint had been
         proven against their access when it had been proven against somebody else's.
         """
-        await self._require(candidate_id, CandidateStatus.IN_REVIEW)
-        probe = self._probe_for(token)
-        if probe is None:
+        env = await self._require(candidate_id, CandidateStatus.IN_REVIEW)
+        probe = self._probe_for(token) if env.type == "blueprint" else None
+        if env.type == "blueprint" and probe is None:
             raise InboxTransitionError(
                 f"approve_needs_token: approving {candidate_id!r} replays the blueprint against "
                 "the live warehouse, and this surface mints no tokens — paste one you already "
                 "hold"
             )
-        env = await self._store.get(candidate_id)
         decision = await self._scheduler.apply_human_decision(env, "approve", probe=probe)
         if decision.action != "approve":
             raise InboxTransitionError(
@@ -899,7 +918,7 @@ class ReviewInbox:
         The row is retained for the S9 learner (D29). `needs_parameterization` is accepted because
         reject writes no content, so gating it would leave a row with NO terminal action at all —
         completable only by a human who may have decided the form has no honest answer, and otherwise
-        clearable only by waiting out a 90-day TTL.
+        clearable only by waiting out a 180-day TTL.
 
         RACE, stated because it is real and unclosed here: the guard reads the envelope and
         `apply_human_decision` writes it back, so a completion finishing in between is overwritten by

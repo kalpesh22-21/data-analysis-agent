@@ -46,7 +46,7 @@ from `template.py`.
 `writer/routing.py::route_candidate` gained a branch: any candidate whose
 `revalidation.authored` is True routes to `in_review` / `hand_authored` instead of the auto-land
 path. Precedence is unchanged — it sits **below** every defect reason, so `fail_to_review`,
-`dedup_conflict`, `leakage_near_miss` and an unsettled scan all still win.
+`dedup_conflict` / `suppressed_duplicate`, `leakage_near_miss` and an unsettled scan all still win.
 
 Mined candidates are unaffected: `authored` defaults False on every snapshot built
 `from_summary` or rehydrated `from_doc`.

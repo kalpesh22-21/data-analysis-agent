@@ -160,6 +160,8 @@ class SuppliedTokenMinter:
 
     __slots__ = ("_token",)
 
+    binds_session = False
+
     def __init__(self, token: str) -> None:
         token = (token or "").strip()
         if not token:
@@ -190,6 +192,8 @@ class HttpTokenMinter:
     `allow_unscoped=True` disables the allow-all backstop, which a request-path caller whose
     entitlement legitimately resolves to allow-all has to state explicitly at its wiring site.
     """
+
+    binds_session = True
 
     def __init__(
         self,

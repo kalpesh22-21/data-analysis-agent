@@ -279,9 +279,9 @@ the review-inbox UI / audit tooling. The candidate envelopes in neo4j / the vect
 **only `evidence_ref`** (the KV key), never the snapshot — so the global stores stay entity-free
 (D17) while audit stays durable (D51).
 
-**Retention policy:** `LEARNING_AUDIT_TTL_SECONDS`, default **90 days** (`7776000`), a floor that must
+**Retention policy:** `LEARNING_AUDIT_TTL_SECONDS`, default **180 days** (`15552000`), a floor that must
 be **≥ the maximum candidate lifetime** (max review-inbox dwell). Tunable; if review SLAs push
-candidate lifetime past 90 d, raise this — the invariant is `audit_TTL ≥ max_candidate_lifetime`.
+candidate lifetime past 180 d, raise this — the invariant is `audit_TTL ≥ max_candidate_lifetime`.
 
 **Slice-1 vs Slice-2 — RECOMMENDATION: DEFER provisioning to Slice 2.** Slice 1 writes **no
 evidence** (there is no extractor to snapshot anything). Standing up an access-controlled bucket,
@@ -363,7 +363,7 @@ kill-switch accessor.
 | `LEARNING_BATCH_SIZE` | `10` | `XREADGROUP COUNT`. |
 | `LEARNING_BLOCK_MS` | `5000` | `XREADGROUP BLOCK`. |
 | `LEARNING_AUDIT_BUCKET` | `learning_audit` | **Reserved, unread in Slice 1** (D95, §8). |
-| `LEARNING_AUDIT_TTL_SECONDS` | `7776000` (90 d) | **Reserved, unread in Slice 1** (D95, §8). |
+| `LEARNING_AUDIT_TTL_SECONDS` | `15552000` (180 d) | **Reserved, unread in Slice 1** (D95, §8). |
 
 `LEARNING_ENABLED` deliberately lives outside the `@lru_cache`d `RuntimeSettings`.
 

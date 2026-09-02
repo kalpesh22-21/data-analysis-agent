@@ -35,11 +35,11 @@ from .verdicts import DriftStamp
 #
 # `needs_parameterization` is deliberately NOT here, and the tradeoff is worth stating
 # because it is a loss: a fail-to-review item nobody completes within
-# `learning_candidates_ttl_seconds` (90 days) EXPIRES, and the blueprint it would have
+# `learning_candidates_ttl_seconds` (180 days) EXPIRES, and the blueprint it would have
 # become is gone again. It sits on the transient side anyway because it is the same kind
 # of thing as `in_review` — an unfinished work item, not a settled record — and giving it
 # a different retention posture from the queue it renders next to would be a rule with
-# one member and no principle. A queue nobody drains in 90 days is a staffing signal, and
+# one member and no principle. A queue nobody drains in 180 days is a staffing signal, and
 # the honest fix is to drain it or to raise the TTL, not to make one row immortal.
 
 _TERMINAL_STATUSES = frozenset(
@@ -246,7 +246,9 @@ class CouchbaseCandidateStore(CouchbaseStoreBase):
         except DocumentNotFoundException:
             return
 
-    async def supersede(self, content_hash: str) -> None:
+    async def supersede(
+        self, content_hash: str, *, keep_candidate_ids: tuple[str, ...] = ()
+    ) -> None:
         await self._ensure_connected()
         # N1QL-SELECT the stale candidate ids (query_select), then KV-remove each
         # (data_writer) — avoids needing query_delete on the writer role. A doc
@@ -258,7 +260,8 @@ class CouchbaseCandidateStore(CouchbaseStoreBase):
         result = self._cluster.query(
             statement, QueryOptions(named_parameters={"content_hash": content_hash})
         )
-        ids = [row["id"] async for row in result]
+        keep = set(keep_candidate_ids)
+        ids = [row["id"] async for row in result if row["id"] not in keep]
         for candidate_id in ids:
             try:
                 await self._collection.remove(candidate_id)

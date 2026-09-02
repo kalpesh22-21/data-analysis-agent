@@ -278,7 +278,7 @@ config:
   #    first, read the distribution, then turn it off. Not the same as a high
   #    confidence bar, and not the same as JUDGE_ENABLED=false (which records
   #    nothing at all).
-  LEARNING_JUDGE_SHADOW_MODE: "false"
+  LEARNING_JUDGE_SHADOW_MODE: "true"
   # -- Model id for the judge. Empty ⇒ reuse the extractor's client. The
   #    economics favour a smaller model: the judge sees a bounded brief, while
   #    the call it cancels carries the whole session transcript.
@@ -356,7 +356,7 @@ config:
   #      EVERY document's expiry in every scope, silently — the corpus and
   #      user-knowledge stores write with NO expiry on purpose (durable), and a cap
   #      would delete them on the bucket's clock with nothing raised anywhere. Audit
-  #      and candidates set 90 days per WRITE and are unaffected either way.
+  #      and candidates set 180 days per WRITE and are unaffected either way.
   #   2. RBAC STAYS FOUR SEPARATE SCOPED CREDENTIALS — one per store, granted at
   #      `bucket:scope:collection` (Couchbase 7.x supports that granularity), NOT one
   #      shared bucket-wide superuser. Collapsing them would re-merge the four
@@ -372,8 +372,8 @@ config:
   LEARNING_AUDIT_SCOPE: "_default"
   LEARNING_AUDIT_COLLECTION: "_default"
   LEARNING_AUDIT_USERNAME: "learning_audit"
-  # -- Audit retention floor (90 days): audit_TTL >= max candidate lifetime.
-  LEARNING_AUDIT_TTL_SECONDS: "7776000"
+  # -- Audit retention floor (180 days): audit_TTL >= max candidate lifetime.
+  LEARNING_AUDIT_TTL_SECONDS: "15552000"
   # -- Couchbase connection string for the learning CANDIDATES keyspace. EXTERNAL.
   LEARNING_CANDIDATES_CONNECTION_STRING: "couchbase://couchbase"
   LEARNING_CANDIDATES_BUCKET: "learning_candidates"
@@ -383,9 +383,9 @@ config:
   LEARNING_CANDIDATES_SCOPE: "_default"
   LEARNING_CANDIDATES_COLLECTION: "_default"
   LEARNING_CANDIDATES_USERNAME: "learning_candidates"
-  # -- Candidate retention (90 days). MUST outlive the review-inbox dwell, or a
+  # -- Candidate retention (180 days). MUST outlive the review-inbox dwell, or a
   #    candidate expires out from under the reviewer looking at it.
-  LEARNING_CANDIDATES_TTL_SECONDS: "7776000"
+  LEARNING_CANDIDATES_TTL_SECONDS: "15552000"
   # -- Couchbase connection string for the learning CORPUS keyspace. EXTERNAL.
   LEARNING_CORPUS_CONNECTION_STRING: "couchbase://couchbase"
   LEARNING_CORPUS_BUCKET: "learning_corpus"

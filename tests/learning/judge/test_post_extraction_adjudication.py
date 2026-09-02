@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from data_agent.learning.audit import InMemoryAuditStore
 from data_agent.learning.audit.judgement import post_extraction_ref
 from data_agent.learning.candidate.models import CandidateEnvelope
@@ -290,10 +292,20 @@ async def test_the_judge_never_softens_a_merge_into_an_auto_land() -> None:
     assert result.control == "continue"
 
 
-async def test_a_hard_key_hit_short_circuits_before_the_judge_ever_runs() -> None:
+@pytest.mark.parametrize(
+    ("status", "control"), [("extracted", "continue"), ("rejected", "drop")]
+)
+async def test_a_hard_key_hit_short_circuits_before_the_judge_ever_runs(
+    status: str, control: str
+) -> None:
     """The deterministic, race-safe SHA-256 layer stays the first layer and is never
-    displaced. A byte-identical re-derivation is dropped by arithmetic, with no model
-    call and no judgement record."""
+    displaced. A byte-identical re-derivation is settled by ARITHMETIC — no model call and
+    no judgement record — whichever way it is settled.
+
+    Which way that is depends on the matched artifact, and both are asserted here so the
+    short-circuit cannot be read as a property of the drop alone: a hit on a TERMINAL
+    artifact drops (the human said no to exactly this thing), a hit on a LIVE one
+    continues to the writer as a suppressed duplicate. Neither consults the judge."""
     from data_agent.learning.dedup import CorpusArtifact, compute_canonical_key
 
     env = make_envelope()
@@ -311,13 +323,15 @@ async def test_a_hard_key_hit_short_circuits_before_the_judge_ever_runs() -> Non
     )
     corpus = InMemoryBlueprintCorpus()
     await corpus.seed_artifact(
-        CorpusArtifact(id="art-1", canonical_key=key, intent=_INTENT, hit_count=1)
+        CorpusArtifact(
+            id="art-1", canonical_key=key, intent=_INTENT, hit_count=1, status=status
+        )
     )
     stage, client, audit, _corpus = _stage(
         [verdict_turn("duplicate")], score=0.90, corpus=corpus
     )
     result = await stage.process(env, _ctx())
-    assert result.control == "drop"
+    assert result.control == control
     assert result.envelope.dedup is not None
     assert result.envelope.dedup.layer == "hard"
     assert client.calls_made == 0

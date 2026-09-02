@@ -79,11 +79,16 @@ class CandidateStore(Protocol):
         """
         ...
 
-    async def supersede(self, content_hash: str) -> None:
-        """Remove ALL candidates previously written for *content_hash*.
+    async def supersede(
+        self, content_hash: str, *, keep_candidate_ids: tuple[str, ...] = ()
+    ) -> None:
+        """Remove every candidate written for *content_hash* EXCEPT *keep_candidate_ids*.
 
-        Called before persisting a fresh extraction so a re-run — a redelivery re-invokes the LLM,
+        Called AFTER persisting a fresh extraction so a re-run — a redelivery re-invokes the LLM,
         which may emit a different count or order — never leaves a MIXED set from two attempts.
-        Idempotent.
+        The keeper list is what makes that ordering safe: extraction publishes the replacement
+        generation first, passes the ids it just wrote, and only then removes the prior one, so a
+        store/audit failure part-way through cannot leave the session with neither generation.
+        Idempotent. An id in *keep_candidate_ids* that does not exist is simply not matched.
         """
         ...

@@ -70,7 +70,7 @@ These are the durable part. The slice list below is downstream of them.
 
 **The scheduler becomes a router, not a promoter.** Auto path is `candidate → in_review`; landing happens only in `apply_human_decision`. Rationale: `_recheck_validated` runs a golden-replay ClickHouse probe against every validated node. Auto-landing at T=1 would put hundreds of never-recalled nodes into that loop within weeks, and recall ignores them anyway.
 
-**The judge drops outright above a configurable confidence bar.** User's call, taken with the risk stated (a wrong drop is invisible). Mitigation built in: every drop writes a durable record to `learning_audit` — session id, verdict, reason, covered-by ref, confidence — so drops are queryable rather than a log line.
+**The judge drops outright above a configurable confidence bar.** User's call, taken with the risk stated (a wrong drop is invisible). Mitigation built in: every drop writes a durable record to `learning_audit` — session id, verdict, reason, covered-by ref, confidence — so drops are queryable rather than a log line. **As shipped this is latent: `LEARNING_JUDGE_SHADOW_MODE` now defaults to `true`, so nothing is discarded** — see the shadow-mode bullet in §"What the build found" below.
 
 **The judge emits a structured verdict**, `duplicate | existing-plus-delta | new`, as a typed field. This field *is* the dataset that decides whether atomic blueprints are worth building.
 
@@ -337,8 +337,22 @@ Decisions taken while building, each deliberate:
   a week, read the distribution, discard nothing — could not be configured while two
   documents asserted that it could. `LEARNING_JUDGE_SHADOW_MODE` now runs everything and
   forces the drop to False; the row carries `would_drop` and `shadow`.
+* **Shadow is now the DEFAULT, not a temporary rollout setting** (`learning_judge_shadow_mode
+  = True` in `learning/config.py`, `LEARNING_JUDGE_SHADOW_MODE: "true"` in the learning chart).
+  This is a deliberate posture, not an un-flipped switch: the loop is human-gated end to end, so
+  a prior-art-covered session costs one extraction that a reviewer skims, while a wrong drop is
+  invisible forever. Every verdict is still recorded to `learning_audit`; the drop is the only
+  thing suppressed.
+
+  **The accepted consequence.** `judge.py` computes `drop = would_drop and not shadow` and then
+  `outcome = DROPPED if drop else PROCEEDED`, so under shadow a would-drop is recorded as
+  `proceeded`. `_persist_declined_for_review` gates on exactly that value, so a session the judge
+  flagged as already-covered can now ALSO produce a `needs_parameterization` review row if its
+  extraction then declines on parameterization. That is intended — the reviewer sees the judge's
+  verdict and `covered_by` on the card and can reject in one click — and it is written down here
+  so the next reader does not "fix" it by tightening the gate to `would_drop == false`.
 * **Judge verdicts get their OWN retention** (`LEARNING_JUDGE_RECORD_TTL_SECONDS`,
-  3 years). Inheriting the D95 90-day evidence floor would have erased the dataset about
+  3 years). Inheriting the D95 180-day evidence floor would have erased the dataset about
   as fast as the skew signal accrues — the questions are quarterly. An evidence quote is
   entity-bearing and should expire; a verdict row is scalars plus one capped reason.
 * **The drop precondition is an ACK, not durability**, and the docstring says so rather

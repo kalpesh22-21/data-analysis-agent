@@ -3641,9 +3641,11 @@
           + (r.verify_reason ? " (" + r.verify_reason + ")" : "")))
       );
     }
-    pass.appendChild(el("p", "", "rows: " + String(r.row_count) +
-      (r.distinct_grain_count === null || r.distinct_grain_count === undefined
-        ? "" : "  ·  distinct grain: " + String(r.distinct_grain_count))));
+    pass.appendChild(el("p", "", r.row_count_measured === false
+      ? "row count: not measured (no grain count came back from the warehouse)"
+      : "rows: " + String(r.row_count) +
+        (r.distinct_grain_count === null || r.distinct_grain_count === undefined
+          ? "" : "  ·  distinct grain: " + String(r.distinct_grain_count))));
     var cols = renderChips(r.columns, "inbox-trial-columns");
     if (cols) pass.appendChild(cols);
     // Stated, not implied: a reviewer who sees a row COUNT will wonder where the rows are.
@@ -3858,13 +3860,13 @@
     return action === "verify" || action === "promote";
   }
 
-  function performAction(candidateId, action, node, actions) {
+  function performAction(candidateId, action, node, actions, needsWarehouseToken) {
     clearError();
     // APPROVE REPLAYS AGAINST THE WAREHOUSE, so it needs the reviewer's own token — nothing
     // here or upstream mints one. Read from the trial box on the same card when it is filled
     // in (the common flow: trial it, then approve it), and asked for otherwise.
     var body = {};
-    if (action === "approve") {
+    if (action === "approve" && needsWarehouseToken) {
       var box = node.querySelector("[data-testid=inbox-trial-token]");
       var token = (box && box.value.trim()) || window.prompt(
         "Approving runs this blueprint against the warehouse as YOU.\n" +
@@ -3958,7 +3960,9 @@
 
   // Build one action button with a two-step confirm: the first click arms it
   // (destructive/promotion actions require intent), the second click fires.
-  function makeActionButton(candidateId, action, label, node, actions, disabled) {
+  function makeActionButton(
+    candidateId, action, label, node, actions, disabled, needsWarehouseToken
+  ) {
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "action-btn action-" + action;
@@ -3972,7 +3976,7 @@
 
     btn.addEventListener("click", function () {
       if (btn.dataset.confirming === "1") {
-        performAction(candidateId, action, node, actions);
+        performAction(candidateId, action, node, actions, needsWarehouseToken === true);
         return;
       }
       // Arm this button; reset any other armed button first.
@@ -5492,7 +5496,9 @@
       // Approve is pre-disabled offline (contract §5); retract is disabled here
       // because every listed item is in_review, not validated (contract §4).
       actions.appendChild(
-        makeActionButton(id, "approve", "Approve", li, actions, state.offline)
+        makeActionButton(
+          id, "approve", "Approve", li, actions, state.offline, item.type === "blueprint"
+        )
       );
       // Said AGAIN beside the button: the badge sits at the top of a long card and the
       // decision is made at the bottom of it. It does not block approve — a reviewer who has

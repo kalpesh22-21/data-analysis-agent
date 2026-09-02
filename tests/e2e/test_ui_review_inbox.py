@@ -130,14 +130,16 @@ class TestReviewerApprovesBlueprintAndKnowledge:
         expect(page.get_by_test_id("inbox-summary").first).to_be_visible(
             timeout=_ASSERT_TIMEOUT_MS
         )
-        expect(page.get_by_test_id("inbox-payload-view").first).to_be_visible(
+        expect(page.get_by_test_id("inbox-raw-toggle").first).to_be_visible(
             timeout=_ASSERT_TIMEOUT_MS
         )
+        expect(page.get_by_test_id("inbox-payload-view").first).to_be_hidden()
 
         # No error at rest.
         expect(page.get_by_test_id("error-banner")).to_be_hidden()
 
         # Approve the FIRST item (two-step confirm): first click arms, second fires.
+        page.get_by_test_id("inbox-trial-token").fill("e2e-reviewer-warehouse-token")
         self._approve_first_item(page)
 
         # After a successful approve the item leaves the in_review projection and
@@ -146,6 +148,8 @@ class TestReviewerApprovesBlueprintAndKnowledge:
         expect(page.get_by_test_id("error-banner")).to_be_hidden()
 
         # Approve the remaining item → inbox drains to empty.
+        _tab(page, "global_knowledge").click()
+        expect(_visible_items(page)).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
         self._approve_first_item(page)
         expect(items).to_have_count(0, timeout=_ASSERT_TIMEOUT_MS)
         expect(page.get_by_test_id("inbox-empty")).to_be_visible(

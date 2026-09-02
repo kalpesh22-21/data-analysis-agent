@@ -190,7 +190,7 @@ class LearningSettings(BaseSettings):
         "", description="Password for the learning_audit_writer RBAC user (secret)."
     )
     learning_audit_ttl_seconds: int = Field(
-        7_776_000,  # 90 days
+        15_552_000,  # 180 days (six-month review/evidence window)
         ge=1,
         description="Audit retention floor (D95): audit_TTL ≥ max_candidate_lifetime. Set fresh per write.",
     )
@@ -227,7 +227,7 @@ class LearningSettings(BaseSettings):
         "", description="Password for the learning_candidates_writer RBAC user (secret)."
     )
     learning_candidates_ttl_seconds: int = Field(
-        7_776_000,  # 90 days — a candidate must outlive the review-inbox dwell (D101/D95).
+        15_552_000,  # 180 days — a candidate must outlive the review-inbox dwell (D101/D95).
         ge=1,
         description="Candidate retention (≥ review-inbox dwell). Set fresh per write.",
     )
@@ -479,7 +479,7 @@ class LearningSettings(BaseSettings):
         ),
     )
     learning_judge_shadow_mode: bool = Field(
-        False,
+        True,
         description=(
             "SHADOW MODE — the safe rollout. The judge runs, is asked, and records "
             "EVERY verdict to learning_audit exactly as it would in anger, but the drop "
@@ -499,7 +499,7 @@ class LearningSettings(BaseSettings):
         description=(
             "Retention for judge verdict records — its OWN clock, deliberately much "
             "longer than LEARNING_AUDIT_TTL_SECONDS. An evidence quote is "
-            "entity-bearing and should expire on the D95 90-day floor; a verdict row is "
+            "entity-bearing and should expire on the D95 180-day floor; a verdict row is "
             "scalars plus one capped reason, and the questions it exists to answer "
             "('how many drops last quarter', 'do verdicts skew to existing-plus-delta') "
             "accumulate over months. Inheriting the evidence retention would erase the "

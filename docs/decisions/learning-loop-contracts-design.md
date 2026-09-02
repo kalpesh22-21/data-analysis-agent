@@ -252,6 +252,12 @@ class InboxItem:
 #   retract → a post-promotion pull-from-index (leak found) → status: retired (D58b, D25 trace)
 ```
 
+> **The `reason` literal above is the S7-era snapshot and has since GROWN** —
+> `suppressed_duplicate` (a deterministic dedup match against a live artifact),
+> `needs_parameterization` (the fail-to-review form) and `hand_authored` (minted at `/mint`) were
+> added later, along with several fields. `learning/inbox/models.py::InboxReason` is authoritative;
+> the wire shape is `learning/inbox/service.py::_inbox_item_to_wire`.
+
 **Attaches at:** no new envelope field — `InboxItem` is derived from the envelope + its `status`.
 S7's writer stage sets `status = in_review` for inbox-bound targets and `status = candidate` for
 auto-landing blueprints (D58b) / `user_knowledge` (auto-commit, but that writer is S8's store).

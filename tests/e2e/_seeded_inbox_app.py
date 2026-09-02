@@ -60,6 +60,13 @@ _kn = with_type(
         make_blueprint_candidate(status=CandidateStatus.IN_REVIEW),
         candidate_id="candidate::hash-fixture-knowledge::0",
         content_hash="hash-fixture-knowledge",
+        payload={
+            "statement": "Overtime earnings are reported separately from regular earnings.",
+            "knowledge_type": "business_rule",
+            "structured": {"regular_and_overtime_are_distinct": True},
+            "related_terms": ["overtime", "regular earnings"],
+            "scope": "payroll earnings",
+        },
     ),
     "global_knowledge",
 )

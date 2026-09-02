@@ -377,7 +377,7 @@ class EvidenceSnapshot:                 # ENTITY-BEARING — lives ONLY in learn
   UpsertOptions(expiry=timedelta(seconds=learning_audit_ttl_seconds)))`; `read` = `collection.get`,
   `None` on `DocumentNotFoundException`.
 - **`InMemoryAuditStore`** — dict-backed fake, same semantics, for Layer-1 wiring tests.
-- **Retention** — every `snapshot` write carries `expiry = LEARNING_AUDIT_TTL_SECONDS` (default 90 d),
+- **Retention** — every `snapshot` write carries `expiry = LEARNING_AUDIT_TTL_SECONDS` (default 180 d),
   the D95 floor `audit_TTL ≥ max_candidate_lifetime`. Unlike the session-lifecycle transitions (which
   `preserve_expiry` so as not to re-arm the session clock), audit writes SET the audit TTL fresh —
   the audit clock is independent by design.

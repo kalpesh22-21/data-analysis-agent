@@ -26,8 +26,14 @@ mutates only `status` (D102 additivity — `status` is a consumer-pipeline-owned
 2. blueprint, `static_validation.outcome == "fail_to_review"` → `in_review`, reason
    `fail_to_review` (un-rewritable, reviewed not dropped — D52/D97).
 3. blueprint, `dedup.action ∈ {conflict, merge}` (a SOFT near-miss) → `in_review`,
-   reason `dedup_conflict` ("soft conflict/variant" — never auto-append, §3). A hard-key
-   `increment` never reaches the writer (S6 already dropped it).
+   reason `dedup_conflict` ("soft conflict/variant" — never auto-append, §3).
+   **AMENDED (blueprint-review-rework slice):** a hard-key `increment` against a **live**
+   artifact now DOES reach the writer and routes to `in_review` under the reason
+   `suppressed_duplicate` — the hit count is still incremented, and the row is kept so a human
+   can revise a genuine delta. An `increment` against a **terminal** artifact, and
+   `redundant_with_canon`, are still dropped at S6 and never arrive. The writer also maps
+   `redundant_with_canon → suppressed_duplicate` as fail-closed defence-in-depth for a
+   rehydrated verdict (`DedupVerdict.from_doc` does not validate `action`).
 4. blueprint, settled `entity_scan.result != "pass"` (a leakage near-miss) → **ALWAYS**
    `in_review`, reason `leakage_near_miss` (100% of near-misses, never sampled out — D58b).
 5. clean blueprint, **sampled** (`blueprint_inbox_sample_rate = 0.10` provisional) →

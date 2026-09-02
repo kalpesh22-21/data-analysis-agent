@@ -14,10 +14,11 @@ Routing precedence, top wins:
       (R8) — never an auto-land.
   2.  blueprint with `static_validation.outcome == "fail_to_review"` → `in_review`
       (un-rewritable is reviewed, never dropped — D52/D97).
-  3.  blueprint whose `dedup.action` is anything but `insert` → `in_review`. An ALLOWLIST,
-      not a denylist, so an unrecognized action becomes review noise rather than a silent
-      auto-land; the two DROP verdicts should never reach the writer, and if one does a human
-      sees it instead of the guarantee being trusted.
+  3.  blueprint whose `dedup.action` is anything but `insert` → `in_review`. This is the
+      NORMAL route for an `increment` against a LIVE artifact (S6 hands those on with
+      `continue`) — it becomes `suppressed_duplicate`. It is also an ALLOWLIST, not a
+      denylist, so a verdict S6 would have dropped in-process, or an action nobody
+      recognizes, becomes review noise rather than a silent auto-land.
   4.  blueprint with a settled `entity_scan.result != "pass"` → ALWAYS `in_review` (100% of
       leakage near-misses, D58b).
   5.  clean blueprint, sampled → `in_review` (the D58b audit sample).
@@ -37,12 +38,22 @@ from ..stage import StageControl
 # inversion is load-bearing.
 #
 # This was `_INBOX_DEDUP_ACTIONS = {"conflict", "merge"}` — force those to review, let
-# everything else through. That was safe only because the two DROP actions (`increment`,
-# `redundant_with_canon`) never reach the writer: S6 stops the pipeline on both, in the
-# same in-process pass. But `DedupVerdict.from_doc` rehydrates `action` with NO
-# validation, so a persisted envelope, a redelivery, or an envelope written by anything
-# other than today's S6 could arrive here carrying a drop action — and a denylist would
-# route it as CLEAN and auto-land a blueprint the loop had decided was redundant with
+# everything else through. Two different things reach here with a non-`insert` action, and
+# only one of them is an accident:
+#
+#   * DROPPED IN-PROCESS BY S6, so normally absent: `redundant_with_canon`, and an
+#     `increment` whose matched artifact is TERMINAL (`rejected`/`retired`). These reach
+#     the writer only through a REHYDRATED verdict.
+#   * ROUTED HERE DELIBERATELY, on the normal path: an `increment` whose matched artifact
+#     is LIVE. S6 returns `continue` for it, and this allowlist is what turns it into the
+#     `suppressed_duplicate` row a human then adjudicates. That branch is PRODUCTION
+#     ROUTING, not defence-in-depth — delete it as dead and live duplicates silently
+#     start wearing the wrong reviewer-facing label (`dedup_conflict`).
+#
+# The allowlist shape is for the first group. `DedupVerdict.from_doc` rehydrates `action`
+# with NO validation, so a persisted envelope, a redelivery, or an envelope written by
+# anything other than today's S6 could arrive here carrying a drop action — and a denylist
+# would route it as CLEAN and auto-land a blueprint the loop had decided was redundant with
 # the canon. Making the invariant depend on another module's control flow is exactly the
 # shape this codebase keeps getting bitten by.
 #
@@ -130,7 +141,12 @@ def derive_inbox_reason(env: CandidateEnvelope) -> str:
     if _static_outcome(env) == "fail_to_review":
         return "fail_to_review"
     if _dedup_forces_review(env):
-        return "dedup_conflict"
+        return (
+            "suppressed_duplicate"
+            if env.dedup is not None
+            and env.dedup.action in {"increment", "redundant_with_canon"}
+            else "dedup_conflict"
+        )
     if _is_leakage_near_miss(env):
         return "leakage_near_miss"
     if _entity_scan_unsettled(env):
@@ -177,7 +193,13 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
         if _static_outcome(env) == "fail_to_review":
             return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "fail_to_review")
         if _dedup_forces_review(env):
-            return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "dedup_conflict")
+            reason = (
+                "suppressed_duplicate"
+                if env.dedup is not None
+                and env.dedup.action in {"increment", "redundant_with_canon"}
+                else "dedup_conflict"
+            )
+            return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", reason)
         if _is_leakage_near_miss(env):
             return RoutingDecision(
                 CandidateStatus.IN_REVIEW, "route_inbox", "leakage_near_miss"

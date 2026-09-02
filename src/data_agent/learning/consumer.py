@@ -695,15 +695,15 @@ class LearningConsumer:
         pre-slice behaviour of no review route.
         """
         result = await self._extractor.extract(summary, verdict)
-        # MEDIUM-3: drop any candidates a PRIOR attempt (redelivery before `done`)
-        # wrote for this session, so the store never holds a mixed set from two
-        # LLM runs that emitted a different count/order.
-        await self._candidates.supersede(summary.content_hash)
+        # Publish the replacement generation BEFORE superseding the prior one. Deleting first
+        # creates a loss window: an audit/store failure below followed by dead-lettering leaves
+        # the session with neither its old valid candidates nor replacements.
         # Capture the CURRENT trace context (the open consume span) as a W3C
         # traceparent and stamp it onto each envelope, so the cron scheduler's
         # promote/land spans continue this SAME session trace. None when no tracer.
         traceparent = inject_current_traceparent() if self._tracer is not None else None
         intent = slots = rationale = None
+        replacement_ids: list[str] = []
         for ordinal, candidate in enumerate(result.candidates):
             evidence_refs = await self._snapshot_evidence(candidate, summary)
             envelope = build_envelope(
@@ -714,6 +714,16 @@ class LearningConsumer:
                 traceparent=traceparent,
             )
             await self._candidates.put(envelope)
+            # KEEPER LIST = every envelope this run actually PUT, recorded here and not
+            # after the stages. A stage's `drop` control means only "do not persist the
+            # ENRICHED envelope" (`stage.py`); the `extracted` envelope on the line above
+            # is already written and is meant to survive. Deriving the keeper set from the
+            # stage control instead made the trailing `supersede` delete a row this very
+            # run had just written. The production stages that return `drop`:
+            # `user/commit_stage.py`, and three separate points in `dedup/stage.py` —
+            # layer 1 when the hard-key match is a TERMINAL artifact, layer 2 on
+            # `redundant_with_canon`, and the layer-3b judge drop.
+            replacement_ids.append(envelope.candidate_id)
             # The rationale comes off the HEADER, which every target has — see
             # `_blueprint_verbose`. Reading it only inside the blueprint branch left a
             # knowledge-only extraction with a verbose span carrying nothing readable.
@@ -725,6 +735,18 @@ class LearningConsumer:
                 break
         review_count = await self._persist_declined_for_review(
             result.declines, summary, verdict, judged, traceparent
+        )
+        if review_count:
+            replacement_ids.append(mint_review_candidate_id(summary.content_hash, 0))
+        # Remove the previous generation only AFTER every replacement and its evidence have
+        # landed. This is strictly better than deleting first, but it is not a guarantee that
+        # nothing is ever erased before a successor exists: a `halt` breaks the loop, so the
+        # candidates after it are never put this run and their prior-generation rows ARE
+        # superseded — as are all of them if the extractor returns fewer candidates than last
+        # time. What it does buy is that a store/audit failure part-way through no longer
+        # leaves the session with neither generation, and a retry can leave a mixed one.
+        await self._candidates.supersede(
+            summary.content_hash, keep_candidate_ids=tuple(replacement_ids)
         )
         decline_reasons = tuple(d.reason for d in result.declines)
         self._emit_extract(

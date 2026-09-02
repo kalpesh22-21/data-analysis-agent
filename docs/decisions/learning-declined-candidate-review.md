@@ -78,6 +78,19 @@ unfillable forms; the review route makes the tail survivable regardless.
    verdict was `proceeded`. Merit-failed declines (`no_evidence`, `no_acceptance`,
    `unrewritable_sql`, judge-dropped) keep today's behaviour — they are *supposed* to
    die.
+
+   ⚠ **`proceeded` is a weaker statement than it was, and that is accepted.**
+   `LEARNING_JUDGE_SHADOW_MODE` now defaults to `true`, and `judge.py` computes
+   `drop = would_drop and not shadow` before `outcome = DROPPED if drop else PROCEEDED`.
+   So under the shipped default a session the judge flagged as **already covered by prior
+   art** is recorded with `would_drop=true` / `shadow=true` and its outcome is
+   `proceeded` — which is exactly the value `_persist_declined_for_review` gates on.
+   Prior-art-covered sessions can therefore produce `needs_parameterization` review rows.
+   **Intended, not a bug.** The loop is human-gated, a wrong drop is invisible, and the
+   card carries `judge_verdict` + `judge_covered_by` ungated (they are entity-free), so a
+   reviewer can see the coverage claim and reject in one click. Do not "fix" this by
+   gating on `would_drop == false`: that would re-introduce a silent discard on the one
+   path built to stop candidates evaporating.
 2. **What persists**: the last corrected candidate payload (best attempt), the FULL
    decline detail (predicates + hints, the same text the model saw — already
    sanitized by `_flattened`/`_quoted`), `correction_history`, the judge verdict +

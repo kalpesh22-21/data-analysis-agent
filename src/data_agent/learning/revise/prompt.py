@@ -41,9 +41,10 @@ with exactly one role:
            Needs: why — what the value MEANS, e.g. "defines the metric earnings".
   rule   — a catalog rule already declares this exact predicate. Needs: rule_id.
 
-A validator has REJECTED this blueprint because one or more predicates have no entry, or have \
-one it cannot accept. You will be shown its complaint verbatim. Your job is to propose the \
-entries that satisfy it."""
+This blueprint is either in the review queue or was returned by validation because one or more \
+predicates have no acceptable entry. You will be shown the validator's complaint when one exists. \
+Your job is to follow the reviewer's instruction and return a complete, internally consistent \
+parameterization for the query you propose."""
 
 _NO_REWRITE = """\
 YOU CANNOT CHANGE THE SQL. The template is regenerated from your entries by a deterministic \
@@ -53,7 +54,7 @@ field in which to write SQL. If a predicate looks wrong, classify it honestly an
 _REWRITE = f"""\
 YOU MAY CHANGE THE SQL, BUT PREFER NOT TO. The reviewer has explicitly enabled it for this \
 request, so the tool has a top-level `sql` field. Use it ONLY when their feedback cannot be met \
-by re-roling literals — a predicate that must be ADDED, REMOVED or CORRECTED, which no \
+by reclassifying literals — a predicate that must be ADDED, REMOVED or CORRECTED, which no \
 classification can do. If the feedback is about what a literal MEANS, leave `sql` out.
 
 If you do return a query, ALL of the following must hold or it will be refused:

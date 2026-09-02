@@ -61,11 +61,11 @@ fi
 echo "[learning-candidates-init] keyspace $KEYSPACE, grant [$GRANT]"
 echo "[learning-candidates-init] waiting for node REST..."
 for i in $(seq 1 30); do
-  docker exec l2-cb curl -sf "$CLUSTER/pools" >/dev/null 2>&1 && break
+  docker exec l2-cb curl -sf -u "$U:$P" "$CLUSTER/pools" >/dev/null 2>&1 && break
   sleep 2
 done
 
-# maxTTL=0 — no bucket-level expiry cap. Candidates set a 90-day expiry per WRITE (and
+# maxTTL=0 — no bucket-level expiry cap. Candidates set a 180-day expiry per WRITE (and
 # terminal rows deliberately set expiry=0 to persist forever), so a bucket cap would
 # silently evict the rejected archive and the promoted records the Phase-3 re-emit needs.
 # RAMSIZE IS SIZED FOR ONE STORE. In the shared layout create the bucket beforehand

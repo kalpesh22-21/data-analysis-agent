@@ -512,7 +512,7 @@ async def test_a_later_successful_run_clears_the_stale_review_item() -> None:
     so the ONE row it counts is explained by the deterministic id overwriting itself —
     `supersede` could be a no-op and it would still pass. Here the second run SUCCEEDS and
     writes a different id, so only a real content-hash sweep removes the form. Otherwise
-    a reviewer is asked, for ninety days, to fill in a blank the model has already
+    a reviewer is asked, for a hundred and eighty days, to fill in a blank the model has already
     filled."""
     from .extractor.helpers import PAYROLL_SQL, payroll_parameterization
     from .extractor.helpers import make_tool_call as _tc

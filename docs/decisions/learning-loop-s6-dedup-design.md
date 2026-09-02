@@ -74,6 +74,25 @@ conflict/variant"). The dedup stage itself only sets `control="drop"` for the ha
 increment; every other verdict returns `control="continue"` so the writer owns the
 inbox/auto-land decision (clean separation: dedup adjudicates, writer routes).
 
+> **AMENDED (blueprint-review-rework slice) — a hard-key `increment` no longer always drops.**
+> The matched artifact's `hit_count` is still incremented either way, but the candidate's fate
+> now depends on the artifact's status:
+>
+> * matched artifact is **live** ⇒ `control="continue"`. The writer routes it to the inbox
+>   under the new reason **`suppressed_duplicate`**, so a human can look at the match and revise
+>   a genuine delta instead of the candidate evaporating. Production is human-gated; a duplicate
+>   costs one skim, a silent drop costs the delta.
+> * matched artifact is **terminal** (`rejected` / `retired`) ⇒ still **dropped**. A human said
+>   no to exactly this thing; rejection is negative memory and re-surfacing it would relitigate a
+>   settled decision.
+> * `redundant_with_canon` (layer 2, structurally identical to an MCP canon blueprint) ⇒ still
+>   **dropped**. There is no learning artifact to increment, and approving it would land on the
+>   matched artifact's own node: `landing_id()` derives the node id from `dedup.canonical_key`.
+>
+> The writer keeps its `redundant_with_canon → suppressed_duplicate` mapping as fail-closed
+> defence-in-depth: `DedupVerdict.from_doc` does not validate `action`, so a rehydrated verdict
+> must land in review rather than fall through to auto-land.
+
 ## 3. Fail-soft (D52)
 
 If `canonical_ast_norm` is absent/empty (S4 could not produce a template), the hard

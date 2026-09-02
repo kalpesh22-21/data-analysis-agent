@@ -12,7 +12,7 @@ BUCKET=agent_sessions
 
 echo "[couchbase-init] waiting for node REST..."
 for i in $(seq 1 30); do
-  docker exec l2-cb curl -sf "$CLUSTER/pools" >/dev/null 2>&1 && break
+  docker exec l2-cb curl -sf -u "$U:$P" "$CLUSTER/pools" >/dev/null 2>&1 && break
   sleep 2
 done
 

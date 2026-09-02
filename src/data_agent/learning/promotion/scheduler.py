@@ -384,7 +384,7 @@ class PromotionScheduler:
             #
             # `stamp_drift`, NOT `put`: this is bookkeeping on a candidate S9 is not
             # transitioning, so it must not rewrite fields S9 does not own, must not
-            # renew the 90-day retention TTL (which would make a parked candidate
+            # renew the 180-day retention TTL (which would make a parked candidate
             # immortal), and must not RESURRECT a document `supersede` deleted between
             # this cycle's scan read and now. A full-envelope upsert would do all three.
             #
@@ -408,7 +408,7 @@ class PromotionScheduler:
 
         # Guard 4 — CORROBORATION ≥ T. Below it the candidate STAYS `candidate` and is
         # re-examined on the next rotation, accruing hits and soft recurrences until it
-        # crosses (or until its 90-day retention expires).
+        # crosses (or until its 180-day retention expires).
         corroboration = await self._corroboration(env)
         if corroboration < self._policy.blueprint_hit_threshold:
             return self._hold(env, "below_hit_threshold")

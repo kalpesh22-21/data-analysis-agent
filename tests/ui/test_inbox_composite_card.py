@@ -380,6 +380,7 @@ def test_the_binding_boxes_come_from_template_parts_only(render: Any) -> None:
     """
     _SERVED["trial"] = (200, {"ok": True, "reason": "", "detail": "", "missing": [],
                               "columns": ["employee_id"], "row_count": 3,
+                              "row_count_measured": False,
                               "distinct_grain_count": None, "verify_passed": True,
                               "verify_reason": None, "inconclusive": False})
     page = render([_composite_item()])
@@ -399,6 +400,9 @@ def test_the_binding_boxes_come_from_template_parts_only(render: Any) -> None:
     assert body["token"] == "a-token-the-reviewer-holds"
     # The borrowed credential does not outlive the request that borrowed it.
     assert page.locator('[data-testid="inbox-trial-token"]').input_value() == ""
+    assert "row count: not measured" in (
+        page.locator('[data-testid="inbox-trial-result"]').text_content() or ""
+    )
 
 
 def test_the_table_intermediate_refusal_reads_as_a_limit_not_a_failure(render: Any) -> None:

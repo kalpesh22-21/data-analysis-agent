@@ -185,7 +185,7 @@ and `CandidateStore.stamp_drift` (replay verdict on a candidate S9 is not transi
 `mutate_in` single-path writes with `preserve_expiry=True`. That closes three things a full-envelope
 upsert would open: clobbering fields S9 does not own from a cycle-start snapshot; RESURRECTING a
 document `supersede` deleted mid-cycle (`mutate_in` replaces, it does not upsert, so a missing document
-is a swallowed no-op); and renewing the 90-day retention TTL on a schedule, which would make a
+is a swallowed no-op); and renewing the 180-day retention TTL on a schedule, which would make a
 permanently parked candidate immortal. Genuine lifecycle writes (promote / demote / approve / retire)
 still go through `put` and still renew the TTL — those are events, not bookkeeping.
 

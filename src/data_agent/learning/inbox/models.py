@@ -33,6 +33,11 @@ InboxReason = Literal[
     "leakage_near_miss",
     "blueprint_sampled",
     "dedup_conflict",
+    # Deterministically matches a LIVE learning artifact — retained in review so a human can
+    # inspect the match and revise a genuine delta instead of losing the candidate. (A canon
+    # match, or a match against a terminal artifact, is dropped in-process by S6 and only wears
+    # this label when a rehydrated verdict reaches the writer, which refuses to auto-land it.)
+    "suppressed_duplicate",
     "fail_to_review",
     # The judge passed it on merit and the parameterization form could not be filled in.
     # The reviewer's task is to COMPLETE it, not to adjudicate it — see

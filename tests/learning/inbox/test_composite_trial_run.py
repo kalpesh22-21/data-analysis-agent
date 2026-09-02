@@ -128,8 +128,20 @@ class _FakeProbe:
         cell_raises: Exception | None = None,
     ) -> None:
         self._cells = list(cells)
+        # THE DEFAULT MIRRORS WHAT THE REAL PROBE ANSWERS FOR THIS PAYLOAD. Every
+        # `_generalization` here declares `result_grain: {columns: []}`, and
+        # `_result_grain_columns` (`inbox/inbox.py`) derives the probe's `grain_columns`
+        # from that COLUMN LIST alone — it never reads `verifiable`, so a payload with
+        # non-empty columns and `verifiable: false` WOULD still be probed. With `columns`
+        # empty, `MCPWarehouseProbe.run` is handed `grain_columns=()`, never issues the
+        # COUNT(DISTINCT) round-trip, and returns the `row_count=0, distinct=None`
+        # placeholder with only the column header read. The previous default paired a
+        # non-zero `row_count` with `distinct=None`, which no code path in the probe can
+        # produce (every path that leaves `distinct=None` also returns `row_count=0`) — it
+        # made the card assert a measured row count against a fixture the warehouse could
+        # never hand back.
         self._result = result or ProbeResult(
-            row_count=2, distinct_grain_count=None, columns=("employee_id", "gross_pay")
+            row_count=0, distinct_grain_count=None, columns=("employee_id", "gross_pay")
         )
         # What `run` raises INSTEAD of answering — a warehouse that rejected the query. The
         # real one quotes the failing SQL back, which is why this is a fixture at all.
@@ -195,8 +207,13 @@ async def test_a_two_node_scalar_composite_runs_and_reports_the_terminal_shape()
 
     assert result.ok is True, result.reason
     assert len(probe.ran) == 2, "every node runs, not just the terminal one"
+    # The TERMINAL node's columns — node 0 returns `total`, node 1 returns these.
     assert result.columns == ("employee_id", "gross_pay")
-    assert result.row_count == 2
+    # No verifiable grain is declared, so no COUNT(DISTINCT) ran and there is no row count
+    # to report: the 0 is a placeholder, and the flag is what stops the card presenting it
+    # as a measurement.
+    assert result.row_count == 0
+    assert result.row_count_measured is False
     # The declared footprint scopes EVERY node's read, not only the last.
     assert probe.scopes == [USES, USES]
 
@@ -432,7 +449,7 @@ async def test_a_composite_the_minter_actually_produces_can_be_trialled() -> Non
     )
     store = InMemoryCandidateStore()
     await store.put(env)
-    probe = _FakeProbe(cells=(41000,), result=ProbeResult(1, None, ("share",)))
+    probe = _FakeProbe(cells=(41000,), result=ProbeResult(0, None, ("share",)))
     inbox = ReviewInbox(store, probe_factory=lambda _token: probe)
 
     # The card asks for exactly what the trial requires — the classified literal, and nothing
@@ -799,7 +816,7 @@ async def test_a_one_step_composite_runs_through_the_terminal_probe_only() -> No
     payload["composes"] = [
         {"order": 0, "consumes": {}, "output": {"total": "scalar"}, "feeds_from": []}
     ]
-    probe = _FakeProbe(result=ProbeResult(1, None, ("total",)))
+    probe = _FakeProbe(result=ProbeResult(0, None, ("total",)))
     inbox, env = await _inbox(payload, probe)
 
     result = await inbox.trial_run(

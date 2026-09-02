@@ -111,14 +111,14 @@ def test_shadow_mode_is_a_real_flag_and_not_a_high_bar() -> None:
         unconditionally or never drops, so it is a config error, not a posture);
       * at exactly 1.0 the comparison is inclusive, so a model asserting perfect
         certainty still drops.
-    Shadow mode is therefore its own flag, off by default.
+    Shadow mode is therefore its own flag, on by default for the human-review-only posture.
     """
     with pytest.raises(JudgeConfigError):
         JudgeConfig(pre_drop_confidence=1.01)
     assert JudgeConfig(pre_drop_confidence=1.0).pre_drop_confidence == 1.0
     assert JudgeConfig().shadow is False
     assert JudgeConfig(shadow=True).shadow is True
-    assert LearningSettings().learning_judge_shadow_mode is False
+    assert LearningSettings().learning_judge_shadow_mode is True
 
 
 async def test_shadow_mode_records_the_verdict_and_discards_nothing() -> None:

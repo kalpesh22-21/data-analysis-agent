@@ -16,16 +16,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from data_agent.learning.candidate.models import CandidateEnvelope
+import pytest
+
+from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.dedup import (
     CorpusArtifact,
     DedupStage,
     InMemoryBlueprintCorpus,
     compute_canonical_key,
 )
-from data_agent.learning.stage import StageContext
+from data_agent.learning.priorart.models import TERMINAL_STATUSES
+from data_agent.learning.stage import StageContext, run_pipeline
 from data_agent.learning.summary.models import SessionSummary
 from data_agent.learning.triage import TriageVerdict
+from data_agent.learning.writer.routing import derive_inbox_reason, route_candidate
+from data_agent.learning.writer.stage import WriterStage
 from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "learning"
@@ -82,10 +87,15 @@ async def test_identical_semantics_hash_to_identical_key():
     assert compute_canonical_key(b2, gen["uses_rules"], gen["result_grain"], gen["canonical_ast_norm"]) != _key_of(a)
 
 
-async def test_hard_key_hit_increments_and_drops():
+async def test_hard_key_hit_increments_and_continues_to_human_review():
     """S6-canonical-key-dedup: one create + one bump. The first pass against an
     empty corpus inserts; after the artifact is landed, an identical candidate
-    hits the hard key, increments the artifact's hit_count, and is DROPPED."""
+    hits the hard key and increments the artifact's hit_count.
+
+    The matched artifact is LIVE (the default `extracted` status), so the duplicate
+    CONTINUES to the writer, which routes it to the inbox as a suppressed duplicate.
+    A hard-key hit on a TERMINAL artifact still drops — that is the negative-memory
+    contract, pinned in `test_dedup_span.py` and `test_rejection_is_negative_memory_qa.py`."""
     env = _single_envelope()
     key = _key_of(env)
     corpus = InMemoryBlueprintCorpus()  # empty — nothing landed yet
@@ -112,9 +122,9 @@ async def test_hard_key_hit_increments_and_drops():
         )
     )
 
-    # Pass 2: an identical candidate now HITS the hard key ⇒ increment + drop.
+    # Pass 2: an identical candidate now HITS the hard key ⇒ increment + preserve.
     second = await stage.process(_single_envelope(), _ctx())
-    assert second.control == "drop"  # the duplicate is dropped, not persisted
+    assert second.control == "continue"  # the writer routes it to editable review
     assert second.envelope.dedup is not None
     assert second.envelope.dedup.action == "increment"
     assert second.envelope.dedup.layer == "hard"
@@ -163,7 +173,7 @@ async def test_seeded_existing_corpus_hard_key_hit():
     )
     stage = DedupStage(corpus, FakeEmbeddingClient())
     result = await stage.process(env, _ctx())
-    assert result.control == "drop"
+    assert result.control == "continue"
     assert result.envelope.dedup.action == "increment"
     assert corpus.get_sync(key).hit_count == 3
 
@@ -314,3 +324,211 @@ async def test_non_blueprint_passes_through_untouched():
     result = await stage.process(env, _ctx())
     assert result.control == "continue"
     assert result.envelope.dedup is None
+
+
+# --- the hard layer's TERMINAL / LIVE split -----------------------------------
+#
+# A hard-key hit is the one lookup here that is deliberately NOT status-filtered, and what
+# it does with the artifact it finds is a two-way branch: drop a re-derivation of something
+# a human KILLED (negative memory), keep a duplicate of something still LIVE (an editable
+# review item). `test_dedup_span.py` pins the telemetry of that split; what follows pins the
+# split itself — over the WHOLE status space rather than one member of it, and through to
+# the routing decision rather than stopping at the stage boundary.
+
+
+@pytest.mark.parametrize("status", sorted(TERMINAL_STATUSES))
+async def test_every_terminal_status_drops_the_byte_identical_re_derivation(status):
+    """DERIVED FROM `TERMINAL_STATUSES`, not from a remembered list of two.
+
+    `CorpusArtifact.is_terminal` reads the shared frozenset that `priorart.models` owns, so
+    the day a third dead state is added (say `superseded`) this parametrization covers it
+    automatically and a stage that only special-cased `rejected` fails here. That direction
+    matters more than it looks: the failure of an UNCOVERED terminal status is silent and
+    permanent — the loop re-proposes an idea a human already declined, and the approve of
+    that duplicate MERGEs the dead artifact's own graph node (`landing_id` is derived from
+    `dedup.canonical_key`, which for a hard-key hit IS the matched artifact's key) and
+    stamps it `validated` again.
+    """
+    env = _single_envelope()
+    key = _key_of(env)
+    corpus = InMemoryBlueprintCorpus(
+        [CorpusArtifact(id="a-dead-one", canonical_key=key, intent="x", status=status)]
+    )
+
+    result = await DedupStage(corpus, FakeEmbeddingClient()).process(env, _ctx())
+
+    assert result.control == "drop"
+    assert result.envelope.dedup.action == "increment"
+    assert result.envelope.dedup.layer == "hard"
+    assert result.envelope.dedup.matched_id == "a-dead-one"
+
+
+def test_the_terminal_set_is_exactly_what_a_human_decision_can_leave_on_an_artifact():
+    """The coverage question behind the parametrization above: are those the statuses an
+    artifact can actually END UP in?
+
+    Only two edges ever stamp a `learning_corpus` artifact — the scheduler's `reject` and
+    `retract` — and this reads their arguments out of the source rather than restating them,
+    so a THIRD terminal edge added without extending `TERMINAL_STATUSES` fails here instead
+    of silently creating a dead artifact the hard layer still treats as live. Every other
+    status an artifact can carry (`extracted`, and anything a future writer seeds) is by
+    construction not a human decision, which is why the live branch is the default.
+    """
+    import inspect
+    import re
+
+    from data_agent.learning.promotion import scheduler as scheduler_module
+
+    stamped = set(
+        re.findall(
+            r"_stamp_corpus_status\(\s*env,\s*CandidateStatus\.([A-Z_]+)\s*\)",
+            inspect.getsource(scheduler_module),
+        )
+    )
+    assert stamped, "the reject/retract corpus stamps moved — this test needs rewriting"
+    assert {getattr(CandidateStatus, name) for name in stamped} == TERMINAL_STATUSES
+
+
+@pytest.mark.parametrize(
+    "status",
+    sorted(
+        {
+            value
+            for name, value in vars(CandidateStatus).items()
+            if not name.startswith("_") and isinstance(value, str)
+        }
+        - TERMINAL_STATUSES
+    )
+    + ["", "REJECTED", "rejected ", "some_future_state"],
+)
+async def test_a_hit_on_any_live_status_keeps_the_duplicate_for_a_human(status):
+    """The complement, over every status that is NOT terminal — including the ones a
+    rehydrated doc could carry that nobody wrote (`CorpusArtifact.from_doc` does not
+    validate `status`, so casing and whitespace near-misses of `rejected` arrive verbatim).
+
+    Nothing is settled about a live artifact, so the duplicate must stay reachable: the
+    candidate CONTINUES down the pipeline and its fate is the writer's to decide. Note the
+    asymmetry with the terminal case is fail-SOFT in the direction that costs a reviewer a
+    row rather than the one that resurrects a settled decision.
+    """
+    env = _single_envelope()
+    key = _key_of(env)
+    corpus = InMemoryBlueprintCorpus(
+        [CorpusArtifact(id="a-live-one", canonical_key=key, intent="x", status=status)]
+    )
+
+    result = await DedupStage(corpus, FakeEmbeddingClient()).process(env, _ctx())
+
+    assert result.control == "continue"
+    assert result.envelope.dedup.action == "increment"
+
+
+async def test_the_hit_count_is_bumped_on_both_the_terminal_and_the_live_path():
+    """ONE BUMP EITHER WAY, asserted side by side because the whole point of the
+    `matched_status` span tag is that these two increments are NOT the same fact.
+
+    The count on a live artifact feeds the promotion corroboration gate ("the third sighting
+    of something we might promote"); the count on a dead one is a measurement of how good
+    our rejections are ("somebody re-derived a declined idea"). A change that stopped
+    counting on the drop path would look harmless — the candidate dies anyway — and would
+    silently zero the second metric. The two are therefore pinned together, not apart.
+    """
+    env = _single_envelope()
+    key = _key_of(env)
+
+    live = InMemoryBlueprintCorpus(
+        [CorpusArtifact(id="a-live-one", canonical_key=key, intent="x", hit_count=1)]
+    )
+    live_result = await DedupStage(live, FakeEmbeddingClient()).process(env, _ctx())
+
+    dead = InMemoryBlueprintCorpus(
+        [
+            CorpusArtifact(
+                id="a-dead-one", canonical_key=key, intent="x", hit_count=1, status="rejected"
+            )
+        ]
+    )
+    dead_result = await DedupStage(dead, FakeEmbeddingClient()).process(
+        _single_envelope(), _ctx()
+    )
+
+    assert (live_result.control, dead_result.control) == ("continue", "drop")
+    # Exactly one increment each, on the right key, and it LANDED on the artifact.
+    assert live.increment_calls == [key] and live.get_sync(key).hit_count == 2
+    assert dead.increment_calls == [key] and dead.get_sync(key).hit_count == 2
+
+
+async def test_a_live_hard_key_hit_reaches_the_writer_as_a_suppressed_duplicate():
+    """END TO END through the stage INTO the routing decision, which is the only place the
+    live branch's promise is actually kept.
+
+    "The writer recognizes the non-insert verdict and routes it to the inbox as a suppressed
+    duplicate" is a claim spanning two modules, and both halves are separately tested today:
+    the stage returns `continue`, and `route_candidate` labels an `increment` verdict
+    `suppressed_duplicate`. Neither notices if the ENVELOPE stops carrying the verdict
+    between them — a `replace(env, dedup=...)` that dropped the field, or a writer reached
+    before the stamp — and the result would be a byte-identical duplicate auto-landing as
+    clean. So this runs the real two-stage pipeline and reads the routing off the envelope
+    that actually came out of it.
+
+    The sampler is pinned OFF so that reaching the inbox can only be the dedup verdict's
+    doing, never the audit sample's.
+    """
+    env = _single_envelope()
+    key = _key_of(env)
+    corpus = InMemoryBlueprintCorpus(
+        [CorpusArtifact(id="blueprint::dept-earnings-year", canonical_key=key, intent="x")]
+    )
+
+    outcome = await run_pipeline(
+        (
+            DedupStage(corpus, FakeEmbeddingClient()),
+            WriterStage(sampler=lambda _env: False),
+        ),
+        env,
+        _ctx(),
+    )
+
+    assert outcome.control == "route_inbox"
+    assert outcome.persist is True  # it is a review item, so it MUST be written
+    assert outcome.envelope.status == CandidateStatus.IN_REVIEW
+    assert outcome.envelope.dedup.action == "increment"
+    # The label the reviewer sees, from BOTH sources of it — the writer's decision and the
+    # inbox's re-derivation — over the envelope the pipeline actually produced.
+    assert route_candidate(outcome.envelope, sampled_for_inbox=False).reason == (
+        "suppressed_duplicate"
+    )
+    assert derive_inbox_reason(outcome.envelope) == "suppressed_duplicate"
+
+
+async def test_a_terminal_hard_key_hit_never_reaches_the_writer_at_all():
+    """The control for the test above, through the same pipeline: a drop is not a route.
+
+    Asserted on the WRITER's absence of effect rather than only on the control string,
+    because the failure that matters is a candidate that both drops AND gets a status: the
+    envelope must leave the pipeline unrouted, so nothing downstream can mistake it for a
+    review item, and `persist=False` so the enriched copy is never written.
+    """
+    env = _single_envelope()
+    key = _key_of(env)
+    corpus = InMemoryBlueprintCorpus(
+        [
+            CorpusArtifact(
+                id="a-dead-one", canonical_key=_key_of(env), intent="x", status="retired"
+            )
+        ]
+    )
+    assert key  # the hit is a hard-key hit, not a soft one
+
+    outcome = await run_pipeline(
+        (
+            DedupStage(corpus, FakeEmbeddingClient()),
+            WriterStage(sampler=lambda _env: True),  # even a sampled coin cannot save it
+        ),
+        env,
+        _ctx(),
+    )
+
+    assert outcome.control == "drop"
+    assert outcome.persist is False
+    assert outcome.envelope.status == env.status  # never routed, never re-statused

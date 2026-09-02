@@ -614,7 +614,7 @@ async def test_a_replay_reaching_hold_records_its_verdict_without_a_full_put():
 
     Three things ride on that being a single-path write rather than an upsert of the
     cycle-start snapshot: it does not rewrite fields S9 does not own, it does not renew
-    the 90-day retention TTL (a verdict re-stamped on a schedule would make a parked
+    the 180-day retention TTL (a verdict re-stamped on a schedule would make a parked
     candidate immortal), and it cannot RESURRECT a document `supersede` deleted between
     the scan read and the write."""
     store = InMemoryCandidateStore()

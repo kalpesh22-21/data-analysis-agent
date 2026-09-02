@@ -269,6 +269,7 @@ def test_the_supplied_token_minter_ignores_column_scope_and_hides_the_token() ->
 
     minter = SuppliedTokenMinter("secret-token-value")
 
+    assert minter.binds_session is False
     assert asyncio.run(minter.mint(["a.b.c"], session_id="s")) == "secret-token-value"
     assert asyncio.run(minter.mint([], session_id="s")) == "secret-token-value"
     assert "secret-token-value" not in repr(minter)
@@ -338,6 +339,70 @@ async def test_approve_will_not_replay_without_the_reviewers_token() -> None:
         await inbox.approve(env.candidate_id, token="   ")
     # And nothing moved.
     assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
+async def test_a_non_blueprint_approve_needs_no_token_and_is_given_no_probe() -> None:
+    """THE OTHER HALF OF THE SAME RULE, and the one that is easy to lose.
+
+    The refusal above is scoped to BLUEPRINTS, because a blueprint approve replays SQL against
+    the live warehouse. `global_knowledge` and `schema_edit` query nothing at all, so demanding
+    a warehouse credential from their reviewer would expand authority without ever using it —
+    and satisfying that demand with the DEPLOYMENT's principal would re-create precisely the
+    silent substitution `_probe_for` refuses. So those types approve with NO token and are
+    handed NO probe: `probe=None` reaches `apply_human_decision`, which is a different thing
+    from "a probe the scheduler happens to own", and the difference is only observable at this
+    call.
+
+    Both facts are asserted here because either alone is a false comfort: a token requirement
+    that crept back would be caught by the transition failing, and a fallback probe quietly
+    substituted would not — the approve would still succeed.
+    """
+    from data_agent.learning.candidate.models import CandidateStatus
+    from data_agent.learning.inbox import ReviewInbox
+    from data_agent.learning.inbox.inbox import _NoOpProbe, _ZeroHitCounts
+    from data_agent.learning.promotion.scheduler import PromotionScheduler
+
+    base = json.loads((FIXTURES / "envelopes_each_reason.json").read_text())[
+        "knowledge_pre_gate"
+    ]
+    env = CandidateEnvelope.from_doc(base)
+    assert env.type == "global_knowledge" and env.status == CandidateStatus.IN_REVIEW
+
+    store = InMemoryCandidateStore()
+    await store.put(env)
+
+    class _RecordsTheProbe:
+        """A spy in front of the real scheduler — the decision is genuine, the probe is read."""
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+            self.probes: list[object] = []
+
+        @property
+        def policy(self):
+            return self._inner.policy
+
+        @property
+        def probe(self):
+            return self._inner.probe
+
+        async def apply_human_decision(self, env, action, *, probe=None):
+            self.probes.append(probe)
+            return await self._inner.apply_human_decision(env, action, probe=probe)
+
+    # The inbox's OWN default scheduler, wrapped — not a substitute one — so what this
+    # observes is the wiring an unwired inbox really has.
+    spy = _RecordsTheProbe(
+        PromotionScheduler(store, probe=_NoOpProbe(), hit_counts=_ZeroHitCounts())
+    )
+    inbox = ReviewInbox(store, scheduler=spy)
+
+    approved = await inbox.approve(env.candidate_id, token="")  # NO token, and no refusal
+
+    assert approved.status == CandidateStatus.VALIDATED
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.VALIDATED
+    # Not the scheduler's own probe, and not a minted one: NOTHING.
+    assert spy.probes == [None]
 
 
 def test_the_human_approve_replays_through_the_reviewers_probe() -> None:

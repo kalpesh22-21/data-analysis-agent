@@ -107,8 +107,15 @@ class InMemoryCandidateStore:
         self.drift_stamps += 1
         self._by_id[candidate_id] = replace(current, drift=drift)
 
-    async def supersede(self, content_hash: str) -> None:
-        stale = [cid for cid, c in self._by_id.items() if c.content_hash == content_hash]
+    async def supersede(
+        self, content_hash: str, *, keep_candidate_ids: tuple[str, ...] = ()
+    ) -> None:
+        keep = set(keep_candidate_ids)
+        stale = [
+            cid
+            for cid, c in self._by_id.items()
+            if c.content_hash == content_hash and cid not in keep
+        ]
         for cid in stale:
             del self._by_id[cid]
 

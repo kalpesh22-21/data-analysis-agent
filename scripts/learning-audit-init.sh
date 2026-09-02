@@ -77,7 +77,7 @@ fi
 echo "[learning-audit-init] keyspace $KEYSPACE, grant [$GRANT]"
 echo "[learning-audit-init] waiting for node REST..."
 for i in $(seq 1 30); do
-  docker exec l2-cb curl -sf "$CLUSTER/pools" >/dev/null 2>&1 && break
+  docker exec l2-cb curl -sf -u "$U:$P" "$CLUSTER/pools" >/dev/null 2>&1 && break
   sleep 2
 done
 
@@ -85,7 +85,7 @@ done
 # and user-knowledge stores are configured TTL 0 (durable, no expiry), and a bucket
 # maxTTL silently CAPS every document's expiry regardless of what the SDK asks for, so a
 # non-zero value here would quietly delete landed artifacts and per-user facts. Audit and
-# candidates set their own 90-day expiry per write and are unaffected either way.
+# candidates set their own 180-day expiry per write and are unaffected either way.
 # RAMSIZE IS SIZED FOR ONE STORE. In the shared layout create the bucket beforehand
 # with a quota covering every store in it — only the first script run creates it, and
 # the rest silently accept whatever size that one chose (see SHARED-BUCKET NOTES at the
@@ -166,7 +166,7 @@ echo "[learning-audit-init] done."
 #    bucket's clock. The `--max-ttl 0` above is explicit for that reason. If the bucket
 #    was created elsewhere, verify it:
 #      couchbase-cli bucket-list -o json | jq '.[] | {name, maxTTL}'
-#    Audit and candidates set a 90-day expiry per WRITE and are unaffected by the cap
+#    Audit and candidates set a 180-day expiry per WRITE and are unaffected by the cap
 #    being absent.
 #
 # 2. RBAC STAYS FOUR SEPARATE SCOPED CREDENTIALS. One shared bucket is not a reason for

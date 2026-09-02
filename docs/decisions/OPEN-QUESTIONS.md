@@ -10,7 +10,8 @@ Forks and details still to resolve. Grouped by area; link to the owning chapter.
 - ~~**Provenance/audit store** (D51): concrete store choice + retention duration (≥ candidate lifetime).~~
   **RESOLVED by D95 (Track-B Slice 1):** a **dedicated Couchbase bucket `learning_audit`** (not the
   session collection), KV-keyed by `evidence_ref`, access-controlled (own RBAC user), retention
-  `LEARNING_AUDIT_TTL_SECONDS` default **90 d** with the invariant `audit_TTL ≥ max_candidate_lifetime`.
+  `LEARNING_AUDIT_TTL_SECONDS` default **180 d** (`15552000`) with the invariant
+  `audit_TTL ≥ max_candidate_lifetime` (`LEARNING_CANDIDATES_TTL_SECONDS` is the same 180 d).
   Candidates carry only `evidence_ref`; the entity-bearing snapshot is never inlined into the
   entity-free global stores (D17). The **decision is locked now; the store is provisioned in Slice 2**
   (the spine writes no evidence yet). See [learning-loop-infra-design.md](learning-loop-infra-design.md) §8.

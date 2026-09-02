@@ -56,11 +56,11 @@ class CouchbaseAuditStore(CouchbaseStoreBase):
         )
         # A SEPARATE clock for judge verdicts (plan §3b). Same bucket, different
         # question: an evidence quote is entity-bearing and SHOULD expire on the D95
-        # 90-day audit floor, while a verdict row is scalars plus one capped reason and
+        # 180-day audit floor, while a verdict row is scalars plus one capped reason and
         # exists to be aggregated over quarters. Inheriting the evidence retention would
         # have erased the dataset roughly as fast as the skew signal it carries
         # accumulates — the composable-blueprint question is answered by months of rows,
-        # not by 90 days of them.
+        # not by 180 days of them.
         self._judgement_ttl = couchbase_ttl(settings.learning_judge_record_ttl_seconds)
 
     def _bind_collections(self, bucket: Any) -> None:

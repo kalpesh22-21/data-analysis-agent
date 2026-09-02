@@ -375,7 +375,7 @@ async def test_completing_an_ordinary_review_item_is_refused(enabled) -> None:
 async def test_a_fail_to_review_row_can_be_rejected() -> None:
     """It writes no content, and gating it would leave the row with NO terminal action —
     completable only by a human who may have decided the form has no honest answer, and
-    otherwise clearable only by waiting out a 90-day TTL."""
+    otherwise clearable only by waiting out a 180-day TTL."""
     store = await _store_with(_declined_envelope())
     inbox = ReviewInbox(store)
     env = await inbox.reject(mint_review_candidate_id("hash-ratio", 0))

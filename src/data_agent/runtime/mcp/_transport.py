@@ -34,7 +34,19 @@ def side_channel_headers(jwt: str, session_id: str) -> dict[str, str]:
         scratch route also NAMES the table, D92). Neither is ever reflected back into a
         handle, a corpus node, or a model-visible message.
     """
-    return {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
+    headers = {"Authorization": f"Bearer {jwt}"}
+    # OMIT the header rather than send an empty one. Exactly ONE caller reaches here with
+    # a blank session id: the review inbox's borrowed-reviewer-token path, where
+    # `SuppliedTokenMinter.binds_session` is False because the inbox holds a token somebody
+    # else minted and cannot invent the sid_hash that would bind it to a new synthetic
+    # session. Every RUNTIME caller takes its session id from `RuntimeCredentials`, whose
+    # single construction site (`runtime/app.py::_extract_credentials`) 400s a missing or
+    # malformed `X-Session-Id`, so none of them can land in this branch. Sending
+    # `X-Session-Id: ""` would present an empty id as a real one to the MCP's sid binding;
+    # omitting it lets the server apply its own "no session presented" rule.
+    if session_id:
+        headers["X-Session-Id"] = session_id
+    return headers
 
 
 def auth_headers(*, service_key: str | None, jwt: str, session_id: str) -> dict[str, str]:

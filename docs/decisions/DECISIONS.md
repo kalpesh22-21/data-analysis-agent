@@ -580,7 +580,7 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   not the warehouse); write = the Slice-2 extractor, read = the review-inbox/audit tooling. Candidate
   envelopes in neo4j / the vector index carry **only `evidence_ref`** (the KV key), never the
   snapshot — global stores stay entity-free (D17), audit stays durable (D51). **Retention:**
-  `LEARNING_AUDIT_TTL_SECONDS` default **90 d** (`7776000`), an invariant floor of
+  `LEARNING_AUDIT_TTL_SECONDS` default **180 d** (`15552000`), an invariant floor of
   `audit_TTL ≥ max_candidate_lifetime`. **Slice-1-vs-Slice-2:** Slice 1 writes **no** evidence (no
   extractor to snapshot anything), so provisioning an access-controlled bucket nothing writes to is
   premature — the DECISION is locked now (the load-bearing part, "never inline entities", must be

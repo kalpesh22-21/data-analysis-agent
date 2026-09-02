@@ -430,9 +430,11 @@ async def test_only_one_review_item_is_written_per_extraction() -> None:
 
 
 async def test_a_reprocessed_session_replaces_its_stale_review_item() -> None:
-    """`supersede(content_hash)` runs before the persist, so re-processing a session
-    leaves ONE review item — the current one — rather than accumulating a row per run.
-    The live case was processed three times."""
+    """`supersede(content_hash)` runs AFTER the persist, keeping only the ids this run
+    wrote, so re-processing a session leaves ONE review item — the current one — rather than
+    accumulating a row per run. The ordering is the point: superseding first would erase the
+    prior generation before its replacement existed. The live case was processed three
+    times."""
     candidates = InMemoryCandidateStore()
     summary = _summary(content_hash="hash-stable")
 
@@ -441,6 +443,56 @@ async def test_a_reprocessed_session_replaces_its_stale_review_item() -> None:
         await consumer._run_extractor(summary, KEEP_VERDICT, _proceeded())
 
     assert len(candidates.all_candidates()) == 1
+
+
+async def test_the_review_row_is_a_keeper_and_survives_the_sweep_beside_kept_candidates() -> None:
+    """THE REVIEW ROW IS ON THE KEEPER LIST, and this is the arrangement that proves it.
+
+    `_run_extractor` supersedes the prior generation AFTER publishing the new one, keeping
+    every id this run wrote. The review row is written LAST, by `_persist_declined_for_review`,
+    under an id from a different namespace (`review-0`, not `::N`) — so it is appended to the
+    keeper list separately from the loop, and it is the one keeper that no `enumerate` would
+    ever produce. Drop that append and the sweep deletes, microseconds after writing it, the
+    single row this whole route exists to create.
+
+    The other tests here run a decline ALONE, where a sweep that removed the review row would
+    leave an empty store that looks much like "nothing qualified". Here the run produces BOTH
+    a kept candidate and a review row, over a session that previously produced three kept
+    candidates, so all three facts are separable in one assertion: the replacement `::0`
+    survives, the review row survives, and the two genuine orphans (`::1`, `::2`) are swept.
+    """
+    candidates = InMemoryCandidateStore()
+    summary = _summary(content_hash="hash-both")
+
+    # Run 1: three ordinary, complete candidates and no decline at all.
+    await _consumer(
+        candidates, turns=[scripted_turn([_COVERED, _COVERED, _COVERED])]
+    )._run_extractor(summary, KEEP_VERDICT, _proceeded())
+    assert {c.candidate_id for c in candidates.all_candidates()} == {
+        mint_candidate_id("hash-both", 0),
+        mint_candidate_id("hash-both", 1),
+        mint_candidate_id("hash-both", 2),
+    }
+
+    # Run 2: one candidate survives validation, one is corrected and then WITHDRAWN — the
+    # merit-passed, form-failed decline that becomes the review row.
+    await _consumer(
+        candidates, turns=[scripted_turn([_COVERED, _UNCOVERED]), scripted_turn([])]
+    )._run_extractor(summary, KEEP_VERDICT, _proceeded())
+
+    stored = {c.candidate_id: c for c in candidates.all_candidates()}
+    assert set(stored) == {
+        mint_candidate_id("hash-both", 0),  # the one kept candidate of this run
+        mint_review_candidate_id("hash-both", 0),  # the review row, NOT superseded
+    }
+    assert stored[mint_review_candidate_id("hash-both", 0)].status == (
+        CandidateStatus.NEEDS_PARAMETERIZATION
+    )
+    assert stored[mint_candidate_id("hash-both", 0)].status == CandidateStatus.EXTRACTED
+    # The sweep DID run — run 1's surplus ordinals are gone — so the review row's survival
+    # is a keeper-list fact and not an absence of superseding.
+    assert await candidates.get(mint_candidate_id("hash-both", 1)) is None
+    assert await candidates.get(mint_candidate_id("hash-both", 2)) is None
 
 
 async def test_with_no_leakage_stage_the_scan_stays_unsettled() -> None:

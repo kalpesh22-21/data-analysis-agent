@@ -81,7 +81,9 @@ class MCPWarehouseProbe:
         # BOUND to a fresh synthetic session id the probe also presents as
         # X-Session-Id (the live MCP's require_sid_binding, §1.3 deviation). Any mint
         # failure RAISES (TokenMintError) → probe_unavailable HOLD (§1.4).
-        session_id = self._new_session_id()
+        session_id = (
+            self._new_session_id() if getattr(self._minter, "binds_session", True) else ""
+        )
         jwt = await self._minter.mint(list(column_scope), session_id=session_id)
 
         # 1. Run the replay SQL to (a) PROVE it still executes against the live schema
@@ -142,7 +144,9 @@ class MCPWarehouseProbe:
         question this answers is "is there a single bindable cell here", and the honest answer
         to a result we cannot read is no.
         """
-        session_id = self._new_session_id()
+        session_id = (
+            self._new_session_id() if getattr(self._minter, "binds_session", True) else ""
+        )
         jwt = await self._minter.mint(list(column_scope), session_id=session_id)
         result = await self._mcp.call_tool(
             "runQuery",

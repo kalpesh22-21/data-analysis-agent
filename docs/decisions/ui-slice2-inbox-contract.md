@@ -82,7 +82,7 @@ Pinned from `learning/inbox/models.py:61-87`. These are the **real** fields — 
 |---|---|---|
 | `candidate_id` | `InboxItem.candidate_id` | string |
 | `type` | `.type` | `blueprint \| global_knowledge \| user_knowledge \| schema_edit` (`extractor/models.py:20`); `user_knowledge` never appears (auto-committed, not reviewed) |
-| `reason` (category) | `.reason` — re-derived via `derive_inbox_reason` (`writer/routing.py`) | one of `InboxReason` (`models.py:26-33`): `knowledge_pre_gate \| schema_edit \| leakage_near_miss \| blueprint_sampled \| dedup_conflict \| fail_to_review`. **Re-derived, never stored** — cannot drift from the routing decision. |
+| `reason` (category) | `.reason` — re-derived via `derive_inbox_reason` (`writer/routing.py`) | one of `InboxReason` (`learning/inbox/models.py`): `knowledge_pre_gate \| schema_edit \| leakage_near_miss \| blueprint_sampled \| dedup_conflict \| suppressed_duplicate \| fail_to_review \| needs_parameterization \| hand_authored`. **Re-derived, never stored** — cannot drift from the routing decision. `suppressed_duplicate` is the deterministic (`action: "increment"`) match against a **live** learning artifact, kept in review so a human can revise a delta; `dedup_conflict` stays the SOFT near-miss (`conflict` / `merge`). |
 | `summary` | `.summary` | entity-free one-liner (`_summary_of`, `models.py:36-41`) |
 | `payload_view` | `.payload_view` — `entity_free_payload_view` (`candidate/redaction.py:91-94`) | **redacted** dict; entity spans replaced with `"[redacted]"` (D17). The UI renders this **verbatim** and must never expect raw entity values. |
 | `evidence_refs` | `.evidence_refs` | array of KV keys (identifiers only — **not quotes**, §0 evidence decision) |

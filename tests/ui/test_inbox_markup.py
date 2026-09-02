@@ -428,7 +428,9 @@ def test_the_rewrite_caution_never_disables_approve() -> None:
     """A caution, not a gate. A reviewer who has trial-run the rewrite is exactly the person
     who should be able to approve it, and a page that blocked them would push the decision to
     someone with less context."""
-    branch = _HTML[_HTML.index('makeActionButton(id, "approve", "Approve", li, actions, state.offline)') :]
+    branch = _HTML[
+        _HTML.index('id, "approve", "Approve", li, actions, state.offline') :
+    ]
     branch = branch[: branch.index('makeActionButton(id, "reject"')]
     assert "sqlRewriteRecord(item)" in branch
     # The only thing the branch does is append a line — no disable, no removal.

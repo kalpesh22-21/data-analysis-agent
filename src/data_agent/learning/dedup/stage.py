@@ -260,16 +260,30 @@ class DedupStage:
             hard_key = compute_canonical_key(resolves, uses_rules, result_grain, norm)
             artifact = await self._corpus.get_by_canonical_key(hard_key)
             if artifact is not None:
-                # Layer 1 HIT: bump the existing artifact, drop this duplicate.
+                # Layer 1 HIT: bump the existing artifact. What happens to THIS candidate
+                # then depends on whether the artifact it matched is still alive.
                 #
-                # DELIBERATELY unfiltered by status, unlike every other prior-art read
-                # here. A byte-identical re-derivation of an idea a human REJECTED must
-                # still be dropped — the human said no to exactly this thing, and letting
-                # it back through because the artifact is dead would resurrect a settled
-                # decision. (The soft layer DOES skip terminal artifacts, because a
-                # near-match to a rejected idea is not the same idea.)
+                # The lookup is DELIBERATELY unfiltered by status, unlike every other
+                # prior-art read here, and the two outcomes are the reason why:
                 #
-                # But the two increments mean very different things, so they must not be
+                #   TERMINAL match (rejected/retired) ⇒ DROP. The human said no to exactly
+                #     this thing; letting it back through because the artifact is dead
+                #     would resurrect a settled decision, and a rejection has to work as
+                #     negative memory or the loop re-proposes what it was told to stop
+                #     proposing. It is also a corpus-integrity hole, not just noise:
+                #     `promotion/landing.py::landing_id` derives the graph node id from
+                #     `dedup.canonical_key`, which for a hard-key hit IS the matched
+                #     artifact's key — so approving the duplicate MERGEs the RETIRED
+                #     blueprint's own node and stamps it `validated` again. (The soft layer
+                #     SKIPS terminal artifacts entirely, because a near-match to a rejected
+                #     idea is not the same idea.)
+                #   LIVE match ⇒ CONTINUE. Nothing is settled about a live artifact, so the
+                #     duplicate stays as an editable review item; the writer recognizes the
+                #     non-insert verdict and routes it to the inbox as a suppressed
+                #     duplicate, where the matched artifact remains visible.
+                #
+                # The increment happens on BOTH paths and is pre-existing behaviour: the
+                # two increments mean very different things, so they must not be
                 # indistinguishable in telemetry: `matched_status` on the span separates
                 # "this is the third sighting of a live artifact" (which feeds the
                 # promotion count) from "somebody re-derived a declined idea" (which is a
@@ -297,7 +311,10 @@ class DedupStage:
                     env, verdict, tier=None, matched_status=artifact.status,
                     matched_origin="corpus",  # the hard key only ever reads the bucket
                 )
-                return StageResult(replace(env, dedup=verdict), "drop")
+                return StageResult(
+                    replace(env, dedup=verdict),
+                    "drop" if artifact.is_terminal else "continue",
+                )
 
         # Layer 2 — the cross-tier structural identity. Deterministic, so it runs BEFORE
         # any cosine and can be terminal.
@@ -317,6 +334,12 @@ class DedupStage:
             if verdict.action == "redundant_with_canon":
                 # DROP without touching the corpus: there is no artifact to increment,
                 # and seeding one would record a canon blueprint as a learning artifact.
+                # The candidate is structurally IDENTICAL to a blueprint the agent already
+                # recalls from git-versioned MCP canon, so a reviewer has nothing to decide
+                # — and approving it would land a SECOND, learning-tier node for a query
+                # the canon already answers, which is the duplication the governed-corpus
+                # split exists to prevent. The `warning` in `_structural_layer` is the
+                # signal that matters here: this is a RETRIEVAL defect upstream.
                 self._observe(
                     env, verdict, tier=card.tier, matched_status=card.status,
                     matched_origin=card.origin,

@@ -88,16 +88,22 @@ def test_the_soft_near_miss_actions_still_route_to_review(action):
 
 
 @pytest.mark.parametrize("action", ["increment", "redundant_with_canon"])
-def test_a_rehydrated_drop_action_routes_to_review_instead_of_auto_landing(action):
-    """THE regression this inversion exists to prevent. S6 drops both of these in-process
-    so the writer should never see them — but `DedupVerdict.from_doc` does not validate
-    `action`, so "should never" is a property of a different module. Under the old
-    denylist this auto-landed a blueprint the loop had decided was redundant with the
-    canon; now it reaches a human."""
+def test_a_suppressed_duplicate_routes_to_editable_review(action):
+    """THE regression this ALLOWLIST inversion exists to prevent, now under its own reason.
+
+    S6 drops `redundant_with_canon` in-process, and drops `increment` when the matched
+    artifact is TERMINAL, so a persisted verdict carrying either action is either a live
+    hard-key duplicate or a rehydration the writer should never have seen. "Should never"
+    is a property of a different module: `DedupVerdict.from_doc` does not validate
+    `action`, so nothing stops a hand-edited or future-versioned doc from arriving here
+    with one. Under the old DENYLIST that auto-landed a blueprint the loop had decided was
+    redundant with the canon; under the allowlist it reaches a human either way. The
+    reason is now `suppressed_duplicate` rather than `dedup_conflict`, because a
+    deterministic match is a different reviewer task from a near-miss judgement call."""
     decision = route_candidate(_blueprint(action), sampled_for_inbox=False)
     assert decision.status == CandidateStatus.IN_REVIEW
     assert decision.control == "route_inbox"
-    assert decision.reason == "dedup_conflict"
+    assert decision.reason == "suppressed_duplicate"
 
 
 @pytest.mark.parametrize(

@@ -24,7 +24,7 @@ flowchart TD
     S --> S2["<b>S2 triage</b><br/>is this session worth mining?"]
     S2 -->|"no"| DROP1(["dropped"])
     S2 --> CJ["<b>coverage judge</b><br/>does the corpus already cover it?"]
-    CJ -->|"covered"| DROP2(["dropped"])
+    CJ -->|"covered<br/>(shadow mode, the default:<br/>recorded, never dropped)"| DROP2(["dropped"])
     CJ --> S3["<b>S3 extract</b><br/>LLM proposes candidates,<br/>grounded on prior art"]
 
     S3 --> TOT{"<b>D97 totality walk</b><br/>is every literal in the<br/>accepted SQL classified?"}
@@ -75,7 +75,7 @@ any extraction, because extraction costs a model call:
 | stage | question | on "no" |
 |---|---|---|
 | **S2 triage** | did this session do anything worth learning? | dropped |
-| **coverage judge** | does the corpus already answer this? | dropped |
+| **coverage judge** | does the corpus already answer this? | dropped — **but not by default**: `LEARNING_JUDGE_SHADOW_MODE` ships `true`, so the verdict is written to `learning_audit` with `would_drop=true`/`shadow=true` and the session proceeds |
 | **S3 extract** | what generalizable artifact is in here? | declines with a reason |
 
 S3 is grounded on **prior art** — it is shown what already exists across every trust tier before
