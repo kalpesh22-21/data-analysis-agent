@@ -3,6 +3,8 @@ no live OTLP/Phoenix collector required)."""
 
 from __future__ import annotations
 
+import asyncio
+
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -42,6 +44,45 @@ def test_agent_span_sets_openinference_kind_and_attributes() -> None:
     assert attrs[SpanAttributes.OPENINFERENCE_SPAN_KIND] == OpenInferenceSpanKindValues.AGENT.value
     assert attrs["scope_hash"] == "deadbeef"
     assert attrs["turn.index"] == 2
+
+
+async def test_every_assistant_round_is_a_child_of_one_turn_trace() -> None:
+    """Multiple model responses, including task-spawned work, remain one trace."""
+    provider, exporter = _provider_with_memory_exporter()
+    tracer = tracing.get_tracer(provider)
+
+    async def response(round_index: int) -> None:
+        with tracer.start_as_current_span(
+            "Response", attributes={"assistant.round": round_index}
+        ):
+            await asyncio.sleep(0)
+
+    with tracing.agent_span(tracer, scope_hash="deadbeef", turn_index=7):
+        await response(1)
+        await asyncio.create_task(response(2))
+        await response(3)
+
+    spans = exporter.get_finished_spans()
+    (turn,) = [span for span in spans if span.name == "agent.turn"]
+    responses = [span for span in spans if span.name == "Response"]
+    assert len(responses) == 3
+    assert {span.context.trace_id for span in spans} == {turn.context.trace_id}
+    assert {span.parent.span_id for span in responses} == {turn.context.span_id}
+
+
+def test_configure_tracing_raises_span_capacity_above_sdk_defaults() -> None:
+    exporter = InMemorySpanExporter()
+    provider = tracing.configure_tracing(
+        otlp_endpoint="", service_name="test", span_exporter=exporter
+    )
+    tracer = tracing.get_tracer(provider)
+    attributes = {f"attribute.{index}": index for index in range(512)}
+
+    with tracing.chain_span(tracer, "large.response", attributes=attributes):
+        pass
+
+    (span,) = exporter.get_finished_spans()
+    assert len(span.attributes) == 513  # 512 payload attributes + OpenInference kind
 
 
 def test_tool_span_masks_are_caller_responsibility_but_shape_is_recorded() -> None:

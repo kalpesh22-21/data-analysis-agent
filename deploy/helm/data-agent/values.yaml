@@ -189,6 +189,11 @@ config:
   OTLP_ENDPOINT: ""
   # -- Service name reported to the OTLP collector.
   OTLP_SERVICE_NAME: "data-agent-runtime"
+  # -- Larger per-turn trace capacity for multi-round agent conversations.
+  OTLP_SPAN_ATTRIBUTE_COUNT_LIMIT: "1024"
+  OTLP_SPAN_EVENT_COUNT_LIMIT: "1024"
+  OTLP_BATCH_MAX_QUEUE_SIZE: "8192"
+  OTLP_BATCH_MAX_EXPORT_SIZE: "2048"
   # -- JWKS URL used to validate inbound JWTs. EXTERNAL (token IdP).
   JWKS_URL: "http://token:8000/.well-known/jwks.json"
   # -- Expected JWT issuer.

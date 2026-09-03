@@ -137,6 +137,10 @@ def test_telemetry_defaults_toward_reveal() -> None:
     collector holds real entity values and must be access-controlled like the session
     store — see the field description."""
     settings = RuntimeSettings(_env_file=None)
+    assert settings.otlp_span_attribute_count_limit == 1_024
+    assert settings.otlp_span_event_count_limit == 1_024
+    assert settings.otlp_batch_max_queue_size == 8_192
+    assert settings.otlp_batch_max_export_size == 2_048
     assert settings.otlp_disable_redaction is True
     assert effective_llm_hide(settings) is False
     # Hiding the LLM content now takes BOTH settings; the single flag no longer does it.

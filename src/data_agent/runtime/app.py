@@ -390,6 +390,10 @@ def create_app(
         # tunable via RuntimeSettings.otlp_drop_span_names ([] disables it). This
         # only changes WHICH spans export — not what CONTENT a kept span carries.
         drop_span_names=settings.otlp_drop_span_names,
+        span_attribute_count_limit=settings.otlp_span_attribute_count_limit,
+        span_event_count_limit=settings.otlp_span_event_count_limit,
+        batch_max_queue_size=settings.otlp_batch_max_queue_size,
+        batch_max_export_size=settings.otlp_batch_max_export_size,
     )
     # D25 amended 2026-07-15: the auto-instrumented OpenAI LLM span's raw prompt/
     # completion is REVEALED by default (the online per-turn Phoenix project is

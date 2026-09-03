@@ -556,6 +556,38 @@ class RuntimeSettings(BaseSettings):
             "separate otlp_hide_llm_content / otlp_disable_redaction posture)."
         ),
     )
+    otlp_span_attribute_count_limit: int = Field(
+        1_024,
+        ge=128,
+        description=(
+            "Maximum attributes retained on one span. Raised above the OTel SDK's "
+            "128 default so long, multi-round OpenInference response spans do not lose "
+            "later message attributes."
+        ),
+    )
+    otlp_span_event_count_limit: int = Field(
+        1_024,
+        ge=128,
+        description=(
+            "Maximum events retained on one span. Raised above the OTel SDK's 128 "
+            "default for long-running turns."
+        ),
+    )
+    otlp_batch_max_queue_size: int = Field(
+        8_192,
+        ge=2_048,
+        description=(
+            "Maximum completed spans buffered by the OTLP batch processor before new "
+            "spans are dropped."
+        ),
+    )
+    otlp_batch_max_export_size: int = Field(
+        2_048,
+        ge=512,
+        description=(
+            "Maximum spans sent in one OTLP export batch. Must not exceed the queue size."
+        ),
+    )
     otlp_disable_redaction: bool = Field(
         True,
         description=(

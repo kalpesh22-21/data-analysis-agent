@@ -26,7 +26,7 @@ from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.propagate import inject
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanLimits, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     SimpleSpanProcessor,
@@ -141,6 +141,10 @@ def configure_tracing(
     span_exporter: SpanExporter | None = None,
     drop_span_names: Collection[str] = (),
     id_generator: IdGenerator | None = None,
+    span_attribute_count_limit: int = 1_024,
+    span_event_count_limit: int = 1_024,
+    batch_max_queue_size: int = 8_192,
+    batch_max_export_size: int = 2_048,
 ) -> TracerProvider:
     """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a no-op
         provider (no span processor) when *otlp_endpoint* is empty.
@@ -176,19 +180,32 @@ def configure_tracing(
             "openinference.project.name": project_name or service_name,
         }
     )
-    # Branch on *id_generator* so the default path stays byte-identical (passing
-    # id_generator=None explicitly would override the SDK's own default generator).
+    span_limits = SpanLimits(
+        max_attributes=span_attribute_count_limit,
+        max_events=span_event_count_limit,
+    )
+    if batch_max_export_size > batch_max_queue_size:
+        raise ValueError("batch_max_export_size must not exceed batch_max_queue_size")
+    # Branch on *id_generator* so the default path retains the SDK's default generator.
     if id_generator is not None:
-        provider = TracerProvider(resource=resource, id_generator=id_generator)
+        provider = TracerProvider(
+            resource=resource, id_generator=id_generator, span_limits=span_limits
+        )
     else:
-        provider = TracerProvider(resource=resource)
+        provider = TracerProvider(resource=resource, span_limits=span_limits)
     # FIRST (see LLMExceptionEventScrubber docstring): must precede any synchronous
     # SimpleSpanProcessor export so the LLM `exception` event is scrubbed pre-export.
     if hide_llm_content:
         provider.add_span_processor(LLMExceptionEventScrubber())
     if otlp_endpoint:
         exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
-        provider.add_span_processor(BatchSpanProcessor(_filtered(exporter)))
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                _filtered(exporter),
+                max_queue_size=batch_max_queue_size,
+                max_export_batch_size=batch_max_export_size,
+            )
+        )
     if span_exporter is not None:
         provider.add_span_processor(SimpleSpanProcessor(_filtered(span_exporter)))
     return provider
