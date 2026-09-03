@@ -221,10 +221,27 @@ def test_ask_user_brief_carries_the_question_not_a_draft_answer() -> None:
     import json
 
     judge = AnswerJudge(model_client=ScriptedModelClient([]), token_budget=_ROOMY)
-    brief = _brief(site="ask_user", pending_question="AnnualSalary or HourlyRate?", draft="")
+    brief = _brief(
+        site="ask_user",
+        pending_question="Which employee?",
+        pending_options=("Jane Doe (E1042)", "Sam Lee (E1043)"),
+        draft="",
+    )
     payload = json.loads(judge.messages_for(brief)[1]["content"])
-    assert payload["question_the_agent_wants_to_ask"] == "AnnualSalary or HourlyRate?"
+    assert payload["question_the_agent_wants_to_ask"] == "Which employee?"
+    assert payload["structured_options"] == ["Jane Doe (E1042)", "Sam Lee (E1043)"]
     assert "draft_answer" not in payload
+
+
+def test_ask_user_judge_prompt_guards_codes_and_plain_text_options() -> None:
+    judge = AnswerJudge(model_client=ScriptedModelClient([]), token_budget=_ROOMY)
+    system = judge.messages_for(
+        _brief(site="ask_user", pending_question="Which employee?", draft="")
+    )[0]["content"]
+    assert "employee name and code" in system
+    assert "department name and code" in system
+    assert "options_in_question" in system
+    assert "at most five structured options" in system
 
 
 def test_the_agent_system_prompt_is_not_sent_to_the_judge() -> None:

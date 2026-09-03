@@ -130,6 +130,11 @@ ASK_USER_VIOLATIONS: tuple[str, ...] = (
     # half-redacted string that is neither usable nor honest. The judge's job is to get a
     # question that never needed redacting.
     "non_contextual_question",
+    # Raw identifiers are not meaningful choices for a business user. Codes may be
+    # included only beside a human-readable label (for example, "Jane Doe (E123)").
+    "code_only_choices",
+    # Choices embedded in the prose do not render as selectable UI controls.
+    "options_in_question",
 )
 
 
@@ -209,6 +214,8 @@ class JudgeBrief:
     figure_corroborated: bool | None = None
     # The question the model wants to ask — `ask_user` only.
     pending_question: str = ""
+    # Structured choices accompanying the question — `ask_user` only.
+    pending_options: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, Any]:
         """The brief as a plain JSON-able document, before fitting."""
@@ -217,6 +224,7 @@ class JudgeBrief:
             doc["today"] = self.date_anchor
         if self.site == "ask_user":
             doc["question_the_agent_wants_to_ask"] = self.pending_question
+            doc["structured_options"] = list(self.pending_options)
         else:
             doc["draft_answer"] = self.draft
         if self.intents:
@@ -437,6 +445,20 @@ _ASK_USER_JUDGE_PROMPT = (
     "user's own terms is fine: not which of two fields to read, but which THING they "
     "want measured.\n"
     "\n"
+    "REJECT AS code_only_choices when the question or structured options present raw "
+    "codes/IDs without the human-readable information needed to identify them. A code "
+    "may be shown only together with its label. For employees require the employee name "
+    "and code, for departments require the department name and code, and apply the same "
+    "rule to every other coded entity (location, job, cost center, earning code, etc.). "
+    "For example, reject 'E1042' but accept 'Jane Doe (E1042)'; reject 'D07' but accept "
+    "'Sales (D07)'.\n"
+    "\n"
+    "REJECT AS options_in_question when the question prose enumerates choices but "
+    "structured_options is empty, or when additional choices are hidden in the question "
+    "instead of being represented in structured_options. Tell the agent to put the "
+    "choices in the options field. There may be at most five structured options, so it "
+    "must consolidate a longer list.\n"
+    "\n"
     "APPROVE otherwise, including when the question is merely long, or when you think "
     "the agent could have worked the answer out for itself. You are checking that the "
     "question is ANSWERABLE by this user, not whether it needed asking."
@@ -597,15 +619,17 @@ def ask_user_judge_nudge_text(question: str, feedback: str) -> str:
         lines.append(f"You were about to ask: {asked}")
         lines.append("")
     lines.append(
-        "That question was NOT sent. The user has not seen it, and they cannot answer it "
-        "as written: it asks them about the database rather than about their business."
+        "That question was NOT sent. The user has not seen it, and it is not suitable "
+        "as written."
     )
     lines.append(feedback)
     lines.append(
         "The turn is NOT over and every tool is still available to you. Ask the same "
-        "thing again in the user's own words — what they want measured, never which "
-        "field, table or code to read — or, if you can pick a sensible default, take it "
-        "and record it with recordAssumptions instead of asking."
+        "thing again in the user's own words. Put every choice in the options field "
+        "(maximum five), never as a list in the question. Never offer a bare code or ID: "
+        "pair it with its human-readable label, such as employee name plus employee code "
+        "or department name plus department code. If you can pick a sensible default, "
+        "take it and record it with recordAssumptions instead of asking."
     )
     return "\n".join(lines)
 

@@ -137,8 +137,13 @@ def _build(
     return loop, store, events, model
 
 
-def _ask(question: str, call_id: str = "a1") -> ToolCallRequest:
-    return ToolCallRequest(id=call_id, name="askUser", arguments={"question": question})
+def _ask(
+    question: str, call_id: str = "a1", options: list[str] | None = None
+) -> ToolCallRequest:
+    arguments: dict[str, Any] = {"question": question}
+    if options is not None:
+        arguments["options"] = options
+    return ToolCallRequest(id=call_id, name="askUser", arguments=arguments)
 
 
 def _turn(*calls: ToolCallRequest, text: str | None = None) -> ModelTurnResult:
@@ -263,6 +268,20 @@ async def test_the_judge_sees_the_raw_question_not_the_scrubbed_one() -> None:
     assert brief.site == "ask_user"
     assert brief.pending_question == _SCHEMA_QUESTION
     assert "withheld" not in brief.pending_question
+
+
+async def test_the_judge_sees_structured_options_for_code_and_placement_checks() -> None:
+    judge = _ScriptedJudge([APPROVED])
+    choices = ["Jane Doe (E1042)", "Sam Lee (E1043)"]
+    loop, _store, _events_, _model = _build(
+        [_turn(_ask("Which employee?", options=choices))], judge
+    )
+    await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="show employee payroll"
+    )
+    (brief,) = judge.briefs
+    assert brief.pending_question == "Which employee?"
+    assert brief.pending_options == tuple(choices)
 
 
 async def test_a_batched_state_call_survives_the_rejection() -> None:

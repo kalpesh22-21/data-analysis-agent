@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
@@ -23,6 +25,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResu
 from data_agent.runtime.loop.agent_loop import (
     AgentLoop,
     _assembled_to_canonical,
+    _declines_clarification,
     _tool_trail_entry_to_canonical,
 )
 from data_agent.runtime.mcp.client import MCPToolError
@@ -145,6 +148,116 @@ async def test_ask_user_pause_writes_checkpoint_and_never_reaches_dispatcher() -
     assert doc.pause_checkpoint is not None
     assert doc.pause_checkpoint.reason == "askUser"
     assert doc.pause_checkpoint.consumed is False
+
+
+async def test_ask_user_limits_model_options_to_five() -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="askUser",
+                        arguments={
+                            "question": "Which department?",
+                            "options": ["A", "B", "C", "D", "E", "F", "G"],
+                        },
+                    )
+                ]
+            )
+        ]
+    )
+    loop, _ = _build_loop(model_client=model, mcp_client=FakeMCPClient())
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll."
+    )
+
+    assert outcome.pending_question == {
+        "question": "Which department?",
+        "options": ["A", "B", "C", "D", "E"],
+    }
+
+
+async def test_declined_clarification_is_not_shown_again_and_agent_answers_best_effort() -> None:
+    repeated = ModelTurnResult(
+        tool_calls=[
+            ToolCallRequest(
+                id="repeat",
+                name="askUser",
+                arguments={"question": "What department should I use?"},
+            )
+        ]
+    )
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="first", name="askUser", arguments={"question": "Which department?"}
+                    )
+                ]
+            ),
+            repeated,
+            ModelTurnResult(assistant_text="I used all departments because you skipped that choice."),
+        ]
+    )
+    loop, _ = _build_loop(model_client=model, mcp_client=FakeMCPClient())
+    await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll."
+    )
+
+    outcome = await loop.resume(
+        session_id=SESSION_ID, credentials=_credentials(), answer="Prefer not to answer"
+    )
+
+    assert outcome.status == "done"
+    assert outcome.pending_question is None
+    assert outcome.assistant_text == "I used all departments because you skipped that choice."
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "skip",
+        "Pass",
+        "No thanks!",
+        "I'd rather not answer.",
+        "I don't know",
+        "The user declined to answer the question",
+    ],
+)
+def test_declined_clarification_recognizes_common_explicit_answers(answer: str) -> None:
+    assert _declines_clarification(answer) is True
+
+
+def test_plain_no_remains_a_real_answer_not_a_decline() -> None:
+    assert _declines_clarification("no") is False
+
+
+async def test_repeated_declined_clarification_ends_honestly_instead_of_looping() -> None:
+    def ask(call_id: str) -> ModelTurnResult:
+        return ModelTurnResult(
+            tool_calls=[
+                ToolCallRequest(
+                    id=call_id, name="askUser", arguments={"question": "Which department?"}
+                )
+            ]
+        )
+
+    model = ScriptedModelClient([ask("first"), ask("repeat-1"), ask("repeat-2")])
+    loop, _ = _build_loop(model_client=model, mcp_client=FakeMCPClient())
+    await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll."
+    )
+
+    outcome = await loop.resume(
+        session_id=SESSION_ID, credentials=_credentials(), answer="skip"
+    )
+
+    assert outcome.status == "done"
+    assert outcome.pending_question is None
+    assert "stopping instead of asking the same question again" in outcome.assistant_text
 
 
 async def test_ask_user_resume_round_trip_threads_answer_and_completes() -> None:

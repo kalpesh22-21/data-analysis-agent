@@ -137,6 +137,13 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
     assert len(schemas) == 15
     ask_user = next(s for s in schemas if s["name"] == "askUser")
     assert ask_user == ASK_USER_TOOL_SCHEMA
+    assert ask_user["parameters"]["properties"]["options"]["maxItems"] == 5
+    assert "never provide a bare code" in ask_user["parameters"]["properties"]["options"][
+        "description"
+    ]
+    assert "Do not enumerate choices" in ask_user["parameters"]["properties"]["question"][
+        "description"
+    ]
     resolve_values = next(s for s in schemas if s["name"] == "resolveValues")
     assert resolve_values == RESOLVE_VALUES_TOOL_SCHEMA
     assert set(resolve_values["parameters"]["required"]) == {"table", "column", "concept"}

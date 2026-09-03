@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
@@ -171,6 +172,69 @@ _logger = logging.getLogger(__name__)
 RUNTIME_TOOL_INTERNAL_ERROR_CODE = "RUNTIME_TOOL_INTERNAL_ERROR"
 _RUNTIME_TOOL_INTERNAL_ERROR_MESSAGE = "That tool hit an internal error. Please try again."
 
+MAX_ASK_USER_OPTIONS = 5
+_DECLINED_CLARIFICATION_ANSWERS = frozenset(
+    {
+        "skip",
+        "skip this",
+        "pass",
+        "no thanks",
+        "no thank you",
+        "the user declined to answer the question",
+        "i decline to answer",
+        "i'd rather not answer",
+        "i would rather not answer",
+        "i don't know",
+        "i do not know",
+        "not sure",
+        "i'm not sure",
+        "i am not sure",
+        "prefer not to answer",
+        "i prefer not to answer",
+        "i don't want to answer",
+        "i do not want to answer",
+        "can't answer",
+        "cannot answer",
+    }
+)
+
+
+def _ask_user_options(value: Any) -> list[str] | None:
+    """Return at most five usable choices; malformed model output becomes free text."""
+    if not isinstance(value, list):
+        return None
+    options = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return options[:MAX_ASK_USER_OPTIONS] or None
+
+
+def _declines_clarification(answer: str) -> bool:
+    normalized = " ".join(answer.strip().lower().rstrip(".!?").split())
+    return normalized in _DECLINED_CLARIFICATION_ANSWERS
+
+
+def _question_key(question: str) -> str:
+    # Ignore conversational scaffolding so a cosmetic paraphrase cannot evade the
+    # declined-question guard ("Which department?" / "What department should I use?").
+    stop = {
+        "a",
+        "an",
+        "do",
+        "for",
+        "i",
+        "is",
+        "mean",
+        "please",
+        "should",
+        "the",
+        "to",
+        "use",
+        "what",
+        "which",
+        "you",
+    }
+    words = [word for word in re.findall(r"[a-z0-9]+", question.lower()) if word not in stop]
+    return " ".join(sorted(words))
+
 
 @dataclass(frozen=True)
 class TurnContext:
@@ -245,7 +309,13 @@ TurnStatus = Literal["done", "paused_ask_user", "paused_budget_cap", "stopped_ha
 # the same thing: best-effort partial prose from a turn that did not answer.
 # `"ask_user_question"` is the one label that is NOT about `assistant_text`: it
 # tags the `askUser` QUESTION, which is model prose shown to the user too.
-AnswerExitLabel = Literal["no_tool_calls", "answer_with_table", "pause", "ask_user_question"]
+AnswerExitLabel = Literal[
+    "no_tool_calls",
+    "answer_with_table",
+    "pause",
+    "ask_user_question",
+    "declined_clarification",
+]
 
 _BUDGET_CAP_QUESTION = "This is taking a while — continue, refine, or stop?"
 _BUDGET_CAP_OPTIONS = ["continue", "refine", "stop"]
@@ -892,6 +962,13 @@ class AgentLoop:
 
         prior_window_count = checkpoint.budget_window_count if checkpoint else 1
         pause_reason = checkpoint.reason if checkpoint else "askUser"
+        declined_question = (
+            str((checkpoint.pending_question or {}).get("question", ""))
+            if checkpoint is not None
+            and checkpoint.reason == "askUser"
+            and _declines_clarification(answer)
+            else None
+        )
 
         try:
             return await self._continue_consumed_resume(
@@ -903,6 +980,7 @@ class AgentLoop:
                 turn_index=turn_index,
                 prior_window_count=prior_window_count,
                 pause_reason=pause_reason,
+                declined_question=declined_question,
             )
         except BaseException:
             try:
@@ -928,6 +1006,7 @@ class AgentLoop:
         turn_index: int,
         prior_window_count: int,
         pause_reason: str,
+        declined_question: str | None = None,
     ) -> TurnOutcome:
         """Continue after atomically claiming a checkpoint; the caller handles rollback."""
 
@@ -1045,6 +1124,7 @@ class AgentLoop:
             turn_index=turn_index,
             model_client=turn_model_client,
             question=question,
+            declined_question=declined_question,
             # THREE of the six seeds, and the absence of the other three is a
             # decision, not an omission: `sql`, `blueprint_use` and `verification`
             # are turn-level enrichment that only the BLUEPRINT approval-resume
@@ -1833,6 +1913,7 @@ class AgentLoop:
         date_anchor: str | None = None,
         draft: str = "",
         pending_question: str = "",
+        pending_options: tuple[str, ...] = (),
         results: tuple[Mapping[str, Any], ...] = (),
         designated_tables: tuple[tuple[str | None, str], ...] = (),
         figure_corroborated: bool | None = None,
@@ -1869,6 +1950,7 @@ class AgentLoop:
             designated_tables=designated_tables,
             figure_corroborated=figure_corroborated,
             pending_question=pending_question,
+            pending_options=pending_options,
         )
 
     async def _finish(
@@ -2030,9 +2112,11 @@ class AgentLoop:
                 succeeded, then runBlueprint paused on a slot question" turn surfaces the partial
                 SQL and table on this pause flavor too, matching a direct `askUser` pause.
         """
+        pending_question = dict(pause.pending_question)
+        pending_question["options"] = _ask_user_options(pending_question.get("options"))
         checkpoint = PauseCheckpoint(
             reason=pause.reason,
-            pending_question=pause.pending_question,
+            pending_question=pending_question,
             awaiting="user_answer",
             consumed=False,
             budget_window_count=window_count,
@@ -2067,7 +2151,7 @@ class AgentLoop:
             )
         self._observer(
             "loop_paused_ask_user",
-            {"question": pause.pending_question.get("question", "")},
+            {"question": pending_question.get("question", "")},
         )
         return TurnOutcome(
             status="paused_ask_user",
@@ -2493,6 +2577,7 @@ class AgentLoop:
         turn_index: int,
         model_client: ModelClient,
         question: str | None = None,
+        declined_question: str | None = None,
         # This window's answer accumulators (`loop/turn_accumulators.py`), ALREADY
         # SEEDED by the caller when the turn is resuming: `resume()` rebuilds what
         # the trail knows, and `_resume_blueprint` adds the enrichment of the
@@ -2708,7 +2793,15 @@ class AgentLoop:
             # lives EXACTLY ONE ROUND-TRIP: set when an exit-#1 finalization is
             # refused, spliced into the next rebuild, and cleared immediately after
             # that rebuild below.
-            finalization_nudge: str | None = None
+            finalization_nudge: str | None = (
+                "The user declined to answer the previous clarification. Do not ask that "
+                "question again. Use the safest reasonable interpretation and answer as far "
+                "as possible; if the request cannot be completed without it, end with a "
+                "concise, honest explanation of what is missing."
+                if declined_question
+                else None
+            )
+            declined_repeat_refused = False
             # K2: the `tool_call_id`s whose next-round tool result must carry
             # `_INTENT_TAG_DROPPED_NOTE`. Same ephemeral, never-persisted,
             # EXACTLY-ONE-ROUND-TRIP lifetime as `finalization_nudge`: filled during
@@ -4037,6 +4130,41 @@ class AgentLoop:
                 # path, so every other call still waits for the resume exactly as it
                 # always did.
                 if ask_user_call is not None:
+                    raw_question = str(ask_user_call.arguments.get("question", ""))
+                    declined_key = _question_key(declined_question) if declined_question else ""
+                    if declined_key and _question_key(raw_question) == declined_key:
+                        if not declined_repeat_refused:
+                            declined_repeat_refused = True
+                            finalization_nudge = (
+                                "You repeated the clarification the user declined. Do not ask it "
+                                "again. Answer using a safe assumption, or finish now with the "
+                                "specific reason an answer is not possible."
+                            )
+                            continue
+                        honest = (
+                            "I can’t complete this reliably without the information you chose "
+                            "not to provide, so I’m stopping instead of asking the same question "
+                            "again."
+                        )
+                        await self._force_block_pending_intents(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            state=analysis_state,
+                            reason_code="USER_STOPPED",
+                        )
+                        return await self._finish(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            status="done",
+                            exit_label="declined_clarification",
+                            assistant_text=honest,
+                            tool_calls_made=tool_calls_made,
+                            accum=accum,
+                            persist_text=honest,
+                            provenance=await self._compute_turn_provenance_union(
+                                session_id, turn_index
+                            ),
+                        )
                     # --- THE askUser JUDGE (09 §C.3) ------------------------
                     #
                     # THE CHEAPEST SITE IN THE DESIGN TO REJECT AT, and the only one
@@ -4058,11 +4186,13 @@ class AgentLoop:
                     # the scrubbed form would ask the model to repair a string it did
                     # not write; judging the raw one gets a question that never needed
                     # redacting.
-                    raw_question = str(ask_user_call.arguments.get("question", ""))
                     async def _ask_brief(
                         _q: str = question,
                         _state: AnalysisState | None = analysis_state,
                         _asked: str = raw_question,
+                        _options: tuple[str, ...] = tuple(
+                            _ask_user_options(ask_user_call.arguments.get("options")) or ()
+                        ),
                     ) -> JudgeBrief:
                         # No store reads at this site — the question is judged on the
                         # turn's own bookkeeping — but the factory shape is kept so all
@@ -4073,6 +4203,7 @@ class AgentLoop:
                             accum=accum,
                             analysis_state=_state,
                             pending_question=_asked,
+                            pending_options=_options,
                         )
 
                     ask_verdict = await self._judge(
@@ -4153,7 +4284,7 @@ class AgentLoop:
                                 "exit": "ask_user_question",
                             },
                         )
-                    options = ask_user_call.arguments.get("options")
+                    options = _ask_user_options(ask_user_call.arguments.get("options"))
                     checkpoint = PauseCheckpoint(
                         reason="askUser",
                         pending_question={"question": question, "options": options},

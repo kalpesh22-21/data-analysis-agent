@@ -17,13 +17,31 @@ ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "name": "askUser",
     "description": (
-        "Pause and ask the user a clarifying question, then resume with their answer."
+        "Pause and ask the user one clarifying question, then resume with their answer. "
+        "Offer no more than five choices. Put every choice in `options`; never embed a "
+        "choice list in `question`. Consolidate choices when more than five exist. Never "
+        "offer a bare code or ID: pair every code with its human-readable label, such as "
+        "employee name plus employee code or department name plus department code."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "question": {"type": "string"},
-            "options": {"type": "array", "items": {"type": "string"}, "nullable": True},
+            "question": {
+                "type": "string",
+                "description": (
+                    "The question only. Do not enumerate choices here; use `options` for them."
+                ),
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 5,
+                "nullable": True,
+                "description": (
+                    "At most five concise, mutually exclusive choices. Each coded value must "
+                    "include its human-readable label; never provide a bare code or ID."
+                ),
+            },
         },
         "required": ["question"],
     },
