@@ -21,7 +21,7 @@ from typing import Any
 # loader validation agree on the closed set.
 SLOT_TYPES: frozenset[str] = frozenset(
     {"string", "entity", "enum", "period", "as_of_date", "list",
-     "relative_window", "period_range"}
+     "relative_window", "positive_integer", "period_range"}
 )
 
 # One plain-English gloss per SLOT_TYPE, surfaced by `getBlueprint` so the MODEL
@@ -42,6 +42,7 @@ SLOT_TYPE_GLOSS: dict[str, str] = {
         "a whole number N of units (e.g. \"last N months\" -> pass the integer 6, "
         "not \"6 months\")."
     ),
+    "positive_integer": "a whole number greater than zero, passed as a bare integer.",
     "period_range": "an explicit {start, end} date range.",
 }
 
@@ -270,7 +271,9 @@ class SlotSpec:
         # L3: the windowed-period types never consume a warehouse DOMAIN (their
         # values are validated structurally, not matched against a DISTINCT set), so
         # a `binds_to` here would only fire a useless probe — reject it at parse.
-        if binds_to is not None and type_ in ("relative_window", "period_range"):
+        if binds_to is not None and type_ in (
+            "relative_window", "positive_integer", "period_range"
+        ):
             raise BlueprintParseError(
                 f"slot {name!r} of type {type_!r} must not declare 'binds_to' — a "
                 "windowed-period slot consumes no domain (it would fire a useless probe)"

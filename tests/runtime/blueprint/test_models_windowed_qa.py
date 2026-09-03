@@ -28,6 +28,16 @@ def test_relative_window_is_a_valid_slot_type() -> None:
     assert "relative_window" in SLOT_TYPES
     spec = SlotSpec.parse({"name": "w", "type": "relative_window"})
     assert spec.type == "relative_window"
+
+
+def test_positive_integer_is_a_valid_domainless_slot_type() -> None:
+    assert "positive_integer" in SLOT_TYPES
+    spec = SlotSpec.parse({"name": "limit", "type": "positive_integer"})
+    assert spec.type == "positive_integer"
+    with pytest.raises(BlueprintParseError, match="must not declare 'binds_to'"):
+        SlotSpec.parse(
+            {"name": "limit", "type": "positive_integer", "binds_to": "db.t.value"}
+        )
     # Bounds default to None (defer to the resolver's 1..120 safety window).
     assert spec.min_value is None and spec.max_value is None
 

@@ -55,6 +55,7 @@ Role = Literal["slot", "rule", "inline"]
 # marks `binds_to` required for every slot, so a model that finally CAN say
 # `relative_window` would attach a `binds_to` to it and land nothing.
 WINDOWED_SLOT_TYPES: frozenset[str] = frozenset({"relative_window", "period_range"})
+DOMAINLESS_SLOT_TYPES: frozenset[str] = WINDOWED_SLOT_TYPES | frozenset({"positive_integer"})
 
 # Types the runtime EXECUTES but this pipeline cannot yet PRODUCE. Withheld from the
 # prompt enum (`schema.py::SLOT_TYPE_ENUM`) and declined at validation.

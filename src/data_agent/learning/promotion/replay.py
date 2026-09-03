@@ -132,7 +132,7 @@ def _sample_value(name: str, slot_type: str) -> Any:
     same reason `as_of_date`'s fixed 2020-01-01 has always been acceptable."""
     if slot_type in ("as_of_date", "period", "period_range"):
         return _SAMPLE_DATE
-    if slot_type == "relative_window":
+    if slot_type in ("relative_window", "positive_integer"):
         return _SAMPLE_RELATIVE_WINDOW
     if slot_type == "list":
         return [f"__replay_sample_{name}__"]

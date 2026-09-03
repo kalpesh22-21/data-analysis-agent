@@ -150,7 +150,7 @@ def resolve_slot(
     # The windowed-period types resolve BEFORE the string/entity container guard
     # (line below): a `period_range` value is legitimately a dict/list, which that
     # guard would otherwise reject as "not a single value" (F1 windowed-slot gap).
-    if spec.type == "relative_window":
+    if spec.type in ("relative_window", "positive_integer"):
         return _resolve_relative_window(raw, spec)
     if spec.type == "period_range":
         return _resolve_period_range(raw, spec)

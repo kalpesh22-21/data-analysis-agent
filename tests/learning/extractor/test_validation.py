@@ -128,7 +128,7 @@ def _function_horizon_param(**locator_overrides):
         "role": "slot",
         "slot": {
             "name": "forecast_months",
-            "type": "relative_window",
+            "type": "positive_integer",
             "binds_to": None,
             "required": True,
         },

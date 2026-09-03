@@ -67,6 +67,7 @@ import pytest
 
 from data_agent.learning.candidate.models import build_envelope
 from data_agent.learning.extractor.models import (
+    DOMAINLESS_SLOT_TYPES,
     UNSUPPORTED_SLOT_TYPES,
     Decline,
     ExtractedCandidate,
@@ -282,7 +283,7 @@ async def test_every_template_token_s4_emits_is_a_declared_bind_token(slot_type:
             "slot": {
                 "name": "hire_window", "type": slot_type, "required": True,
                 "binds_to": (
-                    None if slot_type == "relative_window"
+                    None if slot_type in DOMAINLESS_SLOT_TYPES
                     else "dbpcm_warehouse.employee.most_recent_hire_date"
                 ),
             },

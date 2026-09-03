@@ -271,3 +271,15 @@ def test_expand_binding_period_range_non_periodrange_falls_back_to_single() -> N
     # under the single {name} token (never silently splits a non-range value).
     spec = _spec("period_range", name="hw")
     assert expand_binding(spec, "raw") == {"hw": "raw"}
+
+
+@pytest.mark.parametrize("raw", [1, 5, "12"])
+def test_positive_integer_accepts_bounded_whole_numbers(raw: object) -> None:
+    out = resolve_slot(raw, _spec("positive_integer"))
+    assert isinstance(out, SlotBinding)
+    assert out.value == int(raw)
+
+
+@pytest.mark.parametrize("raw", [0, -1, 1.5, True, "5 months"])
+def test_positive_integer_rejects_non_positive_or_non_integer_values(raw: object) -> None:
+    assert isinstance(resolve_slot(raw, _spec("positive_integer")), AskUser)

@@ -50,7 +50,7 @@ _NUMERIC = re.compile(r"^-?\d+(\.\d+)?$")
 # Slot types whose bind site is a bare number rather than a quoted literal. Mirrors the reasoning
 # in `promotion/replay.py::_sample_value`: the UNIT lives in the template (`INTERVAL {n} MONTH`),
 # so the site holds a number.
-_BARE_NUMBER_TYPES = frozenset({"relative_window"})
+_BARE_NUMBER_TYPES = frozenset({"relative_window", "positive_integer"})
 
 # Slot types that occupy a SET position (`IN {slot}`), so the literal is a tuple.
 _LIST_TYPES = frozenset({"list"})

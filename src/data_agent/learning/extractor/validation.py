@@ -30,10 +30,10 @@ from ..summary.models import AcceptedSignal, SessionSummary
 from ..summary.refs import sql_by_ref
 from .grounding import CatalogRule, RuleIndex
 from .models import (
+    DOMAINLESS_SLOT_TYPES,
     NODE_KINDS,
     SLOT_TYPES,
     UNSUPPORTED_SLOT_TYPES,
-    WINDOWED_SLOT_TYPES,
     BlueprintPayload,
     CandidateHeader,
     ColumnShape,
@@ -1081,16 +1081,16 @@ def _validate_roles(
             if p.slot is None:
                 mismatches.append("slot=null (expected a slot object)")
             else:
-                if p.slot.type != "relative_window":
+                if p.slot.type not in ("positive_integer", "relative_window"):
                     mismatches.append(
-                        f"slot.type={p.slot.type!r} (expected 'relative_window')"
+                        f"slot.type={p.slot.type!r} (expected 'positive_integer')"
                     )
                 if not p.slot.required:
                     mismatches.append("slot.required=false (expected true)")
             if mismatches:
                 return _role_shape(
                     f"{at}: a function_argument locator is supported only as a required "
-                    "relative_window slot targeting argument 0 of an occurrence of the "
+                    "positive_integer slot targeting argument 0 of an occurrence of the "
                     f"table-source function numbers(...); fix: {', '.join(mismatches)}"
                 )
             try:
@@ -1167,17 +1167,17 @@ def _validate_roles(
             #     absent one was a KeyError ⇒ `malformed_candidate`; it is now a named
             #     role decline, the same hard reject with a reason a prompt-tuner can
             #     act on.)
-            if p.slot.type in WINDOWED_SLOT_TYPES:
+            if p.slot.type in DOMAINLESS_SLOT_TYPES:
                 if p.slot.binds_to is not None:
                     return _role_shape(
                         f"{at}.slot: a {p.slot.type} slot must not declare binds_to "
-                        "(a windowed-period slot consumes no column domain; emit null)",
+                        "(this structural slot consumes no column domain; emit null)",
                     )
             elif not p.slot.binds_to:
                 return _role_shape(
                     f"{at}.slot has no binds_to; it must be the FULLY-QUALIFIED "
                     "'database.table.column' (only a "
-                    f"{sorted(WINDOWED_SLOT_TYPES)} slot may omit it)",
+                    f"{sorted(DOMAINLESS_SLOT_TYPES)} slot may omit it)",
                 )
             # An `enum` slot MUST carry non-empty enum_values — the runtime
             # `SlotSpec.parse` rejects an enum slot without them (un-landable). Catch

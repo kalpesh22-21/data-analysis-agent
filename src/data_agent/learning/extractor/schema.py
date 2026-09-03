@@ -107,7 +107,8 @@ _SLOT_SCHEMA = {
                 '<unit>" window carried as a BARE WHOLE NUMBER ("last 6 months" -> 6; '
                 "the unit lives in the SQL, e.g. INTERVAL {n} MONTH) — use it whenever "
                 "the SQL expresses a trailing window, rather than falling back to "
-                "'period' or 'string'."
+                "'period' or 'string'. 'positive_integer' is a non-temporal whole-number "
+                "count such as the cardinality in numbers(N)."
             ),
         },
         "binds_to": {
@@ -117,9 +118,10 @@ _SLOT_SCHEMA = {
                 "'dbpcm_warehouse.employee.Department') — i.e. locator.table + '.' + "
                 "locator.column. NEVER a bare column name; it MUST lie within the "
                 "blueprint's uses (the columns the accepted SQL touches). MUST be null "
-                "for a 'relative_window' slot ONLY: it carries a plain number rather "
+                "for a 'relative_window' or 'positive_integer' slot: each carries a "
+                "plain number rather "
                 "than a value drawn from a column's domain, and declaring one is "
-                "rejected. Required for every other type."
+                "rejected. Required for every column-domain type."
             ),
         },
         "required": {"type": "boolean"},

@@ -56,6 +56,7 @@ from __future__ import annotations
 import pytest
 
 from data_agent.learning.extractor.models import (
+    DOMAINLESS_SLOT_TYPES,
     SLOT_TYPES,
     UNSUPPORTED_SLOT_TYPES,
     Decline,
@@ -147,7 +148,7 @@ def test_the_unsupported_check_runs_before_the_binds_to_rules():
 @pytest.mark.parametrize("slot_type", sorted(SLOT_TYPES - UNSUPPORTED_SLOT_TYPES))
 def test_every_offered_type_still_extracts(slot_type: str) -> None:
     """The withdrawal must be a scalpel: exactly one type removed, nothing else."""
-    kwargs = {"binds_to": None} if slot_type == "relative_window" else {}
+    kwargs = {"binds_to": None} if slot_type in DOMAINLESS_SLOT_TYPES else {}
     if slot_type == "enum":
         pytest.skip("an enum slot needs enum_values; covered in test_validation.py")
     raw = blueprint_raw(
