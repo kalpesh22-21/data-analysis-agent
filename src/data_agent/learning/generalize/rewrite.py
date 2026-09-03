@@ -104,6 +104,37 @@ def _find_literal(ast: exp.Expression, column: str, value: str) -> exp.Literal |
     return None
 
 
+def _find_function_argument(ast: exp.Expression, locator: dict[str, Any]) -> exp.Literal | None:
+    """Resolve the narrow structural horizon locator supported by the extractor.
+
+    Only ``FROM numbers(<integer>)`` is admitted. The occurrence is counted among matching
+    table-source calls before the value is checked, so a stale locator cannot silently slide
+    to a different call that happens to carry the same number.
+    """
+    if (
+        str(locator.get("function", "")).lower() != "numbers"
+        or locator.get("argument_index") != 0
+        or locator.get("context") != "table_source"
+    ):
+        return None
+    occurrence = locator.get("occurrence", 0)
+    if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 0:
+        return None
+    calls: list[exp.Func] = []
+    for func in ast.find_all(exp.Func):
+        if _func_name(func).lower() != "numbers":
+            continue
+        table = func.parent
+        if isinstance(table, exp.Table) and isinstance(table.parent, (exp.From, exp.Join)):
+            calls.append(func)
+    if occurrence >= len(calls):
+        return None
+    args = calls[occurrence].args.get("expressions") or []
+    if not args or not isinstance(args[0], exp.Literal) or not args[0].is_int:
+        return None
+    return args[0] if str(args[0].this) == str(locator.get("value")) else None
+
+
 def _func_name(node: exp.Expression) -> str:
     """The function's name as authored (`sumIf`, `toYear`) or its SQL name (`SUM`).
 
@@ -297,16 +328,33 @@ def rewrite_sql_to_template(
     for param in parameterization:
         role = param.get("role")
         locator = param.get("locator") or {}
+        locator_kind = locator.get("kind", "column_predicate")
         column = locator.get("column")
         value = locator.get("value")
-        if role == "inline" or column is None or value is None:
+        if role == "inline" or value is None:
+            continue
+        # Preserve the legacy behavior for synthetic/canonicalization callers whose
+        # non-predicate slot has no column locator. Only an explicitly typed structural
+        # locator opts into strict function-argument resolution.
+        if locator_kind == "column_predicate" and column is None:
             continue
 
-        literal = _find_literal(ast, column, str(value))
+        if locator_kind == "function_argument":
+            literal = _find_function_argument(ast, locator)
+            locator_description = (
+                f"{locator.get('function')} argument {locator.get('argument_index')} "
+                f"occurrence {locator.get('occurrence', 0)}"
+            )
+        elif column is not None:
+            literal = _find_literal(ast, column, str(value))
+            locator_description = f"{column}={value!r}"
+        else:
+            literal = None
+            locator_description = "malformed locator"
         if literal is None:
             if strict:
                 raise RewriteError(
-                    f"role={role} literal for {column}={value!r} not found in the "
+                    f"role={role} literal for {locator_description} not found in the "
                     "accepted SQL — cannot rewrite (fail-to-review)."
                 )
             continue

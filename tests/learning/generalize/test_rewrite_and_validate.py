@@ -81,6 +81,90 @@ def test_missing_slot_literal_raises_in_strict_mode():
         raise AssertionError("expected RewriteError for an unlocatable slot literal")
 
 
+def _numbers_horizon(value: str = "5", **overrides):
+    locator = {
+        "kind": "function_argument",
+        "function": "numbers",
+        "argument_index": 0,
+        "occurrence": 0,
+        "context": "table_source",
+        "value": value,
+    }
+    locator.update(overrides)
+    return {
+        "locator": locator,
+        "role": "slot",
+        "slot": {"name": "forecast_months"},
+    }
+
+
+def test_numbers_table_source_horizon_becomes_slot():
+    sql = "SELECT addMonths(today(), number) FROM numbers(5)"
+    template = rewrite_sql_to_template(sql, [_numbers_horizon()], strict=True)
+    assert "numbers({forecast_months})" in template
+
+
+def test_function_argument_occurrence_is_structural_and_exact():
+    sql = "SELECT * FROM numbers(3) a CROSS JOIN numbers(5) b"
+    template = rewrite_sql_to_template(
+        sql, [_numbers_horizon(occurrence=1)], strict=True
+    )
+    assert "numbers(3)" in template
+    assert "numbers({forecast_months})" in template
+
+
+@pytest.mark.parametrize(
+    "sql, locator",
+    [
+        ("SELECT avg(5)", _numbers_horizon()),
+        ("SELECT number FROM numbers(6)", _numbers_horizon()),
+        ("SELECT number FROM numbers(5)", _numbers_horizon(function="range")),
+        ("SELECT number FROM numbers(5)", _numbers_horizon(context="expression")),
+    ],
+)
+def test_function_argument_locator_never_falls_back_to_an_unrelated_literal(sql, locator):
+    with pytest.raises(RewriteError, match="not found"):
+        rewrite_sql_to_template(sql, [locator], strict=True)
+
+
+def test_numbers_horizon_generalizes_to_an_executable_blueprint_template():
+    sql = (
+        "WITH hires AS (SELECT employee_code FROM dbpcm_warehouse.employee "
+        "WHERE employee_status != 'Not Hired'), future AS ("
+        "SELECT addMonths(today(), number + 1) AS month FROM numbers(5)) "
+        "SELECT month, count(employee_code) AS forecast_hires FROM future CROSS JOIN hires "
+        "GROUP BY month"
+    )
+    payload = {
+        "kind": "single",
+        "intent": "forecast hires for the next N months",
+        "source_tool_call_refs": ["tc1"],
+        "parameterization": [
+            _numbers_horizon(),
+            {
+                "locator": {
+                    "table": "dbpcm_warehouse.employee",
+                    "column": "employee_status",
+                    "value": "Not Hired",
+                },
+                "role": "inline",
+                "why": "defines the population",
+            },
+        ],
+        "composes": [],
+        "result_signature": None,
+    }
+    catalog = {
+        "dbpcm_warehouse.employee": {
+            "employee_code": "String",
+            "employee_status": "String",
+        }
+    }
+    generalized = generalize_blueprint(payload, {"tc1": sql}, catalog)
+    assert "numbers({forecast_months})" in generalized.sql_template
+    assert generalized.static_validation.outcome == "ok"
+
+
 @pytest.mark.parametrize("name", [["department"], 7, {"n": "department"}, 1.5])
 def test_non_string_slot_name_raises_rewrite_error_not_type_error(name):
     """A TRUTHY non-string `slot.name` passed the `if not name` guard and then died on

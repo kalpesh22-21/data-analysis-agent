@@ -113,6 +113,63 @@ def test_fully_planned_predicates_pass_totality():
     assert isinstance(out, ExtractedCandidate)
 
 
+def _function_horizon_param(**locator_overrides):
+    locator = {
+        "kind": "function_argument",
+        "function": "numbers",
+        "argument_index": 0,
+        "occurrence": 0,
+        "context": "table_source",
+        "value": "5",
+    }
+    locator.update(locator_overrides)
+    return {
+        "locator": locator,
+        "role": "slot",
+        "slot": {
+            "name": "forecast_months",
+            "type": "relative_window",
+            "binds_to": None,
+            "required": True,
+        },
+    }
+
+
+def test_function_argument_horizon_is_a_valid_additive_locator():
+    raw = blueprint_raw(
+        parameterization=[_function_horizon_param()], source_refs=("tc1",)
+    )
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="tc1", sql="SELECT number FROM numbers(5)"),)
+    )
+    out = _validate(raw, summary=summary)
+    assert isinstance(out, ExtractedCandidate)
+    locator = out.payload.parameterization[0].locator
+    assert locator.kind == "function_argument"
+    assert locator.to_doc() == _function_horizon_param()["locator"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"function": "range"},
+        {"argument_index": 1},
+        {"context": "expression"},
+        {"value": "0"},
+    ],
+)
+def test_function_argument_horizon_rejects_broader_structural_edits(change):
+    raw = blueprint_raw(
+        parameterization=[_function_horizon_param(**change)], source_refs=("tc1",)
+    )
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="tc1", sql="SELECT number FROM numbers(5)"),)
+    )
+    out = _validate(raw, summary=summary)
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+
+
 # --- item 6: unrewritable SQL → fail-to-review (D52) ------------------------
 
 

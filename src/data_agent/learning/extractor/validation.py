@@ -624,23 +624,62 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
                 'column) and "value" (the literal as it appeared)'
             ),
         )
+        locator_kind = optional(
+            loc,
+            "kind",
+            as_text,
+            at=loc_at,
+            requirement="'column_predicate' or 'function_argument'",
+            default="column_predicate",
+        )
+        if locator_kind == "function_argument":
+            function = require(
+                loc, "function", as_text, at=loc_at, requirement="the allowlisted function name"
+            )
+            argument_index = require(
+                loc,
+                "argument_index",
+                as_int,
+                at=loc_at,
+                requirement="a zero-based integer argument index",
+            )
+            occurrence = optional(
+                loc,
+                "occurrence",
+                as_int,
+                at=loc_at,
+                requirement="a zero-based integer occurrence",
+                default=0,
+            )
+            context = require(
+                loc, "context", as_text, at=loc_at, requirement="the locator context"
+            )
+            table = ""
+            column = ""
+        else:
+            function = None
+            argument_index = None
+            occurrence = 0
+            context = None
+            table = require(
+                loc,
+                "table",
+                as_text,
+                at=loc_at,
+                requirement="the 'database.table' the column belongs to",
+            )
+            column = require(
+                loc,
+                "column",
+                as_text,
+                at=loc_at,
+                requirement="the BARE column name, with no table prefix",
+            )
         plans.append(
             ParamPlan(
                 locator=Locator(
-                    table=require(
-                        loc,
-                        "table",
-                        as_text,
-                        at=loc_at,
-                        requirement="the 'database.table' the column belongs to",
-                    ),
-                    column=require(
-                        loc,
-                        "column",
-                        as_text,
-                        at=loc_at,
-                        requirement="the BARE column name, with no table prefix",
-                    ),
+                    table=table,
+                    column=column,
                     value=_bare_locator_value(
                         require(
                             loc,
@@ -652,6 +691,11 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
                             ),
                         )
                     ),
+                    kind=locator_kind,
+                    function=function,
+                    argument_index=argument_index,
+                    occurrence=occurrence,
+                    context=context,
                 ),
                 # Presence and stringness only. An unknown role string still declines
                 # `role_inconsistent` in `_validate_roles`, which is where the roles and
@@ -996,6 +1040,53 @@ def _validate_roles(
     """
     for index, p in enumerate(params):
         at = f"candidate.payload.parameterization[{index}]"
+        if p.locator.kind == "function_argument":
+            mismatches: list[str] = []
+            if p.role != "slot":
+                mismatches.append(f"role={p.role!r} (expected 'slot')")
+            if p.locator.function is None or p.locator.function.lower() != "numbers":
+                mismatches.append(
+                    f"locator.function={p.locator.function!r} (expected 'numbers')"
+                )
+            if p.locator.argument_index != 0:
+                mismatches.append(
+                    f"locator.argument_index={p.locator.argument_index!r} (expected 0)"
+                )
+            if p.locator.occurrence < 0:
+                mismatches.append(
+                    f"locator.occurrence={p.locator.occurrence!r} (expected >= 0)"
+                )
+            if p.locator.context != "table_source":
+                mismatches.append(
+                    f"locator.context={p.locator.context!r} (expected 'table_source')"
+                )
+            if p.slot is None:
+                mismatches.append("slot=null (expected a slot object)")
+            else:
+                if p.slot.type != "relative_window":
+                    mismatches.append(
+                        f"slot.type={p.slot.type!r} (expected 'relative_window')"
+                    )
+                if not p.slot.required:
+                    mismatches.append("slot.required=false (expected true)")
+            if mismatches:
+                return _role_shape(
+                    f"{at}: a function_argument locator is supported only as a required "
+                    "relative_window slot targeting argument 0 of an occurrence of the "
+                    f"table-source function numbers(...); fix: {', '.join(mismatches)}"
+                )
+            try:
+                horizon = int(p.locator.value)
+            except ValueError:
+                horizon = 0
+            if str(horizon) != p.locator.value or not 1 <= horizon <= 120:
+                return _role_shape(
+                    f"{at}.locator.value must be a canonical positive integer from 1 to 120"
+                )
+        elif p.locator.kind != "column_predicate":
+            return _role_shape(
+                f"{at}.locator.kind must be 'column_predicate' or 'function_argument'"
+            )
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
                 return _role_shape(
@@ -1221,7 +1312,8 @@ def _validate_totality(
                 covering = [
                     (index, plan)
                     for index, plan in enumerate(plans)
-                    if plan.locator.column.lower() == pred.column.lower()
+                    if plan.locator.kind == "column_predicate"
+                    and plan.locator.column.lower() == pred.column.lower()
                     and plan.locator.value == pred.value
                     and _table_compatible(plan.locator.table, pred.table)
                 ]

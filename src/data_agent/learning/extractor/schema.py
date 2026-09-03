@@ -45,7 +45,7 @@ _EVIDENCE_SCHEMA = {
     "required": ["turn_ref", "tool_call_ref", "quote"],
 }
 
-_LOCATOR_SCHEMA = {
+_COLUMN_LOCATOR_SCHEMA = {
     "type": "object",
     "properties": {
         "table": {
@@ -62,6 +62,34 @@ _LOCATOR_SCHEMA = {
         },
     },
     "required": ["table", "column", "value"],
+}
+
+_FUNCTION_ARGUMENT_LOCATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"const": "function_argument"},
+        "function": {
+            "type": "string",
+            "enum": ["numbers"],
+            "description": "The allowlisted table-source function containing the horizon.",
+        },
+        "argument_index": {"type": "integer", "const": 0},
+        "occurrence": {"type": "integer", "minimum": 0},
+        "context": {"type": "string", "const": "table_source"},
+        "value": {
+            "type": "string",
+            "description": "The positive integer argument as authored, without SQL quoting.",
+        },
+    },
+    "required": ["kind", "function", "argument_index", "occurrence", "context", "value"],
+}
+
+_LOCATOR_SCHEMA = {
+    "description": (
+        "A legacy column predicate locator, or the numeric horizon argument of the "
+        "allowlisted table-source function numbers(...)."
+    ),
+    "oneOf": [_COLUMN_LOCATOR_SCHEMA, _FUNCTION_ARGUMENT_LOCATOR_SCHEMA],
 }
 
 _SLOT_SCHEMA = {
@@ -194,7 +222,8 @@ _BLUEPRINT_PAYLOAD_SCHEMA = {
             "items": _PARAM_PLAN_SCHEMA,
             "description": (
                 "Exactly one entry per literal predicate in the WHERE / JOIN-ON clause, "
-                "each classified slot|rule|inline (no drop). Do NOT add an entry for the "
+                "plus a supported function_argument horizon when present; classify each "
+                "as slot|rule|inline (no drop). Do NOT add an entry for the "
                 "aggregated metric column."
             ),
         },
@@ -415,7 +444,8 @@ def build_extractor_tool() -> dict[str, Any]:
             "session. Emit a PLAN only — never SQL. Every candidate MUST cite at least "
             "one evidence quote from the session (turn_ref + tool_call_ref). For a "
             "blueprint, parameterization must have exactly one entry per literal "
-            "predicate of the accepted SQL, each classified slot|rule|inline (no drop)."
+            "predicate of the accepted SQL, plus supported structural horizon entries; "
+            "classify each as slot|rule|inline (no drop)."
         ),
         "parameters": _PARAMETERS_SCHEMA,
     }

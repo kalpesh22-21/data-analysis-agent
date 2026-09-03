@@ -122,11 +122,25 @@ class CandidateHeader:
 
 @dataclass(frozen=True)
 class Locator:
-    table: str  # "database.table"
+    table: str  # "database.table" for a column_predicate locator; empty otherwise
     column: str
     value: str  # the literal as it appeared (pre-generalization)
+    kind: str = "column_predicate"
+    function: str | None = None
+    argument_index: int | None = None
+    occurrence: int = 0
+    context: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
+        if self.kind == "function_argument":
+            return {
+                "kind": self.kind,
+                "function": self.function,
+                "argument_index": self.argument_index,
+                "occurrence": self.occurrence,
+                "context": self.context,
+                "value": self.value,
+            }
         return {"table": self.table, "column": self.column, "value": self.value}
 
 
