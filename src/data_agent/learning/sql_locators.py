@@ -108,3 +108,42 @@ def interval_argument(
     if require_value_match and str(argument.this) != str(locator.get("value")):
         return None
     return argument
+
+
+def in_list_predicates(ast: exp.Expression, column: str) -> list[exp.In]:
+    """Every literal-only IN predicate for *column*, in deterministic AST order."""
+    matches: list[exp.In] = []
+    for predicate in ast.find_all(exp.In):
+        columns = list(predicate.this.find_all(exp.Column))
+        if len(columns) != 1 or columns[0].name.lower() != column.lower():
+            continue
+        matches.append(predicate)
+    return matches
+
+
+def in_list(
+    ast: exp.Expression, locator: dict[str, Any], *, require_value_match: bool = True
+) -> exp.In | None:
+    """Resolve one literal-only IN list as a single typed-list bind site."""
+    column = locator.get("column")
+    occurrence = locator.get("occurrence", 0)
+    if (
+        not isinstance(column, str)
+        or not column
+        or locator.get("context") != "in_predicate"
+        or not isinstance(occurrence, int)
+        or isinstance(occurrence, bool)
+        or occurrence < 0
+    ):
+        return None
+    predicates = in_list_predicates(ast, column)
+    if occurrence >= len(predicates):
+        return None
+    predicate = predicates[occurrence]
+    members = predicate.expressions
+    if not members or not all(isinstance(member, exp.Literal) for member in members):
+        return None
+    value = ",".join(str(member.this) for member in members)
+    if require_value_match and value != str(locator.get("value")):
+        return None
+    return predicate

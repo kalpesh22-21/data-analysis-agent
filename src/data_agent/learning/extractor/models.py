@@ -151,6 +151,15 @@ class Locator:
                 "context": self.context,
                 "value": self.value,
             }
+        if self.kind == "in_list":
+            return {
+                "kind": self.kind,
+                "table": self.table,
+                "column": self.column,
+                "occurrence": self.occurrence,
+                "context": self.context,
+                "value": self.value,
+            }
         return {"table": self.table, "column": self.column, "value": self.value}
 
 

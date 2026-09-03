@@ -6,8 +6,10 @@ Matrix rows 1/8/9/6/5/11 (task items 1,2,3,4,5,6).
 from __future__ import annotations
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from data_agent.learning.extractor.models import BlueprintPayload, Decline, ExtractedCandidate
+from data_agent.learning.extractor.schema import build_extractor_tool
 from data_agent.learning.extractor.validation import (
     REASON_BAD_ROLE,
     REASON_MALFORMED,
@@ -185,6 +187,80 @@ def test_function_argument_stale_value_is_correctable_before_rewrite():
     assert out.correctable is True
     assert ".locator.value='6'" in out.detail
     assert "occurrence 0 has value '5'" in out.detail
+    assert "Change only locator.value" in out.detail
+
+
+def _in_list_param(*, value="Sales,Finance", slot_type="list", **locator_overrides):
+    locator = {
+        "kind": "in_list",
+        "table": "payroll.payroll_fact",
+        "column": "department",
+        "occurrence": 0,
+        "context": "in_predicate",
+        "value": value,
+    }
+    locator.update(locator_overrides)
+    return {
+        "locator": locator,
+        "role": "slot",
+        "slot": {
+            "name": "departments",
+            "type": slot_type,
+            "binds_to": "payroll.payroll_fact.department",
+            "required": True,
+        },
+    }
+
+
+def test_in_list_locator_covers_one_predicate_and_parses_as_list_slot():
+    sql = "SELECT department FROM payroll.payroll_fact WHERE department IN ('Sales','Finance')"
+    raw = blueprint_raw(parameterization=[_in_list_param()], source_refs=("tc1",))
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, ExtractedCandidate)
+    assert out.payload.parameterization[0].locator.to_doc() == _in_list_param()["locator"]
+
+
+def test_in_list_locator_satisfies_exactly_one_tool_schema_branch():
+    tool = build_extractor_tool()
+    item = tool["parameters"]["properties"]["candidates"]["items"]
+    blueprint_branch = next(
+        branch
+        for branch in item["allOf"]
+        if branch["if"]["properties"]["type"].get("const") == "blueprint"
+    )
+    payload_schema = blueprint_branch["then"]["properties"]["payload"]
+    locator_schema = payload_schema["properties"]["parameterization"]["items"][
+        "properties"
+    ]["locator"]
+
+    errors = list(Draft202012Validator(locator_schema).iter_errors(_in_list_param()["locator"]))
+
+    assert errors == []
+
+
+def test_in_list_locator_rejects_scalar_slot_type_with_actionable_hint():
+    sql = "SELECT department FROM payroll.payroll_fact WHERE department IN ('Sales','Finance')"
+    raw = blueprint_raw(
+        parameterization=[_in_list_param(slot_type="entity")], source_refs=("tc1",)
+    )
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "expected 'list'" in out.detail
+
+
+def test_in_list_stale_value_reports_the_exact_accepted_members():
+    sql = "SELECT department FROM payroll.payroll_fact WHERE department IN ('Sales','Finance')"
+    raw = blueprint_raw(
+        parameterization=[_in_list_param(value="Sales,Legal")], source_refs=("tc1",)
+    )
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "occurrence 0 has value 'Sales,Finance'" in out.detail
     assert "Change only locator.value" in out.detail
 
 

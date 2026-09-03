@@ -9,6 +9,7 @@ import pytest
 from data_agent.learning.generalize.builder import generalize_blueprint
 from data_agent.learning.generalize.rewrite import RewriteError, rewrite_sql_to_template
 from data_agent.learning.generalize.validate import check_read_only_select
+from data_agent.runtime.blueprint.template import bind_template
 
 from .helpers import CATALOG
 
@@ -130,6 +131,44 @@ def test_interval_occurrence_does_not_slide_past_an_unsupported_site():
         },
         "role": "slot", "slot": {"name": "historical_years"},
     }]
+    with pytest.raises(RewriteError, match="not found"):
+        rewrite_sql_to_template(sql, parameterization, strict=True)
+
+
+def test_in_list_becomes_one_typed_list_slot_without_double_parentheses():
+    sql = "SELECT department FROM payroll.payroll_fact WHERE department IN ('Sales','Finance')"
+    parameterization = [{
+        "locator": {
+            "kind": "in_list", "table": "payroll.payroll_fact",
+            "column": "department", "occurrence": 0,
+            "context": "in_predicate", "value": "Sales,Finance",
+        },
+        "role": "slot", "slot": {"name": "departments"},
+    }]
+
+    template = rewrite_sql_to_template(sql, parameterization, strict=True)
+
+    assert "department IN {departments}" in template
+    assert "IN ({departments})" not in template
+    assert "department IN ('Legal', 'HR')" in bind_template(
+        template, {"departments": ["Legal", "HR"]}
+    )
+
+
+def test_in_list_occurrence_does_not_slide_to_a_later_matching_value():
+    sql = (
+        "SELECT department FROM payroll.payroll_fact "
+        "WHERE department IN (lower('Sales')) OR department IN ('Sales','Finance')"
+    )
+    parameterization = [{
+        "locator": {
+            "kind": "in_list", "table": "payroll.payroll_fact",
+            "column": "department", "occurrence": 0,
+            "context": "in_predicate", "value": "Sales,Finance",
+        },
+        "role": "slot", "slot": {"name": "departments"},
+    }]
+
     with pytest.raises(RewriteError, match="not found"):
         rewrite_sql_to_template(sql, parameterization, strict=True)
 

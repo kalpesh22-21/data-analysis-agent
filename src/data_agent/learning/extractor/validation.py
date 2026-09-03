@@ -27,6 +27,8 @@ from data_agent.runtime.blueprint.template import (
 
 from ..sql_locators import (
     function_argument,
+    in_list,
+    in_list_predicates,
     interval_argument,
     interval_arguments,
     table_source_function_calls,
@@ -639,7 +641,9 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
             "kind",
             as_text,
             at=loc_at,
-            requirement="'column_predicate', 'function_argument', or 'interval_argument'",
+            requirement=(
+                "'column_predicate', 'function_argument', 'interval_argument', or 'in_list'"
+            ),
             default="column_predicate",
         )
         if locator_kind == "function_argument":
@@ -678,6 +682,25 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
             unit = require(loc, "unit", as_text, at=loc_at, requirement="an interval unit")
             table = ""
             column = ""
+        elif locator_kind == "in_list":
+            function = None
+            unit = None
+            argument_index = None
+            occurrence = optional(
+                loc, "occurrence", as_int, at=loc_at,
+                requirement="a zero-based integer occurrence", default=0,
+            )
+            context = require(
+                loc, "context", as_text, at=loc_at, requirement="'in_predicate'"
+            )
+            table = require(
+                loc, "table", as_text, at=loc_at,
+                requirement="the 'database.table' the column belongs to",
+            )
+            column = require(
+                loc, "column", as_text, at=loc_at,
+                requirement="the BARE column name, with no table prefix",
+            )
         else:
             function = None
             argument_index = None
@@ -1144,9 +1167,32 @@ def _validate_roles(
                 magnitude = 0
             if str(magnitude) != p.locator.value or not 1 <= magnitude <= 120:
                 return _role_shape(f"{at}.locator.value must be a canonical positive integer from 1 to 120")
+        elif p.locator.kind == "in_list":
+            mismatches = []
+            if p.role != "slot":
+                mismatches.append(f"role={p.role!r} (expected 'slot')")
+            if p.locator.context != "in_predicate":
+                mismatches.append(
+                    f"locator.context={p.locator.context!r} (expected 'in_predicate')"
+                )
+            if p.locator.occurrence < 0:
+                mismatches.append(
+                    f"locator.occurrence={p.locator.occurrence!r} (expected >= 0)"
+                )
+            if p.slot is None or p.slot.type != "list":
+                actual = None if p.slot is None else p.slot.type
+                mismatches.append(f"slot.type={actual!r} (expected 'list')")
+            elif not p.slot.required:
+                mismatches.append("slot.required=false (expected true)")
+            if mismatches:
+                return _role_shape(
+                    f"{at}: an in_list locator must be a required list slot; fix: "
+                    + ", ".join(mismatches)
+                )
         elif p.locator.kind != "column_predicate":
             return _role_shape(
-                f"{at}.locator.kind must be 'column_predicate', 'function_argument', or 'interval_argument'"
+                f"{at}.locator.kind must be 'column_predicate', 'function_argument', "
+                "'interval_argument', or 'in_list'"
             )
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
@@ -1373,7 +1419,7 @@ def _validate_totality(
                 covering = [
                     (index, plan)
                     for index, plan in enumerate(plans)
-                    if plan.locator.kind == "column_predicate"
+                    if plan.locator.kind in ("column_predicate", "in_list")
                     and plan.locator.column.lower() == pred.column.lower()
                     and plan.locator.value == pred.value
                     and _table_compatible(plan.locator.table, pred.table)
@@ -1439,7 +1485,7 @@ def _validate_structural_locators(
     structural = [
         (index, plan)
         for index, plan in enumerate(payload.parameterization)
-        if plan.locator.kind in ("function_argument", "interval_argument")
+        if plan.locator.kind in ("function_argument", "interval_argument", "in_list")
     ]
     if not structural:
         return None
@@ -1455,11 +1501,11 @@ def _validate_structural_locators(
 
     for index, plan in structural:
         locator = plan.locator.to_doc()
-        resolver = (
-            function_argument
-            if plan.locator.kind == "function_argument"
-            else interval_argument
-        )
+        resolver = {
+            "function_argument": function_argument,
+            "interval_argument": interval_argument,
+            "in_list": in_list,
+        }[plan.locator.kind]
         if any(resolver(ast, locator) is not None for ast in parsed):
             continue
 
@@ -1471,10 +1517,15 @@ def _validate_structural_locators(
                 len(table_source_function_calls(ast, plan.locator.function or ""))
                 for ast in parsed
             ]
-        else:
+        elif plan.locator.kind == "interval_argument":
             subject = f"INTERVAL {plan.locator.unit}"
             available_counts = [
                 len(interval_arguments(ast, plan.locator.unit or "")) for ast in parsed
+            ]
+        else:
+            subject = f"IN list for column {plan.locator.column}"
+            available_counts = [
+                len(in_list_predicates(ast, plan.locator.column)) for ast in parsed
             ]
         selected = [
             resolver(ast, locator, require_value_match=False)
@@ -1482,7 +1533,16 @@ def _validate_structural_locators(
         ]
         selected = [argument for argument in selected if argument is not None]
         if selected:
-            actual_values = sorted({str(argument.this) for argument in selected})
+            actual_values = sorted(
+                {
+                    (
+                        ",".join(str(member.this) for member in argument.expressions)
+                        if isinstance(argument, exp.In)
+                        else str(argument.this)
+                    )
+                    for argument in selected
+                }
+            )
             expected = actual_values[0] if len(actual_values) == 1 else actual_values
             return _role_shape(
                 f"{at}.value={plan.locator.value!r} does not match the accepted SQL; "
@@ -1506,11 +1566,16 @@ def _validate_structural_locators(
                 "locator.occurrence; the accepted SQL is fixed."
             )
 
+        supported_shape = (
+            "literal-only IN list"
+            if plan.locator.kind == "in_list"
+            else "integer literal"
+        )
         return Decline(
             "blueprint",
             REASON_UNREWRITABLE,
             f"{at} points to a structural argument whose SQL expression is not a supported "
-            "integer literal",
+            f"{supported_shape}",
         )
     return None
 

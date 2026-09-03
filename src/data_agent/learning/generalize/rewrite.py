@@ -28,7 +28,7 @@ from ...runtime.blueprint.template import (
     referenced_slots,
 )
 from ..extractor.sql_predicates import literal_predicates
-from ..sql_locators import function_argument, function_name, interval_argument
+from ..sql_locators import function_argument, function_name, in_list, interval_argument
 
 # Comparison / membership predicates whose literal operand a slot can parameterize.
 _COMPARISONS: tuple[type[exp.Expression], ...] = (
@@ -327,6 +327,12 @@ def rewrite_sql_to_template(
             locator_description = (
                 f"INTERVAL {locator.get('unit')} occurrence {locator.get('occurrence', 0)}"
             )
+        elif locator_kind == "in_list":
+            literal = in_list(ast, locator)
+            locator_description = (
+                f"IN list for {locator.get('column')} occurrence "
+                f"{locator.get('occurrence', 0)}"
+            )
         elif column is not None:
             literal = _find_literal(ast, column, str(value))
             locator_description = f"{column}={value!r}"
@@ -373,7 +379,10 @@ def rewrite_sql_to_template(
                     "into the template as text, so anything else is SQL authored by "
                     "whoever wrote the plan (fail-to-review)."
                 )
-            literal.replace(exp.Placeholder(this=name))
+            if locator_kind == "in_list":
+                literal.set("expressions", [exp.Placeholder(this=name)])
+            else:
+                literal.replace(exp.Placeholder(this=name))
             slot_names.append(name)
         # role == "rule": KEEP THE PREDICATE, ANNOTATE THE BLUEPRINT. The literal was
         # LOCATED above (a miss is still a strict `RewriteError` — a plan naming a
@@ -422,5 +431,8 @@ def rewrite_sql_to_template(
         # grammar `INTERVAL {n} UNIT`; remove only the parentheses around tokens this
         # rewrite created, never arbitrary authored expressions.
         rendered = rendered.replace(f"INTERVAL ({{{name}}}) ", f"INTERVAL {{{name}}} ")
+        # A list binding expands to its own tuple. Keeping sqlglot's IN-parentheses
+        # would bind `IN (('a', 'b'))` (one tuple member) instead of `IN ('a', 'b')`.
+        rendered = rendered.replace(f" IN ({{{name}}})", f" IN {{{name}}}")
     _check_rewritten(rendered, before, ast)
     return rendered

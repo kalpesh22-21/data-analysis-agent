@@ -48,6 +48,9 @@ _EVIDENCE_SCHEMA = {
 _COLUMN_LOCATOR_SCHEMA = {
     "type": "object",
     "properties": {
+        # Optional for backward compatibility. When present, the const keeps an
+        # `in_list` locator from also satisfying this branch of `_LOCATOR_SCHEMA.oneOf`.
+        "kind": {"const": "column_predicate"},
         "table": {
             "type": "string",
             "description": "The fully-qualified 'database.table' the column belongs to.",
@@ -97,14 +100,31 @@ _INTERVAL_ARGUMENT_LOCATOR_SCHEMA = {
     "required": ["kind", "unit", "occurrence", "context", "value"],
 }
 
+_IN_LIST_LOCATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"const": "in_list"},
+        "table": {"type": "string", "description": "The fully-qualified database.table."},
+        "column": {"type": "string", "description": "The bare left-hand column name."},
+        "occurrence": {"type": "integer", "minimum": 0},
+        "context": {"type": "string", "const": "in_predicate"},
+        "value": {
+            "type": "string",
+            "description": "The ordered bare literal members joined by commas.",
+        },
+    },
+    "required": ["kind", "table", "column", "occurrence", "context", "value"],
+}
+
 _LOCATOR_SCHEMA = {
     "description": (
-        "A column predicate, numbers(...) cardinality, or INTERVAL magnitude locator."
+        "A column predicate, typed IN-list, numbers(...) cardinality, or INTERVAL locator."
     ),
     "oneOf": [
         _COLUMN_LOCATOR_SCHEMA,
         _FUNCTION_ARGUMENT_LOCATOR_SCHEMA,
         _INTERVAL_ARGUMENT_LOCATOR_SCHEMA,
+        _IN_LIST_LOCATOR_SCHEMA,
     ],
 }
 
@@ -125,6 +145,7 @@ _SLOT_SCHEMA = {
                 "the SQL expresses a trailing window, rather than falling back to "
                 "'period' or 'string'. 'positive_integer' is a non-temporal whole-number "
                 "count such as the cardinality in numbers(N)."
+                " 'list' is a set of values bound together into one IN predicate."
             ),
         },
         "binds_to": {
