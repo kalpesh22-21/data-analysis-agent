@@ -147,3 +147,31 @@ def in_list(
     if require_value_match and value != str(locator.get("value")):
         return None
     return predicate
+
+
+def limit_arguments(ast: exp.Expression) -> list[exp.Expression]:
+    """Every LIMIT expression in deterministic AST order, including unsupported ones."""
+    return [limit.expression for limit in ast.find_all(exp.Limit)]
+
+
+def limit_argument(
+    ast: exp.Expression, locator: dict[str, Any], *, require_value_match: bool = True
+) -> exp.Literal | None:
+    """Resolve a positive integer LIMIT while excluding OFFSET and expression limits."""
+    occurrence = locator.get("occurrence", 0)
+    if (
+        locator.get("context") != "limit"
+        or not isinstance(occurrence, int)
+        or isinstance(occurrence, bool)
+        or occurrence < 0
+    ):
+        return None
+    arguments = limit_arguments(ast)
+    if occurrence >= len(arguments):
+        return None
+    argument = arguments[occurrence]
+    if not isinstance(argument, exp.Literal) or not str(argument.this).isdigit():
+        return None
+    if require_value_match and str(argument.this) != str(locator.get("value")):
+        return None
+    return argument

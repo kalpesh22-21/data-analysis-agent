@@ -173,6 +173,39 @@ def test_in_list_occurrence_does_not_slide_to_a_later_matching_value():
         rewrite_sql_to_template(sql, parameterization, strict=True)
 
 
+def test_limit_argument_becomes_a_positive_integer_slot():
+    sql = "SELECT employee_code FROM dbpcm_warehouse.employee ORDER BY employee_code LIMIT 5"
+    parameterization = [{
+        "locator": {
+            "kind": "limit_argument", "occurrence": 0,
+            "context": "limit", "value": "5",
+        },
+        "role": "slot", "slot": {"name": "result_count"},
+    }]
+
+    template = rewrite_sql_to_template(sql, parameterization, strict=True)
+
+    assert template.endswith("LIMIT {result_count}")
+    assert bind_template(template, {"result_count": 3}).endswith("LIMIT 3")
+
+
+def test_limit_occurrence_does_not_slide_past_an_expression_limit():
+    sql = (
+        "WITH unsupported AS (SELECT 1 LIMIT 2 + 3), "
+        "supported AS (SELECT 2 LIMIT 5) SELECT * FROM supported"
+    )
+    parameterization = [{
+        "locator": {
+            "kind": "limit_argument", "occurrence": 0,
+            "context": "limit", "value": "5",
+        },
+        "role": "slot", "slot": {"name": "result_count"},
+    }]
+
+    with pytest.raises(RewriteError, match="not found"):
+        rewrite_sql_to_template(sql, parameterization, strict=True)
+
+
 def test_function_argument_occurrence_is_structural_and_exact():
     sql = "SELECT * FROM numbers(3) a CROSS JOIN numbers(5) b"
     template = rewrite_sql_to_template(

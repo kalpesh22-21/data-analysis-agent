@@ -116,6 +116,17 @@ _IN_LIST_LOCATOR_SCHEMA = {
     "required": ["kind", "table", "column", "occurrence", "context", "value"],
 }
 
+_LIMIT_ARGUMENT_LOCATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"const": "limit_argument"},
+        "occurrence": {"type": "integer", "minimum": 0},
+        "context": {"type": "string", "const": "limit"},
+        "value": {"type": "string", "description": "The positive integer LIMIT value."},
+    },
+    "required": ["kind", "occurrence", "context", "value"],
+}
+
 _LOCATOR_SCHEMA = {
     "description": (
         "A column predicate, typed IN-list, numbers(...) cardinality, or INTERVAL locator."
@@ -125,6 +136,7 @@ _LOCATOR_SCHEMA = {
         _FUNCTION_ARGUMENT_LOCATOR_SCHEMA,
         _INTERVAL_ARGUMENT_LOCATOR_SCHEMA,
         _IN_LIST_LOCATOR_SCHEMA,
+        _LIMIT_ARGUMENT_LOCATOR_SCHEMA,
     ],
 }
 

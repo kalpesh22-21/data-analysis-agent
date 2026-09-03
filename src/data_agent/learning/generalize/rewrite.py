@@ -28,7 +28,13 @@ from ...runtime.blueprint.template import (
     referenced_slots,
 )
 from ..extractor.sql_predicates import literal_predicates
-from ..sql_locators import function_argument, function_name, in_list, interval_argument
+from ..sql_locators import (
+    function_argument,
+    function_name,
+    in_list,
+    interval_argument,
+    limit_argument,
+)
 
 # Comparison / membership predicates whose literal operand a slot can parameterize.
 _COMPARISONS: tuple[type[exp.Expression], ...] = (
@@ -333,6 +339,9 @@ def rewrite_sql_to_template(
                 f"IN list for {locator.get('column')} occurrence "
                 f"{locator.get('occurrence', 0)}"
             )
+        elif locator_kind == "limit_argument":
+            literal = limit_argument(ast, locator)
+            locator_description = f"LIMIT occurrence {locator.get('occurrence', 0)}"
         elif column is not None:
             literal = _find_literal(ast, column, str(value))
             locator_description = f"{column}={value!r}"

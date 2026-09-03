@@ -160,6 +160,13 @@ class Locator:
                 "context": self.context,
                 "value": self.value,
             }
+        if self.kind == "limit_argument":
+            return {
+                "kind": self.kind,
+                "occurrence": self.occurrence,
+                "context": self.context,
+                "value": self.value,
+            }
         return {"table": self.table, "column": self.column, "value": self.value}
 
 

@@ -31,6 +31,8 @@ from ..sql_locators import (
     in_list_predicates,
     interval_argument,
     interval_arguments,
+    limit_argument,
+    limit_arguments,
     table_source_function_calls,
 )
 from ..summary.models import AcceptedSignal, SessionSummary
@@ -642,7 +644,8 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
             as_text,
             at=loc_at,
             requirement=(
-                "'column_predicate', 'function_argument', 'interval_argument', or 'in_list'"
+                "'column_predicate', 'function_argument', 'interval_argument', 'in_list', "
+                "or 'limit_argument'"
             ),
             default="column_predicate",
         )
@@ -701,6 +704,17 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
                 loc, "column", as_text, at=loc_at,
                 requirement="the BARE column name, with no table prefix",
             )
+        elif locator_kind == "limit_argument":
+            function = None
+            unit = None
+            argument_index = None
+            occurrence = optional(
+                loc, "occurrence", as_int, at=loc_at,
+                requirement="a zero-based integer occurrence", default=0,
+            )
+            context = require(loc, "context", as_text, at=loc_at, requirement="'limit'")
+            table = ""
+            column = ""
         else:
             function = None
             argument_index = None
@@ -1189,10 +1203,38 @@ def _validate_roles(
                     f"{at}: an in_list locator must be a required list slot; fix: "
                     + ", ".join(mismatches)
                 )
+        elif p.locator.kind == "limit_argument":
+            mismatches = []
+            if p.role != "slot":
+                mismatches.append(f"role={p.role!r} (expected 'slot')")
+            if p.locator.context != "limit":
+                mismatches.append(f"locator.context={p.locator.context!r} (expected 'limit')")
+            if p.locator.occurrence < 0:
+                mismatches.append(
+                    f"locator.occurrence={p.locator.occurrence!r} (expected >= 0)"
+                )
+            if p.slot is None or p.slot.type != "positive_integer":
+                actual = None if p.slot is None else p.slot.type
+                mismatches.append(f"slot.type={actual!r} (expected 'positive_integer')")
+            elif not p.slot.required:
+                mismatches.append("slot.required=false (expected true)")
+            if mismatches:
+                return _role_shape(
+                    f"{at}: a limit_argument must be a required positive_integer slot; fix: "
+                    + ", ".join(mismatches)
+                )
+            try:
+                limit = int(p.locator.value)
+            except ValueError:
+                limit = 0
+            if str(limit) != p.locator.value or not 1 <= limit <= 10_000:
+                return _role_shape(
+                    f"{at}.locator.value must be a canonical positive integer from 1 to 10000"
+                )
         elif p.locator.kind != "column_predicate":
             return _role_shape(
                 f"{at}.locator.kind must be 'column_predicate', 'function_argument', "
-                "'interval_argument', or 'in_list'"
+                "'interval_argument', 'in_list', or 'limit_argument'"
             )
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
@@ -1485,7 +1527,9 @@ def _validate_structural_locators(
     structural = [
         (index, plan)
         for index, plan in enumerate(payload.parameterization)
-        if plan.locator.kind in ("function_argument", "interval_argument", "in_list")
+        if plan.locator.kind in (
+            "function_argument", "interval_argument", "in_list", "limit_argument"
+        )
     ]
     if not structural:
         return None
@@ -1505,6 +1549,7 @@ def _validate_structural_locators(
             "function_argument": function_argument,
             "interval_argument": interval_argument,
             "in_list": in_list,
+            "limit_argument": limit_argument,
         }[plan.locator.kind]
         if any(resolver(ast, locator) is not None for ast in parsed):
             continue
@@ -1522,11 +1567,14 @@ def _validate_structural_locators(
             available_counts = [
                 len(interval_arguments(ast, plan.locator.unit or "")) for ast in parsed
             ]
-        else:
+        elif plan.locator.kind == "in_list":
             subject = f"IN list for column {plan.locator.column}"
             available_counts = [
                 len(in_list_predicates(ast, plan.locator.column)) for ast in parsed
             ]
+        else:
+            subject = "LIMIT"
+            available_counts = [len(limit_arguments(ast)) for ast in parsed]
         selected = [
             resolver(ast, locator, require_value_match=False)
             for ast in parsed

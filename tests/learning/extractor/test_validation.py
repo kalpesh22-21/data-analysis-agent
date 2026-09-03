@@ -264,6 +264,58 @@ def test_in_list_stale_value_reports_the_exact_accepted_members():
     assert "Change only locator.value" in out.detail
 
 
+def _limit_param(*, value="5", slot_type="positive_integer", **locator_overrides):
+    locator = {
+        "kind": "limit_argument",
+        "occurrence": 0,
+        "context": "limit",
+        "value": value,
+    }
+    locator.update(locator_overrides)
+    return {
+        "locator": locator,
+        "role": "slot",
+        "slot": {
+            "name": "result_count",
+            "type": slot_type,
+            "binds_to": None,
+            "required": True,
+        },
+    }
+
+
+def test_limit_argument_is_a_valid_positive_integer_slot():
+    sql = "SELECT employee_code FROM dbpcm_warehouse.employee ORDER BY employee_code LIMIT 5"
+    raw = blueprint_raw(parameterization=[_limit_param()], source_refs=("tc1",))
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, ExtractedCandidate)
+    assert out.payload.parameterization[0].locator.to_doc() == _limit_param()["locator"]
+
+
+def test_limit_argument_stale_value_is_correctable():
+    sql = "SELECT employee_code FROM dbpcm_warehouse.employee LIMIT 5"
+    raw = blueprint_raw(parameterization=[_limit_param(value="10")], source_refs=("tc1",))
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "occurrence 0 has value '5'" in out.detail
+    assert "Change only locator.value" in out.detail
+
+
+def test_limit_argument_rejects_a_relative_window_slot():
+    sql = "SELECT employee_code FROM dbpcm_warehouse.employee LIMIT 5"
+    raw = blueprint_raw(
+        parameterization=[_limit_param(slot_type="relative_window")], source_refs=("tc1",)
+    )
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "expected 'positive_integer'" in out.detail
+
+
 def test_function_argument_missing_occurrence_is_correctable_before_rewrite():
     raw = blueprint_raw(
         parameterization=[_function_horizon_param(occurrence=1)], source_refs=("tc1",)
