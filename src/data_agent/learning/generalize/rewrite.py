@@ -28,6 +28,7 @@ from ...runtime.blueprint.template import (
     referenced_slots,
 )
 from ..extractor.sql_predicates import literal_predicates
+from ..sql_locators import function_argument, function_name
 
 # Comparison / membership predicates whose literal operand a slot can parameterize.
 _COMPARISONS: tuple[type[exp.Expression], ...] = (
@@ -117,22 +118,7 @@ def _find_function_argument(ast: exp.Expression, locator: dict[str, Any]) -> exp
         or locator.get("context") != "table_source"
     ):
         return None
-    occurrence = locator.get("occurrence", 0)
-    if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 0:
-        return None
-    calls: list[exp.Func] = []
-    for func in ast.find_all(exp.Func):
-        if _func_name(func).lower() != "numbers":
-            continue
-        table = func.parent
-        if isinstance(table, exp.Table) and isinstance(table.parent, (exp.From, exp.Join)):
-            calls.append(func)
-    if occurrence >= len(calls):
-        return None
-    args = calls[occurrence].args.get("expressions") or []
-    if not args or not isinstance(args[0], exp.Literal) or not args[0].is_int:
-        return None
-    return args[0] if str(args[0].this) == str(locator.get("value")) else None
+    return function_argument(ast, locator)
 
 
 def _func_name(node: exp.Expression) -> str:
@@ -141,16 +127,7 @@ def _func_name(node: exp.Expression) -> str:
     Unrecognized functions carry their spelling as a STRING in `this` (the `Anonymous` family);
     recognized ones answer `sql_name()`. Both are stable across the rewrite.
     """
-    this = node.args.get("this")
-    if isinstance(this, str) and this:
-        return this
-    sql_name = getattr(node, "sql_name", None)
-    if callable(sql_name):
-        try:
-            return str(sql_name())
-        except Exception:  # pragma: no cover — defensive
-            pass
-    return type(node).__name__.upper()
+    return function_name(node)
 
 
 def _function_shapes(ast: exp.Expression) -> Counter[tuple[str, int]]:

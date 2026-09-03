@@ -36,6 +36,7 @@ from .helpers import (
     blueprint_raw,
     make_extractor,
     make_summary,
+    make_tool_call,
     malformed_turn,
     scripted_turn,
     search_turn,
@@ -127,6 +128,48 @@ async def test_missing_shape_type_correction_names_canonical_field_and_example()
     assert "shape[0].semantic_type" not in correction
     assert len(result.candidates) == 1
     assert result.declines == ()
+
+
+async def test_stale_function_locator_correction_recovers_on_second_emission() -> None:
+    def candidate(value: str) -> dict:
+        return blueprint_raw(
+            parameterization=[
+                {
+                    "locator": {
+                        "kind": "function_argument",
+                        "function": "numbers",
+                        "argument_index": 0,
+                        "occurrence": 0,
+                        "context": "table_source",
+                        "value": value,
+                    },
+                    "role": "slot",
+                    "slot": {
+                        "name": "forecast_months",
+                        "type": "relative_window",
+                        "binds_to": None,
+                        "required": True,
+                    },
+                }
+            ]
+        )
+
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="tc1", sql="SELECT number FROM numbers(5)"),)
+    )
+    extractor = make_extractor(
+        [scripted_turn([candidate("6")]), scripted_turn([candidate("5")])]
+    )
+
+    result = await extractor.extract(summary, KEEP_VERDICT)
+
+    correction = _correction_text(extractor)
+    assert ".locator.value='6'" in correction
+    assert "occurrence 0 has value '5'" in correction
+    assert "Change only locator.value" in correction
+    assert len(result.candidates) == 1
+    assert result.declines == ()
+    assert result.corrections == 1
 
 
 async def test_the_correction_rides_on_a_tool_reply_so_no_call_is_left_dangling() -> None:

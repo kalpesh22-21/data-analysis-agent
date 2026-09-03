@@ -170,6 +170,60 @@ def test_function_argument_horizon_rejects_broader_structural_edits(change):
     assert out.reason == REASON_BAD_ROLE
 
 
+def test_function_argument_stale_value_is_correctable_before_rewrite():
+    raw = blueprint_raw(
+        parameterization=[_function_horizon_param(value="6")], source_refs=("tc1",)
+    )
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="tc1", sql="SELECT number FROM numbers(5)"),)
+    )
+
+    out = _validate(raw, summary=summary)
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert out.correctable is True
+    assert ".locator.value='6'" in out.detail
+    assert "occurrence 0 has value '5'" in out.detail
+    assert "Change only locator.value" in out.detail
+
+
+def test_function_argument_missing_occurrence_is_correctable_before_rewrite():
+    raw = blueprint_raw(
+        parameterization=[_function_horizon_param(occurrence=1)], source_refs=("tc1",)
+    )
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="tc1", sql="SELECT number FROM numbers(5)"),)
+    )
+
+    out = _validate(raw, summary=summary)
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert out.correctable is True
+    assert ".locator.occurrence=1" in out.detail
+    assert "has 1 occurrence(s)" in out.detail
+    assert "from 0 to 0" in out.detail
+    assert "Change only locator.occurrence" in out.detail
+
+
+def test_function_argument_with_no_matching_sql_site_is_terminal():
+    raw = blueprint_raw(
+        parameterization=[_function_horizon_param()], source_refs=("tc1",)
+    )
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="tc1", sql="SELECT 5 AS fixed_horizon"),)
+    )
+
+    out = _validate(raw, summary=summary)
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_UNREWRITABLE
+    assert out.correctable is False
+    assert "contains no matching structural site" in out.detail
+    assert "0 to -1" not in out.detail
+
+
 # --- item 6: unrewritable SQL → fail-to-review (D52) ------------------------
 
 

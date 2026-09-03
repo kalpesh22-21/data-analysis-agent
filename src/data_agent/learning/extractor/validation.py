@@ -19,8 +19,13 @@ from typing import Any, get_args
 import sqlglot
 import sqlglot.expressions as exp
 
-from data_agent.runtime.blueprint.template import TemplateBindError, validate_optional_pattern
+from data_agent.runtime.blueprint.template import (
+    TemplateBindError,
+    parse_template,
+    validate_optional_pattern,
+)
 
+from ..sql_locators import function_argument, table_source_function_calls
 from ..summary.models import AcceptedSignal, SessionSummary
 from ..summary.refs import sql_by_ref
 from .grounding import CatalogRule, RuleIndex
@@ -1376,6 +1381,83 @@ def _validate_totality(
     return mismatch
 
 
+def _validate_structural_locators(
+    payload: BlueprintPayload,
+    summary: SessionSummary,
+) -> Decline | None:
+    """Resolve structural locator coordinates against the immutable accepted SQL.
+
+    Role validation proves that a function locator is in the supported family. This
+    check proves that its coordinates identify an actual argument before S4. A stale
+    value or occurrence is a model-authored expression error with one mechanical fix,
+    so it is correctable; an accepted SQL expression outside the supported literal
+    shape remains the human-review valve.
+    """
+    structural = [
+        (index, plan)
+        for index, plan in enumerate(payload.parameterization)
+        if plan.locator.kind == "function_argument"
+    ]
+    if not structural:
+        return None
+
+    resolved = sql_by_ref(summary)
+    parsed: list[exp.Expression] = []
+    for ref in payload.source_tool_call_refs:
+        for sql in resolved.get(ref, ()):
+            try:
+                parsed.append(parse_template(sql))
+            except Exception:  # noqa: BLE001 - totality reports the stable terminal reason
+                return Decline("blueprint", REASON_UNREWRITABLE, f"un-parseable SQL at {ref}")
+
+    for index, plan in structural:
+        locator = plan.locator.to_doc()
+        if any(function_argument(ast, locator) is not None for ast in parsed):
+            continue
+
+        at = f"candidate.payload.parameterization[{index}].locator"
+        function = plan.locator.function or ""
+        occurrence = plan.locator.occurrence
+        available_counts = [len(table_source_function_calls(ast, function)) for ast in parsed]
+        selected = [
+            function_argument(ast, locator, require_value_match=False)
+            for ast in parsed
+        ]
+        selected = [argument for argument in selected if argument is not None]
+        if selected:
+            actual_values = sorted({str(argument.this) for argument in selected})
+            expected = actual_values[0] if len(actual_values) == 1 else actual_values
+            return _role_shape(
+                f"{at}.value={plan.locator.value!r} does not match the accepted SQL; "
+                f"occurrence {occurrence} has value {expected!r}. Change only locator.value; "
+                "the accepted SQL is fixed."
+            )
+
+        maximum = max(available_counts, default=0)
+        if maximum == 0:
+            return Decline(
+                "blueprint",
+                REASON_UNREWRITABLE,
+                f"{at} names table-source function {function}(...), but the accepted SQL "
+                "contains no matching structural site",
+            )
+        if occurrence >= maximum:
+            return _role_shape(
+                f"{at}.occurrence={occurrence} does not exist in the accepted SQL; "
+                f"the table-source function {function}(...) has {maximum} occurrence(s), "
+                f"so use a zero-based occurrence from 0 to {maximum - 1}. Change only "
+                "locator.occurrence; the accepted SQL is fixed."
+            )
+
+        return Decline(
+            "blueprint",
+            REASON_UNREWRITABLE,
+            f"{at} points to a function argument whose SQL expression is not a supported "
+            "integer literal",
+        )
+    return None
+
+
 def _first_rule_mismatch(
     covering: list[tuple[int, ParamPlan]],
     pred: LiteralPredicate,
@@ -1929,6 +2011,10 @@ def to_candidate(
     role_decline = _validate_roles(list(payload.parameterization), known_rules, rule_index)
     if role_decline is not None:
         return role_decline
+
+    structural_decline = _validate_structural_locators(payload, summary)
+    if structural_decline is not None:
+        return structural_decline
 
     totality_decline = _validate_totality(payload, summary, rule_index)
     if totality_decline is not None:
