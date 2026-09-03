@@ -102,6 +102,33 @@ async def test_a_shape_decline_produces_a_second_turn_that_names_the_field() -> 
     assert result.corrections == 1
 
 
+async def test_missing_shape_type_correction_names_canonical_field_and_example() -> None:
+    bad = blueprint_raw(
+        result_signature={
+            "shape": [{"column": "projected_month"}],
+            "grain": {"columns": ["projected_month"], "verifiable": True},
+            "invariants": [],
+        }
+    )
+    good = blueprint_raw(
+        result_signature={
+            "shape": [{"column": "projected_month", "type": "date"}],
+            "grain": {"columns": ["projected_month"], "verifiable": True},
+            "invariants": [],
+        }
+    )
+    extractor = make_extractor([scripted_turn([bad]), scripted_turn([good])])
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    correction = _correction_text(extractor)
+    assert "result_signature.shape[0].type is required" in correction
+    assert '"column": "projected_month", "type": "date"' in correction
+    assert "shape[0].semantic_type" not in correction
+    assert len(result.candidates) == 1
+    assert result.declines == ()
+
+
 async def test_the_correction_rides_on_a_tool_reply_so_no_call_is_left_dangling() -> None:
     """A provider rejects a follow-up whose history has an unanswered tool call, so the
     corrective turn cannot simply append a user message: the `emit_candidates` call the

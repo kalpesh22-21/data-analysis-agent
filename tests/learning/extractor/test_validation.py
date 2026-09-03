@@ -495,6 +495,42 @@ def test_result_columns_aliases_normalize_and_are_audited():
     )
 
 
+def test_missing_result_shape_type_names_canonical_key_and_gives_example():
+    raw = blueprint_raw(
+        result_signature={
+            "shape": [{"column": "projected_month"}],
+            "grain": {"columns": ["projected_month"], "verifiable": True},
+            "invariants": [],
+        }
+    )
+
+    out = _validate(raw)
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert out.correctable is True
+    assert "result_signature.shape[0].type is required" in out.detail
+    assert '"column": "projected_month", "type": "date"' in out.detail
+    assert "shape[0].semantic_type" not in out.detail
+
+
+def test_missing_result_shape_column_names_canonical_key_not_alias():
+    raw = blueprint_raw(
+        result_signature={
+            "shape": [{"type": "date"}],
+            "grain": {"columns": ["projected_month"], "verifiable": True},
+            "invariants": [],
+        }
+    )
+
+    out = _validate(raw)
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert "result_signature.shape[0].column is required" in out.detail
+    assert "shape[0].name" not in out.detail
+
+
 def test_verifiable_grain_requires_a_nonempty_result_shape():
     raw = blueprint_raw(
         result_signature={

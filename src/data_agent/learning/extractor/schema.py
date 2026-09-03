@@ -162,9 +162,26 @@ _RESULT_SIGNATURE_SCHEMA = {
     "properties": {
         "shape": {
             "type": "array",
+            "description": (
+                "Every selected output column, using the canonical object shape "
+                '{"column": <output name>, "type": <output type>}. For example: '
+                '{"column": "projected_month", "type": "date"}.'
+            ),
             "items": {
                 "type": "object",
-                "properties": {"column": {"type": "string"}, "type": {"type": "string"}},
+                "properties": {
+                    "column": {
+                        "type": "string",
+                        "description": "The selected output column or alias.",
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": (
+                            "A non-empty output type label, such as date, number, string, "
+                            "dimension, measure, or the database result type when known."
+                        ),
+                    },
+                },
                 "required": ["column", "type"],
             },
         },
@@ -241,7 +258,10 @@ _BLUEPRINT_PAYLOAD_SCHEMA = {
             "description": (
                 "Set ONLY when the accepted SQL has a GROUP BY whose grouped columns "
                 "appear in the SELECT output, with grain.columns equal to exactly those "
-                "grouped columns. For a single scalar aggregate (e.g. sum(...) with only "
+                "grouped columns. Every shape item must use the canonical JSON object "
+                '{"column": <selected output name>, "type": <output type>}; for example, '
+                '{"column": "projected_month", "type": "date"}. For a single scalar '
+                "aggregate (e.g. sum(...) with only "
                 "a WHERE filter and NO GROUP BY) there is no per-group output to verify — "
                 "emit null."
             ),

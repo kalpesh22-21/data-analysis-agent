@@ -801,8 +801,18 @@ def _result_signature(raw: Any) -> ResultSignature | None:
     for idx, item in enumerate(shape_items):
         item_at = f"{at}.shape[{idx}]"
         column_shape = as_object(item, at=item_at, requirement='an object with "column" and "type"')
-        column_key = "column" if "column" in column_shape else "name"
-        type_key = "type" if "type" in column_shape else "semantic_type"
+        # Prefer the canonical keys, accept an alias only when the model actually
+        # supplied it, and report the canonical key when neither exists. Previously
+        # an item with no type at all selected ``semantic_type`` merely because
+        # ``type`` was absent. The corrective turn therefore asked a model that had
+        # followed the canonical schema to add an undocumented alias, and the live
+        # extractor repeated the same malformed result until its budget expired.
+        column_key = "column" if "column" in column_shape else (
+            "name" if "name" in column_shape else "column"
+        )
+        type_key = "type" if "type" in column_shape else (
+            "semantic_type" if "semantic_type" in column_shape else "type"
+        )
         if column_key == "name":
             normalizations.append("name_to_column")
         if type_key == "semantic_type":
@@ -821,7 +831,10 @@ def _result_signature(raw: Any) -> ResultSignature | None:
                     type_key,
                     as_text,
                     at=item_at,
-                    requirement="the output column's type",
+                    requirement=(
+                        "the output column's type; canonical shape example: "
+                        '{"column": "projected_month", "type": "date"}'
+                    ),
                 ),
             )
         )
