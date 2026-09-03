@@ -5323,6 +5323,11 @@
     key.className = "key";
     key.textContent = dedup.canonical_key;
     wrap.appendChild(key);
+    if (item.dedup_cluster && item.dedup_cluster.size > 1) {
+      var cluster = document.createElement("span");
+      cluster.textContent = " · " + item.dedup_cluster.size + " candidates in this cluster";
+      wrap.appendChild(cluster);
+    }
     return wrap;
   }
 
@@ -5389,6 +5394,14 @@
     // `payload_view` (D17) and still reaches the DOM through textContent; what
     // changed is the RANKING — slots beside frozen filters, with the verbatim dump
     // collapsed at the bottom of the card rather than standing in for it.
+    if (item.display_sql_redacted) {
+      var redacted = document.createElement("p");
+      redacted.className = "decline-detail";
+      redacted.setAttribute("data-testid", "inbox-redacted-sql-note");
+      redacted.textContent =
+        "Displayed SQL is redacted and is not executable. Validation and trial runs use the preserved accepted SQL; this candidate remains quarantined until reviewed.";
+      li.appendChild(redacted);
+    }
     li.appendChild(renderPayload(item));
 
     // The parameterization judge's observation, ABOVE the evidence and below the payload:

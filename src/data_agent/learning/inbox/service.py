@@ -20,6 +20,7 @@ Run: `uv run python scripts/run_inbox_service.py`
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -277,6 +278,11 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
     is the already-redacted dict (D17) rendered verbatim — the raw entity values never cross this
     boundary.
     """
+    template_redacted = (
+        item.type == "blueprint"
+        and item.entity_scan.result in {"quarantine", "reroute"}
+        and "[redacted]" in json.dumps(item.payload_view.get("generalization") or {})
+    )
     return {
         "candidate_id": item.candidate_id,
         "type": item.type,
@@ -318,6 +324,8 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
         # is exactly as entity-sensitive as the payload beside it and is redacted by the same
         # pass. `[]` for every candidate without a template.
         "template_parts": [dict(part) for part in item.template_parts],
+        "display_sql_redacted": template_redacted,
+        "display_sql_executable": not template_redacted,
         # The S4 parameterization judge's verdict (design §D), or null when it did not run.
         # Part of the EXACT wire shape for the same reason `decline` is: a client cannot
         # branch on a field it cannot know exists. In phase D-1 this is the ONLY thing the
@@ -334,6 +342,31 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
             item.leakage_attestation.to_doc() if item.leakage_attestation is not None else None
         ),
     }
+
+
+def _attach_dedup_clusters(rows: list[dict[str, Any]]) -> None:
+    """Annotate related review rows in-place without deleting their audit records."""
+
+    def family(row: dict[str, Any]) -> str:
+        dedup = row.get("dedup") or {}
+        return str(dedup.get("matched_id") or dedup.get("canonical_key") or "")
+
+    clusters: dict[str, list[str]] = {}
+    for row in rows:
+        key = family(row)
+        if key:
+            clusters.setdefault(key, []).append(str(row["candidate_id"]))
+    for row in rows:
+        members = clusters.get(family(row), [])
+        row["dedup_cluster"] = (
+            {
+                "size": len(members),
+                "member_ids": members,
+                "representative_id": members[0],
+            }
+            if len(members) > 1
+            else None
+        )
 
 
 def _action_result(env: Any) -> dict[str, Any]:
@@ -1341,6 +1374,7 @@ def create_inbox_app(
         )
         items = await inbox.list(status=selected, limit=100, order=order)
         wire = [_inbox_item_to_wire(it) for it in items]
+        _attach_dedup_clusters(wire)
         return {"items": wire, "count": len(wire)}
 
     @app.get("/inbox/mint/schema", dependencies=guard)

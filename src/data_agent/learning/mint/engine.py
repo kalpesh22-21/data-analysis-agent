@@ -31,6 +31,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+import sqlglot
+from sqlglot import exp
+
 from data_agent.runtime.blueprint.compiler import _SCRATCH_DB
 from data_agent.runtime.blueprint.template import parse_template, referenced_slots
 from data_agent.runtime.model.client import ModelClient
@@ -130,6 +133,19 @@ def _check_nodes(request: MintRequest, sql_per_node: list[str]) -> None:
                 "step's result, write its name in braces — {name} — not the $0.name form, "
                 "which is the DAG's own wiring notation and is not SQL."
             ) from None
+        if node.output_kind == "scalar":
+            probe = re.sub(r"\{[A-Za-z_][A-Za-z0-9_]*\}", "1", sql)
+            try:
+                root = sqlglot.parse_one(probe, dialect="clickhouse")
+            except Exception:  # parse_template above owns the actionable parse error
+                root = None
+            select = root if isinstance(root, exp.Select) else None
+            if select is not None and select.args.get("group") is not None:
+                raise fault(
+                    f"step {order + 1} declares one scalar value, but its SQL has GROUP BY "
+                    "and can return multiple rows. Declare this step's output as a table, or "
+                    "rewrite it to return exactly one value."
+                )
         # `referenced_slots` is the runtime's own reader of `{token}` occurrences — the same one
         # binding uses to decide which slots a template actually has. Asking it beats a substring
         # search, which would count a token inside a string literal or a comment.
@@ -217,6 +233,68 @@ def _composes(request: MintRequest, refs: list[str]) -> list[dict[str, Any]]:
             }
         )
     return nodes
+
+
+def _semantic_type(expression: exp.Expression, schema: dict[str, dict[str, str]]) -> str:
+    raw = ""
+    column = expression.find(exp.Column)
+    if column is not None:
+        matches = [
+            kind
+            for columns in schema.values()
+            for name, kind in columns.items()
+            if name == column.name
+        ]
+        raw = matches[0].lower() if len(set(matches)) == 1 else ""
+    if isinstance(expression, (exp.AggFunc, exp.Binary)) or expression.find(exp.AggFunc):
+        return "number"
+    if "datetime" in raw or "timestamp" in raw:
+        return "datetime"
+    if "date" in raw:
+        return "date"
+    if any(token in raw for token in ("int", "decimal", "float", "double", "numeric")):
+        return "number"
+    if "bool" in raw:
+        return "boolean"
+    if raw:
+        return "string"
+    return "unknown"
+
+
+def _infer_result_signature(sql: str, schema: dict[str, dict[str, str]]) -> dict[str, Any] | None:
+    """Infer the terminal SELECT contract; scalar aggregates retain the established null form."""
+    probe = re.sub(r"\{[A-Za-z_][A-Za-z0-9_]*\}", "1", sql)
+    try:
+        root = sqlglot.parse_one(probe, dialect="clickhouse")
+    except Exception:
+        return None
+    select = root if isinstance(root, exp.Select) else root.find(exp.Select)
+    if select is None or any(isinstance(item, exp.Star) for item in select.expressions):
+        return None
+    group = select.args.get("group")
+    if (
+        group is None
+        and select.expressions
+        and all(item.find(exp.AggFunc) for item in select.expressions)
+    ):
+        return None
+    shape = []
+    expression_names: dict[str, str] = {}
+    for index, item in enumerate(select.expressions):
+        name = item.alias_or_name or f"column_{index + 1}"
+        base = item.this if isinstance(item, exp.Alias) else item
+        expression_names[base.sql(dialect="clickhouse")] = name
+        shape.append({"column": name, "type": _semantic_type(base, schema)})
+    grain: list[str] = []
+    if group is not None:
+        for grouped in group.expressions:
+            key = grouped.sql(dialect="clickhouse")
+            grain.append(expression_names.get(key, grouped.name or key))
+    return {
+        "shape": shape,
+        "grain": {"columns": grain, "verifiable": bool(grain)},
+        "invariants": [],
+    }
 
 
 def mint_content_hash(request: MintRequest) -> str:
@@ -525,6 +603,13 @@ class BlueprintMinter:
                 "accepted_signal": MINT_ACCEPTED_SIGNAL,
                 "parameterization": [],
                 "source_tool_call_refs": list(refs),
+                "result_signature": _infer_result_signature(
+                    sql_per_node[-1],
+                    {
+                        table: getattr(self, "catalog_schema", {}).get(table, {})
+                        for table in request.tables
+                    },
+                ),
                 **({"composes": _composes(request, refs)} if request.is_composite else {}),
             },
             source_session=snapshot.session_id,

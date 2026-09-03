@@ -30,7 +30,11 @@ from fastapi.testclient import TestClient
 from data_agent.learning.candidate.memory_candidate_store import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.inbox import ReviewInbox
-from data_agent.learning.inbox.service import _build_inbox_from_env, create_inbox_app
+from data_agent.learning.inbox.service import (
+    _attach_dedup_clusters,
+    _build_inbox_from_env,
+    create_inbox_app,
+)
 from data_agent.learning.promotion import PromotionScheduler
 from data_agent.learning.promotion.landing import LandingInvalidError
 
@@ -136,6 +140,9 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
         # `test_template_parts_are_tokenized_from_the_redacted_view`, which is the guard
         # that matters, since this field carries inline literals.
         "template_parts",
+        "display_sql_redacted",
+        "display_sql_executable",
+        "dedup_cluster",
         # The S4 parameterization judge's verdict (design §D), null on every row where it did
         # not run — which in phase D-1 is most of them. Part of the EXACT shape for the
         # `decline` reason above: a client cannot branch on a field it cannot know exists.
@@ -222,9 +229,7 @@ def test_list_status_rejected_returns_only_archived(enabled: None) -> None:
             ),
         ],
     )
-    resp = _client(ReviewInbox(store)).get(
-        "/inbox", headers=AUTH, params={"status": "rejected"}
-    )
+    resp = _client(ReviewInbox(store)).get("/inbox", headers=AUTH, params={"status": "rejected"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["count"] == 1
@@ -246,9 +251,7 @@ def test_archive_list_returns_newest_reject_first(enabled: None) -> None:
         for i in range(3)
     ]
     _populate(store, rejects)
-    resp = _client(ReviewInbox(store)).get(
-        "/inbox", headers=AUTH, params={"status": "rejected"}
-    )
+    resp = _client(ReviewInbox(store)).get("/inbox", headers=AUTH, params={"status": "rejected"})
     assert resp.status_code == 200
     ids = [i["candidate_id"] for i in resp.json()["items"]]
     assert ids == [
@@ -317,9 +320,7 @@ def test_list_status_promoted_returns_the_terminal_set_newest_first(
         ],
     )
 
-    resp = _client(ReviewInbox(store)).get(
-        "/inbox", headers=AUTH, params={"status": "promoted"}
-    )
+    resp = _client(ReviewInbox(store)).get("/inbox", headers=AUTH, params={"status": "promoted"})
 
     assert resp.status_code == 200
     body = resp.json()
@@ -382,6 +383,59 @@ def test_wire_summary_and_scan_never_ship_raw_entity(enabled: None) -> None:
     assert "[redacted]" in item["summary"]
     assert "E12345" not in json.dumps(item["payload_view"])
     assert all(h["span"] == "" for h in item["entity_scan"]["hits"])
+
+
+def test_redacted_template_is_labelled_non_executable_without_mutating_storage(
+    enabled: None,
+) -> None:
+    doc = copy.deepcopy(_load_reason_docs()["leakage_near_miss"])
+    doc["candidate_id"] = doc["_id"] = "candidate::redacted-template::0"
+    doc["payload"]["generalization"]["sql_template"] = "SELECT 1 WHERE code = 'E12345'"
+    doc["entity_scan"] = {
+        "result": "quarantine",
+        "hits": [
+            {
+                "field": "generalization.sql_template",
+                "kind": "employee_code",
+                "span": "E12345",
+            }
+        ],
+        "scanned_fields": ["generalization.sql_template"],
+        "scanner": "regex+ner",
+    }
+    store = InMemoryCandidateStore()
+    original = CandidateEnvelope.from_doc(doc)
+    _populate(store, [original])
+    client = _client(ReviewInbox(store))
+
+    item = client.get("/inbox", headers=AUTH).json()["items"][0]
+    assert item["display_sql_redacted"] is True
+    assert item["display_sql_executable"] is False
+    assert asyncio.run(store.get(original.candidate_id)).payload == original.payload
+
+
+def test_dedup_rows_are_annotated_as_one_auditable_cluster() -> None:
+    rows = [
+        {
+            "candidate_id": "c1",
+            "dedup": {"canonical_key": "sha256:one", "matched_id": "same:existing"},
+        },
+        {
+            "candidate_id": "c2",
+            "dedup": {"canonical_key": "sha256:two", "matched_id": "same:existing"},
+        },
+        {"candidate_id": "c3", "dedup": {"canonical_key": "sha256:other"}},
+    ]
+
+    _attach_dedup_clusters(rows)
+
+    assert rows[0]["dedup_cluster"] == {
+        "size": 2,
+        "member_ids": ["c1", "c2"],
+        "representative_id": "c1",
+    }
+    assert rows[1]["dedup_cluster"] == rows[0]["dedup_cluster"]
+    assert rows[2]["dedup_cluster"] is None
 
 
 # --- auth gate (§3) -----------------------------------------------------------
@@ -645,9 +699,7 @@ def test_retract_happy_path_mutates_store(enabled: None) -> None:
 
 
 def _validated_blueprint(*, verified: bool) -> CandidateEnvelope:
-    return replace(
-        make_blueprint_candidate(status=CandidateStatus.VALIDATED), verified=verified
-    )
+    return replace(make_blueprint_candidate(status=CandidateStatus.VALIDATED), verified=verified)
 
 
 def test_list_status_validated_exposes_verified_flag(enabled: None) -> None:
@@ -657,15 +709,23 @@ def test_list_status_validated_exposes_verified_flag(enabled: None) -> None:
     _populate(
         store,
         [
-            replace(_validated_blueprint(verified=True),
-                    candidate_id="candidate::v::1", content_hash="h1"),
-            replace(_validated_blueprint(verified=False),
-                    candidate_id="candidate::v::0", content_hash="h0"),
+            replace(
+                _validated_blueprint(verified=True),
+                candidate_id="candidate::v::1",
+                content_hash="h1",
+            ),
+            replace(
+                _validated_blueprint(verified=False),
+                candidate_id="candidate::v::0",
+                content_hash="h0",
+            ),
         ],
     )
-    body = _client(ReviewInbox(store)).get(
-        "/inbox", headers=AUTH, params={"status": "validated"}
-    ).json()
+    body = (
+        _client(ReviewInbox(store))
+        .get("/inbox", headers=AUTH, params={"status": "validated"})
+        .json()
+    )
     assert body["count"] == 2
     by_id = {i["candidate_id"]: i for i in body["items"]}
     assert by_id["candidate::v::1"]["verified"] is True
@@ -717,7 +777,12 @@ def test_promote_route_returns_yaml_and_moves_to_promoted(enabled: None) -> None
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) == {
-        "yaml", "filename", "target_path", "suggested_branch", "commit_message", "note"
+        "yaml",
+        "filename",
+        "target_path",
+        "suggested_branch",
+        "commit_message",
+        "note",
     }
     assert body["target_path"] == "app/corpus/data/blueprints/"
     assert body["yaml"].startswith("id:")

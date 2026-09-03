@@ -421,6 +421,61 @@ async def test_twice_invalid_model_sql_is_blocked_without_a_review_row() -> None
 
 
 @pytest.mark.asyncio
+async def test_grouped_node_cannot_claim_scalar_output() -> None:
+    from data_agent.learning.mint.models import MintNode
+
+    request = composite_request(
+        nodes=(MintNode(step_intent="totals by department", output_name="total"),)
+    )
+    turn = composite_turn(
+        nodes=[
+            {
+                "order": 0,
+                "sql": "SELECT department, sum(gross_pay) AS total "
+                "FROM payroll.payroll_fact GROUP BY department",
+            }
+        ],
+        entries=[],
+    )
+    minter, store, _ = make_minter([turn])
+
+    with pytest.raises(MintResponseError, match="GROUP BY"):
+        await minter.mint(request)
+
+    assert (
+        await store.get(f"candidate::{mint_content_hash(request).removeprefix('sha256:')}") is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_minted_grouped_query_gets_an_inferred_result_signature() -> None:
+    sql = (
+        "SELECT department, sum(gross_pay) AS total_pay "
+        "FROM payroll.payroll_fact GROUP BY department"
+    )
+    minter, store, _ = make_minter([draft_turn(sql=sql, entries=[])])
+    minter.catalog_schema = {
+        "payroll.payroll_fact": {
+            "department": "String",
+            "gross_pay": "Decimal(18, 2)",
+        }
+    }
+    request = MintRequest(question="pay by department", tables=TABLES)
+
+    result = await minter.mint(request)
+    stored = await store.get(result.candidate_id)
+
+    assert stored.payload["result_signature"] == {
+        "shape": [
+            {"column": "department", "type": "string"},
+            {"column": "total_pay", "type": "number"},
+        ],
+        "grain": {"columns": ["department"], "verifiable": True},
+        "invariants": [],
+    }
+
+
+@pytest.mark.asyncio
 async def test_invalid_authoritative_sql_is_blocked_without_being_rewritten_or_stored() -> None:
     request = exact_request(
         sql="SELECT earnings_type FROM payroll.payroll_fact",
