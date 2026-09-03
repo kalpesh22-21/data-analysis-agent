@@ -300,9 +300,7 @@ async def test_a_second_submission_of_the_same_form_never_forks_a_second_row() -
         await minter.mint(request)
 
     everywhere = [
-        env
-        for status in _ALL_STATUSES
-        for env in await store.list_by_status(status, limit=50)
+        env for status in _ALL_STATUSES for env in await store.list_by_status(status, limit=50)
     ]
     assert [env.candidate_id for env in everywhere] == [first.candidate_id]
 
@@ -331,9 +329,7 @@ async def test_a_declined_draft_is_not_re_minted_over_the_reviewers_work() -> No
 def test_the_hash_is_over_content_and_excludes_the_submitter() -> None:
     """Two experts who independently write the same blueprint should meet at one row; dedup
     is supposed to be arguing about content, not about who typed it."""
-    assert mint_content_hash(exact_request()) == mint_content_hash(
-        exact_request()
-    )
+    assert mint_content_hash(exact_request()) == mint_content_hash(exact_request())
     assert mint_content_hash(exact_request()) != mint_content_hash(
         exact_request(question="a different question entirely")
     )
@@ -347,9 +343,7 @@ async def test_a_submission_whose_candidate_already_moved_on_is_refused() -> Non
 
     minter, store, _ = make_minter([classify_turn()])
     first = await minter.mint(exact_request())
-    await store.put(
-        replace(await store.get(first.candidate_id), status=CandidateStatus.PROMOTED)
-    )
+    await store.put(replace(await store.get(first.candidate_id), status=CandidateStatus.PROMOTED))
     minter.model_client = ScriptedModelClient([classify_turn()])
 
     with pytest.raises(MintInputError, match="already minted"):
@@ -376,6 +370,74 @@ async def test_the_brief_is_narrowed_to_the_tables_the_expert_selected() -> None
     assert "hr.employees.salary" not in brief
 
 
+@pytest.mark.asyncio
+async def test_draft_gets_typed_table_grouped_schema_context() -> None:
+    minter, _, client = make_minter(
+        [draft_turn(sql="SELECT gross_pay FROM payroll.payroll_fact", entries=[])]
+    )
+    minter.catalog_schema = {
+        "payroll.payroll_fact": {"gross_pay": "DECIMAL(18, 2)"},
+        "hr.employees": {"salary": "DECIMAL(18, 2)"},
+    }
+
+    await minter.mint(MintRequest(question="show gross pay", tables=TABLES))
+
+    brief = client.calls[0][0][1]["content"]
+    assert "payroll.payroll_fact:" in brief
+    assert "gross_pay (DECIMAL(18, 2))" in brief
+    assert "hr.employees" not in brief
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_sql_is_repaired_before_any_candidate_is_written() -> None:
+    invalid = draft_turn(sql="SELECT earnings_type FROM payroll.payroll_fact", entries=[])
+    corrected = draft_turn(sql="SELECT gross_pay FROM payroll.payroll_fact", entries=[])
+    minter, store, client = make_minter([invalid, corrected])
+    minter.catalog_schema = {"payroll.payroll_fact": {"gross_pay": "DECIMAL(18, 2)"}}
+    request = MintRequest(question="show gross pay", tables=TABLES)
+
+    result = await minter.mint(request)
+
+    assert result.outcome == "completed", result.decline_detail
+    assert result.accepted_sql == "SELECT gross_pay FROM payroll.payroll_fact"
+    assert len(client.calls) == 2
+    assert "PREVIOUS DRAFT FAILED THE CATALOG CHECK" in client.calls[1][0][1]["content"]
+    assert "earnings_type" in client.calls[1][0][1]["content"]
+    assert await store.get(result.candidate_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_twice_invalid_model_sql_is_blocked_without_a_review_row() -> None:
+    invalid = draft_turn(sql="SELECT earnings_type FROM payroll.payroll_fact", entries=[])
+    minter, store, _ = make_minter([invalid, invalid])
+    minter.catalog_schema = {"payroll.payroll_fact": {"gross_pay": "DECIMAL(18, 2)"}}
+    request = MintRequest(question="show gross pay", tables=TABLES)
+
+    with pytest.raises(MintResponseError, match="nothing was written"):
+        await minter.mint(request)
+
+    candidate_id = f"candidate::{mint_content_hash(request).removeprefix('sha256:')}"
+    assert await store.get(candidate_id) is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_authoritative_sql_is_blocked_without_being_rewritten_or_stored() -> None:
+    request = exact_request(
+        sql="SELECT earnings_type FROM payroll.payroll_fact",
+        steps=(),
+        assumptions=(),
+    )
+    minter, store, client = make_minter([classify_turn(entries=[], intent="earnings by type")])
+    minter.catalog_schema = {"payroll.payroll_fact": {"gross_pay": "DECIMAL(18, 2)"}}
+
+    with pytest.raises(MintInputError, match="nothing was written"):
+        await minter.mint(request)
+
+    assert len(client.calls) == 1  # exact SQL is classified, never silently rewritten
+    candidate_id = f"candidate::{mint_content_hash(request).removeprefix('sha256:')}"
+    assert await store.get(candidate_id) is None
+
+
 # --- composite: the expert declares the DAG, the model fills the queries -------------------
 
 DEPT_SQL = (
@@ -387,8 +449,7 @@ DEPT_SQL = (
 # that way is refused. These tests originally used it and did not notice, because none of them
 # asserted `outcome` — they checked the DAG shape of a candidate that had in fact declined.
 RATIO_SQL = (
-    "SELECT sum(gross_pay) AS company_total FROM payroll.payroll_fact "
-    "WHERE record_type = 'EARNING'"
+    "SELECT sum(gross_pay) AS company_total FROM payroll.payroll_fact WHERE record_type = 'EARNING'"
 )
 
 
@@ -648,9 +709,7 @@ def test_the_routing_rule_reads_the_snapshot_flag_not_the_session_id_shape() -> 
     assert derive_inbox_reason(minted) == "hand_authored"
 
     # Same envelope, same `mint::` session id, but the flag cleared → ordinary routing.
-    not_authored = replace(
-        minted, revalidation=replace(minted.revalidation, authored=False)
-    )
+    not_authored = replace(minted, revalidation=replace(minted.revalidation, authored=False))
     assert route_candidate(not_authored, sampled_for_inbox=False).status == (
         CandidateStatus.CANDIDATE
     )
@@ -681,8 +740,12 @@ def _minted_envelope():
                 "static_validation": {"outcome": "ok", "reason": None},
             },
         },
-        entity_scan={"result": "pass", "hits": [], "scanned_fields": ["intent"],
-                     "scanner": "regex+ner"},
+        entity_scan={
+            "result": "pass",
+            "hits": [],
+            "scanned_fields": ["intent"],
+            "scanner": "regex+ner",
+        },
     )
 
 
@@ -710,8 +773,11 @@ async def test_a_step_can_consume_an_earlier_steps_scalar() -> None:
         )
     )
     minter, store, _ = make_minter(
-        [composite_turn(nodes=[{"order": 0, "sql": DEPT_SQL},
-                               {"order": 1, "sql": SCALAR_CONSUME_SQL}])]
+        [
+            composite_turn(
+                nodes=[{"order": 0, "sql": DEPT_SQL}, {"order": 1, "sql": SCALAR_CONSUME_SQL}]
+            )
+        ]
     )
 
     result = await minter.mint(request)
@@ -735,8 +801,9 @@ async def test_a_step_can_consume_an_earlier_steps_whole_table() -> None:
 
     request = composite_request(
         nodes=(
-            MintNode(step_intent="per-employee earnings", output_name="emp_earnings",
-                     output_kind="table"),
+            MintNode(
+                step_intent="per-employee earnings", output_name="emp_earnings", output_kind="table"
+            ),
             MintNode(step_intent="roll them up", feeds_from=(0,)),
         )
     )
@@ -771,12 +838,18 @@ async def test_a_node_can_consume_two_upstream_steps() -> None:
         )
     )
     combined = (
-        "SELECT ({a} + {b}) AS combined FROM payroll.payroll_fact "
-        "WHERE record_type = 'EARNING'"
+        "SELECT ({a} + {b}) AS combined FROM payroll.payroll_fact WHERE record_type = 'EARNING'"
     )
     minter, store, _ = make_minter(
-        [composite_turn(nodes=[{"order": 0, "sql": DEPT_SQL}, {"order": 1, "sql": DEPT_SQL},
-                               {"order": 2, "sql": combined}])]
+        [
+            composite_turn(
+                nodes=[
+                    {"order": 0, "sql": DEPT_SQL},
+                    {"order": 1, "sql": DEPT_SQL},
+                    {"order": 2, "sql": combined},
+                ]
+            )
+        ]
     )
 
     result = await minter.mint(request)
@@ -799,11 +872,18 @@ async def test_a_table_consumer_that_never_reads_the_scratch_table_is_refused() 
         )
     )
     minter, _, _ = make_minter(
-        [composite_turn(nodes=[
-            {"order": 0, "sql": "SELECT employee_code FROM payroll.payroll_fact "
-                                "WHERE department = '0420'"},
-            {"order": 1, "sql": "SELECT 1 AS total FROM payroll.payroll_fact"},
-        ])]
+        [
+            composite_turn(
+                nodes=[
+                    {
+                        "order": 0,
+                        "sql": "SELECT employee_code FROM payroll.payroll_fact "
+                        "WHERE department = '0420'",
+                    },
+                    {"order": 1, "sql": "SELECT 1 AS total FROM payroll.payroll_fact"},
+                ]
+            )
+        ]
     )
 
     with pytest.raises(MintResponseError, match="never reads scratch.emp_earnings"):

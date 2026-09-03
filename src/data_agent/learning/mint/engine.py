@@ -27,12 +27,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from data_agent.runtime.blueprint.compiler import _SCRATCH_DB
 from data_agent.runtime.blueprint.template import parse_template, referenced_slots
 from data_agent.runtime.model.client import ModelClient
+from data_agent.sqlparse import ProvenanceExtractionError, extract_column_provenance
 
 from ..candidate.decline import EvidencePointer, ValidationSnapshot
 from ..candidate.models import CandidateEnvelope, CandidateStatus
@@ -279,6 +281,7 @@ class BlueprintMinter:
     completer: ParameterizationCompleter
     known_rules: frozenset[str] = frozenset()
     catalog_columns: tuple[str, ...] = ()
+    catalog_schema: dict[str, dict[str, str]] = field(default_factory=dict)
     # The cross-tier prior-art lookup, OPTIONAL. Absent means no duplicate warning — the page
     # still mints, which is the right degrade for a warning that was never a gate.
     prior_art: Any = None
@@ -365,13 +368,11 @@ class BlueprintMinter:
             "status": str(getattr(card, "status", "") or ""),
             "intent": str(getattr(card, "intent", "") or ""),
             "verified": getattr(card, "verified", None),
-            "confidence": (
-                round(confidence, 3) if isinstance(confidence, (int, float)) else None
-            ),
+            "confidence": (round(confidence, 3) if isinstance(confidence, (int, float)) else None),
         }
 
     async def _ask_model(
-        self, request: MintRequest
+        self, request: MintRequest, *, repair_feedback: str = ""
     ) -> tuple[str, list[str], list[dict[str, Any]], str]:
         """One forced call. Returns `(intent, sql_per_node, entries, rationale)`.
 
@@ -399,7 +400,14 @@ class BlueprintMinter:
             request,
             known_rules=tuple(sorted(self.known_rules)),
             catalog_columns=self._columns_for(request),
+            catalog_schema=self.catalog_schema,
         )
+        if repair_feedback:
+            brief += (
+                "\n\n" + "=" * 72 + "\nYOUR PREVIOUS DRAFT FAILED THE CATALOG CHECK. "
+                "Write a corrected complete response; do not defend the old SQL.\n  - "
+                + repair_feedback
+            )
         # APPLIED, not merely stored. `timeout_seconds` was a dataclass field nothing read, so
         # a deployment that configured it got the client's own default and a minting call could
         # outlive the BFF's hop budget — the browser then sees "service unreachable" while the
@@ -436,6 +444,27 @@ class BlueprintMinter:
             return intent, [request.sql.strip()], entries, rationale
         return intent, ([sql] if sql else []), entries, rationale
 
+    def _draft_sql_error(self, request: MintRequest, sql_per_node: list[str]) -> str:
+        """Return a node-specific catalog/provenance error, before a draft is persisted."""
+        if not self.catalog_schema:
+            return ""
+        selected = {table: self.catalog_schema.get(table, {}) for table in request.tables}
+        for order, sql in enumerate(sql_per_node):
+            # Scalar DAG inputs are values, not warehouse columns. Provenance only needs a
+            # parseable stand-in; the real token remains untouched in the accepted SQL.
+            probe = re.sub(r"\{[A-Za-z_][A-Za-z0-9_]*\}", "1", sql)
+            declared_scratch = frozenset(
+                request.nodes[e].output_for(e)
+                for e in (request.nodes[order].feeds_from if request.is_composite else ())
+                if request.nodes[e].output_kind == "table"
+            )
+            try:
+                extract_column_provenance(probe, selected, declared_scratch=declared_scratch)
+            except ProvenanceExtractionError as exc:
+                label = f"step {order + 1}" if request.is_composite else "query"
+                return f"{label}: {str(exc)[:500]}"
+        return ""
+
     def _envelope(
         self,
         request: MintRequest,
@@ -469,9 +498,7 @@ class BlueprintMinter:
             # and for a composite the honest citation set is every query the blueprint is made
             # of, not just the first. A single pointer would also make the walk's view of the
             # DAG disagree with `sql_by_ref`.
-            evidence=tuple(
-                EvidencePointer(turn_ref=0, tool_call_ref=ref) for ref in refs
-            ),
+            evidence=tuple(EvidencePointer(turn_ref=0, tool_call_ref=ref) for ref in refs),
             authored=True,
         )
         return CandidateEnvelope(
@@ -558,9 +585,7 @@ class BlueprintMinter:
             offered = set(self.tables)
             unknown = sorted(t for t in request.tables if t not in offered)
             if unknown:
-                raise MintInputError(
-                    f"these tables are not available here: {', '.join(unknown)}"
-                )
+                raise MintInputError(f"these tables are not available here: {', '.join(unknown)}")
 
         already_exists = await self.find_prior_art(request.question)
 
@@ -577,16 +602,54 @@ class BlueprintMinter:
             ) from exc
         if not sql_per_node or not all(sql_per_node):
             raise MintResponseError("no accepted SQL could be established for this blueprint")
-        _check_nodes(request, sql_per_node)
+        if request.sql_is_authoritative:
+            _check_nodes(request, sql_per_node)
+            complaint = self._draft_sql_error(request, sql_per_node)
+            if complaint:
+                raise MintInputError(
+                    "the submitted SQL does not resolve against the selected catalog schema "
+                    f"({complaint}); nothing was written"
+                )
+        else:
+            # DAG/token contract failures are already precise and may depend on structure the
+            # model is forbidden to change. Catalog provenance failures are the repairable
+            # class: the model can choose a real selected column or table instead.
+            _check_nodes(request, sql_per_node)
+            complaint = self._draft_sql_error(request, sql_per_node)
+            if complaint:
+                try:
+                    intent, sql_per_node, entries, rationale = await self._ask_model(
+                        request, repair_feedback=complaint
+                    )
+                except TimeoutError as exc:
+                    raise MintUnavailableError(
+                        f"the assistant did not correct its invalid SQL within "
+                        f"{self.timeout_seconds:.0f}s — nothing was written, so re-submitting "
+                        "the same form is safe"
+                    ) from exc
+                if not sql_per_node or not all(sql_per_node):
+                    raise MintResponseError(
+                        "the corrected draft carried no SQL; nothing was written"
+                    )
+                try:
+                    _check_nodes(request, sql_per_node)
+                except MintResponseError as exc:
+                    raise MintResponseError(
+                        f"the corrected draft is still invalid ({exc}); nothing was written"
+                    ) from None
+                complaint = self._draft_sql_error(request, sql_per_node)
+                if complaint:
+                    raise MintResponseError(
+                        "the corrected draft still uses SQL outside the selected catalog "
+                        f"schema ({complaint}); nothing was written"
+                    )
         if not entries:
             _logger.info(
                 "mint: the model proposed no parameterization entries; the totality walk will "
                 "decline unless the query has no literal predicates at all"
             )
 
-        env = self._envelope(
-            request, intent=intent, sql_per_node=sql_per_node, rationale=rationale
-        )
+        env = self._envelope(request, intent=intent, sql_per_node=sql_per_node, rationale=rationale)
         # RE-CHECKED immediately before the write. The first check happened before a model call
         # that takes tens of seconds, and the completer one line below narrows exactly this
         # window for its own write — an unguarded `put` here could overwrite a row created (or

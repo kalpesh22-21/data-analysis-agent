@@ -726,6 +726,7 @@ def _build_minter(
 
     import json
 
+    from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
     from data_agent.runtime.model.openai_client import build_openai_model_client
 
     from ..extractor.grounding import known_rule_ids_from_catalog
@@ -758,6 +759,7 @@ def _build_minter(
         completer=completer,
         known_rules=known_rule_ids_from_catalog(catalog),
         catalog_columns=_catalog_columns(catalog),
+        catalog_schema=build_sqlglot_schema_from_catalog(catalog),
         # The duplicate WARNING. Optional by design: absent, the page still mints — which is
         # the right degrade for something that was never a gate.
         prior_art=prior_art,

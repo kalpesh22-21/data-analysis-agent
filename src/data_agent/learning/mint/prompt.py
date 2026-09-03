@@ -154,6 +154,7 @@ def mint_brief(
     *,
     known_rules: tuple[str, ...] = (),
     catalog_columns: tuple[str, ...] = (),
+    catalog_schema: dict[str, dict[str, str]] | None = None,
 ) -> str:
     """Everything the model needs to draft or classify one blueprint.
 
@@ -171,7 +172,13 @@ def mint_brief(
         "THE TABLES YOU MAY READ:",
         *(f"  - {table}" for table in request.tables),
     ]
-    if catalog_columns:
+    selected_schema = {table: (catalog_schema or {}).get(table, {}) for table in request.tables}
+    if any(selected_schema.values()):
+        lines += ["", "THE SCHEMA FOR THOSE TABLES (this is a closed allowlist):"]
+        for table, columns in selected_schema.items():
+            lines.append(f"  {table}:")
+            lines.extend(f"    - {name} ({kind})" for name, kind in columns.items())
+    elif catalog_columns:
         lines += [
             "",
             "THE COLUMNS THOSE TABLES HAVE (a column not listed here does not exist, and a "
@@ -198,7 +205,16 @@ def mint_brief(
             "option for this blueprint.",
         ]
 
-    lines += ["", "=" * 72, "THE EXPERT'S SUBMISSION", "=" * 72, "", "THE QUESTION:", f"  {request.question}", ""]
+    lines += [
+        "",
+        "=" * 72,
+        "THE EXPERT'S SUBMISSION",
+        "=" * 72,
+        "",
+        "THE QUESTION:",
+        f"  {request.question}",
+        "",
+    ]
     lines += _bullets(
         "THE STEPS THEY WOULD TAKE TO ANSWER IT:",
         request.steps,
@@ -217,9 +233,7 @@ def mint_brief(
         for order, node in enumerate(request.nodes):
             lines += ["", f"STEP {order} — {node.step_intent}"]
             kind = "a table" if node.output_kind == "table" else "one value"
-            lines.append(
-                f"  it produces {kind}, named: {node.output_for(order)}"
-            )
+            lines.append(f"  it produces {kind}, named: {node.output_for(order)}")
             if node.feeds_from:
                 # SPELLED PER EDGE, because the two kinds are written differently and a model
                 # told only "it needs step 1" has to guess which. The guard downstream checks
