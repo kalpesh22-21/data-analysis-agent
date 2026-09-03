@@ -224,6 +224,71 @@ def test_function_argument_with_no_matching_sql_site_is_terminal():
     assert "0 to -1" not in out.detail
 
 
+def _interval_param(value: str = "5", **locator_overrides):
+    locator = {
+        "kind": "interval_argument",
+        "unit": "YEAR",
+        "occurrence": 0,
+        "context": "interval",
+        "value": value,
+    }
+    locator.update(locator_overrides)
+    return {
+        "locator": locator,
+        "role": "slot",
+        "slot": {
+            "name": "historical_years",
+            "type": "relative_window",
+            "binds_to": None,
+            "required": True,
+        },
+    }
+
+
+def test_interval_argument_is_located_and_accepted():
+    raw = blueprint_raw(parameterization=[_interval_param()], source_refs=("tc1",))
+    summary = make_summary(tool_calls=(make_tool_call(
+        ref="tc1", sql="SELECT today() - INTERVAL 5 YEAR AS cutoff"
+    ),))
+    out = _validate(raw, summary=summary)
+    assert isinstance(out, ExtractedCandidate)
+    assert out.payload.parameterization[0].locator.to_doc() == _interval_param()["locator"]
+
+
+def test_interval_window_predicate_needs_only_the_structural_locator():
+    raw = blueprint_raw(parameterization=[_interval_param()], source_refs=("tc1",))
+    summary = make_summary(tool_calls=(make_tool_call(
+        ref="tc1",
+        sql=("SELECT count(*) FROM dbpcm_warehouse.employee "
+             "WHERE hire_date >= today() - INTERVAL 5 YEAR"),
+    ),))
+    out = _validate(raw, summary=summary)
+    assert isinstance(out, ExtractedCandidate)
+
+
+def test_interval_argument_stale_value_gets_exact_correction():
+    raw = blueprint_raw(parameterization=[_interval_param("4")], source_refs=("tc1",))
+    summary = make_summary(tool_calls=(make_tool_call(
+        ref="tc1", sql="SELECT today() - INTERVAL 5 YEAR AS cutoff"
+    ),))
+    out = _validate(raw, summary=summary)
+    assert isinstance(out, Decline)
+    assert out.correctable is True
+    assert ".locator.value='4'" in out.detail
+    assert "occurrence 0 has value '5'" in out.detail
+
+
+def test_interval_argument_unit_is_structural_and_exact():
+    raw = blueprint_raw(parameterization=[_interval_param(unit="MONTH")], source_refs=("tc1",))
+    summary = make_summary(tool_calls=(make_tool_call(
+        ref="tc1", sql="SELECT today() - INTERVAL 5 YEAR AS cutoff"
+    ),))
+    out = _validate(raw, summary=summary)
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_UNREWRITABLE
+    assert "contains no matching structural site" in out.detail
+
+
 # --- item 6: unrewritable SQL → fail-to-review (D52) ------------------------
 
 

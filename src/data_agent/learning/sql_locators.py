@@ -68,3 +68,43 @@ def function_argument(
     if require_value_match and str(argument.this) != str(locator.get("value")):
         return None
     return argument
+
+
+def interval_arguments(ast: exp.Expression, unit: str) -> list[exp.Expression]:
+    """Every INTERVAL magnitude for *unit*, in deterministic AST order.
+
+    Unsupported expressions stay in the list so occurrence coordinates cannot slide
+    to a later literal merely because an earlier site was not rewritable.
+    """
+    arguments: list[exp.Expression] = []
+    for interval in ast.find_all(exp.Interval):
+        interval_unit = interval.args.get("unit")
+        if not isinstance(interval_unit, exp.Var) or interval_unit.name.upper() != unit.upper():
+            continue
+        arguments.append(interval.this)
+    return arguments
+
+
+def interval_argument(
+    ast: exp.Expression, locator: dict[str, Any], *, require_value_match: bool = True
+) -> exp.Literal | None:
+    """Resolve an INTERVAL magnitude while keeping its unit fixed in SQL."""
+    unit = locator.get("unit")
+    occurrence = locator.get("occurrence", 0)
+    if (
+        not isinstance(unit, str)
+        or locator.get("context") != "interval"
+        or not isinstance(occurrence, int)
+        or isinstance(occurrence, bool)
+        or occurrence < 0
+    ):
+        return None
+    arguments = interval_arguments(ast, unit)
+    if occurrence >= len(arguments):
+        return None
+    argument = arguments[occurrence]
+    if not isinstance(argument, exp.Literal) or not str(argument.this).isdigit():
+        return None
+    if require_value_match and str(argument.this) != str(locator.get("value")):
+        return None
+    return argument

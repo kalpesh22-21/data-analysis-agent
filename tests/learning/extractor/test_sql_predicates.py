@@ -159,3 +159,11 @@ def test_constant_join_on_predicate_is_enumerated():
 def test_value_side_function_literal_is_enumerated():
     cols = _cols("SELECT x FROM t WHERE dept = '0420' AND pay_period = toDate('2025-01-01')")
     assert "pay_period" in cols  # was MISSING (column-side-only); now enumerated
+
+
+def test_interval_magnitude_is_not_mislabeled_as_the_date_column_value():
+    preds = literal_predicates(
+        "SELECT count(*) FROM employee "
+        "WHERE hire_date >= today() - INTERVAL 5 YEAR"
+    )
+    assert preds == []

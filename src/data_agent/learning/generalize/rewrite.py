@@ -28,7 +28,7 @@ from ...runtime.blueprint.template import (
     referenced_slots,
 )
 from ..extractor.sql_predicates import literal_predicates
-from ..sql_locators import function_argument, function_name
+from ..sql_locators import function_argument, function_name, interval_argument
 
 # Comparison / membership predicates whose literal operand a slot can parameterize.
 _COMPARISONS: tuple[type[exp.Expression], ...] = (
@@ -322,6 +322,11 @@ def rewrite_sql_to_template(
                 f"{locator.get('function')} argument {locator.get('argument_index')} "
                 f"occurrence {locator.get('occurrence', 0)}"
             )
+        elif locator_kind == "interval_argument":
+            literal = interval_argument(ast, locator)
+            locator_description = (
+                f"INTERVAL {locator.get('unit')} occurrence {locator.get('occurrence', 0)}"
+            )
         elif column is not None:
             literal = _find_literal(ast, column, str(value))
             locator_description = f"{column}={value!r}"
@@ -412,5 +417,10 @@ def rewrite_sql_to_template(
     # and binds to nothing.
     for name in set(slot_names) | referenced_slots(accepted_sql):
         rendered = rendered.replace("{" + name + ": }", "{" + name + "}")
+        # sqlglot parenthesizes a Placeholder when it replaces the string literal
+        # stored inside an Interval node. The runtime wants the ordinary ClickHouse
+        # grammar `INTERVAL {n} UNIT`; remove only the parentheses around tokens this
+        # rewrite created, never arbitrary authored expressions.
+        rendered = rendered.replace(f"INTERVAL ({{{name}}}) ", f"INTERVAL {{{name}}} ")
     _check_rewritten(rendered, before, ast)
     return rendered

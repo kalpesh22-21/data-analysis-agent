@@ -104,6 +104,36 @@ def test_numbers_table_source_horizon_becomes_slot():
     assert "numbers({forecast_months})" in template
 
 
+def test_interval_magnitude_becomes_relative_window_slot():
+    sql = "SELECT today() - INTERVAL 5 YEAR AS cutoff"
+    parameterization = [{
+        "locator": {
+            "kind": "interval_argument",
+            "unit": "YEAR",
+            "occurrence": 0,
+            "context": "interval",
+            "value": "5",
+        },
+        "role": "slot",
+        "slot": {"name": "historical_years"},
+    }]
+    template = rewrite_sql_to_template(sql, parameterization, strict=True)
+    assert "INTERVAL {historical_years} YEAR" in template
+
+
+def test_interval_occurrence_does_not_slide_past_an_unsupported_site():
+    sql = "SELECT today() - INTERVAL (1 + 1) YEAR, today() - INTERVAL 5 YEAR"
+    parameterization = [{
+        "locator": {
+            "kind": "interval_argument", "unit": "YEAR", "occurrence": 0,
+            "context": "interval", "value": "5",
+        },
+        "role": "slot", "slot": {"name": "historical_years"},
+    }]
+    with pytest.raises(RewriteError, match="not found"):
+        rewrite_sql_to_template(sql, parameterization, strict=True)
+
+
 def test_function_argument_occurrence_is_structural_and_exact():
     sql = "SELECT * FROM numbers(3) a CROSS JOIN numbers(5) b"
     template = rewrite_sql_to_template(

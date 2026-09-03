@@ -25,7 +25,12 @@ from data_agent.runtime.blueprint.template import (
     validate_optional_pattern,
 )
 
-from ..sql_locators import function_argument, table_source_function_calls
+from ..sql_locators import (
+    function_argument,
+    interval_argument,
+    interval_arguments,
+    table_source_function_calls,
+)
 from ..summary.models import AcceptedSignal, SessionSummary
 from ..summary.refs import sql_by_ref
 from .grounding import CatalogRule, RuleIndex
@@ -634,7 +639,7 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
             "kind",
             as_text,
             at=loc_at,
-            requirement="'column_predicate' or 'function_argument'",
+            requirement="'column_predicate', 'function_argument', or 'interval_argument'",
             default="column_predicate",
         )
         if locator_kind == "function_argument":
@@ -661,11 +666,24 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
             )
             table = ""
             column = ""
+            unit = None
+        elif locator_kind == "interval_argument":
+            function = None
+            argument_index = None
+            occurrence = optional(
+                loc, "occurrence", as_int, at=loc_at,
+                requirement="a zero-based integer occurrence", default=0,
+            )
+            context = require(loc, "context", as_text, at=loc_at, requirement="'interval'")
+            unit = require(loc, "unit", as_text, at=loc_at, requirement="an interval unit")
+            table = ""
+            column = ""
         else:
             function = None
             argument_index = None
             occurrence = 0
             context = None
+            unit = None
             table = require(
                 loc,
                 "table",
@@ -698,6 +716,7 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
                     ),
                     kind=locator_kind,
                     function=function,
+                    unit=unit,
                     argument_index=argument_index,
                     occurrence=occurrence,
                     context=context,
@@ -1101,9 +1120,33 @@ def _validate_roles(
                 return _role_shape(
                     f"{at}.locator.value must be a canonical positive integer from 1 to 120"
                 )
+        elif p.locator.kind == "interval_argument":
+            mismatches = []
+            allowed_units = {"YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE", "SECOND"}
+            if p.role != "slot":
+                mismatches.append(f"role={p.role!r} (expected 'slot')")
+            if p.locator.unit not in allowed_units:
+                mismatches.append(f"locator.unit={p.locator.unit!r} (expected an uppercase interval unit)")
+            if p.locator.context != "interval":
+                mismatches.append(f"locator.context={p.locator.context!r} (expected 'interval')")
+            if p.locator.occurrence < 0:
+                mismatches.append(f"locator.occurrence={p.locator.occurrence!r} (expected >= 0)")
+            if p.slot is None or p.slot.type != "relative_window":
+                actual = None if p.slot is None else p.slot.type
+                mismatches.append(f"slot.type={actual!r} (expected 'relative_window')")
+            elif not p.slot.required:
+                mismatches.append("slot.required=false (expected true)")
+            if mismatches:
+                return _role_shape(f"{at}: an interval_argument must be a required relative_window slot; fix: {', '.join(mismatches)}")
+            try:
+                magnitude = int(p.locator.value)
+            except ValueError:
+                magnitude = 0
+            if str(magnitude) != p.locator.value or not 1 <= magnitude <= 120:
+                return _role_shape(f"{at}.locator.value must be a canonical positive integer from 1 to 120")
         elif p.locator.kind != "column_predicate":
             return _role_shape(
-                f"{at}.locator.kind must be 'column_predicate' or 'function_argument'"
+                f"{at}.locator.kind must be 'column_predicate', 'function_argument', or 'interval_argument'"
             )
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
@@ -1396,7 +1439,7 @@ def _validate_structural_locators(
     structural = [
         (index, plan)
         for index, plan in enumerate(payload.parameterization)
-        if plan.locator.kind == "function_argument"
+        if plan.locator.kind in ("function_argument", "interval_argument")
     ]
     if not structural:
         return None
@@ -1412,15 +1455,29 @@ def _validate_structural_locators(
 
     for index, plan in structural:
         locator = plan.locator.to_doc()
-        if any(function_argument(ast, locator) is not None for ast in parsed):
+        resolver = (
+            function_argument
+            if plan.locator.kind == "function_argument"
+            else interval_argument
+        )
+        if any(resolver(ast, locator) is not None for ast in parsed):
             continue
 
         at = f"candidate.payload.parameterization[{index}].locator"
-        function = plan.locator.function or ""
         occurrence = plan.locator.occurrence
-        available_counts = [len(table_source_function_calls(ast, function)) for ast in parsed]
+        if plan.locator.kind == "function_argument":
+            subject = f"table-source function {plan.locator.function}(...)"
+            available_counts = [
+                len(table_source_function_calls(ast, plan.locator.function or ""))
+                for ast in parsed
+            ]
+        else:
+            subject = f"INTERVAL {plan.locator.unit}"
+            available_counts = [
+                len(interval_arguments(ast, plan.locator.unit or "")) for ast in parsed
+            ]
         selected = [
-            function_argument(ast, locator, require_value_match=False)
+            resolver(ast, locator, require_value_match=False)
             for ast in parsed
         ]
         selected = [argument for argument in selected if argument is not None]
@@ -1438,13 +1495,13 @@ def _validate_structural_locators(
             return Decline(
                 "blueprint",
                 REASON_UNREWRITABLE,
-                f"{at} names table-source function {function}(...), but the accepted SQL "
+                f"{at} names {subject}, but the accepted SQL "
                 "contains no matching structural site",
             )
         if occurrence >= maximum:
             return _role_shape(
                 f"{at}.occurrence={occurrence} does not exist in the accepted SQL; "
-                f"the table-source function {function}(...) has {maximum} occurrence(s), "
+                f"{subject} has {maximum} occurrence(s), "
                 f"so use a zero-based occurrence from 0 to {maximum - 1}. Change only "
                 "locator.occurrence; the accepted SQL is fixed."
             )
@@ -1452,7 +1509,7 @@ def _validate_structural_locators(
         return Decline(
             "blueprint",
             REASON_UNREWRITABLE,
-            f"{at} points to a function argument whose SQL expression is not a supported "
+            f"{at} points to a structural argument whose SQL expression is not a supported "
             "integer literal",
         )
     return None

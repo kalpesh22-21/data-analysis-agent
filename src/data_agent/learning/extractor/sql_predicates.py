@@ -71,7 +71,21 @@ def _constant_text(node: exp.Expression | None) -> str | None:
         return None
     if list(node.find_all(exp.Column)):
         return None
-    literal = next(iter(node.find_all(exp.Literal)), None)
+    # A relative boundary such as `today() - INTERVAL 5 YEAR` is not the literal
+    # value 5 of the compared date column. The magnitude is a structural SQL site
+    # owned by an interval_argument locator; treating it as a column predicate is
+    # what produced the bogus locator {column: hire_date, value: 5} in live mining.
+    # Ignore only literals *inside* an Interval, rather than rejecting the whole
+    # side: `date_sub(toDate('2024-01-01'), INTERVAL 1 DAY)` still has a legitimate
+    # date literal for the predicate enumerator to adjudicate.
+    literal = next(
+        (
+            candidate
+            for candidate in node.find_all(exp.Literal)
+            if candidate.find_ancestor(exp.Interval) is None
+        ),
+        None,
+    )
     if literal is not None:
         return literal.name
     boolean = next(iter(node.find_all(exp.Boolean)), None)

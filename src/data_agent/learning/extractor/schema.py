@@ -84,12 +84,28 @@ _FUNCTION_ARGUMENT_LOCATOR_SCHEMA = {
     "required": ["kind", "function", "argument_index", "occurrence", "context", "value"],
 }
 
+_INTERVAL_UNITS = ["YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE", "SECOND"]
+_INTERVAL_ARGUMENT_LOCATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"const": "interval_argument"},
+        "unit": {"type": "string", "enum": _INTERVAL_UNITS},
+        "occurrence": {"type": "integer", "minimum": 0},
+        "context": {"type": "string", "const": "interval"},
+        "value": {"type": "string", "description": "The positive integer magnitude."},
+    },
+    "required": ["kind", "unit", "occurrence", "context", "value"],
+}
+
 _LOCATOR_SCHEMA = {
     "description": (
-        "A legacy column predicate locator, or the numeric horizon argument of the "
-        "allowlisted table-source function numbers(...)."
+        "A column predicate, numbers(...) cardinality, or INTERVAL magnitude locator."
     ),
-    "oneOf": [_COLUMN_LOCATOR_SCHEMA, _FUNCTION_ARGUMENT_LOCATOR_SCHEMA],
+    "oneOf": [
+        _COLUMN_LOCATOR_SCHEMA,
+        _FUNCTION_ARGUMENT_LOCATOR_SCHEMA,
+        _INTERVAL_ARGUMENT_LOCATOR_SCHEMA,
+    ],
 }
 
 _SLOT_SCHEMA = {

@@ -128,6 +128,7 @@ class Locator:
     value: str  # the literal as it appeared (pre-generalization)
     kind: str = "column_predicate"
     function: str | None = None
+    unit: str | None = None
     argument_index: int | None = None
     occurrence: int = 0
     context: str | None = None
@@ -138,6 +139,14 @@ class Locator:
                 "kind": self.kind,
                 "function": self.function,
                 "argument_index": self.argument_index,
+                "occurrence": self.occurrence,
+                "context": self.context,
+                "value": self.value,
+            }
+        if self.kind == "interval_argument":
+            return {
+                "kind": self.kind,
+                "unit": self.unit,
                 "occurrence": self.occurrence,
                 "context": self.context,
                 "value": self.value,
