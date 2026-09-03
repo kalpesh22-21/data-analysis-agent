@@ -318,6 +318,26 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
             ) from exc
         return doc
 
+    async def reopen_failed_resume(self, session_id: str, answer: str) -> bool:
+        reopened: list[bool] = []
+
+        def _mutate(doc: SessionDoc) -> None:
+            reopened.clear()
+            checkpoint = doc.pause_checkpoint
+            if checkpoint is None or not checkpoint.consumed or not doc.messages:
+                reopened.append(False)
+                return
+            latest = doc.messages[-1]
+            if latest.role != "user" or latest.content != answer:
+                reopened.append(False)
+                return
+            doc.messages.pop()
+            doc.pause_checkpoint = dc_replace(checkpoint, consumed=False)
+            reopened.append(True)
+
+        await self._mutate_with_cas_retry(session_id, _mutate)
+        return reopened[-1]
+
     # --- Learning loop (Track-B Slice 1, D96) ---
 
     async def scan_idle_sessions(

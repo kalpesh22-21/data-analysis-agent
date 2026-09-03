@@ -893,6 +893,44 @@ class AgentLoop:
         prior_window_count = checkpoint.budget_window_count if checkpoint else 1
         pause_reason = checkpoint.reason if checkpoint else "askUser"
 
+        try:
+            return await self._continue_consumed_resume(
+                session_id=session_id,
+                credentials=credentials,
+                answer=answer,
+                checkpoint=checkpoint,
+                updated_doc=updated_doc,
+                turn_index=turn_index,
+                prior_window_count=prior_window_count,
+                pause_reason=pause_reason,
+            )
+        except BaseException:
+            try:
+                reopened = await asyncio.shield(
+                    self._session_store.reopen_failed_resume(session_id, answer)
+                )
+                if not reopened:
+                    _logger.warning(
+                        "failed resume could not be reopened safely (session=%s)", session_id
+                    )
+            except Exception:
+                _logger.exception("failed to reopen resume checkpoint (session=%s)", session_id)
+            raise
+
+    async def _continue_consumed_resume(
+        self,
+        *,
+        session_id: str,
+        credentials: RuntimeCredentials,
+        answer: str,
+        checkpoint: PauseCheckpoint | None,
+        updated_doc: Any,
+        turn_index: int,
+        prior_window_count: int,
+        pause_reason: str,
+    ) -> TurnOutcome:
+        """Continue after atomically claiming a checkpoint; the caller handles rollback."""
+
         # Blueprint mid-DAG resume (D45, §2.5): a checkpoint carrying a
         # `blueprint_id` + an `awaiting_node` re-ENTERS the executor at that node
         # with the completed SCALAR outputs rehydrated — completed nodes never

@@ -61,6 +61,11 @@ _STEP_LABELS: dict[str, str] = {
     "loop_hard_ceiling_stop": "stopping — budget exhausted",
 }
 
+_TOOL_PROGRESS_LABELS: dict[tuple[str, str], str] = {
+    ("tool_dispatch_start", "updateAnalysisState"): "I’m organizing the parts of your question…",
+    ("tool_dispatch_ok", "updateAnalysisState"): "I’ve mapped out what needs to be answered",
+}
+
 
 @dataclass(frozen=True)
 class ProgressEvent:
@@ -105,7 +110,10 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
             return None
         shape = {key: payload[key] for key in _SHAPE_ALLOWLIST if key in payload}
         return ProgressEvent(step=summary.strip(), shape=shape)
-    label = _STEP_LABELS.get(event)
+    tool_name = payload.get("tool_name")
+    label = _TOOL_PROGRESS_LABELS.get((event, tool_name)) if isinstance(tool_name, str) else None
+    if label is None:
+        label = _STEP_LABELS.get(event)
     if label is None:
         return None
     shape = {key: payload[key] for key in _SHAPE_ALLOWLIST if key in payload}

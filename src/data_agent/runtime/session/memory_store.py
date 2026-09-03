@@ -176,6 +176,24 @@ class InMemorySessionStore:
         self._bump_version(session_id)
         return copy.deepcopy(doc)
 
+    async def reopen_failed_resume(self, session_id: str, answer: str) -> bool:
+        doc = self._docs.get(session_id)
+        if (
+            doc is None
+            or doc.pause_checkpoint is None
+            or not doc.pause_checkpoint.consumed
+            or not doc.messages
+        ):
+            return False
+        latest = doc.messages[-1]
+        if latest.role != "user" or latest.content != answer:
+            return False
+        doc.messages.pop()
+        doc.pause_checkpoint = replace(doc.pause_checkpoint, consumed=False)
+        doc.last_activity = _now()
+        self._bump_version(session_id)
+        return True
+
     # --- Learning loop (Track-B Slice 1, D96) ---
 
     async def scan_idle_sessions(

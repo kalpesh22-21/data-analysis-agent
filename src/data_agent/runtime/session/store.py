@@ -148,6 +148,10 @@ class SessionStore(Protocol):
         """
         ...
 
+    async def reopen_failed_resume(self, session_id: str, answer: str) -> bool:
+        """Atomically reopen a failed resume when its appended answer is still last."""
+        ...
+
     # --- Learning loop (Track-B Slice 1, D96) — additive, read-only w.r.t.
     # request-path data: the only write is advancing the lifecycle flag. ---
 
