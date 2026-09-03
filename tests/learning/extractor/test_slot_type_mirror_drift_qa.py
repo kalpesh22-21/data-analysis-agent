@@ -155,7 +155,9 @@ def test_the_prompt_enum_is_the_mirror_minus_what_s4_cannot_carry() -> None:
     rather than a second hand-maintained list. Drift (the mirror silently disagreeing
     about which types EXIST) and withdrawal (knowingly not offering one we cannot
     generalize) are different statements, and this is where they are kept apart."""
-    assert SLOT_TYPE_ENUM == sorted(EXTRACTOR_SLOT_TYPES - UNSUPPORTED_SLOT_TYPES)
+    assert SLOT_TYPE_ENUM == sorted(
+        (EXTRACTOR_SLOT_TYPES - UNSUPPORTED_SLOT_TYPES) | {"period_range"}
+    )
     assert UNSUPPORTED_SLOT_TYPES <= EXTRACTOR_SLOT_TYPES
 
 

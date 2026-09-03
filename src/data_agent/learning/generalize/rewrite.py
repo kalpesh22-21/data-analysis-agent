@@ -29,6 +29,7 @@ from ...runtime.blueprint.template import (
 )
 from ..extractor.sql_predicates import literal_predicates
 from ..sql_locators import (
+    between_range,
     function_argument,
     function_name,
     in_list,
@@ -342,6 +343,12 @@ def rewrite_sql_to_template(
         elif locator_kind == "limit_argument":
             literal = limit_argument(ast, locator)
             locator_description = f"LIMIT occurrence {locator.get('occurrence', 0)}"
+        elif locator_kind == "between_range":
+            literal = between_range(ast, locator)
+            locator_description = (
+                f"BETWEEN range for {locator.get('column')} occurrence "
+                f"{locator.get('occurrence', 0)}"
+            )
         elif column is not None:
             literal = _find_literal(ast, column, str(value))
             locator_description = f"{column}={value!r}"
@@ -390,9 +397,16 @@ def rewrite_sql_to_template(
                 )
             if locator_kind == "in_list":
                 literal.set("expressions", [exp.Placeholder(this=name)])
+            elif locator_kind == "between_range":
+                literal.set("low", exp.Placeholder(this=f"{name}_start"))
+                literal.set("high", exp.Placeholder(this=f"{name}_end"))
             else:
                 literal.replace(exp.Placeholder(this=name))
-            slot_names.append(name)
+            slot_names.extend(
+                [f"{name}_start", f"{name}_end"]
+                if locator_kind == "between_range"
+                else [name]
+            )
         # role == "rule": KEEP THE PREDICATE, ANNOTATE THE BLUEPRINT. The literal was
         # LOCATED above (a miss is still a strict `RewriteError` — a plan naming a
         # predicate that is not there is not a plan for this SQL), and that is the whole

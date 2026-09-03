@@ -316,6 +316,56 @@ def test_limit_argument_rejects_a_relative_window_slot():
     assert "expected 'positive_integer'" in out.detail
 
 
+def _between_range_param(*, value="2025-01-01,2025-12-31", **locator_overrides):
+    locator = {
+        "kind": "between_range",
+        "table": "dbpcm_warehouse.employee",
+        "column": "hire_date",
+        "occurrence": 0,
+        "context": "between_predicate",
+        "value": value,
+    }
+    locator.update(locator_overrides)
+    return {
+        "locator": locator,
+        "role": "slot",
+        "slot": {
+            "name": "hire_window",
+            "type": "period_range",
+            "binds_to": None,
+            "required": True,
+        },
+    }
+
+
+def test_between_range_is_one_valid_period_range_slot():
+    sql = (
+        "SELECT employee_code FROM dbpcm_warehouse.employee "
+        "WHERE hire_date BETWEEN '2025-01-01' AND '2025-12-31'"
+    )
+    raw = blueprint_raw(parameterization=[_between_range_param()], source_refs=("tc1",))
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, ExtractedCandidate)
+    assert out.payload.parameterization[0].locator.to_doc() == _between_range_param()["locator"]
+
+
+def test_between_range_stale_bound_pair_is_correctable():
+    sql = (
+        "SELECT employee_code FROM dbpcm_warehouse.employee "
+        "WHERE hire_date BETWEEN '2025-01-01' AND '2025-12-31'"
+    )
+    raw = blueprint_raw(
+        parameterization=[_between_range_param(value="2025-02-01,2025-12-31")],
+        source_refs=("tc1",),
+    )
+    out = _validate(raw, summary=make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),)))
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "occurrence 0 has value '2025-01-01,2025-12-31'" in out.detail
+
+
 def test_function_argument_missing_occurrence_is_correctable_before_rewrite():
     raw = blueprint_raw(
         parameterization=[_function_horizon_param(occurrence=1)], source_refs=("tc1",)

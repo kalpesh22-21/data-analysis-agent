@@ -175,3 +175,41 @@ def limit_argument(
     if require_value_match and str(argument.this) != str(locator.get("value")):
         return None
     return argument
+
+
+def between_ranges(ast: exp.Expression, column: str) -> list[exp.Between]:
+    """Every BETWEEN predicate for *column*, preserving unsupported sites in its index."""
+    ranges: list[exp.Between] = []
+    for predicate in ast.find_all(exp.Between):
+        columns = list(predicate.this.find_all(exp.Column))
+        if len(columns) == 1 and columns[0].name.lower() == column.lower():
+            ranges.append(predicate)
+    return ranges
+
+
+def between_range(
+    ast: exp.Expression, locator: dict[str, Any], *, require_value_match: bool = True
+) -> exp.Between | None:
+    """Resolve a literal BETWEEN pair as one two-token period-range site."""
+    column = locator.get("column")
+    occurrence = locator.get("occurrence", 0)
+    if (
+        not isinstance(column, str)
+        or not column
+        or locator.get("context") != "between_predicate"
+        or not isinstance(occurrence, int)
+        or isinstance(occurrence, bool)
+        or occurrence < 0
+    ):
+        return None
+    ranges = between_ranges(ast, column)
+    if occurrence >= len(ranges):
+        return None
+    predicate = ranges[occurrence]
+    low, high = predicate.args.get("low"), predicate.args.get("high")
+    if not isinstance(low, exp.Literal) or not isinstance(high, exp.Literal):
+        return None
+    value = f"{low.this},{high.this}"
+    if require_value_match and value != str(locator.get("value")):
+        return None
+    return predicate

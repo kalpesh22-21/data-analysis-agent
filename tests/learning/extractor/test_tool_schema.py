@@ -64,7 +64,11 @@ def test_slot_type_is_constrained_to_the_real_enum():
     # a bare `== set(SLOT_TYPES)` until `period_range` was withdrawn — the enum is now
     # a DERIVED subtraction rather than a copy, so there is still exactly one place to
     # change. See `test_period_range_withdrawn_qa.py` for why the type is withheld.
-    assert set(SLOT_TYPE_ENUM) == set(SLOT_TYPES) - set(UNSUPPORTED_SLOT_TYPES)
+    # period_range is the sole guarded exception: it is offered only with the
+    # between_range locator; legacy independent-predicate pairing stays unsupported.
+    assert set(SLOT_TYPE_ENUM) == (
+        set(SLOT_TYPES) - set(UNSUPPORTED_SLOT_TYPES)
+    ) | {"period_range"}
     assert set(UNSUPPORTED_SLOT_TYPES) <= set(SLOT_TYPES)
 
 

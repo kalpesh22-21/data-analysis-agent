@@ -206,6 +206,30 @@ def test_limit_occurrence_does_not_slide_past_an_expression_limit():
         rewrite_sql_to_template(sql, parameterization, strict=True)
 
 
+def test_between_range_emits_and_binds_both_period_tokens():
+    sql = (
+        "SELECT employee_code FROM dbpcm_warehouse.employee "
+        "WHERE hire_date BETWEEN '2025-01-01' AND '2025-12-31'"
+    )
+    parameterization = [{
+        "locator": {
+            "kind": "between_range", "table": "dbpcm_warehouse.employee",
+            "column": "hire_date", "occurrence": 0,
+            "context": "between_predicate", "value": "2025-01-01,2025-12-31",
+        },
+        "role": "slot", "slot": {"name": "hire_window"},
+    }]
+
+    template = rewrite_sql_to_template(sql, parameterization, strict=True)
+
+    assert "BETWEEN {hire_window_start} AND {hire_window_end}" in template
+    bound = bind_template(
+        template,
+        {"hire_window_start": "2026-01-01", "hire_window_end": "2026-06-30"},
+    )
+    assert "BETWEEN '2026-01-01' AND '2026-06-30'" in bound
+
+
 def test_function_argument_occurrence_is_structural_and_exact():
     sql = "SELECT * FROM numbers(3) a CROSS JOIN numbers(5) b"
     template = rewrite_sql_to_template(

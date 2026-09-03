@@ -28,7 +28,9 @@ EXTRACTOR_TOOL_NAME = "emit_candidates"
 # (see `models.py::UNSUPPORTED_SLOT_TYPES`). The mirror stays at parity — the parity
 # test is what makes a future re-enable a one-line change here rather than an
 # archaeology exercise.
-_SLOT_TYPE_ENUM = sorted(SLOT_TYPES - UNSUPPORTED_SLOT_TYPES)
+# `period_range` is offered only with the guarded `between_range` locator. The
+# unsupported set continues to reject legacy attempts to pair independent predicates.
+_SLOT_TYPE_ENUM = sorted((SLOT_TYPES - UNSUPPORTED_SLOT_TYPES) | {"period_range"})
 
 
 class SchemaMismatchError(Exception):
@@ -127,6 +129,22 @@ _LIMIT_ARGUMENT_LOCATOR_SCHEMA = {
     "required": ["kind", "occurrence", "context", "value"],
 }
 
+_BETWEEN_RANGE_LOCATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"const": "between_range"},
+        "table": {"type": "string"},
+        "column": {"type": "string"},
+        "occurrence": {"type": "integer", "minimum": 0},
+        "context": {"type": "string", "const": "between_predicate"},
+        "value": {
+            "type": "string",
+            "description": "The ordered bare lower and upper literals joined by one comma.",
+        },
+    },
+    "required": ["kind", "table", "column", "occurrence", "context", "value"],
+}
+
 _LOCATOR_SCHEMA = {
     "description": (
         "A column predicate, typed IN-list, numbers(...) cardinality, or INTERVAL locator."
@@ -137,6 +155,7 @@ _LOCATOR_SCHEMA = {
         _INTERVAL_ARGUMENT_LOCATOR_SCHEMA,
         _IN_LIST_LOCATOR_SCHEMA,
         _LIMIT_ARGUMENT_LOCATOR_SCHEMA,
+        _BETWEEN_RANGE_LOCATOR_SCHEMA,
     ],
 }
 

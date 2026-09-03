@@ -26,6 +26,8 @@ from data_agent.runtime.blueprint.template import (
 )
 
 from ..sql_locators import (
+    between_range,
+    between_ranges,
     function_argument,
     in_list,
     in_list_predicates,
@@ -645,7 +647,7 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
             at=loc_at,
             requirement=(
                 "'column_predicate', 'function_argument', 'interval_argument', 'in_list', "
-                "or 'limit_argument'"
+                "'limit_argument', or 'between_range'"
             ),
             default="column_predicate",
         )
@@ -715,6 +717,25 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
             context = require(loc, "context", as_text, at=loc_at, requirement="'limit'")
             table = ""
             column = ""
+        elif locator_kind == "between_range":
+            function = None
+            unit = None
+            argument_index = None
+            occurrence = optional(
+                loc, "occurrence", as_int, at=loc_at,
+                requirement="a zero-based integer occurrence", default=0,
+            )
+            context = require(
+                loc, "context", as_text, at=loc_at, requirement="'between_predicate'"
+            )
+            table = require(
+                loc, "table", as_text, at=loc_at,
+                requirement="the 'database.table' the column belongs to",
+            )
+            column = require(
+                loc, "column", as_text, at=loc_at,
+                requirement="the BARE column name, with no table prefix",
+            )
         else:
             function = None
             argument_index = None
@@ -1231,10 +1252,32 @@ def _validate_roles(
                 return _role_shape(
                     f"{at}.locator.value must be a canonical positive integer from 1 to 10000"
                 )
+        elif p.locator.kind == "between_range":
+            mismatches = []
+            if p.role != "slot":
+                mismatches.append(f"role={p.role!r} (expected 'slot')")
+            if p.locator.context != "between_predicate":
+                mismatches.append(
+                    f"locator.context={p.locator.context!r} (expected 'between_predicate')"
+                )
+            if p.locator.occurrence < 0:
+                mismatches.append(
+                    f"locator.occurrence={p.locator.occurrence!r} (expected >= 0)"
+                )
+            if p.slot is None or p.slot.type != "period_range":
+                actual = None if p.slot is None else p.slot.type
+                mismatches.append(f"slot.type={actual!r} (expected 'period_range')")
+            elif not p.slot.required:
+                mismatches.append("slot.required=false (expected true)")
+            if mismatches:
+                return _role_shape(
+                    f"{at}: a between_range must be a required period_range slot; fix: "
+                    + ", ".join(mismatches)
+                )
         elif p.locator.kind != "column_predicate":
             return _role_shape(
                 f"{at}.locator.kind must be 'column_predicate', 'function_argument', "
-                "'interval_argument', 'in_list', or 'limit_argument'"
+                "'interval_argument', 'in_list', 'limit_argument', or 'between_range'"
             )
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
@@ -1261,7 +1304,7 @@ def _validate_roles(
             # start/end assignment wrong silently inverts a filter, which is the D56
             # wrong-answer class this withdrawal exists to avoid. A capability limit of
             # this pipeline is also not a mistake the model made.
-            if p.slot.type in UNSUPPORTED_SLOT_TYPES:
+            if p.slot.type in UNSUPPORTED_SLOT_TYPES and p.locator.kind != "between_range":
                 return Decline(
                     "blueprint",
                     REASON_BAD_ROLE,
@@ -1461,7 +1504,7 @@ def _validate_totality(
                 covering = [
                     (index, plan)
                     for index, plan in enumerate(plans)
-                    if plan.locator.kind in ("column_predicate", "in_list")
+                    if plan.locator.kind in ("column_predicate", "in_list", "between_range")
                     and plan.locator.column.lower() == pred.column.lower()
                     and plan.locator.value == pred.value
                     and _table_compatible(plan.locator.table, pred.table)
@@ -1528,7 +1571,8 @@ def _validate_structural_locators(
         (index, plan)
         for index, plan in enumerate(payload.parameterization)
         if plan.locator.kind in (
-            "function_argument", "interval_argument", "in_list", "limit_argument"
+            "function_argument", "interval_argument", "in_list", "limit_argument",
+            "between_range",
         )
     ]
     if not structural:
@@ -1550,6 +1594,7 @@ def _validate_structural_locators(
             "interval_argument": interval_argument,
             "in_list": in_list,
             "limit_argument": limit_argument,
+            "between_range": between_range,
         }[plan.locator.kind]
         if any(resolver(ast, locator) is not None for ast in parsed):
             continue
@@ -1572,9 +1617,14 @@ def _validate_structural_locators(
             available_counts = [
                 len(in_list_predicates(ast, plan.locator.column)) for ast in parsed
             ]
-        else:
+        elif plan.locator.kind == "limit_argument":
             subject = "LIMIT"
             available_counts = [len(limit_arguments(ast)) for ast in parsed]
+        else:
+            subject = f"BETWEEN range for column {plan.locator.column}"
+            available_counts = [
+                len(between_ranges(ast, plan.locator.column)) for ast in parsed
+            ]
         selected = [
             resolver(ast, locator, require_value_match=False)
             for ast in parsed
@@ -1586,7 +1636,11 @@ def _validate_structural_locators(
                     (
                         ",".join(str(member.this) for member in argument.expressions)
                         if isinstance(argument, exp.In)
-                        else str(argument.this)
+                        else (
+                            f"{argument.args['low'].this},{argument.args['high'].this}"
+                            if isinstance(argument, exp.Between)
+                            else str(argument.this)
+                        )
                     )
                     for argument in selected
                 }
@@ -1616,7 +1670,7 @@ def _validate_structural_locators(
 
         supported_shape = (
             "literal-only IN list"
-            if plan.locator.kind == "in_list"
+            if plan.locator.kind in ("in_list", "between_range")
             else "integer literal"
         )
         return Decline(

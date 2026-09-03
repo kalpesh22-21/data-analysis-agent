@@ -94,20 +94,22 @@ def _decline_for(parameterization: list[dict]) -> Decline | ExtractedCandidate:
 # --- the withdrawal itself -------------------------------------------------------
 
 
-def test_the_type_is_known_but_not_offered():
+def test_the_type_is_known_and_offered_for_guarded_between_ranges():
     """The mirror stays at PARITY — the drift defect is fixed and stays fixed. What is
     withheld is the PROMPT ENUM, which is a different statement: "this type exists and
     we cannot carry it yet", not "this type does not exist"."""
     assert "period_range" in SLOT_TYPES
     assert "period_range" in RUNTIME_SLOT_TYPES
     assert "period_range" in UNSUPPORTED_SLOT_TYPES
-    assert "period_range" not in SLOT_TYPE_ENUM
+    assert "period_range" in SLOT_TYPE_ENUM
 
 
-def test_the_tool_schema_cannot_mention_it():
+def test_the_tool_schema_offers_the_guarded_range_type_and_locator():
     import json
 
-    assert "period_range" not in json.dumps(build_extractor_tool())
+    schema = json.dumps(build_extractor_tool())
+    assert "period_range" in schema
+    assert "between_range" in schema
 
 
 def test_relative_window_is_still_offered():

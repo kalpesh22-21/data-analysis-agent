@@ -273,6 +273,8 @@ async def test_every_template_token_s4_emits_is_a_declared_bind_token(slot_type:
     withdrawn type without teaching S4 its grammar fails HERE, immediately."""
     if slot_type == "enum":
         pytest.skip("an enum slot needs enum_values; its token arity is the scalar one")
+    if slot_type == "period_range":
+        pytest.skip("period_range is offered only through the two-token between_range locator")
     # ONE predicate: D97 totality wants one plan entry per literal, so a single-entry
     # plan needs a single-predicate query. `_RANGE_SQL` has two by design.
     payload = await _generalized(
@@ -303,11 +305,11 @@ async def test_every_template_token_s4_emits_is_a_declared_bind_token(slot_type:
     )
 
 
-def test_the_withdrawal_is_what_closes_this_gap():
+def test_legacy_independent_predicate_pairing_remains_withdrawn():
     """Ties the finding to its resolution, so neither can be changed alone: the type is
     still in the mirror (the runtime executes it), and still out of the prompt enum."""
     assert "period_range" in UNSUPPORTED_SLOT_TYPES
-    assert "period_range" not in SLOT_TYPE_ENUM
+    assert "period_range" in SLOT_TYPE_ENUM
 
 
 # --- the control: relative_window, which DOES clear the whole path ---------------
