@@ -58,16 +58,25 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
 )
+from data_agent.runtime.help_center.client import HelpCenterClient, HttpHelpCenterClient
+from data_agent.runtime.help_center.tools import (
+    GetHelpCenterDocumentTool,
+    SearchHelpCenterTool,
+)
 from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
 from data_agent.runtime.loop.answer_judge import AnswerJudge
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
-from data_agent.runtime.mcp.tool_schema import ToolSchemaCache
+from data_agent.runtime.mcp.tool_schema import (
+    GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA,
+    SEARCH_HELP_CENTER_TOOL_SCHEMA,
+    ToolSchemaCache,
+)
 from data_agent.runtime.model.client import ModelClient
 from data_agent.runtime.model.embedding_client import EmbeddingClient, HttpEmbeddingClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
-from data_agent.runtime.model.reranker_client import HttpRerankerClient
+from data_agent.runtime.model.reranker_client import HttpRerankerClient, RerankerClient
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
@@ -252,6 +261,8 @@ def create_app(
     embedding_client: EmbeddingClient | None = None,
     resolve_values: ResolveValuesComposite | None = None,
     retrieval: RetrievalPipeline | None = None,
+    help_center_client: HelpCenterClient | None = None,
+    help_center_reranker: RerankerClient | None = None,
     # The D93 scratch-write side-channel client (table-intermediate Slice 2). When
     # None AND `scratch_enabled`, a real `ScratchClient` is built from settings
     # (same MCP host). Pass a `FakeScratchClient` in a smoke test.
@@ -302,6 +313,20 @@ def create_app(
         model=settings.openai_model,
         base_url=settings.openai_base_url,
     )
+
+    if settings.help_center_enabled:
+        if help_center_client is None:
+            if not settings.help_center_search_url or not settings.help_center_documents_url:
+                raise ValueError(
+                    "HELP_CENTER_ENABLED requires HELP_CENTER_SEARCH_URL and "
+                    "HELP_CENTER_DOCUMENTS_URL."
+                )
+            help_center_client = HttpHelpCenterClient(
+                search_url=settings.help_center_search_url,
+                documents_url=settings.help_center_documents_url,
+                api_key=settings.help_center_api_key,
+                timeout_seconds=settings.help_center_timeout_seconds,
+            )
 
     # LLM-generated progress summaries (opt-in, `progress_summary_enabled`). Built
     # ONCE here from a SECOND, cheap `OpenAIModelClient` on `openai_summary_model`
@@ -402,6 +427,19 @@ def create_app(
     # (`otlp_hide_llm_content=True`), mirroring the learning loop's verbose gate.
     tracing.instrument_openai(tracer_provider, hide_content=hide_llm_content)
     tracer = tracing.get_tracer(tracer_provider)
+
+    if settings.help_center_enabled and help_center_reranker is None:
+        if not settings.reranker_api_url:
+            raise ValueError(
+                "HELP_CENTER_ENABLED requires RERANKER_API_URL or an injected reranker."
+            )
+        help_center_reranker = HttpRerankerClient(
+            url=settings.reranker_api_url,
+            api_key=settings.reranker_api_key,
+            model=settings.reranker_model,
+            timeout_seconds=settings.reranker_timeout_seconds,
+            tracer=tracer,
+        )
 
     # D77/OQ-1: the real `HttpEmbeddingClient` is wired only when the custom
     # embedding API is configured; otherwise the composite runs with NO
@@ -518,7 +556,14 @@ def create_app(
 
         catalog_provider = _catalog_provider
 
-    tool_schema_cache = ToolSchemaCache(mcp_client)
+    help_center_schemas = (
+        (SEARCH_HELP_CENTER_TOOL_SCHEMA, GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA)
+        if settings.help_center_enabled
+        else ()
+    )
+    tool_schema_cache = ToolSchemaCache(
+        mcp_client, additional_local_schemas=help_center_schemas
+    )
     context_assembler = ContextAssembler(
         session_store,
         preview_row_count=settings.preview_row_count,
@@ -654,6 +699,24 @@ def create_app(
         runtime_tools["updateAnalysisState"] = UpdateAnalysisStateTool(
             session_store=session_store, observer=observer, tracer=tracer
         )
+        if settings.help_center_enabled:
+            assert help_center_client is not None
+            assert help_center_reranker is not None
+            runtime_tools["searchHelpCenter"] = SearchHelpCenterTool(
+                client=help_center_client,
+                reranker=help_center_reranker,
+                candidate_limit=settings.help_center_search_candidate_limit,
+                top_k=settings.help_center_search_top_k,
+                observer=observer,
+                tracer=tracer,
+                disable_redaction=settings.otlp_disable_redaction,
+            )
+            runtime_tools["getHelpCenterDocument"] = GetHelpCenterDocumentTool(
+                client=help_center_client,
+                observer=observer,
+                tracer=tracer,
+                disable_redaction=settings.otlp_disable_redaction,
+            )
         blueprint_executor: BlueprintExecutor | None = None
         if active_retrieval is not None:
             # `disable_redaction` (telemetry-only debug switch) reveals the real

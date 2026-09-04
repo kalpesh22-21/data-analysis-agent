@@ -191,7 +191,8 @@ async def test_serves_intent_is_advertised_on_exactly_the_taggable_tools() -> No
         for schema in schemas
         if "serves_intent" in (schema.get("parameters") or {}).get("properties", {})
     }
-    assert advertised == set(INTENT_TAGGABLE_TOOLS)
+    schema_names = {schema["name"] for schema in schemas}
+    assert advertised == set(INTENT_TAGGABLE_TOOLS) & schema_names
     for schema in schemas:
         properties = (schema.get("parameters") or {}).get("properties", {})
         if "serves_intent" in properties:

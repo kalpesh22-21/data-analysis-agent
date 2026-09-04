@@ -77,6 +77,7 @@ _NEO4J_URL = "bolt://localhost:7687"
 _NEO4J_USERNAME = "neo4j"
 _NEO4J_PASSWORD = "testpassword"
 _EMBEDDING_API_URL = "http://localhost:18003/embed"
+_RERANKER_API_URL = "http://localhost:18004/rerank"
 
 # The `.env` key read and the Responses-API model preflight are `_e2e_harness
 # .load_openai_key` / `.pick_openai_model` — the SYNC preflight, which is what this
@@ -131,6 +132,12 @@ def build_real_app():
     # only. It makes the Phoenix project entity-bearing, so treat this server like
     # the audit store (access-controlled) when the flag is on.
     disable_redaction = os.environ.get("OTLP_DISABLE_REDACTION") == "1"
+    help_center_on = os.environ.get("HELP_CENTER_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     settings = RuntimeSettings(
         _env_file=None,  # explicit wiring only — don't double-read .env
@@ -182,6 +189,11 @@ def build_real_app():
         neo4j_username=_NEO4J_USERNAME,
         neo4j_password=_NEO4J_PASSWORD,
         embedding_api_url=_EMBEDDING_API_URL if retrieval_on else "",
+        help_center_enabled=help_center_on,
+        help_center_search_url=os.environ.get("HELP_CENTER_SEARCH_URL", ""),
+        help_center_documents_url=os.environ.get("HELP_CENTER_DOCUMENTS_URL", ""),
+        help_center_api_key=os.environ.get("HELP_CENTER_API_KEY", ""),
+        reranker_api_url=_RERANKER_API_URL if help_center_on else "",
     )
 
     session_store, store_choice = _build_session_store(settings)
@@ -202,6 +214,7 @@ def build_real_app():
             "REAL tool calls (SQL+values), results, and LLM Q/A. ACCESS-CONTROL this server."
         )
     print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
+    print(f"[run_ui_runtime_real] help_center    = {'ON' if help_center_on else 'OFF'}")
     print(
         "[run_ui_runtime_real] retrieval_context = "
         f"{'prefetchContext tool pair' if retrieval_prefetch_tool_on else 'user message'}"

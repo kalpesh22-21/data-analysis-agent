@@ -22,7 +22,7 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
-from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
+from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT, HELP_CENTER_SYSTEM_PROMPT
 
 # enabled but paycompy is missing.
 try:
@@ -718,6 +718,19 @@ class RuntimeSettings(BaseSettings):
         description="The base agent system prompt text (used only when agent_system_prompt_enabled).",
     )
 
+    # --- Help Center retrieval (opt-in, model-invisible when disabled) ---
+    help_center_enabled: bool = Field(
+        False, description="Enable Help Center tools and prompt guidance."
+    )
+    help_center_search_url: str = Field("", description="Help Center search API endpoint.")
+    help_center_documents_url: str = Field(
+        "", description="Help Center documents API base URL."
+    )
+    help_center_api_key: str = Field("", description="Optional Help Center service bearer key.")
+    help_center_timeout_seconds: float = Field(10.0, gt=0)
+    help_center_search_candidate_limit: int = Field(25, ge=5, le=100)
+    help_center_search_top_k: int = Field(5, ge=1, le=5)
+
     # --- Agent loop / budget caps (D47/D55, OQ-H) ---
     #
     # RAISED 2026-08-12 ON LIVE MEASUREMENT, and the direction of the evidence is
@@ -1104,7 +1117,11 @@ class RuntimeSettings(BaseSettings):
         `None` reproduces the pre-existing prompt-less loop exactly (no leading
         system message from this feature).
         """
-        return self.agent_system_prompt if self.agent_system_prompt_enabled else None
+        if not self.agent_system_prompt_enabled:
+            return None
+        if self.help_center_enabled:
+            return self.agent_system_prompt + HELP_CENTER_SYSTEM_PROMPT
+        return self.agent_system_prompt
 
     def request_token_budget(self) -> int:
         """Absolute cap on the FULL assembled request (all messages) handed to `send_turn`: the

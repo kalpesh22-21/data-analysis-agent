@@ -569,6 +569,43 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
     },
 }
 
+SEARCH_HELP_CENTER_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "searchHelpCenter",
+    "description": (
+        "Search Paycom Help Center articles and return the five most relevant excerpts."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The user's product, process, or terminology question.",
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "getHelpCenterDocument",
+    "description": (
+        "Retrieve the complete Help Center article for an id returned by searchHelpCenter."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "An article id returned by searchHelpCenter.",
+            },
+            "serves_intent": SERVES_INTENT_PARAM,
+        },
+        "required": ["id"],
+    },
+}
+
 
 # The locally-authored (runtime-implemented) tool schemas, appended after the
 # live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
@@ -634,7 +671,11 @@ def augment_with_serves_intent(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 async def fetch_function_schemas(
-    mcp_client: MCPClient, *, jwt: str, session_id: str
+    mcp_client: MCPClient,
+    *,
+    jwt: str,
+    session_id: str,
+    additional_local_schemas: tuple[dict[str, Any], ...] = (),
 ) -> list[dict[str, Any]]:
     """Fetch `list_tools()` from *mcp_client*, translate, and append `askUser`.
 
@@ -648,7 +689,9 @@ async def fetch_function_schemas(
     # closed) rather than becoming a silent shadow in the loop's `runtime_tools`
     # interception — the runtime-tool registry is the source of truth for our names.
     mcp_names = {tool.name for tool in tools}
-    collisions = mcp_names & _LOCAL_TOOL_NAMES
+    local_schemas = (*_LOCAL_TOOL_SCHEMAS, *additional_local_schemas)
+    local_names = frozenset(schema["name"] for schema in local_schemas)
+    collisions = mcp_names & local_names
     if collisions:
         raise ToolNameCollisionError(
             "MCP advertises tool name(s) that collide with locally-authored runtime "
@@ -664,7 +707,7 @@ async def fetch_function_schemas(
     # tools + runBlueprint + recordAssumptions + answerWithTable +
     # updateAnalysisState), always advertised, appended after the MCP tools
     # (count 6 → 15).
-    schemas.extend(_LOCAL_TOOL_SCHEMAS)
+    schemas.extend(local_schemas)
     return schemas
 
 
@@ -679,8 +722,14 @@ class ToolSchemaCache:
         call requires the MCP to be reachable.
     """
 
-    def __init__(self, mcp_client: MCPClient) -> None:
+    def __init__(
+        self,
+        mcp_client: MCPClient,
+        *,
+        additional_local_schemas: tuple[dict[str, Any], ...] = (),
+    ) -> None:
         self._mcp_client = mcp_client
+        self._additional_local_schemas = additional_local_schemas
         self._cache: list[dict[str, Any]] | None = None
 
     async def get_schemas(
@@ -688,6 +737,9 @@ class ToolSchemaCache:
     ) -> list[dict[str, Any]]:
         if self._cache is None or force_reload:
             self._cache = await fetch_function_schemas(
-                self._mcp_client, jwt=jwt, session_id=session_id
+                self._mcp_client,
+                jwt=jwt,
+                session_id=session_id,
+                additional_local_schemas=self._additional_local_schemas,
             )
         return self._cache

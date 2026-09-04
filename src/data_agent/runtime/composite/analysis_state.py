@@ -130,7 +130,9 @@ SUBSTANTIVE_TOOLS = frozenset({"runQuery", "runBlueprint", "sampleRows", "resolv
 # any `runQuery`/`runBlueprint` succeeded this turn") was REJECTED on review: the
 # test is per-turn while the concern is per-intent, so it breaks the legitimate
 # mixed request. Do not reintroduce it.
-COMPLETION_EVIDENCE_TOOLS = frozenset({"runQuery", "runBlueprint", "getTableSchema"})
+COMPLETION_EVIDENCE_TOOLS = frozenset(
+    {"runQuery", "runBlueprint", "getTableSchema", "getHelpCenterDocument"}
+)
 # --- call-time intent tagging (the PRIMARY completion path) -----------------
 # The model names the intent WHEN IT DOES THE WORK — `runQuery(sql=…,
 # serves_intent="i2")` — and closes it later with `{intent_id, status}` alone.
