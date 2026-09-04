@@ -84,9 +84,9 @@ class SearchHelpCenterTool(_HelpCenterTool):
         query = model_args.get("query")
         if not isinstance(query, str) or not query.strip():
             return self._error(INVALID_ARGS, "'query' must be non-empty text.", retryable=True)
-        hits = (await self._client.search(query.strip(), self._candidate_limit))[
-            : self._candidate_limit
-        ]
+        hits = (
+            await self._client.search(query.strip(), self._candidate_limit, jwt=credentials.jwt)
+        )[: self._candidate_limit]
         reranked = False
         ranked_hits = [(hit.score, hit) for hit in hits]
         if hits:
@@ -128,7 +128,7 @@ class GetHelpCenterDocumentTool(_HelpCenterTool):
         article_id = model_args.get("id")
         if not isinstance(article_id, str) or not article_id.strip():
             return self._error(INVALID_ARGS, "'id' must be non-empty text.", retryable=True)
-        document = await self._client.get_document(article_id.strip())
+        document = await self._client.get_document(article_id.strip(), jwt=credentials.jwt)
         if document is None:
             return _result(self.tool_name, {"found": False, "id": article_id.strip()})
         return _result(

@@ -324,7 +324,6 @@ def create_app(
             help_center_client = HttpHelpCenterClient(
                 search_url=settings.help_center_search_url,
                 documents_url=settings.help_center_documents_url,
-                api_key=settings.help_center_api_key,
                 timeout_seconds=settings.help_center_timeout_seconds,
             )
 

@@ -192,7 +192,6 @@ def build_real_app():
         help_center_enabled=help_center_on,
         help_center_search_url=os.environ.get("HELP_CENTER_SEARCH_URL", ""),
         help_center_documents_url=os.environ.get("HELP_CENTER_DOCUMENTS_URL", ""),
-        help_center_api_key=os.environ.get("HELP_CENTER_API_KEY", ""),
         reranker_api_url=_RERANKER_API_URL if help_center_on else "",
     )
 

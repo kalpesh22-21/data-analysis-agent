@@ -726,7 +726,6 @@ class RuntimeSettings(BaseSettings):
     help_center_documents_url: str = Field(
         "", description="Help Center documents API base URL."
     )
-    help_center_api_key: str = Field("", description="Optional Help Center service bearer key.")
     help_center_timeout_seconds: float = Field(10.0, gt=0)
     help_center_search_candidate_limit: int = Field(25, ge=5, le=100)
     help_center_search_top_k: int = Field(5, ge=1, le=5)

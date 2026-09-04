@@ -6,7 +6,7 @@ This contract defines the two read-only APIs consumed by the Data Analysis Agent
 
 - JSON encoded as UTF-8.
 - HTTPS in deployed environments.
-- Service authentication: `Authorization: Bearer <service-api-key>`. The agent will not forward a user's JWT, session id, tenant, or column scope.
+- User authentication: `Authorization: Bearer <jwt>`. The agent forwards the same JWT it receives from the UI for the current request. It does not forward the session id or column scope separately.
 - Stable, opaque article IDs. IDs are case-sensitive and must remain valid while an article exists.
 - Article content is plain text or Markdown. It must not contain executable HTML or scripts.
 - A complete document must never exceed 4,000 tokens using the tokenizer agreed with the agent team. This limit includes the title/body if the service combines them in `content`.
@@ -102,7 +102,7 @@ Return `404` when the article does not exist or is no longer available. Do not s
 |---|---|
 | `200` | Success |
 | `400` | Invalid request |
-| `401` / `403` | Invalid service credentials or forbidden service principal |
+| `401` / `403` | Invalid user JWT or user not authorized to access the resource |
 | `404` | Document not found; get API only |
 | `429` | Rate limited; include `Retry-After` when possible |
 | `500` / `502` / `503` / `504` | Transient service failure |
