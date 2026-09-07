@@ -13,6 +13,7 @@ import json
 import pytest
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
     ContextAssembler,
@@ -1460,6 +1461,30 @@ class _StubRuntimeTool:
         )
 
 
+class _StubCapabilityCardTool:
+    intent_taggable = True
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls = 0
+
+    async def run(
+        self, model_args: dict, credentials: RuntimeCredentials, turn=None
+    ) -> ToolResult:
+        self.calls += 1
+        return ToolResult(
+            status="ok",
+            tool_name=self.name,
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full={"tool_name": self.name, "kind": "navigation", "arguments": {}},
+            terminal=True,
+        )
+
+
 def _registry_loop(
     *,
     model_client: ScriptedModelClient,
@@ -1514,6 +1539,104 @@ async def test_registered_runtime_tool_intercepted_one_call_never_dispatched() -
     assert trail[0].status == "ok"
     assert trail[0].provenance == frozenset()  # safe-empty, kept in D44 replay
 
+
+async def test_capability_cards_drain_the_batch_and_finish_together() -> None:
+    first = _StubCapabilityCardTool("first_navigation")
+    second = _StubCapabilityCardTool("second_navigation")
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="cap_1", name=first.name, arguments={}),
+                    ToolCallRequest(id="cap_2", name=second.name, arguments={}),
+                ]
+            )
+        ]
+    )
+    loop, _ = _registry_loop(
+        model_client=model,
+        mcp_client=FakeMCPClient(),
+        runtime_tools={first.name: first, second.name: second},
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert first.calls == second.calls == 1
+    assert [card["tool_name"] for card in outcome.capability_cards or []] == [
+        first.name,
+        second.name,
+    ]
+
+
+async def test_capability_card_waits_for_required_answer_table() -> None:
+    capability = _StubCapabilityCardTool("navigate_to_position_management")
+    sql = f"SELECT Department FROM {_E}"
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="query_1", name="runQuery", arguments={"sql": sql})
+                ]
+            ),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="cap_1", name=capability.name, arguments={})
+                ]
+            ),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="answer_1",
+                        name="answerWithTable",
+                        arguments={
+                            "answer": "Here are the results and the requested page.",
+                            "tables": [{"sql": sql}],
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                {
+                    "columns": ["Department"],
+                    "rows": [["Sales"], ["Engineering"], ["Payroll"]],
+                    "row_count": 3,
+                    "truncated": False,
+                }
+            ]
+        }
+    )
+    loop, _ = _registry_loop(
+        model_client=model,
+        mcp_client=mcp,
+        runtime_tools={
+            capability.name: capability,
+            "answerWithTable": AnswerWithTableTool(),
+        },
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID,
+        credentials=_credentials(),
+        user_message="Show the departments and take me to Position Management.",
+    )
+
+    assert outcome.status == "done"
+    assert outcome.answer_tables is not None
+    assert outcome.answer_tables[0]["sql"] == sql
+    assert [card["tool_name"] for card in outcome.capability_cards or []] == [
+        capability.name
+    ]
+    assert capability.calls == 1
+    assert len(model.calls) == 3
+    assert any(
+        "capability cards are already prepared" in str(message.get("content") or "")
+        for message in model.calls[2].messages
+    )
 
 async def test_unwired_retrieval_tool_returns_unavailable_never_dispatched() -> None:
     model = ScriptedModelClient(

@@ -336,5 +336,25 @@ HELP_CENTER_SYSTEM_PROMPT = (
     "answer, say so plainly."
 )
 
+CAPABILITY_TOOLS_SYSTEM_PROMPT = (
+    "\n\n## UI capabilities\n"
+    "UI capabilities provide navigation, actions, and interactive information in the UI. "
+    "Call getCapabilityTool with an option's exact tool_name to load its executable schema, "
+    "then call that tool to ask the UI to render the requested option. The runtime does not "
+    "perform the represented navigation or action. Use searchCapabilityTools if the "
+    "prefetched options do not fit. "
+    "Prefer a data widget for a direct UI display and SQL for aggregation, comparisons, "
+    "trends, calculations, or custom filtering. Complete other parts of a mixed request "
+    "before presenting a capability because it finalizes the current tool batch. "
+    "For a mixed request, put the concise answer to the completed work in the capability "
+    "call's answer field so the user receives both the answer and the UI option. Never tell "
+    "the user about cards, widgets, capabilities, tools, hydration, or internal routing. "
+    "Describe only what they can view or do."
+)
 
-__all__ = ["AGENT_SYSTEM_PROMPT", "HELP_CENTER_SYSTEM_PROMPT"]
+
+__all__ = [
+    "AGENT_SYSTEM_PROMPT",
+    "CAPABILITY_TOOLS_SYSTEM_PROMPT",
+    "HELP_CENTER_SYSTEM_PROMPT",
+]

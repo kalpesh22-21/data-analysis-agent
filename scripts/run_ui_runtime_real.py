@@ -138,6 +138,15 @@ def build_real_app():
         "yes",
         "on",
     )
+    capability_tools_on = os.environ.get("CAPABILITY_TOOLS_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    capability_prefetch_on = os.environ.get(
+        "CAPABILITY_PREFETCH_ENABLED", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
 
     settings = RuntimeSettings(
         _env_file=None,  # explicit wiring only — don't double-read .env
@@ -193,6 +202,9 @@ def build_real_app():
         help_center_search_url=os.environ.get("HELP_CENTER_SEARCH_URL", ""),
         help_center_documents_url=os.environ.get("HELP_CENTER_DOCUMENTS_URL", ""),
         reranker_api_url=_RERANKER_API_URL if help_center_on else "",
+        capability_tools_enabled=capability_tools_on,
+        capability_prefetch_enabled=capability_prefetch_on,
+        capability_api_url=os.environ.get("CAPABILITY_API_URL", ""),
     )
 
     session_store, store_choice = _build_session_store(settings)
@@ -214,6 +226,11 @@ def build_real_app():
         )
     print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
     print(f"[run_ui_runtime_real] help_center    = {'ON' if help_center_on else 'OFF'}")
+    print(
+        "[run_ui_runtime_real] capabilities   = "
+        f"{'ON' if capability_tools_on else 'OFF'} "
+        f"(prefetch={'ON' if capability_prefetch_on else 'OFF'})"
+    )
     print(
         "[run_ui_runtime_real] retrieval_context = "
         f"{'prefetchContext tool pair' if retrieval_prefetch_tool_on else 'user message'}"

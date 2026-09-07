@@ -217,6 +217,7 @@ class TrailEntry:
     # `authoritative` on this dataclass. It is scope-inert: a closed-vocabulary sentence
     # about a window anchor, carrying no column identifier and no warehouse value.
     window_note: str | None = None
+    capability_terminal: bool = False
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -239,6 +240,7 @@ class TrailEntry:
                 else [_provenance_to_doc(item) for item in self.answer_table_provenance]
             ),
             "window_note": self.window_note,
+            "capability_terminal": self.capability_terminal,
         }
 
     @classmethod
@@ -269,6 +271,7 @@ class TrailEntry:
             window_note=(
                 doc.get("window_note") if isinstance(doc.get("window_note"), str) else None
             ),
+            capability_terminal=doc.get("capability_terminal") is True,
         )
 
 

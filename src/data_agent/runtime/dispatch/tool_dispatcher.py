@@ -151,6 +151,7 @@ class ToolResult:
     # channel to the model, and `context/budget.py::_render_entry` drops anything the
     # entry does not carry.
     window_note: str | None = None
+    terminal: bool = False
 
 
 # Default per-result token cap for the stored preview (RuntimeSettings.

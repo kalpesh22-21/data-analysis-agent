@@ -206,6 +206,7 @@ class TurnAccumulators:
         blueprint_use: Mapping[str, Any] | None = None,
         verification: Mapping[str, Any] | None = None,
         assumptions: Sequence[str] | None = None,
+        capability_cards: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         # Every successful query this turn ran, deduped, first-occurrence order.
         self._sql: list[str] = list(sql) if sql else []
@@ -237,6 +238,9 @@ class TurnAccumulators:
         # this turn. Folded from each SUCCESSFUL recordAssumptions call's ARGUMENTS,
         # read at every `TurnOutcome(...)` return site.
         self._assumptions: list[str] = list(assumptions) if assumptions else []
+        self._capability_cards: list[dict[str, Any]] = [
+            dict(card) for card in (capability_cards or ())
+        ]
 
     # --- folds (one per dispatched tool call, all no-ops off their own tool) ---
 
@@ -335,6 +339,18 @@ class TurnAccumulators:
         if resolved:
             self._answer_tables = list(resolved)
 
+    def note_capability_card(self, tool_result: ToolResult) -> str | None:
+        if not (tool_result.status == "ok" and tool_result.terminal):
+            return None
+        payload = tool_result.result_full
+        if not isinstance(payload, dict):
+            return None
+        card = {key: value for key, value in payload.items() if key != "answer"}
+        if card not in self._capability_cards:
+            self._capability_cards.append(card)
+        answer = payload.get("answer")
+        return answer.strip() if isinstance(answer, str) and answer.strip() else None
+
     # --- reads: the turn's exits ---------------------------------------------
 
     @property
@@ -348,6 +364,10 @@ class TurnAccumulators:
     def assumptions(self) -> list[str] | None:
         """`TurnOutcome.assumptions`. The same `[] -> None` fork as `sql_executed`."""
         return self._assumptions or None
+
+    @property
+    def capability_cards(self) -> list[dict[str, Any]] | None:
+        return self._capability_cards or None
 
     def envelope(self) -> AnswerEnvelope:
         """The four answer-table fields of a `TurnOutcome` — `answer_envelope` over this

@@ -419,7 +419,7 @@ def validate_completion_evidence(
             "Completing an intent needs a successful call; a failed one can only "
             "support a blocked intent."
         )
-    if entry.tool_name not in COMPLETION_EVIDENCE_TOOLS:
+    if entry.tool_name not in COMPLETION_EVIDENCE_TOOLS and not entry.capability_terminal:
         return (
             f"a {entry.tool_name} result is not evidence that an intent was answered. "
             "Cite a runQuery, a verified runBlueprint, or a getTableSchema."
@@ -531,7 +531,11 @@ def classify_block_evidence(
 
 
 def split_serves_intent(
-    tool_name: str, arguments: Any, live: AnalysisState | None
+    tool_name: str,
+    arguments: Any,
+    live: AnalysisState | None,
+    *,
+    additional_taggable: bool = False,
 ) -> tuple[Any, str | None, str | None]:
     """Split `serves_intent` out of a model tool call's *arguments*.
 
@@ -553,7 +557,10 @@ def split_serves_intent(
         Only the three `INTENT_TAGGABLE_TOOLS` are touched; on any other tool the arguments are
         returned untouched, so a stray `serves_intent` there fails exactly as it does today.
     """
-    if tool_name not in INTENT_TAGGABLE_TOOLS or not isinstance(arguments, dict):
+    if (
+        (tool_name not in INTENT_TAGGABLE_TOOLS and not additional_taggable)
+        or not isinstance(arguments, dict)
+    ):
         return arguments, None, None
     if SERVES_INTENT_ARG not in arguments:
         return arguments, None, None

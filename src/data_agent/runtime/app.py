@@ -33,6 +33,14 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
+from data_agent.runtime.capabilities.client import CapabilityClient, HttpCapabilityClient
+from data_agent.runtime.capabilities.prefetch import prefetch_capabilities
+from data_agent.runtime.capabilities.resolution import CapabilityResolutionRegistry
+from data_agent.runtime.capabilities.tools import (
+    GetCapabilityTool,
+    PresentCapabilityCardTool,
+    SearchCapabilityToolsTool,
+)
 from data_agent.runtime.catalog.export_client import build_catalog_cache
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import (
@@ -69,7 +77,9 @@ from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
 from data_agent.runtime.mcp.tool_schema import (
+    GET_CAPABILITY_TOOL_SCHEMA,
     GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA,
+    SEARCH_CAPABILITY_TOOLS_SCHEMA,
     SEARCH_HELP_CENTER_TOOL_SCHEMA,
     ToolSchemaCache,
 )
@@ -215,6 +225,7 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
         # list-or-`None` (the `[] -> None` fork mirrors `sql`), so an old client
         # ignores the unknown key.
         "assumptions": outcome.assumptions,
+        "capability_cards": outcome.capability_cards,
     }
 
 
@@ -263,6 +274,7 @@ def create_app(
     retrieval: RetrievalPipeline | None = None,
     help_center_client: HelpCenterClient | None = None,
     help_center_reranker: RerankerClient | None = None,
+    capability_client: CapabilityClient | None = None,
     # The D93 scratch-write side-channel client (table-intermediate Slice 2). When
     # None AND `scratch_enabled`, a real `ScratchClient` is built from settings
     # (same MCP host). Pass a `FakeScratchClient` in a smoke test.
@@ -326,6 +338,19 @@ def create_app(
                 documents_url=settings.help_center_documents_url,
                 timeout_seconds=settings.help_center_timeout_seconds,
             )
+    if settings.capability_tools_enabled and capability_client is None:
+        if not settings.capability_api_url:
+            raise ValueError("CAPABILITY_TOOLS_ENABLED requires CAPABILITY_API_URL.")
+        capability_client = HttpCapabilityClient(
+            base_url=settings.capability_api_url,
+            api_key=settings.capability_api_key,
+            timeout_seconds=settings.capability_timeout_seconds,
+        )
+    capability_resolution_registry = (
+        CapabilityResolutionRegistry.load(settings.capability_resolution_path)
+        if settings.capability_tools_enabled
+        else None
+    )
 
     # LLM-generated progress summaries (opt-in, `progress_summary_enabled`). Built
     # ONCE here from a SECOND, cheap `OpenAIModelClient` on `openai_summary_model`
@@ -560,14 +585,28 @@ def create_app(
         if settings.help_center_enabled
         else ()
     )
-    tool_schema_cache = ToolSchemaCache(
-        mcp_client, additional_local_schemas=help_center_schemas
+    capability_schemas = (
+        (SEARCH_CAPABILITY_TOOLS_SCHEMA, GET_CAPABILITY_TOOL_SCHEMA)
+        if settings.capability_tools_enabled
+        else ()
     )
+    tool_schema_cache = ToolSchemaCache(
+        mcp_client,
+        additional_local_schemas=(*help_center_schemas, *capability_schemas),
+    )
+    capability_prefetch_provider = None
+    if settings.capability_tools_enabled and settings.capability_prefetch_enabled:
+        assert capability_client is not None
+
+        async def capability_prefetch_provider(query: str):
+            return await prefetch_capabilities(capability_client, query)
+
     context_assembler = ContextAssembler(
         session_store,
         preview_row_count=settings.preview_row_count,
         retrieval=active_retrieval,
         retrieval_prefetch_tool_enabled=settings.retrieval_prefetch_tool_enabled,
+        capability_prefetch_provider=capability_prefetch_provider,
         base_system_prompt=settings.effective_agent_system_prompt(),
         tracer=tracer,
     )
@@ -586,7 +625,7 @@ def create_app(
     # re-dispatch on every budget window.
     discovery_emulation_cache = EmulatedDiscoveryCache()
 
-    async def _tools_provider(credentials: RuntimeCredentials) -> list[dict[str, Any]]:
+    async def _base_tools_provider(credentials: RuntimeCredentials) -> list[dict[str, Any]]:
         # The live MCP authenticates tools/list too (no anonymous
         # introspection) — thread this turn's credentials through, but the
         # catalogue itself is scope-independent and cached by
@@ -675,6 +714,15 @@ def create_app(
         # is active — they share the one pipeline + store singleton, and carry
         # this request's observer/tracer for progress + the nested TOOL span.
         runtime_tools: dict[str, RuntimeTool] = {"resolveValues": composite}
+        active_tool_schemas: list[dict[str, Any]] = []
+        base_tools_loaded = False
+
+        async def _tools_provider(credentials: RuntimeCredentials) -> list[dict[str, Any]]:
+            nonlocal base_tools_loaded
+            if not base_tools_loaded:
+                active_tool_schemas.extend(await _base_tools_provider(credentials))
+                base_tools_loaded = True
+            return active_tool_schemas
         # `recordAssumptions` (docs/decisions/ui-assumptions-contract.md): ALWAYS
         # wired — it has no backing stack (it only echoes the model's plain-English
         # assumptions into the turn result), so it is never subject to the
@@ -712,6 +760,51 @@ def create_app(
             )
             runtime_tools["getHelpCenterDocument"] = GetHelpCenterDocumentTool(
                 client=help_center_client,
+                observer=observer,
+                tracer=tracer,
+                disable_redaction=settings.otlp_disable_redaction,
+            )
+        if settings.capability_tools_enabled:
+            assert capability_client is not None
+
+            def _hydrate_capability(definition):
+                if definition.name in runtime_tools:
+                    return True
+                if any(
+                    parameter.resolution_strategy is None
+                    or (
+                        parameter.resolution_strategy == "resolve_values"
+                        and (
+                            capability_resolution_registry is None
+                            or not parameter.semantic_type
+                            or capability_resolution_registry.get(parameter.semantic_type) is None
+                        )
+                    )
+                    for parameter in definition.parameters
+                ):
+                    return False
+                active_tool_schemas.append(
+                    definition.tool_schema(capability_resolution_registry)
+                )
+                runtime_tools[definition.name] = PresentCapabilityCardTool(
+                    client=capability_client,
+                    definition=definition,
+                    observer=observer,
+                    tracer=tracer,
+                    disable_redaction=settings.otlp_disable_redaction,
+                )
+                return True
+
+            runtime_tools["searchCapabilityTools"] = SearchCapabilityToolsTool(
+                client=capability_client,
+                observer=observer,
+                tracer=tracer,
+                disable_redaction=settings.otlp_disable_redaction,
+            )
+            runtime_tools["getCapabilityTool"] = GetCapabilityTool(
+                client=capability_client,
+                hydrate=_hydrate_capability,
+                visible_names=set(),
                 observer=observer,
                 tracer=tracer,
                 disable_redaction=settings.otlp_disable_redaction,

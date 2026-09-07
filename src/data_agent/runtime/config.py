@@ -22,7 +22,11 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
-from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT, HELP_CENTER_SYSTEM_PROMPT
+from data_agent.runtime.prompts import (
+    AGENT_SYSTEM_PROMPT,
+    CAPABILITY_TOOLS_SYSTEM_PROMPT,
+    HELP_CENTER_SYSTEM_PROMPT,
+)
 
 # enabled but paycompy is missing.
 try:
@@ -730,6 +734,15 @@ class RuntimeSettings(BaseSettings):
     help_center_search_candidate_limit: int = Field(25, ge=5, le=100)
     help_center_search_top_k: int = Field(5, ge=1, le=5)
 
+    capability_tools_enabled: bool = Field(False)
+    capability_prefetch_enabled: bool = Field(False)
+    capability_api_url: str = Field("")
+    capability_api_key: str = Field("")
+    capability_timeout_seconds: float = Field(10.0, gt=0)
+    capability_resolution_path: str = Field(
+        "config/capability-value-resolution.yaml"
+    )
+
     # --- Agent loop / budget caps (D47/D55, OQ-H) ---
     #
     # RAISED 2026-08-12 ON LIVE MEASUREMENT, and the direction of the evidence is
@@ -1119,8 +1132,12 @@ class RuntimeSettings(BaseSettings):
         if not self.agent_system_prompt_enabled:
             return None
         if self.help_center_enabled:
-            return self.agent_system_prompt + HELP_CENTER_SYSTEM_PROMPT
-        return self.agent_system_prompt
+            prompt = self.agent_system_prompt + HELP_CENTER_SYSTEM_PROMPT
+        else:
+            prompt = self.agent_system_prompt
+        if self.capability_tools_enabled:
+            prompt += CAPABILITY_TOOLS_SYSTEM_PROMPT
+        return prompt
 
     def request_token_budget(self) -> int:
         """Absolute cap on the FULL assembled request (all messages) handed to `send_turn`: the

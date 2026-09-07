@@ -23,6 +23,10 @@ from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
+from data_agent.runtime.capabilities.prefetch import (
+    render_capability_prefetch,
+    route_uses_data_prefetch,
+)
 from data_agent.runtime.dispatch.denial_mapping import (
     ANSWER_JUDGE_REJECTED_CODE,
     ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
 
     from opentelemetry.trace import Tracer
 
+    from data_agent.runtime.capabilities.client import CapabilityPrefetch
     from data_agent.runtime.retrieval.models import RetrievedContext
     from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
     from data_agent.runtime.session.models import AnalysisState, TrailEntry, TurnMessage
@@ -132,6 +137,7 @@ class ContextAssembler:
         preview_row_count: int = 20,
         retrieval: RetrievalPipeline | None = None,
         retrieval_prefetch_tool_enabled: bool = False,
+        capability_prefetch_provider: Callable[[str], Any] | None = None,
         base_system_prompt: str | None = None,
         tracer: Tracer | None = None,
     ) -> None:
@@ -159,6 +165,7 @@ class ContextAssembler:
         # Feature-flagged representation only; retrieval behavior and lifetime are
         # unchanged. False preserves the established byte-for-byte user-message path.
         self._retrieval_prefetch_tool_enabled = retrieval_prefetch_tool_enabled
+        self._capability_prefetch_provider = capability_prefetch_provider
         # B5: optional — when wired (app.py's composition root), assemble()
         # emits one CHAIN span per call recording only non-sensitive shape
         # counters (trail entries loaded, dropped-by-scope count — design §7's
@@ -174,6 +181,7 @@ class ContextAssembler:
         user_message: str | None = None,
         user_id: str | None = None,
         retrieval_memo: dict[tuple[str, str], RetrievedContext] | None = None,
+        capability_memo: dict[str, CapabilityPrefetch] | None = None,
         withheld_call_ids: set[str] | None = None,
         observer: Observer | None = None,
     ) -> AssembledContext:
@@ -261,8 +269,24 @@ class ContextAssembler:
             # this question's context. NON-system so the base prompt stays the sole
             # system message. Only when both the pipeline and a user_message are
             # present (else byte-identical to the retrieval-off path).
+            capability_prefetch = None
+            if self._capability_prefetch_provider is not None and user_message is not None:
+                capability_prefetch = (
+                    capability_memo.get(user_message) if capability_memo is not None else None
+                )
+                if capability_prefetch is None:
+                    try:
+                        capability_prefetch = await self._capability_prefetch_provider(user_message)
+                    except Exception:
+                        capability_prefetch = None
+                    if capability_prefetch is not None and capability_memo is not None:
+                        capability_memo[user_message] = capability_prefetch
+
             retrieved_counts = (0, 0)
-            if self._retrieval is not None and user_message is not None:
+            should_retrieve = capability_prefetch is None or route_uses_data_prefetch(
+                capability_prefetch.route
+            )
+            if self._retrieval is not None and user_message is not None and should_retrieve:
                 retrieved_counts = await self._insert_retrieval(
                     messages,
                     current_turn_index=current_turn_index,
@@ -273,6 +297,11 @@ class ContextAssembler:
                     retrieval_memo=retrieval_memo,
                     observer=observer,
                 )
+
+            if capability_prefetch is not None:
+                rendered_capabilities = render_capability_prefetch(capability_prefetch)
+                if rendered_capabilities is not None:
+                    messages.insert(_last_user_index(messages), rendered_capabilities)
 
             # 6b. analysisState (Release 1, 03 §D): the live intent ledger,
             # rendered as ONE `user`-role block IMMEDIATELY BEFORE the current

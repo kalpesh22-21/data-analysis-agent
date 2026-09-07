@@ -1,0 +1,11 @@
+version: 1
+
+types:
+  department:
+    table: dbpcm_warehouse.department
+    column: department_name
+
+  employee_identifier:
+    table: dbpcm_warehouse.employee
+    column: employee_code
+    output_column: employee_name

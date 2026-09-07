@@ -240,7 +240,8 @@ def _question_key(question: str) -> str:
 class TurnContext:
     """What a `RuntimeTool` may know about the turn it is running in.
 
-        `turn_index` ONLY, and it must come from the loop's own computation. The two
+        `turn_index` and the turn's original user question. The index must come from the
+        loop's own computation. The two
         alternatives are both wrong: `app.py` has only `turn_index_hint`, documented as
         best-effort telemetry, so making it load-bearing introduces a TOCTOU gap; and
         re-deriving it from the store means duplicating two DIFFERENT formulas (`/turn` uses
@@ -255,6 +256,7 @@ class TurnContext:
     """
 
     turn_index: int
+    question: str = ""
 
 
 class RuntimeTool(Protocol):
@@ -458,6 +460,7 @@ class TurnOutcome:
     # result field mirroring `sql` in EVERY respect (additive, nullable, `[] ->
     # None` fork, accumulated across budget windows at every return site).
     assumptions: list[str] | None = None
+    capability_cards: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1063,6 +1066,9 @@ class AgentLoop:
                 stop_tables, _stop_blueprint_runs = await self._compute_turn_answer_tables(
                     session_id, turn_index
                 )
+                stop_capability_cards = await self._compute_turn_capability_cards(
+                    session_id, turn_index
+                )
                 # Read the outcome fields THROUGH a `TurnAccumulators` rather than
                 # hand-shaping them here: it owns the `[] -> None` forks (§1 fork 1)
                 # and `answer_envelope` is THE ONE PLACE the envelope is computed
@@ -1076,7 +1082,9 @@ class AgentLoop:
                 # for the same reason: only the blueprint approval-resume holds a
                 # `result_full` that no trail entry has been written for yet.
                 stop_accum = TurnAccumulators(
-                    assumptions=stop_assumptions, answer_tables=stop_tables
+                    assumptions=stop_assumptions,
+                    answer_tables=stop_tables,
+                    capability_cards=stop_capability_cards,
                 )
                 stop_envelope = stop_accum.envelope()
                 return TurnOutcome(
@@ -1092,6 +1100,7 @@ class AgentLoop:
                     verification=stop_envelope.verification,
                     answer_tables=stop_envelope.answer_tables,
                     assumptions=stop_accum.assumptions,
+                    capability_cards=stop_accum.capability_cards,
                 )
             window_count = prior_window_count + 1  # D55: "continue"/"refine" grants a fresh window
         else:
@@ -1115,6 +1124,9 @@ class AgentLoop:
         seed_answer_tables, seed_blueprint_runs = await self._compute_turn_answer_tables(
             session_id, turn_index
         )
+        seed_capability_cards = await self._compute_turn_capability_cards(
+            session_id, turn_index
+        )
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
         return await self._run_loop_body(
@@ -1136,6 +1148,7 @@ class AgentLoop:
                 assumptions=seed_assumptions,
                 answer_tables=seed_answer_tables,
                 blueprint_runs=seed_blueprint_runs,
+                capability_cards=seed_capability_cards,
             ),
         )
 
@@ -1148,6 +1161,7 @@ class AgentLoop:
         question: str | None,
         user_id: str | None,
         retrieval_memo: dict[tuple[str, str], Any],
+        capability_memo: dict[str, Any],
         withheld_call_ids: set[str],
         discovery_canonical: list[dict[str, Any]] | None = None,
         finalization_nudge: str | None = None,
@@ -1203,6 +1217,7 @@ class AgentLoop:
             user_message=question,
             user_id=user_id,
             retrieval_memo=retrieval_memo,
+            capability_memo=capability_memo,
             withheld_call_ids=withheld_call_ids,
             observer=self._observer,
         )
@@ -1504,6 +1519,28 @@ class AgentLoop:
                 for index, table in enumerate(finalized.tables)
             ]
         return designated, blueprint_runs
+
+    async def _compute_turn_capability_cards(
+        self, session_id: str, turn_index: int
+    ) -> list[dict[str, Any]]:
+        trail = await self._session_store.load_trail(session_id)
+        cards: list[dict[str, Any]] = []
+        for entry in trail:
+            if (
+                entry.turn_index != turn_index
+                or entry.status != "ok"
+                or not entry.capability_terminal
+                or entry.result_full_ref is None
+            ):
+                continue
+            payload = await self._session_store.read_full_result(
+                session_id, entry.result_full_ref
+            )
+            if isinstance(payload, dict):
+                card = {key: value for key, value in payload.items() if key != "answer"}
+                if card not in cards:
+                    cards.append(card)
+        return cards
 
     def _maybe_start_summary(
         self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
@@ -1967,6 +2004,7 @@ class AgentLoop:
         provenance: frozenset[tuple[str, str]] | None = None,
         persist_text: str | None = None,
         event: tuple[str, dict[str, Any]] | None = None,
+        capability_cards: list[dict[str, Any]] | None = None,
     ) -> TurnOutcome:
         """THE ORDER every in-body `TurnOutcome` return performs its effects in, in one place:
                 checkpoint write, assistant-message append, envelope read, observer event, return.
@@ -2089,6 +2127,7 @@ class AgentLoop:
             # `[]` (no recordAssumptions this turn) -> `None`, same fork as
             # `sql_executed`: the UI treats "no assumptions" and "empty" identically.
             assumptions=accum.assumptions,
+            capability_cards=capability_cards or accum.capability_cards,
         )
 
     async def _pause_from_runtime_tool(
@@ -2346,6 +2385,9 @@ class AgentLoop:
         seed_answer_tables, trail_runs = await self._compute_turn_answer_tables(
             session_id, turn_index
         )
+        seed_capability_cards = await self._compute_turn_capability_cards(
+            session_id, turn_index
+        )
         seed_blueprint_runs = {**trail_runs, **seed_blueprint_runs}
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
@@ -2367,6 +2409,7 @@ class AgentLoop:
                 blueprint_use=seed_blueprint_use,
                 verification=seed_verification,
                 assumptions=seed_assumptions,
+                capability_cards=seed_capability_cards,
             ),
         )
 
@@ -2602,7 +2645,7 @@ class AgentLoop:
             # The loop's OWN turn index, handed to every runtime tool (03 §C.1). It is
             # built here, from the parameter `run`/`resume` computed, so no tool ever
             # re-derives it or reads `app.py`'s explicitly non-load-bearing hint.
-            turn_context = TurnContext(turn_index=turn_index)
+            turn_context = TurnContext(turn_index=turn_index, question=question)
 
             # Emulated-discovery injection (context/discovery_emulation.py): emulate
             # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
@@ -2667,6 +2710,7 @@ class AgentLoop:
             # recall at most ONCE across every round-trip of this window despite the
             # D45 per-round-trip context rebuild. Not persisted — pure in-turn memo.
             retrieval_memo: dict[tuple[str, str], Any] = {}
+            capability_memo: dict[str, Any] = {}
             # D94 Part 2: turn-window-local de-dup for the withheld-provenance
             # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
             # not persisted) so the event fires at most once per stranded call.
@@ -2837,6 +2881,7 @@ class AgentLoop:
                     question=question,
                     user_id=None,
                     retrieval_memo=retrieval_memo,
+                    capability_memo=capability_memo,
                     withheld_call_ids=withheld_call_ids,
                     discovery_canonical=discovery_canonical,
                     finalization_nudge=finalization_nudge,
@@ -2867,6 +2912,8 @@ class AgentLoop:
                 # terminal exit #2 below. Reset per iteration — a designation only ends
                 # the turn it was made in.
                 designated_answer_text: str | None = None
+                capability_terminal_text: str | None = None
+                capability_finalization_refused = False
                 # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
                 # BATCH. Reset per iteration beside `designated_answer_text`, and for the
                 # same reason: it describes one response, not one turn.
@@ -3389,8 +3436,15 @@ class AgentLoop:
                     # refused: the work runs, the entry is untagged, and the drop is
                     # reported (never the offending value — D25: an invalid tag is
                     # arbitrary model text, unlike a valid one).
+                    intent_handler = self._runtime_tools.get(tool_call.name)
                     call_args, serves_intent, tag_drop_reason = split_serves_intent(
-                        tool_call.name, tool_call.arguments, analysis_state
+                        tool_call.name,
+                        tool_call.arguments,
+                        analysis_state,
+                        additional_taggable=bool(
+                            intent_handler is not None
+                            and getattr(intent_handler, "intent_taggable", False)
+                        ),
                     )
                     if tag_drop_reason is not None:
                         self._observer(
@@ -3962,6 +4016,7 @@ class AgentLoop:
                         # data-anchored window; `None` for every other call, so every other
                         # entry serialises byte-identically.
                         window_note=tool_result.window_note,
+                        capability_terminal=tool_result.terminal,
                         # The validated tag (or `None`). Persisted on the entry rather
                         # than left in `args`, so it survives replay/resume and is
                         # readable by `updateAnalysisState` without re-parsing
@@ -4021,6 +4076,10 @@ class AgentLoop:
                     accum.note_answer_tables(
                         tool_call.name, tool_result, resolved_answer_tables
                     )
+                    if tool_result.status == "ok" and tool_result.terminal:
+                        card_answer = accum.note_capability_card(tool_result)
+                        if card_answer is not None:
+                            capability_terminal_text = card_answer
                     # TERMINAL: a successful `answerWithTable` carries the final prose,
                     # so the turn ends on it. Recorded here and acted on AFTER the whole
                     # tool batch drains, so a model that batches recordAssumptions +
@@ -4304,6 +4363,47 @@ class AgentLoop:
                         accum=accum,
                         checkpoint=checkpoint,
                         event=("loop_paused_ask_user", {"question": question}),
+                    )
+
+                if accum.capability_cards and answer_shape.armed and not accum.has_answer_tables:
+                    if await finalization_gate.may_refuse("answer_shape"):
+                        capability_finalization_refused = True
+                        self._observer(
+                            ANSWER_SHAPE_REFUSED_EVENT,
+                            {"multi_row_calls": answer_shape.multi_row_calls},
+                        )
+                        finalization_nudge = (
+                            answer_shape_nudge_text(
+                                result.assistant_text, answer_shape.multi_row_calls
+                            )
+                            + " The capability cards are already prepared; do not call those "
+                            "capabilities again. Call answerWithTable now so the same final "
+                            "response contains both the table and the cards."
+                        )
+                        last_assistant_text = None
+                    else:
+                        self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
+
+                if accum.capability_cards and not capability_finalization_refused:
+                    final_text = (
+                        designated_answer_text
+                        or capability_terminal_text
+                        or "Here are the requested options."
+                    )
+                    return await self._finish(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        status="done",
+                        exit_label="no_tool_calls",
+                        assistant_text=final_text,
+                        tool_calls_made=tool_calls_made,
+                        accum=accum,
+                        provenance=await self._compute_turn_provenance_union(
+                            session_id, turn_index
+                        ),
+                        persist_text=final_text,
+                        event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                        capability_cards=accum.capability_cards,
                     )
 
                 # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model

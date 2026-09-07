@@ -319,6 +319,7 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         return doc
 
     async def reopen_failed_resume(self, session_id: str, answer: str) -> bool:
+        await self._ensure_connected()
         reopened: list[bool] = []
 
         def _mutate(doc: SessionDoc) -> None:

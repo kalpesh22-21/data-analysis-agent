@@ -606,6 +606,28 @@ GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA: dict[str, Any] = {
     },
 }
 
+SEARCH_CAPABILITY_TOOLS_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "searchCapabilityTools",
+    "description": "Search for additional Paycom navigation, action, or interactive UI options.",
+    "parameters": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    },
+}
+
+GET_CAPABILITY_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "getCapabilityTool",
+    "description": "Load the executable schema for a named UI capability.",
+    "parameters": {
+        "type": "object",
+        "properties": {"tool_name": {"type": "string"}},
+        "required": ["tool_name"],
+    },
+}
+
 
 # The locally-authored (runtime-implemented) tool schemas, appended after the
 # live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
