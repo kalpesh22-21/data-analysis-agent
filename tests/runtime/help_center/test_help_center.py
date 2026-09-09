@@ -93,6 +93,20 @@ def test_prompt_is_byte_unchanged_when_disabled() -> None:
     assert "searchHelpCenter" in enabled.effective_agent_system_prompt()
 
 
+def test_product_guidance_navigation_instruction_requires_both_features() -> None:
+    help_only = RuntimeSettings(help_center_enabled=True, capability_tools_enabled=False)
+    capability_only = RuntimeSettings(help_center_enabled=False, capability_tools_enabled=True)
+    both = RuntimeSettings(help_center_enabled=True, capability_tools_enabled=True)
+
+    marker = "Product guidance with navigation"
+    assert marker not in help_only.effective_agent_system_prompt()
+    assert marker not in capability_only.effective_agent_system_prompt()
+    combined = both.effective_agent_system_prompt()
+    assert marker in combined
+    assert "use the Help Center to answer the question in text" in combined
+    assert "If no relevant navigation capability is available" in combined
+
+
 @pytest.mark.asyncio
 async def test_http_contract() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:

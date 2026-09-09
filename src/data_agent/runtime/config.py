@@ -25,6 +25,7 @@ from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
 from data_agent.runtime.prompts import (
     AGENT_SYSTEM_PROMPT,
     CAPABILITY_TOOLS_SYSTEM_PROMPT,
+    HELP_CENTER_CAPABILITY_SYSTEM_PROMPT,
     HELP_CENTER_SYSTEM_PROMPT,
 )
 
@@ -1137,6 +1138,8 @@ class RuntimeSettings(BaseSettings):
             prompt = self.agent_system_prompt
         if self.capability_tools_enabled:
             prompt += CAPABILITY_TOOLS_SYSTEM_PROMPT
+        if self.help_center_enabled and self.capability_tools_enabled:
+            prompt += HELP_CENTER_CAPABILITY_SYSTEM_PROMPT
         return prompt
 
     def request_token_budget(self) -> int:

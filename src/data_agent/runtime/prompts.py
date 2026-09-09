@@ -352,9 +352,21 @@ CAPABILITY_TOOLS_SYSTEM_PROMPT = (
     "Describe only what they can view or do."
 )
 
+HELP_CENTER_CAPABILITY_SYSTEM_PROMPT = (
+    "\n\n## Product guidance with navigation\n"
+    "When the user asks how or where to do something in Paycom, use the Help Center to "
+    "answer the question in text. Also look for a matching navigation UI capability that "
+    "can take the user to the relevant area when clicked. If one is available, present it "
+    "and put the concise Help Center answer in that capability call's answer field so the "
+    "user receives both the explanation and the way to get there. Do not replace the "
+    "explanation with navigation alone. If no relevant navigation capability is available, "
+    "give the Help Center answer normally and do not invent or force an option."
+)
+
 
 __all__ = [
     "AGENT_SYSTEM_PROMPT",
     "CAPABILITY_TOOLS_SYSTEM_PROMPT",
+    "HELP_CENTER_CAPABILITY_SYSTEM_PROMPT",
     "HELP_CENTER_SYSTEM_PROMPT",
 ]
