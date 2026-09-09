@@ -155,6 +155,31 @@ config:
   #    serviceable answer moments earlier. Roughly one model round-trip plus the
   #    judge call; raise it if regenerations are seen being cut off.
   ANSWER_JUDGE_MIN_HEADROOM_SECONDS: "25"
+  # -- Enable Help Center search/get tools and their prompt guidance. When false,
+  #    the tools and prompt additions are absent and the agent is unaware of them.
+  HELP_CENTER_ENABLED: "false"
+  # -- Help Center semantic-search endpoint. Required when HELP_CENTER_ENABLED=true.
+  HELP_CENTER_SEARCH_URL: ""
+  # -- Help Center document API base URL. Required when HELP_CENTER_ENABLED=true.
+  HELP_CENTER_DOCUMENTS_URL: ""
+  # -- Timeout for each Help Center API request, in seconds.
+  HELP_CENTER_TIMEOUT_SECONDS: "10"
+  # -- Number of search candidates fetched before reranking.
+  HELP_CENTER_SEARCH_CANDIDATE_LIMIT: "25"
+  # -- Number of reranked Help Center excerpts exposed to the agent (maximum 5).
+  HELP_CENTER_SEARCH_TOP_K: "5"
+  # -- Master switch for UI capability search, schema loading, hydration, and
+  #    capability payloads. When false, the agent is unaware of capabilities.
+  CAPABILITY_TOOLS_ENABLED: "false"
+  # -- Enable local intent routing and automatic capability prefetch. Has no
+  #    effect unless CAPABILITY_TOOLS_ENABLED=true.
+  CAPABILITY_PREFETCH_ENABLED: "false"
+  # -- Capability Search & Registry API base URL (`/v1/capabilities`).
+  CAPABILITY_API_URL: ""
+  # -- Timeout for each Capability API request, in seconds.
+  CAPABILITY_TIMEOUT_SECONDS: "10"
+  # -- Runtime-owned semantic-type to warehouse-value mapping bundled in the image.
+  CAPABILITY_RESOLUTION_PATH: "config/capability-value-resolution.yaml"
   # -- Couchbase connection string (primary session store). EXTERNAL.
   #    SHARED WITH THE LEARNING CHART: the learning sweeper scans THIS KEYSPACE for
   #    idle sessions, so `data-agent-learning` must point at the same cluster,
@@ -317,6 +342,7 @@ config:
 #   TOKEN_ISSUER_API_KEY
 #   EMBEDDING_API_KEY
 #   RERANKER_API_KEY
+#   CAPABILITY_API_KEY
 # ---------------------------------------------------------------------------
 secrets:
   # -- Name of the pre-existing Secret to mount via envFrom. Empty = the

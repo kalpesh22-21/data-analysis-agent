@@ -50,6 +50,30 @@ config:
   OPENAI_BASE_URL: "https://api.openai.com/v1"
   MODEL_CONTEXT_WINDOW: "128000"
 
+  # Answer validation. Keep disabled until the extra judge-model latency and
+  # spend have been accepted for this environment.
+  ANSWER_JUDGE_ENABLED: "false"
+  ANSWER_JUDGE_MODEL: ""
+  ANSWER_JUDGE_TIMEOUT_SECONDS: "20"
+  ANSWER_JUDGE_MIN_HEADROOM_SECONDS: "25"
+
+  # Help Center is invisible to the agent while disabled. Set both endpoints
+  # before enabling it; the end-user JWT is forwarded to these APIs.
+  HELP_CENTER_ENABLED: "false"
+  HELP_CENTER_SEARCH_URL: "https://ai-api.acme.com/v1/help-center/search"
+  HELP_CENTER_DOCUMENTS_URL: "https://ai-api.acme.com/v1/help-center/documents"
+  HELP_CENTER_TIMEOUT_SECONDS: "10"
+  HELP_CENTER_SEARCH_CANDIDATE_LIMIT: "25"
+  HELP_CENTER_SEARCH_TOP_K: "5"
+
+  # Capability tools are controlled independently from automatic prefetch.
+  # CAPABILITY_API_KEY belongs in the referenced Secret, never in this file.
+  CAPABILITY_TOOLS_ENABLED: "false"
+  CAPABILITY_PREFETCH_ENABLED: "false"
+  CAPABILITY_API_URL: "https://ai-api.acme.com/v1/capabilities"
+  CAPABILITY_TIMEOUT_SECONDS: "10"
+  CAPABILITY_RESOLUTION_PATH: "config/capability-value-resolution.yaml"
+
   # Session store. The learning chart's sweeper scans THIS bucket for idle
   # sessions — keep the two charts pointed at the same cluster + bucket.
   COUCHBASE_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
@@ -119,6 +143,7 @@ config:
 #     --from-literal=TOKEN_ISSUER_API_KEY=... \
 #     --from-literal=EMBEDDING_API_KEY=... \
 #     --from-literal=RERANKER_API_KEY=...
+#     --from-literal=CAPABILITY_API_KEY=...
 # Leaving `existingSecret` empty does not make the chart create one; it just makes
 # the pods look for `<release>-data-agent-secret` instead.
 #
