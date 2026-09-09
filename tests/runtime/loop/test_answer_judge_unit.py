@@ -90,6 +90,7 @@ def test_site_selects_the_violation_vocabulary() -> None:
     at an answer exit is a rejection nothing downstream can act on."""
     assert violations_for_site("exit_prose") == ANSWER_VIOLATIONS
     assert violations_for_site("exit_table") == ANSWER_VIOLATIONS
+    assert violations_for_site("exit_capability") == ANSWER_VIOLATIONS
     assert violations_for_site("ask_user") == ASK_USER_VIOLATIONS
 
 
@@ -161,6 +162,18 @@ def test_a_valid_rejection_survives() -> None:
     assert verdict.approved is False
     assert verdict.violation == "unrecorded_assumption"
     assert verdict.feedback == "Say which year the figure covers."
+
+
+def test_help_center_support_violation_is_accepted() -> None:
+    verdict = parse_verdict(
+        _verdict_turn(
+            False,
+            "unsupported_by_evidence",
+            "Remove the requirement that is not stated in the article.",
+        ),
+        "exit_prose",
+    )
+    assert verdict.violation == "unsupported_by_evidence"
 
 
 def test_a_valid_approval_returns_the_shared_object() -> None:
@@ -242,6 +255,14 @@ def test_ask_user_judge_prompt_guards_codes_and_plain_text_options() -> None:
     assert "department name and code" in system
     assert "options_in_question" in system
     assert "at most five structured options" in system
+
+
+def test_answer_judge_prompt_checks_help_center_support_semantically() -> None:
+    judge = AnswerJudge(model_client=ScriptedModelClient([]), token_budget=_ROOMY)
+    system = judge.messages_for(_brief())[0]["content"]
+    assert "unsupported_by_evidence" in system
+    assert "getHelpCenterDocument" in system
+    assert "verbatim overlap is not required" in system
 
 
 def test_the_agent_system_prompt_is_not_sent_to_the_judge() -> None:

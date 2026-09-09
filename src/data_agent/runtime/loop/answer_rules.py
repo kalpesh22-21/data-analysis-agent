@@ -51,6 +51,7 @@ class AnswerRuleContext:
 
     prose: str
     turn_sql: tuple[str, ...]
+    has_alternative_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -257,7 +258,11 @@ ANSWER_RULES: tuple[AnswerRule, ...] = (
     AnswerRule(
         name="ungrounded_quantity",
         charges_to="ungrounded_answer",
-        applies=lambda ctx: not ctx.turn_sql and asserts_quantity(ctx.prose),
+        applies=lambda ctx: (
+            not ctx.turn_sql
+            and not ctx.has_alternative_evidence
+            and asserts_quantity(ctx.prose)
+        ),
         nudge=_ungrounded_quantity_nudge,
     ),
     AnswerRule(
@@ -278,13 +283,22 @@ ANSWER_RULES: tuple[AnswerRule, ...] = (
 )
 
 
-def first_match(prose: str | None, turn_sql: Sequence[str] | None) -> AnswerRule | None:
+def first_match(
+    prose: str | None,
+    turn_sql: Sequence[str] | None,
+    *,
+    has_alternative_evidence: bool = False,
+) -> AnswerRule | None:
     """The first rule this finish trips, or `None`. Empty prose returns `None`: that is the
     empty-answer gate's complaint, and this must not pre-empt it."""
     text = (prose or "").strip()
     if not text:
         return None
-    ctx = AnswerRuleContext(prose=text, turn_sql=tuple(turn_sql or ()))
+    ctx = AnswerRuleContext(
+        prose=text,
+        turn_sql=tuple(turn_sql or ()),
+        has_alternative_evidence=has_alternative_evidence,
+    )
     for rule in ANSWER_RULES:
         if rule.applies(ctx):
             return rule

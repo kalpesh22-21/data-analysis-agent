@@ -150,6 +150,16 @@ from .turn_accumulators import (
     capture_terminal_sql,
 )
 
+_ALTERNATIVE_ANSWER_EVIDENCE_TOOLS = frozenset({"getHelpCenterDocument"})
+
+
+def _answer_judge_refusal_kind(verdict: JudgeVerdict) -> FinalizationBlockKind:
+    return (
+        "help_center_grounding"
+        if verdict.violation == "unsupported_by_evidence"
+        else "answer_judge"
+    )
+
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
 
@@ -1861,7 +1871,11 @@ class AgentLoop:
             for entry in in_scope
             if entry.turn_index == turn_index
             and entry.status == "ok"
-            and entry.tool_name in DATA_ANSWER_TOOLS
+            and (
+                entry.tool_name in DATA_ANSWER_TOOLS
+                or entry.tool_name in _ALTERNATIVE_ANSWER_EVIDENCE_TOOLS
+                or entry.capability_terminal
+            )
         )
         # The IN-SCOPE entries ride along so `_corroborated_figures` can reuse this one
         # read (issues-stack A3 counts three per window already) — it needs
@@ -2779,6 +2793,7 @@ class AgentLoop:
             # the `claim_finalization_block` key is `(turn_index, window, kind)` too, so a stale
             # refusal cannot be replayed onto a later turn.
             answer_shape = AnswerShapeCounter(accum.has_answer_tables)
+            has_alternative_answer_evidence = False
             # The finalization block allowance (05 §C.1/§C.2, §J.3), also
             # `loop/finalization.py`: the per-round-trip refusal flag and the persisted
             # per-window claim behind all four refusal sites below. Its three ids are
@@ -2826,6 +2841,11 @@ class AgentLoop:
                 answer_shape.observe_prior_entry(
                     prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
                 )
+                if (
+                    prior_entry.tool_name in _ALTERNATIVE_ANSWER_EVIDENCE_TOOLS
+                    or prior_entry.capability_terminal
+                ):
+                    has_alternative_answer_evidence = True
             # Seed the guard with the emulated-discovery signatures swept above (outside
             # the budget window) so a model re-call of listDatabases/listTables is served
             # locally, not re-dispatched to the MCP — together with the pointers to the
@@ -3071,7 +3091,11 @@ class AgentLoop:
                 # adding a rule does not add a round-trip to the window's worst case
                 # unless it is a genuinely new complaint.
                 answer_rule = (
-                    first_match(result.assistant_text, accum.sql_executed)
+                    first_match(
+                        result.assistant_text,
+                        accum.sql_executed,
+                        has_alternative_evidence=has_alternative_answer_evidence,
+                    )
                     if not result.tool_calls and not refused_finalization
                     else None
                 )
@@ -3230,7 +3254,8 @@ class AgentLoop:
                         kind="answer_judge",
                     )
                     if not verdict.approved:
-                        if await finalization_gate.may_refuse("answer_judge"):
+                        refusal_kind = _answer_judge_refusal_kind(verdict)
+                        if await finalization_gate.may_refuse(refusal_kind):
                             refused_finalization = True
                             self._observer(
                                 ANSWER_JUDGE_REFUSED_EVENT,
@@ -3914,7 +3939,8 @@ class AgentLoop:
                                 kind="answer_judge",
                             )
                             if not table_verdict.approved:
-                                if await finalization_gate.may_refuse("answer_judge"):
+                                refusal_kind = _answer_judge_refusal_kind(table_verdict)
+                                if await finalization_gate.may_refuse(refusal_kind):
                                     self._observer(
                                         ANSWER_JUDGE_REFUSED_EVENT,
                                         {
@@ -4080,6 +4106,12 @@ class AgentLoop:
                         card_answer = accum.note_capability_card(tool_result)
                         if card_answer is not None:
                             capability_terminal_text = card_answer
+                        has_alternative_answer_evidence = True
+                    elif (
+                        tool_result.status == "ok"
+                        and tool_call.name in _ALTERNATIVE_ANSWER_EVIDENCE_TOOLS
+                    ):
+                        has_alternative_answer_evidence = True
                     # TERMINAL: a successful `answerWithTable` carries the final prose,
                     # so the turn ends on it. Recorded here and acted on AFTER the whole
                     # tool batch drains, so a model that batches recordAssumptions +
@@ -4390,21 +4422,75 @@ class AgentLoop:
                         or capability_terminal_text
                         or "Here are the requested options."
                     )
-                    return await self._finish(
-                        session_id=session_id,
-                        turn_index=turn_index,
-                        status="done",
-                        exit_label="no_tool_calls",
-                        assistant_text=final_text,
-                        tool_calls_made=tool_calls_made,
-                        accum=accum,
-                        provenance=await self._compute_turn_provenance_union(
-                            session_id, turn_index
-                        ),
-                        persist_text=final_text,
-                        event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
-                        capability_cards=accum.capability_cards,
-                    )
+                    if not finalization_gate.refused_this_round:
+
+                        async def _capability_brief(
+                            _q: str = question,
+                            _state: AnalysisState | None = analysis_state,
+                            _draft: str = final_text,
+                        ) -> JudgeBrief:
+                            results, anchor, in_scope = await self._judge_results(
+                                session_id, turn_index, credentials.column_scope
+                            )
+                            return self._judge_brief(
+                                "exit_capability",
+                                question=_q,
+                                accum=accum,
+                                analysis_state=_state,
+                                date_anchor=anchor,
+                                draft=_draft,
+                                results=results,
+                                figure_corroborated=await self._corroborated_figures(
+                                    session_id, turn_index, _draft, in_scope
+                                ),
+                            )
+
+                        capability_verdict = await self._judge(
+                            _capability_brief,
+                            guard=guard,
+                            gate=finalization_gate,
+                            kind="answer_judge",
+                        )
+                        if not capability_verdict.approved:
+                            refusal_kind = _answer_judge_refusal_kind(capability_verdict)
+                            if await finalization_gate.may_refuse(refusal_kind):
+                                capability_finalization_refused = True
+                                self._observer(
+                                    ANSWER_JUDGE_REFUSED_EVENT,
+                                    {
+                                        "violation": capability_verdict.violation,
+                                        "site": "exit_capability",
+                                    },
+                                )
+                                finalization_nudge = answer_judge_nudge_text(
+                                    final_text, capability_verdict.feedback
+                                )
+                                last_assistant_text = None
+                                designated_answer_text = None
+                            else:
+                                self._observer(
+                                    ANSWER_JUDGE_EXHAUSTED_EVENT,
+                                    {
+                                        "violation": capability_verdict.violation,
+                                        "site": "exit_capability",
+                                    },
+                                )
+                    if not capability_finalization_refused:
+                        return await self._finish(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            status="done",
+                            exit_label="no_tool_calls",
+                            assistant_text=final_text,
+                            tool_calls_made=tool_calls_made,
+                            accum=accum,
+                            provenance=await self._compute_turn_provenance_union(
+                                session_id, turn_index
+                            ),
+                            persist_text=final_text,
+                            event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                            capability_cards=accum.capability_cards,
+                        )
 
                 # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model
                 # turn with NO tool calls; this one fires when the model ended the turn

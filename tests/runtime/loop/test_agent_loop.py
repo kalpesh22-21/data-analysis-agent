@@ -29,6 +29,7 @@ from data_agent.runtime.loop.agent_loop import (
     _declines_clarification,
     _tool_trail_entry_to_canonical,
 )
+from data_agent.runtime.loop.answer_judge import APPROVED, JudgeBrief, JudgeVerdict
 from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -1485,11 +1486,38 @@ class _StubCapabilityCardTool:
         )
 
 
+class _RecordingJudge:
+    def __init__(self, verdicts: list[JudgeVerdict] | None = None) -> None:
+        self.briefs: list[JudgeBrief] = []
+        self.verdicts = list(verdicts or [])
+
+    async def review(self, brief: JudgeBrief):  # noqa: ANN201
+        self.briefs.append(brief)
+        return self.verdicts.pop(0) if self.verdicts else APPROVED
+
+
+class _StubHelpCenterDocumentTool:
+    async def run(
+        self, model_args: dict, credentials: RuntimeCredentials, turn=None
+    ) -> ToolResult:
+        return ToolResult(
+            status="ok",
+            tool_name="getHelpCenterDocument",
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full={"found": True, "id": "article-1", "content": "The limit is 1,000."},
+        )
+
+
 def _registry_loop(
     *,
     model_client: ScriptedModelClient,
     mcp_client: FakeMCPClient,
     runtime_tools: dict,
+    answer_judge=None,
 ) -> tuple[AgentLoop, InMemorySessionStore]:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
@@ -1504,6 +1532,7 @@ def _registry_loop(
         max_wall_clock_seconds=60,
         max_budget_windows=3,
         runtime_tools=runtime_tools,
+        answer_judge=answer_judge,
     )
     return loop, store
 
@@ -1567,6 +1596,150 @@ async def test_capability_cards_drain_the_batch_and_finish_together() -> None:
         first.name,
         second.name,
     ]
+
+
+async def test_capability_terminal_reaches_judge_with_capability_evidence() -> None:
+    capability = _StubCapabilityCardTool("navigate_to_position_management")
+    judge = _RecordingJudge()
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="cap_1", name=capability.name, arguments={})
+                ]
+            )
+        ]
+    )
+    loop, _ = _registry_loop(
+        model_client=model,
+        mcp_client=FakeMCPClient(),
+        runtime_tools={capability.name: capability},
+        answer_judge=judge,
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert len(judge.briefs) == 1
+    assert judge.briefs[0].site == "exit_capability"
+    assert [result["tool_name"] for result in judge.briefs[0].results] == [capability.name]
+
+
+async def test_capability_judge_rejection_retries_without_losing_ui_payload() -> None:
+    capability = _StubCapabilityCardTool("navigate_to_position_management")
+    judge = _RecordingJudge(
+        [
+            JudgeVerdict(
+                approved=False,
+                violation="unexplained_gap",
+                feedback="Explain what the option allows the user to do.",
+            ),
+        ]
+    )
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="cap_1", name=capability.name, arguments={})
+                ]
+            ),
+            ModelTurnResult(assistant_text="You can use this option to manage positions."),
+        ]
+    )
+    loop, store = _registry_loop(
+        model_client=model,
+        mcp_client=FakeMCPClient(),
+        runtime_tools={capability.name: capability},
+        answer_judge=judge,
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert outcome.assistant_text == "You can use this option to manage positions."
+    assert [card["tool_name"] for card in outcome.capability_cards or []] == [capability.name]
+    assert [brief.site for brief in judge.briefs] == ["exit_capability"]
+    assert capability.calls == 1
+    assert await store.claim_finalization_block(SESSION_ID, 0, 1, "answer_judge") is False
+
+
+async def test_help_center_answer_reaches_judge_without_sql_grounding_refusal() -> None:
+    judge = _RecordingJudge()
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="help_1",
+                        name="getHelpCenterDocument",
+                        arguments={"id": "article-1"},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="The documented limit is 1,000."),
+        ]
+    )
+    loop, _ = _registry_loop(
+        model_client=model,
+        mcp_client=FakeMCPClient(),
+        runtime_tools={"getHelpCenterDocument": _StubHelpCenterDocumentTool()},
+        answer_judge=judge,
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert outcome.assistant_text == "The documented limit is 1,000."
+    assert len(model.calls) == 2
+    assert len(judge.briefs) == 1
+    assert judge.briefs[0].site == "exit_prose"
+    assert [result["tool_name"] for result in judge.briefs[0].results] == [
+        "getHelpCenterDocument"
+    ]
+
+
+async def test_help_center_grounding_rejection_preserves_general_judge_allowance() -> None:
+    judge = _RecordingJudge(
+        [
+            JudgeVerdict(
+                approved=False,
+                violation="unsupported_by_evidence",
+                feedback="Remove the unsupported limit.",
+            ),
+            APPROVED,
+        ]
+    )
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="help_1",
+                        name="getHelpCenterDocument",
+                        arguments={"id": "article-1"},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="The limit is 2,000."),
+            ModelTurnResult(assistant_text="The documented limit is 1,000."),
+        ]
+    )
+    loop, store = _registry_loop(
+        model_client=model,
+        mcp_client=FakeMCPClient(),
+        runtime_tools={"getHelpCenterDocument": _StubHelpCenterDocumentTool()},
+        answer_judge=judge,
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert outcome.assistant_text == "The documented limit is 1,000."
+    assert len(judge.briefs) == 2
+    assert await store.claim_finalization_block(
+        SESSION_ID, 0, 1, "help_center_grounding"
+    ) is False
+    assert await store.claim_finalization_block(SESSION_ID, 0, 1, "answer_judge") is True
 
 
 async def test_capability_card_waits_for_required_answer_table() -> None:

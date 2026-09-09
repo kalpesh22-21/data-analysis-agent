@@ -100,7 +100,7 @@ ASK_USER_JUDGE_EXHAUSTED_EVENT = "loop_ask_user_judge_exhausted"
 # loop's two terminal exits; `ask_user` is the pause branch, which 05 §L.9 leaves ungated
 # and which is the ONLY site where the proposed "non-contextual follow-up" complaint can
 # be made at all — an `askUser` is intercepted in the loop and never reaches either exit.
-JudgeSite = Literal["exit_prose", "exit_table", "ask_user"]
+JudgeSite = Literal["exit_prose", "exit_table", "exit_capability", "ask_user"]
 
 # WHY THE SLUGS ARE A CLOSED, RUNTIME-AUTHORED SET (09 §E). `violation` is the only field
 # of the verdict that may go on a span — `observability/tracing.py::guardrail_observer`
@@ -120,6 +120,9 @@ ANSWER_VIOLATIONS: tuple[str, ...] = (
     # The prose disagrees with the rows the turn produced. Nothing in the runtime can see
     # this, and unlike the two above it is checkable against evidence the judge is holding.
     "contradicts_result",
+    # A Help Center document was fetched, but a material factual claim in the answer is
+    # not supported by that document. Retrieval relevance alone does not establish support.
+    "unsupported_by_evidence",
 )
 
 ASK_USER_VIOLATIONS: tuple[str, ...] = (
@@ -407,6 +410,13 @@ _ANSWER_JUDGE_PROMPT = (
     "answer does not say that it is missing or why.\n"
     "- contradicts_result: the answer states something the results contradict — a "
     "direction, a ranking, a figure that is not what the rows show.\n"
+    "- unsupported_by_evidence: ONLY when the results include a successful "
+    "getHelpCenterDocument call, the answer makes a material factual claim that the "
+    "fetched document does not support. Compare the draft to the complete fetched "
+    "document, not merely to the search query or topic. Reject unsupported numbers, "
+    "requirements, steps, guarantees, or omitted qualifications that materially change "
+    "the meaning. Do not use this violation for SQL/blueprint answers or UI capability "
+    "responses.\n"
     "\n"
     "THINGS THAT ARE NOT VIOLATIONS, and rejecting for them is an error:\n"
     "- An assumption in `recorded_assumptions` that the answer does not repeat. The "
@@ -428,6 +438,8 @@ _ANSWER_JUDGE_PROMPT = (
     "not shown. When `figures_found_in_results` is true, a figure in the answer was "
     "located in the full results — treat it as verified. Its ABSENCE means nothing was "
     "checked, never that a figure is missing.\n"
+    "- Different wording from the Help Center document. Paraphrases and concise summaries "
+    "are correct when their meaning is supported; verbatim overlap is not required.\n"
     "- An empty result. A correct query returning no rows is an answer.\n"
     "\n"
     "You are not checking whether the query measured the right thing, and you are not "

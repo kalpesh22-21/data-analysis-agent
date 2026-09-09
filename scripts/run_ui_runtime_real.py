@@ -147,6 +147,12 @@ def build_real_app():
     capability_prefetch_on = os.environ.get(
         "CAPABILITY_PREFETCH_ENABLED", ""
     ).strip().lower() in ("1", "true", "yes", "on")
+    answer_judge_on = os.environ.get("ANSWER_JUDGE_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     settings = RuntimeSettings(
         _env_file=None,  # explicit wiring only — don't double-read .env
@@ -175,6 +181,7 @@ def build_real_app():
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
+        answer_judge_enabled=answer_judge_on,
         # Value-rich progress lines via a cheap side LLM (openai_summary_model);
         # fire-and-forget, never blocks dispatch. Explicitly wired (this launcher
         # sets _env_file=None, so the flag must not rely on `.env`).
@@ -226,6 +233,7 @@ def build_real_app():
         )
     print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
     print(f"[run_ui_runtime_real] help_center    = {'ON' if help_center_on else 'OFF'}")
+    print(f"[run_ui_runtime_real] answer_judge   = {'ON' if answer_judge_on else 'OFF'}")
     print(
         "[run_ui_runtime_real] capabilities   = "
         f"{'ON' if capability_tools_on else 'OFF'} "

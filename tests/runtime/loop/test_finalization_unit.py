@@ -453,10 +453,14 @@ def test_the_two_judge_kinds_are_claimable_and_independent() -> None:
     which `may_refuse` catches and treats as no re-round, so a missing kind disables the
     judge silently rather than loudly."""
     assert "answer_judge" in FINALIZATION_BLOCK_KINDS
+    assert "help_center_grounding" in FINALIZATION_BLOCK_KINDS
     assert "ask_user_judge" in FINALIZATION_BLOCK_KINDS
     assert finalization_block_key(TURN, WINDOW, "answer_judge") != finalization_block_key(
         TURN, WINDOW, "ask_user_judge"
     )
+    assert finalization_block_key(
+        TURN, WINDOW, "help_center_grounding"
+    ) != finalization_block_key(TURN, WINDOW, "answer_judge")
 
 
 async def test_both_answer_exits_share_one_judge_allowance() -> None:

@@ -331,6 +331,7 @@ FinalizationBlockKind = Literal[
     "empty_answer",
     "ungrounded_answer",
     "answer_judge",
+    "help_center_grounding",
     "ask_user_judge",
 ]
 FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = (
@@ -348,6 +349,7 @@ FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = (
     # route) must not be judged twice for the same answer. Sharing also bounds the
     # judge at ONE model call per window even when the turn tries both exits.
     "answer_judge",
+    "help_center_grounding",
     # The askUser-question judge (09 §C.3), DELIBERATELY SEPARATE from the one
     # above. It is a different complaint made at a different moment, and rejecting
     # it costs the user nothing — the pause has not happened, so they have not seen
