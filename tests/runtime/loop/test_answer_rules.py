@@ -55,7 +55,7 @@ ANSWER = "answerWithTable"
 # Phrases unique to each nudge, so a test can say WHICH rule fired. Precedence
 # between the rules — and between them and the three gates — is part of the
 # contract, so "a nudge appeared" is never a sufficient assertion.
-_GROUNDING_MARK = "this turn executed no query"
+_GROUNDING_MARK = "this turn has no supporting evidence"
 _MARKDOWN_MARK = "contains a markdown table"
 _SQL_MARK = "That answer contains SQL"
 
@@ -212,6 +212,8 @@ async def test_the_refused_draft_is_carried_back_and_never_persisted() -> None:
 
     nudge = _nudge_text(model, _GROUNDING_MARK)
     assert _FABRICATED in nudge, "the draft must come back — nothing else holds it"
+    assert "complete Help Center document" in nudge
+    assert "getHelpCenterDocument" in nudge
     assert outcome.assistant_text == "I could not run a query for that."
 
 

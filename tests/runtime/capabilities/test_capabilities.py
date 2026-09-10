@@ -354,6 +354,14 @@ async def test_disabled_agent_has_no_capability_schema_or_prompt() -> None:
     }
 
 
+def test_capability_prompt_keeps_navigation_and_action_out_of_the_sql_fallback() -> None:
+    prompt = RuntimeSettings(capability_tools_enabled=True).effective_agent_system_prompt()
+
+    assert "follow the blueprint-first path" in prompt
+    assert "SQL only if no blueprint fits" in prompt
+    assert "rather than substituting SQL" in prompt
+
+
 @pytest.mark.asyncio
 async def test_enabled_discovery_schemas_are_explicitly_added() -> None:
     schemas = await ToolSchemaCache(

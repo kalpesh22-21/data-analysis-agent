@@ -194,12 +194,14 @@ def _draft_echo(draft: str | None) -> list[str]:
 def _ungrounded_quantity_nudge(draft: str | None) -> str:
     lines = _draft_echo(draft)
     lines.append(
-        "That answer reports a figure, but this turn executed no query — no runQuery "
-        "result and no runBlueprint result stands behind it."
+        "That answer reports a figure, but this turn has no supporting evidence — no "
+        "runQuery result, runBlueprint result, or complete Help Center document stands "
+        "behind it."
     )
     lines.append(
-        "The turn is NOT over and every tool is still available to you. Run the query "
-        "or blueprint that produces the figure, then answer from what it returns."
+        "The turn is NOT over and every tool is still available to you. Run the query or "
+        "blueprint that produces the figure, or fetch the complete relevant article with "
+        "getHelpCenterDocument, then answer only from what it returns."
     )
     lines.append(
         "If you cannot run one, say so in text and say what blocked you — that is a "

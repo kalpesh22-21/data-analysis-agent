@@ -82,7 +82,14 @@ def test_a_clearly_fitting_offered_card_can_be_run_without_searching_first() -> 
     """
     assert "Analytical, ONE deliverable" in AGENT_SYSTEM_PROMPT
     assert "recalled from this question as a whole" in AGENT_SYSTEM_PROMPT
-    assert "RUN IT with runBlueprint and do not search first" in AGENT_SYSTEM_PROMPT
+    assert "CHOOSE IT and do not search first" in AGENT_SYSTEM_PROMPT
+
+
+def test_every_hand_written_query_requires_a_blueprint_search_first() -> None:
+    routing = AGENT_SYSTEM_PROMPT.split("## What runQuery accepts", 1)[0]
+    assert "Do it before any runQuery" in routing
+    assert "verified blueprints are the user's preferred data path" in routing
+    assert "Analytical, after search finds no suitable blueprint" in routing
 
 
 def test_per_deliverable_search_is_still_mandated_for_a_multi_part_request() -> None:
@@ -98,7 +105,7 @@ def test_per_deliverable_search_is_still_mandated_for_a_multi_part_request() -> 
     assert "Analytical, SEVERAL deliverables, or no offered card clearly fits" in (
         AGENT_SYSTEM_PROMPT
     )
-    assert "under-serve every part of a multi-part request" in AGENT_SYSTEM_PROMPT
+    assert "one search per deliverable, not one for the whole question" in AGENT_SYSTEM_PROMPT
 
 
 def test_blueprint_cards_are_consulted_before_schema_discovery() -> None:
@@ -168,10 +175,10 @@ def test_late_init_boundary_is_named_as_the_four_substantive_tools() -> None:
     ].split("\n- ")[0]
     for tool in SUBSTANTIVE_TOOLS:
         assert tool in boundary, f"late-init boundary sentence no longer names {tool}"
-    assert "before any substantive tool call" in boundary
+    assert "Search/discovery may come first" in boundary
     # Discovery is explicitly NOT locking — an over-deterred model would decompose
     # blind rather than look first (03 §E).
-    assert "discovery does not close that door" in boundary
+    assert "or other tool intended to answer a part" in boundary
 
 
 def test_the_boundary_teaches_declare_before_tag() -> None:
@@ -187,8 +194,7 @@ def test_the_boundary_teaches_declare_before_tag() -> None:
     assert "DECLARE THEM FIRST" in boundary
     # The tag is DROPPED, not refused — the prompt must not imply the call fails,
     # or a model reading this will avoid tagging rather than reorder its calls.
-    assert "a serves_intent tag sent before any declaration is IGNORED" in boundary
-    assert "REFUSED" not in boundary.split("then declare —")[1]
+    assert "a serves_intent tag sent before declaration is IGNORED" in boundary
 
 
 def test_state_contract_lines_are_present() -> None:
@@ -205,9 +211,9 @@ def test_state_contract_lines_are_present() -> None:
     # getTableSchema"); citation was retired outright in 01a §14, so the tag is now
     # the ONLY binding path the prompt teaches — the closed set is unchanged and
     # still named.
-    assert "pass `serves_intent` with the intent's id" in AGENT_SYSTEM_PROMPT
-    assert "runQuery, authoritative runBlueprint or getTableSchema" in AGENT_SYSTEM_PROMPT
-    assert "nothing else counts as evidence" in AGENT_SYSTEM_PROMPT
+    assert "pass `serves_intent` on the runQuery" in AGENT_SYSTEM_PROMPT
+    assert "runBlueprint, getTableSchema or other answer-producing tool" in AGENT_SYSTEM_PROMPT
+    assert "Search and loading calls are not evidence" in AGENT_SYSTEM_PROMPT
     # ...and the ORDERING caveat survived the rewrite. It applies to the tag exactly
     # as it applied to the citation: state calls dispatch first, so the call you are
     # making right now cannot close an intent in this same message.

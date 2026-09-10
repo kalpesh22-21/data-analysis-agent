@@ -80,8 +80,8 @@ def test_base_prompt_state_survives_where_the_models_own_notes_do_not() -> None:
     # to declare a multi-part request there BEFORE the late-init boundary closes,
     # since crossing it leaves the turn untracked with no recovery.
     assert "DECLARE THEM FIRST with updateAnalysisState" in AGENT_SYSTEM_PROMPT
-    assert "before any substantive tool call" in AGENT_SYSTEM_PROMPT
-    assert "a first declaration is REFUSED and the turn goes untracked" in AGENT_SYSTEM_PROMPT
+    assert "Search/discovery may come first, but declare before" in AGENT_SYSTEM_PROMPT
+    assert "a first declaration is REFUSED" in AGENT_SYSTEM_PROMPT
 
 
 def test_base_prompt_routes_independent_deliverables_through_blueprints_in_one_turn() -> None:
@@ -93,11 +93,11 @@ def test_base_prompt_routes_independent_deliverables_through_blueprints_in_one_t
     #
     # The first property used to be a bullet of its own ("One blueprint covers it:
     # run it with runBlueprint."). Live finding 20 folded it into the two routing
-    # bullets — the single-deliverable one now says to RUN a clearly-fitting offered
+    # bullets — the single-deliverable one now says to CHOOSE a clearly-fitting offered
     # card, and the multi-deliverable one ends by running the blueprint that covers
     # it — so BOTH run-instructions are asserted here instead of the deleted bullet.
     # The property is unchanged; only where it is stated moved.
-    assert "RUN IT with runBlueprint and do not search first" in AGENT_SYSTEM_PROMPT
+    assert "CHOOSE IT and do not search first" in AGENT_SYSTEM_PROMPT
     assert "Run the blueprint that covers it" in AGENT_SYSTEM_PROMPT
     assert "call them together in one response" in AGENT_SYSTEM_PROMPT
 
