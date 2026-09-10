@@ -345,7 +345,11 @@ class TurnAccumulators:
         payload = tool_result.result_full
         if not isinstance(payload, dict):
             return None
-        card = {key: value for key, value in payload.items() if key != "answer"}
+        card = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"answer", "_agent_evidence"}
+        }
         if card not in self._capability_cards:
             self._capability_cards.append(card)
         answer = payload.get("answer")

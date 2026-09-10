@@ -174,6 +174,23 @@ class PresentCapabilityCardTool(_CapabilityTool):
                 "That capability is no longer available.",
                 retryable=False,
             )
+        result = {
+            **result,
+            "_agent_evidence": {
+                "kind": self._definition.kind,
+                "description": self._definition.description,
+                "parameters": [
+                    {
+                        "name": parameter.name,
+                        "description": parameter.description,
+                        "type": parameter.type,
+                        "collection": parameter.collection,
+                    }
+                    for parameter in self._definition.parameters
+                ],
+                "metadata": self._definition.metadata,
+            },
+        }
         if isinstance(answer, str) and answer.strip():
             result = {**result, "answer": answer.strip()}
         return _ok(

@@ -22,7 +22,7 @@ from data_agent.runtime.context.discovery_emulation import (
     EmulatedDiscovery,
     build_emulated_discovery,
 )
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
+from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult, _build_preview
 from data_agent.runtime.loop.agent_loop import (
     AgentLoop,
     _assembled_to_canonical,
@@ -1623,6 +1623,43 @@ async def test_capability_terminal_reaches_judge_with_capability_evidence() -> N
     assert len(judge.briefs) == 1
     assert judge.briefs[0].site == "exit_capability"
     assert [result["tool_name"] for result in judge.briefs[0].results] == [capability.name]
+
+
+async def test_internal_capability_evidence_is_not_sent_to_the_ui() -> None:
+    class _EvidenceCapability(_StubCapabilityCardTool):
+        async def run(self, model_args, credentials, turn=None):  # noqa: ANN001, ANN201
+            result = await super().run(model_args, credentials, turn)
+            result.result_full["_agent_evidence"] = {
+                "description": "Shows employee position.",
+                "metadata": {"presentation_columns": ["position"]},
+            }
+            object.__setattr__(
+                result,
+                "result_preview",
+                _build_preview(result.result_full, 20, 4_000),
+            )
+            return result
+
+    capability = _EvidenceCapability("show_employee_profile")
+    judge = _RecordingJudge()
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[ToolCallRequest(id="cap_1", name=capability.name, arguments={})]
+            )
+        ]
+    )
+    loop, _ = _registry_loop(
+        model_client=model,
+        mcp_client=FakeMCPClient(),
+        runtime_tools={capability.name: capability},
+        answer_judge=judge,
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert "_agent_evidence" in str(judge.briefs[0].results)
+    assert "_agent_evidence" not in str(outcome.capability_cards)
 
 
 async def test_capability_judge_rejection_retries_without_losing_ui_payload() -> None:

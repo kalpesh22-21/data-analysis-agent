@@ -176,6 +176,18 @@ def test_help_center_support_violation_is_accepted() -> None:
     assert verdict.violation == "unsupported_by_evidence"
 
 
+def test_capability_coverage_violation_is_accepted() -> None:
+    verdict = parse_verdict(
+        _verdict_turn(
+            False,
+            "capability_coverage_gap",
+            "Choose a widget whose presentation columns include the requested balance.",
+        ),
+        "exit_capability",
+    )
+    assert verdict.violation == "capability_coverage_gap"
+
+
 def test_a_valid_approval_returns_the_shared_object() -> None:
     assert parse_verdict(_verdict_turn(True), "exit_prose") is APPROVED
 
@@ -185,6 +197,18 @@ def test_ask_user_slug_is_accepted_at_its_own_site() -> None:
         _verdict_turn(False, "non_contextual_question", "Ask in the user's terms."), "ask_user"
     )
     assert verdict.violation == "non_contextual_question"
+
+
+def test_unsupported_environment_claim_is_accepted_for_follow_up() -> None:
+    verdict = parse_verdict(
+        _verdict_turn(
+            False,
+            "unsupported_environment_claim",
+            "Ask neutrally; no result establishes that this workflow is configured.",
+        ),
+        "ask_user",
+    )
+    assert verdict.violation == "unsupported_environment_claim"
 
 
 def test_feedback_cannot_forge_structure_in_the_nudge_it_lands_in() -> None:
@@ -255,6 +279,8 @@ def test_ask_user_judge_prompt_guards_codes_and_plain_text_options() -> None:
     assert "department name and code" in system
     assert "options_in_question" in system
     assert "at most five structured options" in system
+    assert "unsupported_environment_claim" in system
+    assert "not explicitly present" in system
 
 
 def test_answer_judge_prompt_checks_help_center_support_semantically() -> None:
@@ -263,6 +289,16 @@ def test_answer_judge_prompt_checks_help_center_support_semantically() -> None:
     assert "unsupported_by_evidence" in system
     assert "getHelpCenterDocument" in system
     assert "verbatim overlap is not required" in system
+
+
+def test_answer_judge_prompt_checks_capability_grounding_and_widget_coverage() -> None:
+    judge = AnswerJudge(model_client=ScriptedModelClient([]), token_budget=_ROOMY)
+    system = judge.messages_for(_brief(site="exit_capability"))[0]["content"]
+    assert "_agent_evidence.description" in system
+    assert "capability_coverage_gap" in system
+    assert "presentation columns" in system
+    assert "metadata.ui_parameters" in system
+    assert "navigation capabilities do not need presentation columns" in system
 
 
 def test_the_agent_system_prompt_is_not_sent_to_the_judge() -> None:

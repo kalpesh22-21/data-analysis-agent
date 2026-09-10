@@ -1547,7 +1547,11 @@ class AgentLoop:
                 session_id, entry.result_full_ref
             )
             if isinstance(payload, dict):
-                card = {key: value for key, value in payload.items() if key != "answer"}
+                card = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"answer", "_agent_evidence"}
+                }
                 if card not in cards:
                     cards.append(card)
         return cards
@@ -1838,7 +1842,12 @@ class AgentLoop:
         return await self._answer_judge.review(brief)
 
     async def _judge_results(
-        self, session_id: str, turn_index: int, column_scope: frozenset[str]
+        self,
+        session_id: str,
+        turn_index: int,
+        column_scope: frozenset[str],
+        *,
+        include_all_successful: bool = False,
     ) -> tuple[tuple[Mapping[str, Any], ...], str | None, tuple[TrailEntry, ...]]:
         """This turn's data-bearing results as the MODEL saw them, plus the date anchor —
                 the two brief fields that cannot be read off a window-local (09 §D).
@@ -1872,7 +1881,8 @@ class AgentLoop:
             if entry.turn_index == turn_index
             and entry.status == "ok"
             and (
-                entry.tool_name in DATA_ANSWER_TOOLS
+                include_all_successful
+                or entry.tool_name in DATA_ANSWER_TOOLS
                 or entry.tool_name in _ALTERNATIVE_ANSWER_EVIDENCE_TOOLS
                 or entry.capability_terminal
             )
@@ -4285,14 +4295,19 @@ class AgentLoop:
                             _ask_user_options(ask_user_call.arguments.get("options")) or ()
                         ),
                     ) -> JudgeBrief:
-                        # No store reads at this site — the question is judged on the
-                        # turn's own bookkeeping — but the factory shape is kept so all
-                        # three sites read identically.
+                        results, anchor, _ = await self._judge_results(
+                            session_id,
+                            turn_index,
+                            credentials.column_scope,
+                            include_all_successful=True,
+                        )
                         return self._judge_brief(
                             "ask_user",
                             question=_q,
                             accum=accum,
                             analysis_state=_state,
+                            date_anchor=anchor,
+                            results=results,
                             pending_question=_asked,
                             pending_options=_options,
                         )

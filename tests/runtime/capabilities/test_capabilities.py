@@ -313,6 +313,19 @@ async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> N
         "resolved_entities": {"employee": ["Jane Doe"]},
         "additional_arguments": {},
         "answer": "Jane is active.",
+        "_agent_evidence": {
+            "kind": "data_widget",
+            "description": "Display an employee profile.",
+            "parameters": [
+                {
+                    "name": "employees",
+                    "description": "The employee or employees.",
+                    "type": "employee",
+                    "collection": True,
+                }
+            ],
+            "metadata": {"preamble_url": "ember:EmployeeCard"},
+        },
     }
 
 

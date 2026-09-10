@@ -123,6 +123,9 @@ ANSWER_VIOLATIONS: tuple[str, ...] = (
     # A Help Center document was fetched, but a material factual claim in the answer is
     # not supported by that document. Retrieval relevance alone does not establish support.
     "unsupported_by_evidence",
+    # A selected data widget cannot expose all requested data points or cannot express the
+    # requested scope using its presentation columns and filters/parameters.
+    "capability_coverage_gap",
 )
 
 ASK_USER_VIOLATIONS: tuple[str, ...] = (
@@ -138,6 +141,9 @@ ASK_USER_VIOLATIONS: tuple[str, ...] = (
     "code_only_choices",
     # Choices embedded in the prose do not render as selectable UI controls.
     "options_in_question",
+    # The follow-up asserts a fact about this customer's environment or Paycom setup that
+    # is absent from both the user's request and the successful tool evidence.
+    "unsupported_environment_claim",
 )
 
 
@@ -410,13 +416,21 @@ _ANSWER_JUDGE_PROMPT = (
     "answer does not say that it is missing or why.\n"
     "- contradicts_result: the answer states something the results contradict — a "
     "direction, a ranking, a figure that is not what the rows show.\n"
-    "- unsupported_by_evidence: ONLY when the results include a successful "
-    "getHelpCenterDocument call, the answer makes a material factual claim that the "
-    "fetched document does not support. Compare the draft to the complete fetched "
-    "document, not merely to the search query or topic. Reject unsupported numbers, "
-    "requirements, steps, guarantees, or omitted qualifications that materially change "
-    "the meaning. Do not use this violation for SQL/blueprint answers or UI capability "
-    "responses.\n"
+    "- unsupported_by_evidence: the answer makes a material factual claim about Paycom "
+    "that is not supported by the successful getHelpCenterDocument content or by the "
+    "selected UI capability's own evidence. For Help Center answers, compare against the "
+    "complete fetched document, not the search query or topic. For UI capability answers, "
+    "compare against `_agent_evidence.description`, its parameters and metadata, plus the "
+    "hydrated result. Search matches are retrieval hints, not evidence. Reject invented "
+    "steps, unsupported promises about what the option can do or show, and claims that an "
+    "action or navigation already happened. Do not use this violation for SQL/blueprint "
+    "claims.\n"
+    "- capability_coverage_gap: a selected data_widget does not contain every data point "
+    "needed to answer the user's question, or its available parameters/filters cannot "
+    "express the requested scope. Check the hydrated capability's presentation columns "
+    "and filter metadata, including metadata.ui_parameters, together with parameters and "
+    "`_agent_evidence`. A related widget is insufficient. Use this only when a UI "
+    "capability was selected; navigation capabilities do not need presentation columns.\n"
     "\n"
     "THINGS THAT ARE NOT VIOLATIONS, and rejecting for them is an error:\n"
     "- An assumption in `recorded_assumptions` that the answer does not repeat. The "
@@ -440,6 +454,8 @@ _ANSWER_JUDGE_PROMPT = (
     "checked, never that a figure is missing.\n"
     "- Different wording from the Help Center document. Paraphrases and concise summaries "
     "are correct when their meaning is supported; verbatim overlap is not required.\n"
+    "- A data point whose label is worded differently from a presentation column when the "
+    "two clearly have the same meaning. Judge semantic coverage, not exact string overlap.\n"
     "- An empty result. A correct query returning no rows is an answer.\n"
     "\n"
     "You are not checking whether the query measured the right thing, and you are not "
@@ -470,6 +486,17 @@ _ASK_USER_JUDGE_PROMPT = (
     "instead of being represented in structured_options. Tell the agent to put the "
     "choices in the options field. There may be at most five structured options, so it "
     "must consolidate a longer list.\n"
+    "\n"
+    "REJECT AS unsupported_environment_claim when the question or its structured options "
+    "state or presuppose a fact about the user's environment that is not explicitly present "
+    "in the user's request or successful tool results. This includes claiming that an "
+    "employee, department, field, report, workflow, setting, capability, or product behavior "
+    "exists, is configured, has a particular value, or supports an operation. Do not allow "
+    "the agent to infer a likely fact or bridge a gap from related evidence. A neutral question "
+    "that asks the user to supply or choose information without asserting it is available is "
+    "fine. Treat paraphrases as supported when they preserve the explicit meaning; exact word "
+    "overlap is not required. If a result is truncated or omitted, do not assume the missing "
+    "portion either supports or disproves a claim.\n"
     "\n"
     "APPROVE otherwise, including when the question is merely long, or when you think "
     "the agent could have worked the answer out for itself. You are checking that the "
