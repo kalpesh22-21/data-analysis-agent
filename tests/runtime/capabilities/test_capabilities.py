@@ -147,6 +147,20 @@ def test_prefetch_router_is_local(question: str, expected: str) -> None:
     assert PrefetchRouter().route(question) == expected
 
 
+@pytest.mark.asyncio
+async def test_action_prefetch_searches_navigation_and_action_bearing_widgets() -> None:
+    class RecordingClient:
+        kinds = None
+
+        async def search(self, query, kinds, limit=5):
+            self.kinds = kinds
+            return []
+
+    client = RecordingClient()
+    await prefetch_capabilities(client, "Change an employee position")
+    assert client.kinds == ("navigation", "data_widget")
+
+
 def test_definition_translates_locked_parameter_types_for_the_model() -> None:
     definition = CapabilityDefinition(
         name="example",
@@ -285,6 +299,11 @@ async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> N
         "tool_name": "show_employee_profile",
         "kind": "data_widget",
         "ready": True,
+        "presented": False,
+        "next_step": (
+            "Call show_employee_profile to present this option; definition lookup alone does "
+            "not present it. Omit optional arguments the user did not supply."
+        ),
     }
     assert result.terminal is True
     assert {"answer", "serves_intent"} <= set(schema["parameters"]["properties"])
@@ -313,8 +332,9 @@ async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> N
         "resolved_entities": {"employee": ["Jane Doe"]},
         "additional_arguments": {},
         "answer": "Jane is active.",
-        "_agent_evidence": {
-            "kind": "data_widget",
+            "_agent_evidence": {
+                "kind": "data_widget",
+                "activation": "user_interaction_required",
             "description": "Display an employee profile.",
             "parameters": [
                 {

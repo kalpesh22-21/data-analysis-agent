@@ -107,7 +107,10 @@ class ToolParam:
                 )
                 description = (
                     f"{description} First call resolveValues with table {target.table}, "
-                    f"column {target.column}{period}, then pass the resolved stored value."
+                    f"column {target.column}{period}, then pass the resolved stored value. "
+                    "Use a returned value without asking when the user's wording is its "
+                    "case-insensitive exact match, unique prefix, or unambiguous abbreviation. "
+                    "Ask only when multiple returned values remain plausible."
                 )
         schema["description"] = description
         if self.default is not None and self.default != "null":
@@ -149,7 +152,9 @@ class CapabilityDefinition:
             "description": (
                 "For a mixed request only: the concise answer to work completed before this "
                 "UI option. Omit when the UI option alone answers the request. Never mention "
-                "cards, widgets, capabilities, tools, or hydration to the user."
+                "cards, widgets, capabilities, tools, or hydration to the user. Navigation "
+                "is never automatic: say the user can use the displayed option, never that "
+                "you are opening, navigating, taking, or redirecting them."
             ),
         }
         properties["serves_intent"] = {

@@ -374,8 +374,8 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
         "Do NOT copy the rows into 'answer' — the user can already see them. "
         "Describe what each table shows and call out what matters: the shape, the "
         "outliers, the trend, the total. Quoting two or three individual figures is fine. "
-        "If your answer is a single number or a single row, do NOT use this tool — just "
-        "reply with your answer as an ordinary message."
+        "If your answer is a single number or a single row, do NOT use this tool — use "
+        "answerWithText instead."
     ),
     "parameters": {
         "type": "object",
@@ -437,6 +437,36 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
         # `answerWithTable` with no table is a terminal call that shows the user
         # nothing. Requiring it is the same argument that made `answer` required.
         "required": ["answer", "tables"],
+    },
+}
+
+
+ANSWER_WITH_TEXT_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "answerWithText",
+    "description": (
+        "Give your FINAL prose answer when no table is needed. This ENDS the turn. "
+        "Put the complete user-facing answer in 'answer'; do not send a separate message. "
+        "In 'evidence', name each successful tool whose result directly supports the answer. "
+        "Use exact tool names such as runQuery, runBlueprint, or getHelpCenterDocument. "
+        "Do not list search or loading tools as evidence. Use an empty list only when the "
+        "answer is intentionally based on no retrieved evidence; the runtime will ask you "
+        "to confirm that choice."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "answer": {
+                "type": "string",
+                "description": "The complete final answer shown to the user.",
+            },
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Exact names of successful current-turn tools that support the answer.",
+            },
+        },
+        "required": ["answer", "evidence"],
     },
 }
 
@@ -641,6 +671,7 @@ _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
     RUN_BLUEPRINT_TOOL_SCHEMA,
     RECORD_ASSUMPTIONS_TOOL_SCHEMA,
+    ANSWER_WITH_TEXT_TOOL_SCHEMA,
     ANSWER_WITH_TABLE_TOOL_SCHEMA,
     UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
 )

@@ -48,6 +48,7 @@ from data_agent.runtime.composite.answer_with_table import (
     BlueprintRun,
     blueprint_run_from_result,
 )
+from data_agent.runtime.composite.answer_with_text import AnswerWithTextTool
 from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import (
@@ -735,6 +736,7 @@ def create_app(
         # an answer it already wrote. The UI pages the designated query itself via
         # `POST /query/page`.
         runtime_tools["answerWithTable"] = AnswerWithTableTool()
+        runtime_tools["answerWithText"] = AnswerWithTextTool()
         # `updateAnalysisState` (Release 1, composite/analysis_state.py): ALWAYS
         # wired — its only dependency is the session store, so it is never subject
         # to the advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path. Unlike the

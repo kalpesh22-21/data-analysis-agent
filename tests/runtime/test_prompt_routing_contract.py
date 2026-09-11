@@ -247,7 +247,7 @@ def test_multi_row_answers_are_delivered_with_answer_with_table() -> None:
     nothing, so the user lost the paginated grid and got a truncated table.
     """
     assert "If the answer is MORE THAN ONE ROW" in AGENT_SYSTEM_PROMPT
-    assert "Call answerWithTable instead" in AGENT_SYSTEM_PROMPT
+    assert "call answerWithTable instead" in AGENT_SYSTEM_PROMPT
     assert "This rule is UNCONDITIONAL." in AGENT_SYSTEM_PROMPT
     assert "answerWithTable is how you finalize in those cases too" in AGENT_SYSTEM_PROMPT
 
@@ -275,6 +275,7 @@ def test_closing_the_last_intent_is_not_the_end_of_the_turn() -> None:
     """
     from data_agent.runtime.mcp.tool_schema import (
         ANSWER_WITH_TABLE_TOOL_SCHEMA,
+        ANSWER_WITH_TEXT_TOOL_SCHEMA,
         UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
     )
 
@@ -290,14 +291,10 @@ def test_closing_the_last_intent_is_not_the_end_of_the_turn() -> None:
     assert "The answer still has to be sent" in tracking
     # Both calls in ONE response — 03 §E.2's partition dispatches state first, so
     # this is a runtime guarantee and not a hope (05 §G).
-    assert "send both in the SAME response" in tracking
+    assert "final answer tool in the SAME response" in tracking
     assert "state calls run first, so one response does both" in tracking
-    # ...and it is scoped to the terminal TOOL, because exit #1 requires
-    # `not result.tool_calls` (`agent_loop.py:2880`): a plain final message batched
-    # with a state call is not final at all — D22 discards the free text and the
-    # turn loops. Telling the model to batch "the answer" unqualified would trade
-    # one wasted round for another.
-    assert "An ordinary message cannot share a response with a tool call" in tracking
+    # Both final answer shapes are tools and can therefore share the state-update batch.
+    assert ANSWER_WITH_TEXT_TOOL_SCHEMA["name"] == "answerWithText"
     # The multi-row rule is NOT restated here (duplicating it is how the reverted
     # merge rule was built); the tracking section points at the section that owns it.
     assert "see Presenting a table" in tracking

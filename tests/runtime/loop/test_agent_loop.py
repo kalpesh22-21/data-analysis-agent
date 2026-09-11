@@ -14,6 +14,7 @@ import pytest
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
+from data_agent.runtime.composite.answer_with_text import AnswerWithTextTool
 from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
     ContextAssembler,
@@ -47,6 +48,7 @@ SESSION_ID = "sess-loop-test"
 TOOLS_SCHEMA = [
     {"type": "function", "name": "listDatabases", "description": "", "parameters": {}},
     {"type": "function", "name": "runQuery", "description": "", "parameters": {}},
+    {"type": "function", "name": "answerWithText", "description": "", "parameters": {}},
     {
         "type": "function",
         "name": "askUser",
@@ -74,6 +76,7 @@ def _build_loop(
     max_budget_windows: int = 3,
     discovery_emulation_provider=None,
     base_system_prompt: str | None = None,
+    runtime_tools: dict | None = None,
 ) -> tuple[AgentLoop, InMemorySessionStore]:
     store = store or InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
@@ -90,6 +93,7 @@ def _build_loop(
         max_wall_clock_seconds=max_wall_clock_seconds,
         max_budget_windows=max_budget_windows,
         discovery_emulation_provider=discovery_emulation_provider,
+        runtime_tools={"answerWithText": AnswerWithTextTool(), **(runtime_tools or {})},
     )
     return loop, store
 
@@ -99,8 +103,20 @@ def _build_loop(
 # ---------------------------------------------------------------------------
 
 
-async def test_normal_termination_tool_call_free_response() -> None:
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="Here is your answer.")])
+async def test_normal_response_is_rejected_until_answer_with_text_is_called() -> None:
+    model = ScriptedModelClient([
+        ModelTurnResult(assistant_text="Here is your answer."),
+        ModelTurnResult(tool_calls=[ToolCallRequest(
+            id="answer_1",
+            name="answerWithText",
+            arguments={"answer": "Here is your answer.", "evidence": []},
+        )]),
+        ModelTurnResult(tool_calls=[ToolCallRequest(
+            id="answer_2",
+            name="answerWithText",
+            arguments={"answer": "Here is your answer.", "evidence": []},
+        )]),
+    ])
     mcp = FakeMCPClient()
     loop, store = _build_loop(model_client=model, mcp_client=mcp)
 
@@ -110,11 +126,13 @@ async def test_normal_termination_tool_call_free_response() -> None:
 
     assert outcome.status == "done"
     assert outcome.assistant_text == "Here is your answer."
-    assert outcome.tool_calls_made == 0
+    assert outcome.tool_calls_made == 2
 
     doc = await store.get_or_create_session(SESSION_ID)
     roles = [m.role for m in doc.messages]
     assert roles == ["user", "assistant"]
+    assert "cannot finish this turn" in model.calls[1].messages[-1]["content"]
+    assert "Are you sure" in model.calls[2].messages[-1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -1531,7 +1549,7 @@ def _registry_loop(
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
-        runtime_tools=runtime_tools,
+        runtime_tools={"answerWithText": AnswerWithTextTool(), **runtime_tools},
         answer_judge=answer_judge,
     )
     return loop, store
@@ -1680,7 +1698,14 @@ async def test_capability_judge_rejection_retries_without_losing_ui_payload() ->
                     ToolCallRequest(id="cap_1", name=capability.name, arguments={})
                 ]
             ),
-            ModelTurnResult(assistant_text="You can use this option to manage positions."),
+            ModelTurnResult(tool_calls=[ToolCallRequest(
+                id="answer_1",
+                name="answerWithText",
+                arguments={
+                    "answer": "You can use this option to manage positions.",
+                    "evidence": [],
+                },
+            )]),
         ]
     )
     loop, store = _registry_loop(
@@ -1713,7 +1738,14 @@ async def test_help_center_answer_reaches_judge_without_sql_grounding_refusal() 
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="The documented limit is 1,000."),
+            ModelTurnResult(tool_calls=[ToolCallRequest(
+                id="answer_1",
+                name="answerWithText",
+                arguments={
+                    "answer": "The documented limit is 1,000.",
+                    "evidence": ["getHelpCenterDocument"],
+                },
+            )]),
         ]
     )
     loop, _ = _registry_loop(
@@ -1757,8 +1789,19 @@ async def test_help_center_grounding_rejection_preserves_general_judge_allowance
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="The limit is 2,000."),
-            ModelTurnResult(assistant_text="The documented limit is 1,000."),
+            ModelTurnResult(tool_calls=[ToolCallRequest(
+                id="answer_1",
+                name="answerWithText",
+                arguments={"answer": "The limit is 2,000.", "evidence": ["getHelpCenterDocument"]},
+            )]),
+            ModelTurnResult(tool_calls=[ToolCallRequest(
+                id="answer_2",
+                name="answerWithText",
+                arguments={
+                    "answer": "The documented limit is 1,000.",
+                    "evidence": ["getHelpCenterDocument"],
+                },
+            )]),
         ]
     )
     loop, store = _registry_loop(

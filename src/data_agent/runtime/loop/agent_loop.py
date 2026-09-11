@@ -1,8 +1,8 @@
 """AgentLoop — the per-turn state machine.
 
 Per turn: assemble the canonical messages, then loop `send_turn` -> dispatch each
-requested tool -> budget check, until the model returns no tool calls (done), a tool
-pauses, or the budget window ends. `resume()` is the separate entry point that
+requested tool -> budget check, until an explicit answer tool finishes, a tool pauses,
+or the budget window ends. A response without tool calls is rejected and retried. `resume()` is the separate entry point that
 CAS-consumes the checkpoint (D45), threads the answer back in, and re-enters with a FRESH
 `BudgetGuard` window; only a `budget_cap` resume answered "continue"/"refine" counts a new
 window grant, and a "stop" ends the turn with the best partial result already in the trail.
@@ -65,6 +65,8 @@ from data_agent.runtime.composite.answer_with_table import (
     resolve_designations,
     terminal_sql_by_id,
 )
+from data_agent.runtime.composite.answer_with_text import TOOL_NAME as ANSWER_TEXT_TOOL_NAME
+from data_agent.runtime.composite.answer_with_text import clean_evidence
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
@@ -117,9 +119,7 @@ from .answer_judge import (
     ask_user_judge_nudge_text,
 )
 from .answer_rules import (
-    ANSWER_RULE_EXHAUSTED_EVENT,
     ANSWER_RULE_REFUSED_EVENT,
-    first_match,
     reported_figures,
 )
 from .blueprint_gate import BlueprintGate
@@ -128,15 +128,11 @@ from .finalization import (
     ANSWER_SHAPE_EXHAUSTED_EVENT,
     ANSWER_SHAPE_REFUSED_EVENT,
     DATA_ANSWER_TOOLS,
-    EMPTY_ANSWER_EXHAUSTED_EVENT,
-    EMPTY_ANSWER_FALLBACK_TEXT,
-    EMPTY_ANSWER_REFUSED_EVENT,
     AnswerShapeCounter,
     FinalizationGate,
     answer_judge_rejected,
     answer_shape_nudge_text,
     answer_table_no_table_designated,
-    empty_answer_nudge_text,
     finalization_blocked,
     finalization_nudge_text,
     pending_intents,
@@ -151,6 +147,27 @@ from .turn_accumulators import (
 )
 
 _ALTERNATIVE_ANSWER_EVIDENCE_TOOLS = frozenset({"getHelpCenterDocument"})
+_TEXT_ANSWER_EVIDENCE_TOOLS = frozenset(
+    {"runQuery", "runBlueprint", "getTableSchema", "getHelpCenterDocument"}
+)
+
+_NAVIGATION_EXECUTION_CLAIM = re.compile(
+    r"\b(?:i(?:'ll|\s+will|\s+am|'m)?\s+)(?:open|navigate|take|send|redirect)\b|"
+    r"\b(?:opening|navigating|redirecting)\b.{0,30}\b(?:now|you)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_navigation_option(cards: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        isinstance(card.get("metadata"), Mapping)
+        and card["metadata"].get("preamble_url") == "ember:GenericButton"
+        for card in cards
+    )
+
+
+def _claims_navigation_was_performed(text: str, cards: Sequence[Mapping[str, Any]]) -> bool:
+    return _has_navigation_option(cards) and bool(_NAVIGATION_EXECUTION_CLAIM.search(text))
 
 
 def _answer_judge_refusal_kind(verdict: JudgeVerdict) -> FinalizationBlockKind:
@@ -313,17 +330,17 @@ TurnStatus = Literal["done", "paused_ask_user", "paused_budget_cap", "stopped_ha
 # WHICH EXIT produced the prose the answer scrub inspected (ISSUES I1) — the
 # `exit` label on `loop_answer_prose_redacted`, and nothing else. It is a
 # PARAMETER of `_finish`, never derived from `status`, for the same reason
-# *event* and *provenance* are: `status="done"` is reached by TWO exits (the
-# no-tool-calls finish and the `answerWithTable` finish) whose disclosure
-# profiles are entirely different, and a derivation could not tell them apart.
+# *event* and *provenance* are: `status="done"` is reached by explicit answer
+# tools whose disclosure profiles differ, and a derivation could not tell them apart.
 # `"pause"` covers every non-`done` finisher — the `askUser` pause, the budget
 # cap, the hard ceiling and `_pause_from_runtime_tool` — because all four carry
 # the same thing: best-effort partial prose from a turn that did not answer.
 # `"ask_user_question"` is the one label that is NOT about `assistant_text`: it
 # tags the `askUser` QUESTION, which is model prose shown to the user too.
 AnswerExitLabel = Literal[
-    "no_tool_calls",
+    "answer_with_text",
     "answer_with_table",
+    "capability",
     "pause",
     "ask_user_question",
     "declined_clarification",
@@ -2803,7 +2820,7 @@ class AgentLoop:
             # the `claim_finalization_block` key is `(turn_index, window, kind)` too, so a stale
             # refusal cannot be replayed onto a later turn.
             answer_shape = AnswerShapeCounter(accum.has_answer_tables)
-            has_alternative_answer_evidence = False
+            successful_text_evidence_tools: set[str] = set()
             # The finalization block allowance (05 §C.1/§C.2, §J.3), also
             # `loop/finalization.py`: the per-round-trip refusal flag and the persisted
             # per-window claim behind all four refusal sites below. Its three ids are
@@ -2851,11 +2868,8 @@ class AgentLoop:
                 answer_shape.observe_prior_entry(
                     prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
                 )
-                if (
-                    prior_entry.tool_name in _ALTERNATIVE_ANSWER_EVIDENCE_TOOLS
-                    or prior_entry.capability_terminal
-                ):
-                    has_alternative_answer_evidence = True
+                if prior_entry.tool_name in _TEXT_ANSWER_EVIDENCE_TOOLS:
+                    successful_text_evidence_tools.add(prior_entry.tool_name)
             # Seed the guard with the emulated-discovery signatures swept above (outside
             # the budget window) so a model re-call of listDatabases/listTables is served
             # locally, not re-dispatched to the MCP — together with the pointers to the
@@ -2942,6 +2956,8 @@ class AgentLoop:
                 # terminal exit #2 below. Reset per iteration — a designation only ends
                 # the turn it was made in.
                 designated_answer_text: str | None = None
+                designated_text_answer: str | None = None
+                designated_text_has_evidence = False
                 capability_terminal_text: str | None = None
                 capability_finalization_refused = False
                 # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
@@ -2988,369 +3004,16 @@ class AgentLoop:
                 # NOTHING IS PERSISTED on this path: not the refused answer, not the
                 # nudge. Both are within-turn control flow, and a persisted nudge would
                 # appear in `/session/history` as something the user said.
-                refused_finalization = False
-                # The fast path, and it must stay this cheap: `pending_intents(None)`
-                # is an `is None` test on a window-local — no store read, on the
-                # overwhelming majority of turns that never declare a state at all.
-                pending_at_exit = pending_intents(analysis_state) if not result.tool_calls else ()
-                if pending_at_exit:
-                    if await finalization_gate.may_refuse("intents"):
-                        refused_finalization = True
-                        self._observer(
-                            "loop_finalization_refused",
-                            {"exit": "no_tool_calls", "pending_count": len(pending_at_exit)},
-                        )
-                        finalization_nudge = finalization_nudge_text(
-                            result.assistant_text, pending_at_exit
-                        )
-                        # CLEAR THE DRAFT. `last_assistant_text` was set above and is
-                        # returned as `assistant_text` on the hard-ceiling and
-                        # budget-cap paths — so a refused, incomplete answer could
-                        # still reach the user there while never appearing in history,
-                        # making live and history disagree on exactly the enforcement
-                        # path.
-                        last_assistant_text = None
-                    else:
-                        # The window's one forced re-round is spent and the intents are
-                        # still pending. Record the disposition the runtime CAN
-                        # establish and let finalization proceed — see
-                        # `_force_block_pending_intents` for what the code does and does
-                        # not claim.
-                        analysis_state = await self._force_block_pending_intents(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            state=analysis_state,
-                            reason_code="ENFORCEMENT_EXHAUSTED",
-                        )
-                        self._observer(
-                            "loop_enforcement_exhausted",
-                            {"intent_count": len(pending_at_exit)},
-                        )
-                elif not result.tool_calls and answer_shape.armed:
-                    # --- THE ANSWER-SHAPE GATE (05 §J) --------------------------
-                    #
-                    # The model is ending the turn in bare prose while holding
-                    # multi-row results it never tabled. "Presenting a table" is an
-                    # UNCONDITIONAL prompt rule and the only strong one with no runtime
-                    # enforcement; measured live it failed ~5/8 of expected-table runs,
-                    # and its worst mode was an APOLOGY — the model asserting it could
-                    # no longer call the tool, on a turn nothing had refused and nothing
-                    # had ended. A belief about turn mechanics is not something a prompt
-                    # can correct from inside the same turn; only the runtime can, by
-                    # refusing the finish once and handing back a round.
-                    #
-                    # `elif`: THE PENDING-INTENTS REFUSAL TAKES PRECEDENCE and its
-                    # behaviour is untouched. It is the more specific complaint (there is
-                    # work the model has not done, not merely work it has not presented),
-                    # so at most one refusal happens per round-trip.
-                    #
-                    # ITS OWN ALLOWANCE, `kind="answer_shape"` (05 §J.3, revised
-                    # 2026-08-12 on live data). This gate SHARED the intents allowance
-                    # for one release, which bounded the worst case at one extra
-                    # round-trip per window and looked like the conservative choice. It
-                    # was not: on multi-intent questions the two gates fire in SEQUENCE,
-                    # not in competition — prose with intents pending (intents nudge,
-                    # allowance gone), then the ledger closed, then prose again with the
-                    # tables still untabled. 2 of 4 live three-part runs went exactly
-                    # that way and this gate could only emit `..._exhausted`, starved on
-                    # the question it exists for (traces `900a85a4`, `16f090db`).
-                    # Separate allowances make that sequence terminate; the price is a
-                    # worst case of TWO extra round-trips per window, still bounded by
-                    # `max_budget_windows`.
-                    if await finalization_gate.may_refuse("answer_shape"):
-                        refused_finalization = True
-                        self._observer(
-                            ANSWER_SHAPE_REFUSED_EVENT,
-                            {"multi_row_calls": answer_shape.multi_row_calls},
-                        )
-                        finalization_nudge = answer_shape_nudge_text(
-                            result.assistant_text, answer_shape.multi_row_calls
-                        )
-                        # CLEAR THE DRAFT, for the reason the pending-intents path
-                        # clears it: `last_assistant_text` is returned as
-                        # `assistant_text` on the hard-ceiling and budget-cap paths, so
-                        # a refused answer could still reach the user there while never
-                        # appearing in history.
-                        last_assistant_text = None
-                    else:
-                        # THIS GATE'S OWN allowance for the window is spent, which now
-                        # means only one thing: it already refused once here and the
-                        # model answered in prose again. (Before the allowances were
-                        # split it also meant "the intents nudge took it", which made
-                        # this counter ambiguous and hid the starvation above.) THE
-                        # PROSE PASSES. The runtime records what it can and never
-                        # hard-locks a turn: the same posture `ENFORCEMENT_EXHAUSTED`
-                        # takes for intents, minus the ledger write, because there is no
-                        # ledger for answer shape and the user's answer is in hand.
-                        self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
-
-                # --- THE ANSWER RULES (05 §L) -----------------------------------
-                #
-                # NOT AN `elif`, for §K.4's reason: the branches above are entered when
-                # their complaint QUALIFIES, not when they refuse, so chaining would
-                # silence this on any round where an earlier gate had already spent its
-                # grant. `not refused_finalization` keeps the one-refusal-per-round-trip
-                # rule the chain expresses structurally.
-                #
-                # BEFORE THE EMPTY-ANSWER GATE, though the order is free: `first_match`
-                # returns `None` for blank prose, so the two conditions are disjoint by
-                # construction and neither can pre-empt the other.
-                #
-                # THE ALLOWANCE IS THE RULE'S, not this site's — a grounding rule spends
-                # `ungrounded_answer`, a form rule spends the shape gate's own grant. So
-                # adding a rule does not add a round-trip to the window's worst case
-                # unless it is a genuinely new complaint.
-                answer_rule = (
-                    first_match(
-                        result.assistant_text,
-                        accum.sql_executed,
-                        has_alternative_evidence=has_alternative_answer_evidence,
+                if not result.tool_calls:
+                    finalization_nudge = (
+                        "A normal assistant message cannot finish this turn. Put the complete "
+                        "answer in answerWithText, or use answerWithTable when rows must be "
+                        "shown. If the answer is grounded, list the exact successful supporting "
+                        "tool names in answerWithText.evidence."
                     )
-                    if not result.tool_calls and not refused_finalization
-                    else None
-                )
-                if answer_rule is not None:
-                    if await finalization_gate.may_refuse(answer_rule.charges_to):
-                        refused_finalization = True
-                        self._observer(
-                            ANSWER_RULE_REFUSED_EVENT, {"rule": answer_rule.name}
-                        )
-                        finalization_nudge = answer_rule.nudge(result.assistant_text)
-                        # CLEAR THE DRAFT, for the reason the two gates above clear it:
-                        # `last_assistant_text` is returned as `assistant_text` on the
-                        # hard-ceiling and budget-cap paths, so a refused answer could
-                        # otherwise reach the user there while never entering history.
-                        last_assistant_text = None
-                    else:
-                        # The kind's allowance for this window is spent. THE PROSE
-                        # PASSES — the runtime records what it can and never hard-locks
-                        # a turn (§J.5), and here that posture is load-bearing rather
-                        # than inherited: these rules read SHAPE, not truth, so a second
-                        # refusal would be the runtime destroying an answer it cannot
-                        # prove is wrong. The event is what makes the pass visible, and
-                        # its rate is what says whether a rule is tuned right.
-                        self._observer(
-                            ANSWER_RULE_EXHAUSTED_EVENT, {"rule": answer_rule.name}
-                        )
-
-                # --- THE EMPTY-ANSWER GATE (05 §K) ------------------------------
-                #
-                # NOT AN `elif`, and that is the whole placement decision. The two
-                # branches above are entered when their complaint QUALIFIES, not when
-                # they actually refuse — an exhausted allowance still takes the branch
-                # and falls into its `else`. As an `elif` this gate would therefore go
-                # silent on any round where an earlier gate had already spent its grant,
-                # which is §J.3's starvation argument arriving one gate later: a silent
-                # finish is exactly the outcome that must always get a second word in.
-                #
-                # `not refused_finalization` KEEPS THE ONE-REFUSAL-PER-ROUND-TRIP RULE
-                # the chain expressed structurally: if either gate above refused, this
-                # round already has its nudge and its cleared draft, and a second
-                # refusal would overwrite the more specific complaint with a vaguer one.
-                if (
-                    not result.tool_calls
-                    and not refused_finalization
-                    and not (result.assistant_text or "").strip()
-                ):
-                    #
-                    # The model ended the turn with NO tool calls AND NO prose. Nothing
-                    # was refused, nothing failed, no error was raised — the round-trip
-                    # simply carried no words, and every downstream stage handles that
-                    # silently: exit #1 below persists nothing (`or None`), the `result`
-                    # event carries `assistant_text: null`, and the UI renders
-                    # `text || ""` beside `status: done`. The user gets a blank bubble
-                    # labelled as a completed answer, and NOTHING anywhere records that
-                    # it happened. It is the only turn outcome that produces no
-                    # artifact of any kind.
-                    #
-                    # Measured causes are three, and this gate is deliberately blind to
-                    # which: a genuinely empty completion, a completion cut short by the
-                    # provider (`incomplete_reason`), and — until the same change fixed
-                    # it in `model/openai_client.py` — a REFUSAL whose text the parser
-                    # dropped, which looked identical from here. The response to all
-                    # three is the same one round-trip back.
-                    #
-                    # LAST, and the ordering is not arbitrary: pending intents and
-                    # untabled results are both MORE SPECIFIC complaints about a turn
-                    # that at least said something, and each already clears the draft
-                    # when it refuses. This check is what remains — the model said
-                    # nothing anyone can act on — so it yields to a refusal made above
-                    # it and fires whenever none was.
-                    #
-                    # ITS OWN ALLOWANCE (`kind="empty_answer"`), for the reason
-                    # `session/models.py` records at the enum: sharing would make the
-                    # silent finish the one failure the runtime could never get a
-                    # second word in about, precisely because it is checked last.
-                    if await finalization_gate.may_refuse("empty_answer"):
-                        refused_finalization = True
-                        self._observer(
-                            EMPTY_ANSWER_REFUSED_EVENT,
-                            # `""`, never `None`: the observer's allowlist filter keeps
-                            # `str | int | float | bool` and drops everything else, so a
-                            # `None` would vanish from the span and make "ordinary
-                            # completion" indistinguishable from "attribute missing".
-                            {"incomplete_reason": result.incomplete_reason or ""},
-                        )
-                        finalization_nudge = empty_answer_nudge_text(result.incomplete_reason)
-                        # NO DRAFT TO CLEAR — `last_assistant_text` is already empty by
-                        # the branch condition. Assigned anyway, and NOT as ceremony:
-                        # the hard-ceiling and budget-cap paths return it verbatim, and
-                        # `""` reaching them would be a blank answer surfacing on
-                        # exactly the enforcement path this gate exists to close.
-                        last_assistant_text = None
-                    else:
-                        # THIS GATE'S allowance for the window is spent: it refused once,
-                        # handed back a round, and the model came back empty AGAIN. The
-                        # posture is the answer-shape gate's — record and let the turn
-                        # finish, never hard-lock — but the finish itself differs, and
-                        # must: there is no answer in hand to pass through. The exit
-                        # below substitutes `EMPTY_ANSWER_FALLBACK_TEXT` so the user is
-                        # told what happened instead of shown a blank.
-                        self._observer(
-                            EMPTY_ANSWER_EXHAUSTED_EVENT,
-                            {"incomplete_reason": result.incomplete_reason or ""},
-                        )
-
-                # --- THE ANSWER JUDGE, exit #1 (09 §C.1) ------------------------
-                #
-                # LAST, AFTER EVERY FREE CHECK, and the ordering is the cost model
-                # rather than a precedence claim. §B/§J/§L/§K are regexes and counters;
-                # this one is a MODEL CALL. `not refused_finalization` means the judge
-                # is never paid for on a round some cheaper check already won — a
-                # pasted markdown table costs zero judge tokens — and it keeps the
-                # one-refusal-per-round-trip rule the chain expresses structurally.
-                #
-                # THE ORDER AGAINST §K IS FREE, for §L.5's reason: this requires
-                # non-blank prose and §K fires only on blank, so the two conditions are
-                # disjoint by construction. Placed after it anyway, so a silent finish
-                # never reaches a model call.
-                #
-                # THE TWO SKIPS ARE INSIDE `_judge`, not here: a spent allowance and a
-                # wall clock with no room for a rejection to act in both make the call
-                # pointless, and both are invisible from the verdict.
-                if (
-                    not result.tool_calls
-                    and not refused_finalization
-                    and (result.assistant_text or "").strip()
-                ):
-                    # A FACTORY, so the session load and the corroboration KV reads
-                    # happen only if a verdict could be acted on — see `_judge`.
-                    async def _prose_brief(
-                        _q: str = question,
-                        _state: AnalysisState | None = analysis_state,
-                        _draft: str = result.assistant_text or "",
-                    ) -> JudgeBrief:
-                        results, anchor, in_scope = await self._judge_results(
-                            session_id, turn_index, credentials.column_scope
-                        )
-                        return self._judge_brief(
-                            "exit_prose",
-                            question=_q,
-                            accum=accum,
-                            analysis_state=_state,
-                            date_anchor=anchor,
-                            draft=_draft,
-                            results=results,
-                            # 09 §D.4 / 05 §L.7: `True` or "not checked", never `False`.
-                            figure_corroborated=await self._corroborated_figures(
-                                session_id, turn_index, _draft, in_scope
-                            ),
-                        )
-
-                    verdict = await self._judge(
-                        _prose_brief,
-                        guard=guard,
-                        gate=finalization_gate,
-                        kind="answer_judge",
-                    )
-                    if not verdict.approved:
-                        refusal_kind = _answer_judge_refusal_kind(verdict)
-                        if await finalization_gate.may_refuse(refusal_kind):
-                            refused_finalization = True
-                            self._observer(
-                                ANSWER_JUDGE_REFUSED_EVENT,
-                                {"violation": verdict.violation, "site": "exit_prose"},
-                            )
-                            finalization_nudge = answer_judge_nudge_text(
-                                result.assistant_text, verdict.feedback
-                            )
-                            # CLEAR THE DRAFT, for the reason all three gates above
-                            # clear it: `last_assistant_text` is returned as
-                            # `assistant_text` on the hard-ceiling and budget-cap paths,
-                            # so a refused answer could otherwise reach the user there
-                            # while never entering history.
-                            last_assistant_text = None
-                        else:
-                            # THE PROSE PASSES. §J.5/§L.8's posture, and load-bearing
-                            # here rather than inherited: this check reads MEANING, and
-                            # a second refusal would be the runtime destroying an answer
-                            # on the say-so of a model it cannot appeal. The event is
-                            # what makes the pass visible — see 09 §F.1 for why this
-                            # branch is reached only across a resume.
-                            self._observer(
-                                ANSWER_JUDGE_EXHAUSTED_EVENT,
-                                {"violation": verdict.violation, "site": "exit_prose"},
-                            )
-
-                if not result.tool_calls and not refused_finalization:
-                    # B1/D44 (2026-07-01 clarification) AND UI Slice 1: the union of
-                    # this turn's tool-result provenance — the tag for the final
-                    # assistant message (so it is scope re-filtered on replay exactly
-                    # like the trail itself) AND the enriched `result` event's lineage.
-                    # Computed ONCE here (the single fail-closed source of truth; do
-                    # not re-derive in-loop).
-                    turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
-                    # THE SILENT-FINISH SUBSTITUTION (05 §K). Reaching here with empty
-                    # prose means the empty-answer gate above already spent its
-                    # allowance on this window — it refused one finish, handed back a
-                    # round, and the model came back with nothing a second time. The
-                    # turn must end, so the only question left is WHAT THE USER IS
-                    # SHOWN, and the honest sentence beats the blank bubble that
-                    # shipped before it.
-                    #
-                    # `.strip()`, not a truthiness test: `"   "` renders exactly as
-                    # blank as `""` does and must take the same path.
-                    final_text = result.assistant_text
-                    if not (final_text or "").strip():
-                        final_text = EMPTY_ANSWER_FALLBACK_TEXT
-                    return await self._finish(
-                        session_id=session_id,
-                        turn_index=turn_index,
-                        status="done",
-                        exit_label="no_tool_calls",
-                        assistant_text=final_text,
-                        tool_calls_made=tool_calls_made,
-                        accum=accum,
-                        provenance=turn_provenance,
-                        # PERSISTED UNCONDITIONALLY NOW, like the `answerWithTable`
-                        # exit — and for that exit's reason: `final_text` is non-empty
-                        # by construction above, so the `or None` append guard this
-                        # carried has nothing left to guard against. It existed to keep
-                        # an EMPTY assistant message out of history; the substitution
-                        # removes the empty message rather than the record of the turn.
-                        # What it used to produce was a turn that reached the user as a
-                        # blank bubble and reached `/session/history` as nothing at all
-                        # — live and history disagreeing on exactly the turns that
-                        # failed, which is the divergence `_finish` scrubs before
-                        # persisting to prevent.
-                        persist_text=final_text,
-                        event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
-                    )
-
-                # A REFUSED EXIT-#1 ROUND FALLS THROUGH FROM HERE — deliberately, and
-                # this is what charges it to the budget (05 §C.3). `result.tool_calls`
-                # is empty on that path, so every step between here and
-                # `guard.record_iteration` below is inert: both partitions produce
-                # empty lists, `ask_user_call` is `None`, the dispatch loop body never
-                # runs, and `designated_answer_text` stays `None`. Control therefore
-                # reaches `record_iteration` and the existing hard-ceiling / budget-cap
-                # handling, and only then loops back for the re-round.
-                #
-                # Returning `continue` here instead would make the forced re-round
-                # FREE — no iteration, no tokens — leaving `BudgetGuard.exceeded` able
-                # to trip only on the 60-second wall clock, which every resume
-                # restarts. Anything added below that is NOT inert for an empty
-                # `tool_calls` list must be guarded explicitly.
+                    last_assistant_text = None
+                # No dispatch occurs for an invalid plain response. It still reaches the
+                # budget accounting below, so repeated violations are bounded.
 
                 # --- analysisState: PARTITION BEFORE CAPPING (03 §E.2) ------------
                 #
@@ -4105,6 +3768,7 @@ class AgentLoop:
                     # fold a SUCCESSFUL call's plain-English assumptions into the
                     # turn accumulator, same discipline as the enrichment above.
                     accum.note_assumptions(tool_call.name, call_args, tool_result)
+                    accum.note_loaded_capability(tool_call.name, tool_result)
                     # answerWithTable (composite/answer_with_table.py): the
                     # model-designated answer tables. Same discipline again — read from
                     # the call ARGUMENTS on success — except LAST designation wins,
@@ -4112,16 +3776,27 @@ class AgentLoop:
                     accum.note_answer_tables(
                         tool_call.name, tool_result, resolved_answer_tables
                     )
+                    if (
+                        tool_result.status == "ok"
+                        and tool_call.name in _TEXT_ANSWER_EVIDENCE_TOOLS
+                    ):
+                        successful_text_evidence_tools.add(tool_call.name)
+                    if tool_call.name == ANSWER_TEXT_TOOL_NAME and tool_result.status == "ok":
+                        designated_text_answer = (
+                            clean_answer_text(call_args.get("answer"))
+                            if isinstance(call_args, dict)
+                            else None
+                        )
+                        declared_evidence = clean_evidence(
+                            call_args.get("evidence") if isinstance(call_args, dict) else None
+                        )
+                        designated_text_has_evidence = bool(declared_evidence) and set(
+                            declared_evidence
+                        ).issubset(successful_text_evidence_tools)
                     if tool_result.status == "ok" and tool_result.terminal:
                         card_answer = accum.note_capability_card(tool_result)
                         if card_answer is not None:
                             capability_terminal_text = card_answer
-                        has_alternative_answer_evidence = True
-                    elif (
-                        tool_result.status == "ok"
-                        and tool_call.name in _ALTERNATIVE_ANSWER_EVIDENCE_TOOLS
-                    ):
-                        has_alternative_answer_evidence = True
                     # TERMINAL: a successful `answerWithTable` carries the final prose,
                     # so the turn ends on it. Recorded here and acted on AFTER the whole
                     # tool batch drains, so a model that batches recordAssumptions +
@@ -4231,6 +3906,18 @@ class AgentLoop:
                 # path, so every other call still waits for the resume exactly as it
                 # always did.
                 if ask_user_call is not None:
+                    if (
+                        accum.unpresented_capability_names
+                        and await finalization_gate.may_refuse("ask_user_judge")
+                    ):
+                        capability_names = ", ".join(accum.unpresented_capability_names)
+                        finalization_nudge = (
+                            "Do not ask for optional inputs before presenting the loaded UI "
+                            f"option. Call {capability_names} now, omitting values the user did "
+                            "not supply. The UI can collect them. Put any completed Help Center "
+                            "answer in the capability call's answer field."
+                        )
+                        continue
                     raw_question = str(ask_user_call.arguments.get("question", ""))
                     declined_key = _question_key(declined_question) if declined_question else ""
                     if declined_key and _question_key(raw_question) == declined_key:
@@ -4412,6 +4099,102 @@ class AgentLoop:
                         event=("loop_paused_ask_user", {"question": question}),
                     )
 
+                if designated_text_answer is not None:
+                    designated_text_has_evidence = (
+                        designated_text_has_evidence or bool(accum.capability_cards)
+                    )
+                    pending_at_text = pending_intents(analysis_state)
+                    if (
+                        accum.unpresented_capability_names
+                        and await finalization_gate.may_refuse("help_center_grounding")
+                    ):
+                        capability_names = ", ".join(accum.unpresented_capability_names)
+                        finalization_nudge = (
+                            "You loaded a matching UI option but did not present it. Call "
+                            f"{capability_names} now; definition lookup alone is not visible "
+                            "to the user. Put the completed text answer in that call's answer "
+                            "field and do not call getCapabilityTool again."
+                        )
+                        designated_text_answer = None
+                        capability_finalization_refused = True
+                    elif pending_at_text and await finalization_gate.may_refuse("intents"):
+                        self._observer(
+                            "loop_finalization_refused",
+                            {"exit": "answer_with_text", "pending_count": len(pending_at_text)},
+                        )
+                        finalization_nudge = finalization_nudge_text(
+                            designated_text_answer, pending_at_text
+                        )
+                        designated_text_answer = None
+                        capability_finalization_refused = True
+                    elif (
+                        not designated_text_has_evidence
+                        and await finalization_gate.may_refuse("ungrounded_answer")
+                    ):
+                        self._observer(
+                            ANSWER_RULE_REFUSED_EVENT, {"rule": "ungrounded_text_answer"}
+                        )
+                        finalization_nudge = (
+                            "You tried to finish with answerWithText without valid current-turn "
+                            "evidence. Are you sure this answer can be given without runQuery, "
+                            "runBlueprint, getTableSchema, or a complete Help Center document? "
+                            "If evidence is available, use it and list its exact tool name in "
+                            "answerWithText.evidence. Otherwise call answerWithText again with "
+                            "an empty evidence list and give a concise, honest answer that makes "
+                            "no unsupported claim."
+                        )
+                        designated_text_answer = None
+                        capability_finalization_refused = True
+
+                if (
+                    designated_text_answer is not None
+                    and not finalization_gate.refused_this_round
+                ):
+                    async def _text_tool_brief(
+                        _q: str = question,
+                        _state: AnalysisState | None = analysis_state,
+                        _draft: str = designated_text_answer,
+                    ) -> JudgeBrief:
+                        results, anchor, in_scope = await self._judge_results(
+                            session_id, turn_index, credentials.column_scope
+                        )
+                        return self._judge_brief(
+                            "exit_prose",
+                            question=_q,
+                            accum=accum,
+                            analysis_state=_state,
+                            date_anchor=anchor,
+                            draft=_draft,
+                            results=results,
+                            figure_corroborated=await self._corroborated_figures(
+                                session_id, turn_index, _draft, in_scope
+                            ),
+                        )
+
+                    text_verdict = await self._judge(
+                        _text_tool_brief,
+                        guard=guard,
+                        gate=finalization_gate,
+                        kind="answer_judge",
+                    )
+                    if not text_verdict.approved:
+                        refusal_kind = _answer_judge_refusal_kind(text_verdict)
+                        if await finalization_gate.may_refuse(refusal_kind):
+                            self._observer(
+                                ANSWER_JUDGE_REFUSED_EVENT,
+                                {"violation": text_verdict.violation, "site": "exit_prose"},
+                            )
+                            finalization_nudge = answer_judge_nudge_text(
+                                designated_text_answer, text_verdict.feedback
+                            )
+                            designated_text_answer = None
+                            capability_finalization_refused = True
+                        else:
+                            self._observer(
+                                ANSWER_JUDGE_EXHAUSTED_EVENT,
+                                {"violation": text_verdict.violation, "site": "exit_prose"},
+                            )
+
                 if accum.capability_cards and answer_shape.armed and not accum.has_answer_tables:
                     if await finalization_gate.may_refuse("answer_shape"):
                         capability_finalization_refused = True
@@ -4434,9 +4217,25 @@ class AgentLoop:
                 if accum.capability_cards and not capability_finalization_refused:
                     final_text = (
                         designated_answer_text
+                        or designated_text_answer
                         or capability_terminal_text
                         or "Here are the requested options."
                     )
+                    if _claims_navigation_was_performed(final_text, accum.capability_cards):
+                        if await finalization_gate.may_refuse("help_center_grounding"):
+                            capability_finalization_refused = True
+                            self._observer(
+                                ANSWER_JUDGE_REFUSED_EVENT,
+                                {"violation": "unsupported_by_evidence", "site": "exit_capability"},
+                            )
+                            finalization_nudge = (
+                                "Navigation requires the user to click the displayed option. "
+                                "Rewrite the answer without claiming that you opened, will open, "
+                                "navigated, took, sent, or redirected the user. Do not call the "
+                                "capability again; it is already prepared."
+                            )
+                            last_assistant_text = None
+                            designated_answer_text = None
                     if not finalization_gate.refused_this_round:
 
                         async def _capability_brief(
@@ -4495,7 +4294,11 @@ class AgentLoop:
                             session_id=session_id,
                             turn_index=turn_index,
                             status="done",
-                            exit_label="no_tool_calls",
+                            exit_label=(
+                                "answer_with_text"
+                                if designated_text_answer is not None
+                                else "capability"
+                            ),
                             assistant_text=final_text,
                             tool_calls_made=tool_calls_made,
                             accum=accum,
@@ -4507,9 +4310,9 @@ class AgentLoop:
                             capability_cards=accum.capability_cards,
                         )
 
-                # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model
-                # turn with NO tool calls; this one fires when the model ended the turn
-                # THROUGH a tool, carrying its final prose in the call. It is checked
+                # Explicit answer tools are checked after the whole batch drains, so
+                # batched bookkeeping and finalization calls are folded together.
+                # answerWithTable carries its final prose in the call. It is checked
                 # AFTER the whole batch drains so a batched recordAssumptions +
                 # answerWithTable still folds both before the turn closes.
                 #
@@ -4532,11 +4335,24 @@ class AgentLoop:
                         tool_calls_made=tool_calls_made,
                         accum=accum,
                         provenance=turn_provenance,
-                        # UNCONDITIONAL, unlike the no-tool-calls exit's `or None`, and
-                        # allowed to be: `designated_answer_text` came through
-                        # `clean_answer_text`, which returns `None` for anything that
-                        # strips to empty — so reaching here means a non-empty string.
                         persist_text=designated_answer_text,
+                        event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                    )
+
+                if designated_text_answer is not None:
+                    turn_provenance = await self._compute_turn_provenance_union(
+                        session_id, turn_index
+                    )
+                    return await self._finish(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        status="done",
+                        exit_label="answer_with_text",
+                        assistant_text=designated_text_answer,
+                        tool_calls_made=tool_calls_made,
+                        accum=accum,
+                        provenance=turn_provenance,
+                        persist_text=designated_text_answer,
                         event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
                     )
 

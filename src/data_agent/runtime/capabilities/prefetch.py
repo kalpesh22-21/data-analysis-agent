@@ -8,7 +8,9 @@ from .client import CapabilityClient, CapabilityKind, CapabilityPrefetch
 from .router import PrefetchRouter
 
 _KINDS: dict[str, tuple[CapabilityKind, ...]] = {
-    "action_navigation": ("navigation",),
+    # CL action-bearing tools are registered as data widgets, so action searches
+    # must include both registry kinds.
+    "action_navigation": ("navigation", "data_widget"),
     "data": ("data_widget",),
     "both": ("navigation", "data_widget"),
     "ambiguous": ("navigation", "data_widget"),
@@ -30,6 +32,8 @@ def render_capability_prefetch(prefetch: CapabilityPrefetch) -> dict[str, Any] |
         "[Available UI options for this request]",
         f"Request route: {prefetch.route}",
         "Load a suitable option with getCapabilityTool before presenting it.",
+        "For a concrete action, prefer an option whose matched actions explicitly cover "
+        "it over a general page-navigation option.",
     ]
     for card in prefetch.cards:
         lines.append(

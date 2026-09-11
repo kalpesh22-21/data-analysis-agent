@@ -34,8 +34,9 @@ class ToolCallRequest:
 class ModelTurnResult:
     """The outcome of one `ModelClient.send_turn` round-trip.
 
-        Empty `tool_calls` means the turn is complete and `assistant_text` is the final
-        answer. `usage` carries whatever token counters the provider reports;
+        Empty `tool_calls` is an invalid non-terminal model response; final answers use
+        an explicit answer tool. `assistant_text` contains any incidental model prose.
+        `usage` carries whatever token counters the provider reports;
         `loop/budget_guard.py` reads `total_tokens` if present.
 
         `incomplete_reason` IS A DIAGNOSTIC, NEVER CONTROL FLOW. A provider can end a

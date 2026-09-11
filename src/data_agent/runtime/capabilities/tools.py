@@ -130,7 +130,19 @@ class GetCapabilityTool(_CapabilityTool):
             self._visible_names.add(name)
         return _ok(
             self.tool_name,
-            {"found": True, "tool_name": name, "kind": definition.kind, "ready": ready},
+            {
+                "found": True,
+                "tool_name": name,
+                "kind": definition.kind,
+                "ready": ready,
+                "presented": False,
+                "next_step": (
+                    f"Call {name} to present this option; definition lookup alone does not "
+                    "present it. Omit optional arguments the user did not supply."
+                    if ready
+                    else "This definition cannot be presented by the runtime."
+                ),
+            },
         )
 
 
@@ -178,6 +190,11 @@ class PresentCapabilityCardTool(_CapabilityTool):
             **result,
             "_agent_evidence": {
                 "kind": self._definition.kind,
+                "activation": (
+                    "user_click_required"
+                    if self._definition.kind == "navigation"
+                    else "user_interaction_required"
+                ),
                 "description": self._definition.description,
                 "parameters": [
                     {

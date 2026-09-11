@@ -241,6 +241,7 @@ class TurnAccumulators:
         self._capability_cards: list[dict[str, Any]] = [
             dict(card) for card in (capability_cards or ())
         ]
+        self._loaded_capability_names: set[str] = set()
 
     # --- folds (one per dispatched tool call, all no-ops off their own tool) ---
 
@@ -354,6 +355,23 @@ class TurnAccumulators:
             self._capability_cards.append(card)
         answer = payload.get("answer")
         return answer.strip() if isinstance(answer, str) and answer.strip() else None
+
+    def note_loaded_capability(self, tool_name: str, tool_result: ToolResult) -> None:
+        if tool_name != "getCapabilityTool" or tool_result.status != "ok":
+            return
+        payload = tool_result.result_full
+        if not isinstance(payload, Mapping) or payload.get("ready") is not True:
+            return
+        name = payload.get("tool_name")
+        if isinstance(name, str) and name:
+            self._loaded_capability_names.add(name)
+
+    @property
+    def unpresented_capability_names(self) -> tuple[str, ...]:
+        presented = {
+            card.get("name") for card in self._capability_cards if isinstance(card.get("name"), str)
+        }
+        return tuple(sorted(self._loaded_capability_names - presented))
 
     # --- reads: the turn's exits ---------------------------------------------
 

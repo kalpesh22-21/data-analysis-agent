@@ -29,8 +29,10 @@ _SYSTEM_PROMPT = (
     "You write a single short present-tense progress line (max ~12 words) for a "
     "data-analysis assistant's UI, describing in plain business English what the "
     "assistant is doing. Write for a business user who has never seen the database: "
-    "the line MUST NOT contain SQL, table names, column names, database names, or "
-    "any other internal identifier. You MAY include business-level parameters that "
+    "Describe the user's business goal, never the implementation. The line MUST NOT "
+    "mention SQL, queries, databases, schemas, tables, columns, blueprints, tools, "
+    "capabilities, widgets, retrieval, or analysis machinery. You MAY include "
+    "business-level parameters that "
     "appear in the arguments you are given (a department, a period, a search "
     "phrase). No preamble, no quotes, no trailing period, no fluff. Output only "
     "the line."
@@ -69,23 +71,59 @@ _ARG_ALLOWLIST: dict[str, frozenset[str]] = {
 # `_leaks_identifiers` — same register as `progress.py`'s `_STEP_LABELS`, but
 # phrased for a business reader and carrying no tool name.
 _STATIC_LINES: dict[str, str] = {
-    "runQuery": "running a query against the warehouse",
-    "explainQuery": "checking a query before running it",
-    "sampleRows": "looking at a sample of the data",
-    "listDatabases": "checking what data is available",
-    "listTables": "checking what data is available",
-    "getTableSchema": "checking what data is available",
-    "runBlueprint": "running a saved analysis",
-    "getBlueprint": "reading a saved analysis",
-    "searchBlueprints": "looking for a matching saved analysis",
-    "searchKnowledge": "looking up background knowledge",
-    "resolveValues": "matching your wording to the stored values",
+    "runQuery": "finding the requested information",
+    "explainQuery": "checking the requested information",
+    "sampleRows": "reviewing the available information",
+    "listDatabases": "checking what information is available",
+    "listTables": "checking what information is available",
+    "getTableSchema": "checking what information is available",
+    "runBlueprint": "calculating the requested result",
+    "getBlueprint": "preparing the requested calculation",
+    "searchBlueprints": "finding the best way to answer",
+    "searchKnowledge": "looking up relevant background",
+    "resolveValues": "matching your wording to the available choices",
     "askUser": "putting a question back to you",
     "recordAssumptions": "noting the assumptions behind the answer",
     "answerWithTable": "putting the answer together",
+    "answerWithText": "putting the answer together",
+    "searchHelpCenter": "looking up relevant product guidance",
+    "getHelpCenterDocument": "reviewing the relevant product guidance",
+    "searchCapabilityTools": "looking for a useful next step",
+    "getCapabilityTool": "preparing a useful next step",
     "updateAnalysisState": "tracking the parts of your question",
 }
 _GENERIC_STATIC_LINE = "working on your question"
+_ALWAYS_STATIC = frozenset(
+    {
+        "searchHelpCenter",
+        "getHelpCenterDocument",
+        "searchCapabilityTools",
+        "getCapabilityTool",
+        "answerWithText",
+        "answerWithTable",
+        "updateAnalysisState",
+    }
+)
+_MODEL_SUMMARIZED_TOOLS = frozenset(_ARG_ALLOWLIST) | frozenset(
+    {
+        "runQuery",
+        "explainQuery",
+        "sampleRows",
+        "listDatabases",
+        "listTables",
+        "getTableSchema",
+        "answerWithTable",
+        "updateAnalysisState",
+    }
+)
+
+_MECHANICAL_LANGUAGE = re.compile(
+    r"\b(?:sql|quer(?:y|ies|ying)|database|schema|tables?|columns?|blueprints?|"
+    r"tools?|capabilit(?:y|ies)|widgets?|mcp|retriev(?:al|ing)|rerank(?:ing)?|"
+    r"hydrat(?:e|ing|ion)|warehouse|data analysis|system|features?|business insights?|"
+    r"reporting options?)\b",
+    re.IGNORECASE,
+)
 
 # Identifier-looking material extracted from the WITHHELD raw arguments. Simple
 # substring matching by design (not a SQL parser): the projection above is the
@@ -302,6 +340,11 @@ class ProgressSummarizer:
             return None
 
     async def _summarize(self, tool_name: str, arguments: dict[str, Any]) -> str | None:
+        # A name-only call gives the side model no business context and encourages it
+        # to translate internal names into vague mechanical prose. Use the reviewed,
+        # deterministic wording for those calls instead.
+        if tool_name in _ALWAYS_STATIC or tool_name not in _MODEL_SUMMARIZED_TOOLS:
+            return _static_line(tool_name)
         # THE GUARD, before anything is built: the model only ever sees the
         # allowlisted arguments for this tool (nothing at all for an unlisted one).
         projected = _project_args(tool_name, arguments)
@@ -327,7 +370,7 @@ class ProgressSummarizer:
         #     provenance (this is what covers the allowlisted free-text args, which
         #     the schema-aware main model authored);
         #   - PROVENANCE: the line repeats an identifier out of the WITHHELD args.
-        if _looks_structural(text) or _leaks_identifiers(
+        if _MECHANICAL_LANGUAGE.search(text) or _looks_structural(text) or _leaks_identifiers(
             text, _forbidden_tokens(tool_name, arguments)
         ):
             return _static_line(tool_name)
