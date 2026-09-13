@@ -342,7 +342,6 @@ config:
 #   TOKEN_ISSUER_API_KEY
 #   EMBEDDING_API_KEY
 #   RERANKER_API_KEY
-#   CAPABILITY_API_KEY
 # ---------------------------------------------------------------------------
 secrets:
   # -- Name of the pre-existing Secret to mount via envFrom. Empty = the

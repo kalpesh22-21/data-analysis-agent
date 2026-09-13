@@ -75,6 +75,7 @@ from data_agent.runtime.context.assembly import (
     turn_date_anchor_day,
 )
 from data_agent.runtime.context.budget import fit_request_to_budget, render_entry
+from data_agent.runtime.dispatch.denial_mapping import UNKNOWN_TOOL_CODE
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -91,6 +92,7 @@ from data_agent.runtime.hooks.answer_table import (
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
+from data_agent.runtime.sanitize import sanitize_text
 from data_agent.runtime.session.models import (
     AnalysisState,
     FinalizationBlockKind,
@@ -120,14 +122,18 @@ from .answer_judge import (
 )
 from .answer_rules import (
     ANSWER_RULE_REFUSED_EVENT,
+    first_match,
+    is_scope_decline,
     reported_figures,
 )
 from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
+from .dispatch_gates import BlueprintSearchGate, advertised_names, refusal
 from .finalization import (
     ANSWER_SHAPE_EXHAUSTED_EVENT,
     ANSWER_SHAPE_REFUSED_EVENT,
     DATA_ANSWER_TOOLS,
+    EMPTY_ANSWER_FALLBACK_TEXT,
     AnswerShapeCounter,
     FinalizationGate,
     answer_judge_rejected,
@@ -137,6 +143,16 @@ from .finalization import (
     finalization_nudge_text,
     pending_intents,
     refreshed_analysis_state,
+)
+from .help_grounding import HELP_TOOLS, HELP_UNAVAILABLE_TEXT, HelpGrounding
+from .judge_ship_guard import (
+    NAVIGATION_CLAIM_VIOLATION,
+    JudgeShipGuard,
+    capability_hedge_text,
+    coherent_capability_ship_text,
+    is_card_fatal,
+    ship_decline_text,
+    table_hedge_text,
 )
 from .read_guard import ReadGuard, idempotent_read_signature, repeated_read_guard_event
 from .turn_accumulators import (
@@ -152,7 +168,7 @@ _TEXT_ANSWER_EVIDENCE_TOOLS = frozenset(
 )
 
 _NAVIGATION_EXECUTION_CLAIM = re.compile(
-    r"\b(?:i(?:'ll|\s+will|\s+am|'m)?\s+)(?:open|navigate|take|send|redirect)\b|"
+    r"\b(?:i(?:'ll|\s+will|\s+am|'m|\s+have|'ve)?\s+)(?:already\s+)?(?:open(?:ed|ing)?|navigat(?:e|ed|ing)|tak(?:e|en|ing)|took|send|sent|redirect(?:ed|ing)?)\b|"
     r"\b(?:opening|navigating|redirecting)\b.{0,30}\b(?:now|you)\b",
     re.IGNORECASE,
 )
@@ -167,7 +183,7 @@ def _has_navigation_option(cards: Sequence[Mapping[str, Any]]) -> bool:
 
 
 def _claims_navigation_was_performed(text: str, cards: Sequence[Mapping[str, Any]]) -> bool:
-    return _has_navigation_option(cards) and bool(_NAVIGATION_EXECUTION_CLAIM.search(text))
+    return _has_navigation_option(cards) and bool(_NAVIGATION_EXECUTION_CLAIM.search(text.replace("’", "'")))
 
 
 def _answer_judge_refusal_kind(verdict: JudgeVerdict) -> FinalizationBlockKind:
@@ -176,6 +192,7 @@ def _answer_judge_refusal_kind(verdict: JudgeVerdict) -> FinalizationBlockKind:
         if verdict.violation == "unsupported_by_evidence"
         else "answer_judge"
     )
+
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -267,19 +284,19 @@ def _question_key(question: str) -> str:
 class TurnContext:
     """What a `RuntimeTool` may know about the turn it is running in.
 
-        `turn_index` and the turn's original user question. The index must come from the
-        loop's own computation. The two
-        alternatives are both wrong: `app.py` has only `turn_index_hint`, documented as
-        best-effort telemetry, so making it load-bearing introduces a TOCTOU gap; and
-        re-deriving it from the store means duplicating two DIFFERENT formulas (`/turn` uses
-        `messages[-1].turn_index + 1`, `/turn/resume` uses `messages[-1].turn_index`), which
-        guarantees eventual disagreement.
+    `turn_index` and the turn's original user question. The index must come from the
+    loop's own computation. The two
+    alternatives are both wrong: `app.py` has only `turn_index_hint`, documented as
+    best-effort telemetry, so making it load-bearing introduces a TOCTOU gap; and
+    re-deriving it from the store means duplicating two DIFFERENT formulas (`/turn` uses
+    `messages[-1].turn_index + 1`, `/turn/resume` uses `messages[-1].turn_index`), which
+    guarantees eventual disagreement.
 
-        IT MUST NOT CARRY THE TRAIL. `_run_loop_body`'s only trail load sits ABOVE the
-        round-trip loop, so a snapshot taken there contains NOTHING from the current window:
-        evidence written in round 1 and cited in round 2 would fail as "unknown tool_call_id"
-        on every turn, while looking correctly wired. A tool that needs the trail loads it
-        itself, filtered to `turn_index`.
+    IT MUST NOT CARRY THE TRAIL. `_run_loop_body`'s only trail load sits ABOVE the
+    round-trip loop, so a snapshot taken there contains NOTHING from the current window:
+    evidence written in round 1 and cited in round 2 would fail as "unknown tool_call_id"
+    on every turn, while looking correctly wired. A tool that needs the trail loads it
+    itself, filtered to `turn_index`.
     """
 
     turn_index: int
@@ -288,12 +305,12 @@ class TurnContext:
 
 class RuntimeTool(Protocol):
     """A model-facing tool implemented in the RUNTIME (not the MCP), intercepted in the
-        loop and returning an inline `ToolResult`. `askUser` is NOT a `RuntimeTool`: it is
-        TERMINAL — it pauses rather than returning a `ToolResult` — so it stays a hardcoded
-        branch.
+    loop and returning an inline `ToolResult`. `askUser` is NOT a `RuntimeTool`: it is
+    TERMINAL — it pauses rather than returning a `ToolResult` — so it stays a hardcoded
+    branch.
 
-        *turn* is passed by `_run_runtime_tool` on every dispatch, keyword-optional so a tool
-        that does not care about the turn simply ignores it.
+    *turn* is passed by `_run_runtime_tool` on every dispatch, keyword-optional so a tool
+    that does not care about the turn simply ignores it.
     """
 
     async def run(
@@ -301,6 +318,7 @@ class RuntimeTool(Protocol):
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id: str | None = None,
     ) -> ToolResult: ...
 
 
@@ -344,6 +362,7 @@ AnswerExitLabel = Literal[
     "pause",
     "ask_user_question",
     "declined_clarification",
+    "runtime_fallback",
 ]
 
 _BUDGET_CAP_QUESTION = "This is taking a while — continue, refine, or stop?"
@@ -384,7 +403,7 @@ def _first_user_question(messages: list[TurnMessage], turn_index: int) -> str | 
 
 def _runtime_tool_unavailable(tool_name: str, code: str) -> ToolResult:
     """A clean local error for an advertised-but-unwired runtime tool — never dispatched to
-        the MCP under its own name. Shared by `resolveValues` and the three read tools.
+    the MCP under its own name. Shared by `resolveValues` and the three read tools.
     """
     return ToolResult(
         status="error",
@@ -419,10 +438,10 @@ def _sanitize_runtime_provenance(
     provenance: Any, tool_name: str
 ) -> frozenset[tuple[str, str]] | None:
     """Validate a `RuntimeTool`'s returned `provenance` BEFORE it is persisted: it must be
-        `None` or a `frozenset` of `(str, str)` tuples — the exact shape
-        `context/scope_filter.is_provenance_in_scope` unpacks. Anything else is coerced to
-        `None` fail-closed (dropped from replay) with a server-side warning, rather than
-        crashing the NEXT round-trip inside the D44 replay filter.
+    `None` or a `frozenset` of `(str, str)` tuples — the exact shape
+    `context/scope_filter.is_provenance_in_scope` unpacks. Anything else is coerced to
+    `None` fail-closed (dropped from replay) with a server-side warning, rather than
+    crashing the NEXT round-trip inside the D44 replay filter.
     """
     if provenance is None:
         return None
@@ -493,17 +512,17 @@ class TurnOutcome:
 @dataclass(frozen=True)
 class _CanonicalRequest:
     """One round-trip's canonical message list, plus WHICH tool results the model can
-        actually READ in it.
+    actually READ in it.
 
-        The second field exists because "is this result still in context?" cannot be answered
-        from `messages` alone, and the repeated-read guard's trim-aware exemption depends on
-        the answer. Two different things put a `tool` message with a given `tool_call_id` into
-        the list: a REAL rendered result, and a data-free SENTINEL (D94's "result withheld",
-        or the repeated-read nudge). A membership test over ids alone cannot tell them apart,
-        and treating a sentinel id as "visible" would tell the guard a schema is readable
-        while the model is looking at "result withheld … Do not retry" — with no way to
-        recover it. Sentinel ids are excluded HERE, at the one place that still knows which
-        render item was which.
+    The second field exists because "is this result still in context?" cannot be answered
+    from `messages` alone, and the repeated-read guard's trim-aware exemption depends on
+    the answer. Two different things put a `tool` message with a given `tool_call_id` into
+    the list: a REAL rendered result, and a data-free SENTINEL (D94's "result withheld",
+    or the repeated-read nudge). A membership test over ids alone cannot tell them apart,
+    and treating a sentinel id as "visible" would tell the guard a schema is readable
+    while the model is looking at "result withheld … Do not retry" — with no way to
+    recover it. Sentinel ids are excluded HERE, at the one place that still knows which
+    render item was which.
     """
 
     messages: list[dict[str, Any]]
@@ -516,20 +535,20 @@ ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE = "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
 def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
     """The nudge for `answerWithTable(blueprint_id=X)` where X never ran this turn.
 
-        Without it the call SUCCEEDS and — because it carries `answer` — TERMINATES the turn,
-        so the user gets prose with no table and the model never learns why.
+    Without it the call SUCCEEDS and — because it carries `answer` — TERMINATES the turn,
+    so the user gets prose with no table and the model never learns why.
 
-        A non-`ok` status is what makes this work end-to-end: it stops the terminal exit
-        firing, and `scope_filter.filter_trail`'s current-turn exemption is status-gated to
-        `status != "ok"`, so the entry reaches the model this same turn instead of being
-        dropped as undetermined-provenance history.
+    A non-`ok` status is what makes this work end-to-end: it stops the terminal exit
+    firing, and `scope_filter.filter_trail`'s current-turn exemption is status-gated to
+    `status != "ok"`, so the entry reaches the model this same turn instead of being
+    dropped as undetermined-provenance history.
 
-        The instructional text below is NOT what the model reads. `TrailEntry` has no
-        `user_message` field at all, and `context/budget.py::_render_entry` sets it from
-        `classify_denial(entry.error_code)` unconditionally — so the model sees the
-        DENIAL-TABLE text. That is why `ANSWER_TABLE_BLUEPRINT_NOT_RUN` is registered in
-        `dispatch/denial_mapping.py`, and why the two strings are kept in step; the string
-        here reaches only non-model readers (logs, `/query/page`'s error body).
+    The instructional text below is NOT what the model reads. `TrailEntry` has no
+    `user_message` field at all, and `context/budget.py::_render_entry` sets it from
+    `classify_denial(entry.error_code)` unconditionally — so the model sees the
+    DENIAL-TABLE text. That is why `ANSWER_TABLE_BLUEPRINT_NOT_RUN` is registered in
+    `dispatch/denial_mapping.py`, and why the two strings are kept in step; the string
+    here reaches only non-model readers (logs, `/query/page`'s error body).
     """
     return ToolResult(
         status="error",
@@ -612,8 +631,8 @@ _MAX_CORROBORATION_READS = 4
 
 class _NoLiveStateToForceError(Exception):
     """Raised from inside the force-block merge when the live state vanished between the
-        loop's read and the store's write. Aborts the write with nothing persisted, rather
-        than resurrecting a state the model never saw.
+    loop's read and the store's write. Aborts the write with nothing persisted, rather
+    than resurrecting a state the model never saw.
     """
 
 
@@ -648,18 +667,18 @@ def _tool_trail_entry_to_canonical(
     entry: dict[str, Any], intent_note_call_ids: Collection[str] = ()
 ) -> list[dict[str, Any]]:
     """One rendered tool-trail entry -> a synthetic `[assistant-with-tool_calls,
-        tool-result]` canonical pair.
+    tool-result]` canonical pair.
 
-        Required because D22 discards the model's original free text around a tool call, so
-        replay must synthesize a minimal, API-valid exchange rather than replaying the
-        original verbatim.
+    Required because D22 discards the model's original free text around a tool call, so
+    replay must synthesize a minimal, API-valid exchange rather than replaying the
+    original verbatim.
 
-        *intent_note_call_ids* (K2, the silent-drop feedback seam): the `tool_call_id`s
-        whose result must carry `_INTENT_TAG_DROPPED_NOTE` — the model tagged the call with
-        `serves_intent` while NO analysisState existed, so the tag was stripped and, until
-        now, nothing told it. See `_run_loop_body`'s window-local of the same name for the
-        once-per-round selection and the one-round-trip lifetime. Defaults to empty so the
-        emulated-discovery caller (and every existing test) renders byte-identically.
+    *intent_note_call_ids* (K2, the silent-drop feedback seam): the `tool_call_id`s
+    whose result must carry `_INTENT_TAG_DROPPED_NOTE` — the model tagged the call with
+    `serves_intent` while NO analysisState existed, so the tag was stripped and, until
+    now, nothing told it. See `_run_loop_body`'s window-local of the same name for the
+    once-per-round selection and the one-round-trip lifetime. Defaults to empty so the
+    emulated-discovery caller (and every existing test) renders byte-identically.
     """
     tool_call_id = entry["tool_call_id"]
     assistant_message = {
@@ -780,18 +799,18 @@ def _assembled_to_canonical(
     messages: list[dict[str, Any]], intent_note_call_ids: Collection[str] = ()
 ) -> list[dict[str, Any]]:
     """`AssembledContext.messages` (the interleaved render list) -> the canonical
-        `ModelClient.send_turn` message shape.
+    `ModelClient.send_turn` message shape.
 
-        Four render shapes: the base `system` message; a `user` message (a prior-turn
-        question, the current question, an askUser answer, or the retrieval block); an
-        `assistant` TEXT message passed straight through; and a `tool` render item that
-        expands to a synthetic `assistant(tool_calls)` + `tool(result)` PAIR.
+    Four render shapes: the base `system` message; a `user` message (a prior-turn
+    question, the current question, an askUser answer, or the retrieval block); an
+    `assistant` TEXT message passed straight through; and a `tool` render item that
+    expands to a synthetic `assistant(tool_calls)` + `tool(result)` PAIR.
 
-        Defensive dedup: the API requires every `tool_call_id` in a turn to be UNIQUE with
-        exactly one matching `tool` response, so a legacy or corrupt trail — or a
-        paused-and-resumed DAG that re-appended a colliding id — would emit two `tool`
-        messages with one id and abort the turn with a 400. A duplicate is dropped here,
-        keeping the FIRST: fail-closed toward a valid, if lossy, replay.
+    Defensive dedup: the API requires every `tool_call_id` in a turn to be UNIQUE with
+    exactly one matching `tool` response, so a legacy or corrupt trail — or a
+    paused-and-resumed DAG that re-appended a colliding id — would emit two `tool`
+    messages with one id and abort the turn with a 400. A duplicate is dropped here,
+    keeping the FIRST: fail-closed toward a valid, if lossy, replay.
     """
     canonical: list[dict[str, Any]] = []
     seen_tool_call_ids: set[str] = set()
@@ -939,16 +958,9 @@ class AgentLoop:
         # every other tracer seam (`ToolDispatcher`, `RuntimeToolBase`): `None`
         # (Layer-1 loop tests, no Phoenix) means the span is simply never created.
         self._tracer = tracer
-        # LLM-generated progress summaries (opt-in, `progress_summary_enabled`).
-        # `None` (default) → the feature is behaviorally absent: `_summary_tasks`
-        # stays empty, so the window's `finally` takes no extra tick and the cancel
-        # is a no-op. When wired (app.py, gated on the flag + an OpenAI
-        # key), each tool CALL fires a FIRE-AND-FORGET summarization task tracked in
-        # `_summary_tasks` so a still-pending task can be best-effort cancelled when
-        # the turn ends (never awaited before dispatch, never blocking the result).
+        # Summaries complete before dispatch; the summarizer owns its timeout.
         self._progress_summarizer = progress_summarizer
         self._answer_table_hooks = answer_table_hooks or AnswerTableHooks()
-        self._summary_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
         self, *, session_id: str, credentials: RuntimeCredentials, user_message: str
@@ -1151,9 +1163,7 @@ class AgentLoop:
         seed_answer_tables, seed_blueprint_runs = await self._compute_turn_answer_tables(
             session_id, turn_index
         )
-        seed_capability_cards = await self._compute_turn_capability_cards(
-            session_id, turn_index
-        )
+        seed_capability_cards = await self._compute_turn_capability_cards(session_id, turn_index)
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
         return await self._run_loop_body(
@@ -1193,49 +1203,50 @@ class AgentLoop:
         discovery_canonical: list[dict[str, Any]] | None = None,
         finalization_nudge: str | None = None,
         intent_note_call_ids: Collection[str] = (),
+        user_jwt: str | None = None,
     ) -> _CanonicalRequest:
         """Rebuild the canonical `send_turn` message list for ONE round-trip (D45: rebuilt
-                every round-trip, never carried across a pause).
+        every round-trip, never carried across a pause).
 
-                *current_turn_index* exempts the CURRENT turn's own denied/errored entries —
-                whose provenance is always `None` — from D44's strict replay drop, so the model
-                can self-correct. Cross-turn D44 is unchanged, and a denied entry carries no
-                result rows regardless.
+        *current_turn_index* exempts the CURRENT turn's own denied/errored entries —
+        whose provenance is always `None` — from D44's strict replay drop, so the model
+        can self-correct. Cross-turn D44 is unchanged, and a denied entry carries no
+        result rows regardless.
 
-                *question*/*user_id*/*retrieval_memo* thread retrieval through `assemble`. The
-                memo is turn-window-local, so retrieval embeds at most ONCE per window despite
-                the per-round-trip rebuild; *withheld_call_ids* is the same pattern for the D94
-                diagnostic. Both are inert when no retrieval pipeline is wired.
+        *question*/*user_id*/*retrieval_memo* thread retrieval through `assemble`. The
+        memo is turn-window-local, so retrieval embeds at most ONCE per window despite
+        the per-round-trip rebuild; *withheld_call_ids* is the same pattern for the D94
+        diagnostic. Both are inert when no retrieval pipeline is wired.
 
-                *discovery_canonical* is the per-window emulated-discovery pair list, computed
-                ONCE in `_run_loop_body`. It is spliced immediately AFTER the CURRENT turn's
-                question (the LAST `user` message), so the turn reads sequentially — question,
-                then the discovery the model "already did" for it, then its own work — and so it
-                sits inside the range `fit_request_to_budget` pins as the current turn (droppable
-                only under real pressure). Splicing after the leading `system` run instead hoists
-                every pair ABOVE turn 0's question and exposes them to prior-turn trimming; that
-                position remains only as the fallback when there is no `user` message at all.
+        *discovery_canonical* is the per-window emulated-discovery pair list, computed
+        ONCE in `_run_loop_body`. It is spliced immediately AFTER the CURRENT turn's
+        question (the LAST `user` message), so the turn reads sequentially — question,
+        then the discovery the model "already did" for it, then its own work — and so it
+        sits inside the range `fit_request_to_budget` pins as the current turn (droppable
+        only under real pressure). Splicing after the leading `system` run instead hoists
+        every pair ABOVE turn 0's question and exposes them to prior-turn trimming; that
+        position remains only as the fallback when there is no `user` message at all.
 
-                *finalization_nudge* shares that splice site and never-persisted posture but NOT
-                its lifetime: it lives EXACTLY ONE ROUND-TRIP (the caller clears it immediately
-                after this call), because a once-per-window value would repeat the nudge forever,
-                including after the intents were closed, and — being anchored at the tail — would
-                migrate to be the newest message on every rebuild.
+        *finalization_nudge* shares that splice site and never-persisted posture but NOT
+        its lifetime: it lives EXACTLY ONE ROUND-TRIP (the caller clears it immediately
+        after this call), because a once-per-window value would repeat the nudge forever,
+        including after the intents were closed, and — being anchored at the tail — would
+        migrate to be the newest message on every rebuild.
 
-                *intent_note_call_ids* (K2) shares the nudge's EXACTLY-ONE-ROUND-TRIP lifetime
-                and for the same reason — the caller clears it immediately after this call, so a
-                note the model has already been shown is not re-attached to the same tool result
-                on every later rebuild of the window. Unlike the nudge it is not a standalone
-                message: it rides the tool result of the call that was tagged (see
-                `_tool_trail_entry_to_canonical`), which is what makes it legible as feedback ON
-                that call.
+        *intent_note_call_ids* (K2) shares the nudge's EXACTLY-ONE-ROUND-TRIP lifetime
+        and for the same reason — the caller clears it immediately after this call, so a
+        note the model has already been shown is not re-attached to the same tool result
+        on every later rebuild of the window. Unlike the nudge it is not a standalone
+        message: it rides the tool result of the call that was tagged (see
+        `_tool_trail_entry_to_canonical`), which is what makes it legible as feedback ON
+        that call.
 
-                SPLICE ORDER, which this loop owns as the later insertion: `ContextAssembler`
-                inserts the `analysisState` block immediately BEFORE the current question, and the
-                nudge is appended at the TAIL, AFTER that — appending it first would make it the
-                last `user` message and land the state block after the question. A trailing `user`
-                message is safe there: `_current_turn_start` anchors on the first `user` after the
-                last plain-assistant answer, so the current-turn pin does not move.
+        SPLICE ORDER, which this loop owns as the later insertion: `ContextAssembler`
+        inserts the `analysisState` block immediately BEFORE the current question, and the
+        nudge is appended at the TAIL, AFTER that — appending it first would make it the
+        last `user` message and land the state block after the question. A trailing `user`
+        message is safe there: `_current_turn_start` anchors on the first `user` after the
+        last plain-assistant answer, so the current-turn pin does not move.
         """
         assembled = await self._context_assembler.assemble(
             session_id,
@@ -1243,6 +1254,7 @@ class AgentLoop:
             current_turn_index=current_turn_index,
             user_message=question,
             user_id=user_id,
+            user_jwt=user_jwt,
             retrieval_memo=retrieval_memo,
             capability_memo=capability_memo,
             withheld_call_ids=withheld_call_ids,
@@ -1308,9 +1320,7 @@ class AgentLoop:
             # whole contiguous run lands after the question in both shapes:
             #   first turn : [cards, q0]           -> after q0
             #   later turn : [q0] then tool/assistant -> after q0
-            first_user = next(
-                (i for i, m in enumerate(canonical) if m["role"] == "user"), None
-            )
+            first_user = next((i for i, m in enumerate(canonical) if m["role"] == "user"), None)
             if first_user is not None:
                 insert_at = first_user
                 while insert_at < len(canonical) and canonical[insert_at]["role"] == "user":
@@ -1361,9 +1371,7 @@ class AgentLoop:
                 # sweep would drop them first — stranding the model with a guard that
                 # says "already served" for a listing it can no longer see.
                 pinned_tool_call_ids=frozenset(
-                    m["tool_call_id"]
-                    for m in (discovery_canonical or [])
-                    if m["role"] == "tool"
+                    m["tool_call_id"] for m in (discovery_canonical or []) if m["role"] == "tool"
                 ),
             )
             if fit.dropped_messages:
@@ -1406,18 +1414,16 @@ class AgentLoop:
             and isinstance(message.get("tool_call_id"), str)
             and message["tool_call_id"] not in sentinel_tool_call_ids
         )
-        return _CanonicalRequest(
-            messages=canonical, readable_tool_call_ids=readable_tool_call_ids
-        )
+        return _CanonicalRequest(messages=canonical, readable_tool_call_ids=readable_tool_call_ids)
 
     async def _compute_turn_provenance_union(
         self, session_id: str, turn_index: int
     ) -> frozenset[tuple[str, str]] | None:
         """Union of every `TrailEntry.provenance` produced at *turn_index*, across every budget
-                window of this external turn — the tag applied to that turn's final assistant
-                `TurnMessage` (D44). Fail-closed: any undetermined (`None`) tool-result provenance
-                makes the whole turn's assistant message undetermined too. A turn with no tool
-                calls at all is determined-empty (`frozenset()`), always kept on replay.
+        window of this external turn — the tag applied to that turn's final assistant
+        `TurnMessage` (D44). Fail-closed: any undetermined (`None`) tool-result provenance
+        makes the whole turn's assistant message undetermined too. A turn with no tool
+        calls at all is determined-empty (`frozenset()`), always kept on replay.
         """
         trail = await self._session_store.load_trail(session_id)
         turn_entries = [entry for entry in trail if entry.turn_index == turn_index]
@@ -1454,10 +1460,10 @@ class AgentLoop:
 
     async def _compute_turn_assumptions(self, session_id: str, turn_index: int) -> list[str]:
         """Reconstruct the plain-English assumptions recorded at *turn_index* from the
-                persisted `recordAssumptions` entries (deduped, first-occurrence order, via the
-                SAME `fold_assumptions` the loop and `session_history` use). Seeds a resumed
-                window on BOTH resume paths, so assumptions recorded in an earlier window are not
-                dropped and the live result matches what `project_history` reconstructs.
+        persisted `recordAssumptions` entries (deduped, first-occurrence order, via the
+        SAME `fold_assumptions` the loop and `session_history` use). Seeds a resumed
+        window on BOTH resume paths, so assumptions recorded in an earlier window are not
+        dropped and the live result matches what `project_history` reconstructs.
         """
         trail = await self._session_store.load_trail(session_id)
         gathered: list[str] = []
@@ -1474,32 +1480,30 @@ class AgentLoop:
         self, session_id: str, turn_index: int
     ) -> tuple[list[AnswerTable], dict[str, BlueprintRun]]:
         """Reconstruct the model-designated answer TABLES for *turn_index* from the persisted
-                `answerWithTable` entries — the `_compute_turn_assumptions` sibling, seeding a
-                resumed window on BOTH resume paths so a designation made BEFORE a pause survives
-                it.
+        `answerWithTable` entries — the `_compute_turn_assumptions` sibling, seeding a
+        resumed window on BOTH resume paths so a designation made BEFORE a pause survives
+        it.
 
-                THE WHOLE LIST, not the first element: a three-part answer that paused must come
-                back with three tables, or the resume silently degrades the exact turns
-                multi-table exists for. The blueprint-run map is returned alongside because a
-                blueprint that ran BEFORE the pause must stay designatable after it.
+        THE WHOLE LIST, not the first element: a three-part answer that paused must come
+        back with three tables, or the resume silently degrades the exact turns
+        multi-table exists for. The blueprint-run map is returned alongside because a
+        blueprint that ran BEFORE the pause must stay designatable after it.
 
-                LAST successful designation wins, matching the in-window rule. BOTH designation
-                forms are reconstructed: reading only `args["sql"]` silently drops every blueprint
-                designation, which is the form the live model actually emits (observed sending
-                `sql=""` alongside `blueprint_id`). AND BOTH ARGUMENT SHAPES — entries written
-                before the `tables` key carry `sql`/`blueprint_id` at the TOP LEVEL, and
-                `resolve_designations` folds that shape in, so this seed keeps working on any
-                session document ever written, with no migration.
+        LAST successful designation wins, matching the in-window rule. BOTH designation
+        forms are reconstructed: reading only `args["sql"]` silently drops every blueprint
+        designation, which is the form the live model actually emits (observed sending
+        `sql=""` alongside `blueprint_id`). AND BOTH ARGUMENT SHAPES — entries written
+        before the `tables` key carry `sql`/`blueprint_id` at the TOP LEVEL, and
+        `resolve_designations` folds that shape in, so this seed keeps working on any
+        session document ever written, with no migration.
 
-                Resolving a `blueprint_id` here needs the blueprint's `terminal_sql`, which lives
-                behind a D46 KV pointer. That de-reference happens ONLY on the resume path, once
-                per blueprint, and a missing or expired ref leaves the id unresolved rather than
-                raising.
+        Resolving a `blueprint_id` here needs the blueprint's `terminal_sql`, which lives
+        behind a D46 KV pointer. That de-reference happens ONLY on the resume path, once
+        per blueprint, and a missing or expired ref leaves the id unresolved rather than
+        raising.
         """
         trail = await self._session_store.load_trail(session_id)
-        turn_entries = [
-            e for e in trail if e.turn_index == turn_index and e.status == "ok"
-        ]
+        turn_entries = [e for e in trail if e.turn_index == turn_index and e.status == "ok"]
         # blueprint_id -> BlueprintRun, rebuilt from this turn's successful runs.
         blueprint_runs: dict[str, BlueprintRun] = {}
         for entry in turn_entries:
@@ -1512,9 +1516,14 @@ class AgentLoop:
                 capture_terminal_sql(
                     "runBlueprint",
                     ToolResult(
-                        status="ok", tool_name="runBlueprint", error_code=None,
-                        retryable=None, user_message=None, provenance=None,
-                        result_preview=None, result_full=result_full,
+                        status="ok",
+                        tool_name="runBlueprint",
+                        error_code=None,
+                        retryable=None,
+                        user_message=None,
+                        provenance=None,
+                        result_preview=None,
+                        result_full=result_full,
                     ),
                     into=blueprint_runs,
                     arguments=entry.args,
@@ -1560,45 +1569,25 @@ class AgentLoop:
                 or entry.result_full_ref is None
             ):
                 continue
-            payload = await self._session_store.read_full_result(
-                session_id, entry.result_full_ref
-            )
+            payload = await self._session_store.read_full_result(session_id, entry.result_full_ref)
             if isinstance(payload, dict):
-                card = {
-                    key: value
-                    for key, value in payload.items()
-                    if key not in {"answer", "_agent_evidence"}
-                }
+                card = {key: value for key, value in payload.items() if key != "answer"}
                 if card not in cards:
                     cards.append(card)
         return cards
 
-    def _maybe_start_summary(
+    async def _maybe_start_summary(
         self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
     ) -> None:
-        """Fire a FIRE-AND-FORGET progress-summary task for one tool CALL (opt-in).
-
-                Non-blocking is load-bearing: the LLM call is scheduled CONCURRENTLY and the
-                caller never awaits it, so the summarizer can never add latency to the tool nor
-                delay the turn result. If the line never arrives, the instant template label
-                stands. A SHALLOW snapshot of `arguments` is passed so a rebinding of the
-                top-level keys cannot race the background read. No-op when the summarizer is not
-                wired.
-        """
-        if self._progress_summarizer is None:
-            return
-        task: asyncio.Task[None] = asyncio.create_task(
-            self._summarize_and_emit(tool_name, tool_call_id, dict(arguments))
-        )
-        self._summary_tasks.add(task)
-        task.add_done_callback(self._summary_tasks.discard)
+        """Emit the optional summary before dispatch so a late start cannot reopen a spinner."""
+        if self._progress_summarizer is not None:
+            await self._summarize_and_emit(tool_name, tool_call_id, dict(arguments))
 
     async def _summarize_and_emit(
         self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
     ) -> None:
         """Await the summarizer and emit the value-rich progress line — fail-soft: an error or
-                timeout yields `None` (dropped), and even the observer emit is guarded, so a late
-                arrival after the emitter is closed can never raise into this fire-and-forget task.
+        timeout yields `None` (dropped), and observer failures are contained.
         """
         try:
             summary = await self._progress_summarizer.summarize(tool_name, arguments)
@@ -1620,16 +1609,6 @@ class AgentLoop:
         except Exception:
             _logger.debug("progress-summary emit failed for %s (ignored)", tool_name)
 
-    def _cancel_pending_summaries(self) -> None:
-        """Best-effort cancel any still-pending summary tasks at turn end — the turn result
-                never blocks on them. Clearing here is belt-and-suspenders so a resumed window
-                starts clean.
-        """
-        for task in list(self._summary_tasks):
-            if not task.done():
-                task.cancel()
-        self._summary_tasks.clear()
-
     async def _run_runtime_tool(
         self,
         handler: RuntimeTool,
@@ -1637,23 +1616,39 @@ class AgentLoop:
         arguments: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext,
+        tool_call_id: str,
     ) -> ToolResult:
         """Run one registry handler with a crash guard and a returned-provenance-type
-                validation, so a misbehaving runtime tool cannot abort the turn or persist a
-                replay-poisoning provenance.
+        validation, so a misbehaving runtime tool cannot abort the turn or persist a
+        replay-poisoning provenance.
 
-                *turn* is the loop's OWN `turn_index`, threaded explicitly — the only correct
-                source. Passed to every runtime tool, ignored by the ones that do not need it.
+        *turn* is the loop's OWN `turn_index`, threaded explicitly — the only correct
+        source. Passed to every runtime tool, ignored by the ones that do not need it.
         """
+        managed = getattr(handler, "emits_dispatch_events", False)
+        if not managed:
+            self._observer(
+                "tool_dispatch_start", {"tool_name": tool_name, "tool_call_id": tool_call_id}
+            )
         try:
-            result = await handler.run(arguments, credentials, turn=turn)
+            result = await handler.run(arguments, credentials, turn=turn, tool_call_id=tool_call_id)
         except Exception:
             # Never propagate the raw exception (would abort the turn) or leak
             # `str(exc)` — log server-side only, return a clean canned error.
             _logger.exception(
                 "runtime tool %s raised (session=%s)", tool_name, credentials.session_id
             )
-            return _runtime_tool_internal_error(tool_name)
+            result = _runtime_tool_internal_error(tool_name)
+            managed = False
+        if not managed:
+            self._observer(
+                "tool_dispatch_" + result.status,
+                {
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "error_code": result.error_code,
+                },
+            )
         sanitized = _sanitize_runtime_provenance(result.provenance, tool_name)
         if sanitized is not result.provenance:
             result = replace(result, provenance=sanitized)
@@ -1669,39 +1664,39 @@ class AgentLoop:
         budget_cap_reached: bool = False,
     ) -> AnalysisState | None:
         """Mark every surviving `pending` intent `blocked` with a RUNTIME reason code,
-                immediately before a turn reaches a terminal outcome.
+        immediately before a turn reaches a terminal outcome.
 
-                Four callers, three codes:
+        Four callers, three codes:
 
-                  | hard ceiling                              | `BUDGET_EXHAUSTED`      |
-                  | budget cap reached DURING a refused round | `ENFORCEMENT_EXHAUSTED` |
-                  | block counter spent, intents pending      | `ENFORCEMENT_EXHAUSTED` |
-                  | budget-cap resume answered "stop"         | `USER_STOPPED`          |
+          | hard ceiling                              | `BUDGET_EXHAUSTED`      |
+          | budget cap reached DURING a refused round | `ENFORCEMENT_EXHAUSTED` |
+          | block counter spent, intents pending      | `ENFORCEMENT_EXHAUSTED` |
+          | budget-cap resume answered "stop"         | `USER_STOPPED`          |
 
-                `ENFORCEMENT_EXHAUSTED` MEANS "ENFORCEMENT COULD NOT ESTABLISH A DISPOSITION" —
-                NOT that the system proved the intent impossible. Zero rows is often the correct
-                answer, some denial probes cost one metadata call, and a user who withdraws an ask
-                mid-clarification lands here legitimately under that reading.
+        `ENFORCEMENT_EXHAUSTED` MEANS "ENFORCEMENT COULD NOT ESTABLISH A DISPOSITION" —
+        NOT that the system proved the intent impossible. Zero rows is often the correct
+        answer, some denial probes cost one metadata call, and a user who withdraws an ask
+        mid-clarification lands here legitimately under that reading.
 
-                `budget_cap_reached` is TELEMETRY ONLY and is set by the refused-round caller
-                alone. That path really did reach the cap, so an operator watching budget pressure
-                must see it — but the cap is NOT the cause of the disposition, so it does not go on
-                the intent record. Emitted as a bare `True` on `loop_intent_force_blocked` and
-                OMITTED otherwise, so the other three callers' payloads are unchanged.
+        `budget_cap_reached` is TELEMETRY ONLY and is set by the refused-round caller
+        alone. That path really did reach the cap, so an operator watching budget pressure
+        must see it — but the cap is NOT the cause of the disposition, so it does not go on
+        the intent record. Emitted as a bare `True` on `loop_intent_force_blocked` and
+        OMITTED otherwise, so the other three callers' payloads are unchanged.
 
-                THIS PATH WRITES THE RUNTIME CODES DIRECTLY. It must NOT be routed through
-                `validate_block_evidence`, which allowlists `MODEL_REASON_CODES` and would reject
-                every code above, by design. There is no evidence to cite: `evidence_tool_call_id`
-                stays `None`, which is exactly what distinguishes a runtime-forced block from a
-                model-declared one in the ledger.
+        THIS PATH WRITES THE RUNTIME CODES DIRECTLY. It must NOT be routed through
+        `validate_block_evidence`, which allowlists `MODEL_REASON_CODES` and would reject
+        every code above, by design. There is no evidence to cite: `evidence_tool_call_id`
+        stays `None`, which is exactly what distinguishes a runtime-forced block from a
+        model-declared one in the ledger.
 
-                The turn gate is already applied by the caller (the `state` handed in is the LIVE
-                one) and again by the store, whose merge callback receives `live_analysis_state`.
-                No live state, or nothing pending, is a no-op with no write at all.
+        The turn gate is already applied by the caller (the `state` handed in is the LIVE
+        one) and again by the store, whose merge callback receives `live_analysis_state`.
+        No live state, or nothing pending, is a no-op with no write at all.
 
-                DEGRADE-NEVER-FAIL: this runs on terminal paths that are already returning a
-                result to the user, so a store failure is logged and swallowed — losing the forced
-                disposition is bad, aborting the user's answer to record it is worse.
+        DEGRADE-NEVER-FAIL: this runs on terminal paths that are already returning a
+        result to the user, so a store failure is logged and swallowed — losing the forced
+        disposition is bad, aborting the user's answer to record it is worse.
         """
         pending = pending_intents(state)
         if not pending:
@@ -1725,9 +1720,7 @@ class AgentLoop:
                     intents.append(intent)
                     continue
                 forced_ids.append(intent.intent_id)
-                intents.append(
-                    replace(intent, status="blocked", reason_code=reason_code)
-                )
+                intents.append(replace(intent, status="blocked", reason_code=reason_code))
             return AnalysisState(turn_index=turn_index, intents=tuple(intents))
 
         try:
@@ -1783,31 +1776,31 @@ class AgentLoop:
         kind: FinalizationBlockKind,
     ) -> bool:
         """Whether a judge call at this moment could change anything. SYNC AND FREE, and
-                separated from `_judge` so it can be answered BEFORE the brief is built.
+        separated from `_judge` so it can be answered BEFORE the brief is built.
 
-                THE SEPARATION IS THE POINT, not a refactor. Building a brief costs a session
-                load plus up to `_MAX_CORROBORATION_READS` KV reads; doing that first and
-                deciding afterwards put real store I/O on every terminal exit of every turn —
-                INCLUDING with the feature switched off, which is the shipped default. Both
-                halves of the cost have to sit behind the same test.
+        THE SEPARATION IS THE POINT, not a refactor. Building a brief costs a session
+        load plus up to `_MAX_CORROBORATION_READS` KV reads; doing that first and
+        deciding afterwards put real store I/O on every terminal exit of every turn —
+        INCLUDING with the feature switched off, which is the shipped default. Both
+        halves of the cost have to sit behind the same test.
 
-                THREE REASONS TO SKIP, and each is provably pointless rather than merely
-                cheap:
+        THREE REASONS TO SKIP, and each is provably pointless rather than merely
+        cheap:
 
-                  FEATURE ABSENT — nothing to ask.
+          FEATURE ABSENT — nothing to ask.
 
-                  ALLOWANCE SPENT — a rejection cannot act, so the verdict would be bought and
-                  then discarded. `has_spent` is window-local by design; see its docstring for
-                  the one path it under-reports on and why that costs at most one call.
+          ALLOWANCE SPENT — a rejection cannot act, so the verdict would be bought and
+          then discarded. `has_spent` is window-local by design; see its docstring for
+          the one path it under-reports on and why that costs at most one call.
 
-                  NO WALL-CLOCK HEADROOM (09 §H) — a rejection issued near the cap buys a
-                  regeneration `guard.exceeded` cuts off mid-round, and the turn then returns
-                  `paused_budget_cap` with the draft already cleared. The user is asked
-                  "continue, refine, or stop?" and shown NOTHING, having had a serviceable answer
-                  moments earlier. That is the judge making the product worse, and it is the
-                  single failure mode most likely to make the feature net-negative.
+          NO WALL-CLOCK HEADROOM (09 §H) — a rejection issued near the cap buys a
+          regeneration `guard.exceeded` cuts off mid-round, and the turn then returns
+          `paused_budget_cap` with the draft already cleared. The user is asked
+          "continue, refine, or stop?" and shown NOTHING, having had a serviceable answer
+          moments earlier. That is the judge making the product worse, and it is the
+          single failure mode most likely to make the feature net-negative.
         """
-        if self._answer_judge is None:
+        if self._answer_judge is None or not getattr(self._answer_judge, "enabled", True):
             return False
         if gate.has_spent(kind):
             self._observer(ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "allowance_spent"})
@@ -1831,28 +1824,26 @@ class AgentLoop:
     ) -> JudgeVerdict:
         """Run the answer judge for one site, or APPROVE without spending anything (09).
 
-                *make_brief* IS A FACTORY, NOT A BRIEF, so the store reads it performs happen
-                only after `_judge_would_run` has said a verdict could be acted on. An eagerly
-                built brief is a session load and up to four KV reads charged to every terminal
-                exit, disabled deployments included.
+        *make_brief* IS A FACTORY, NOT A BRIEF, so the store reads it performs happen
+        only after `_judge_would_run` has said a verdict could be acted on. An eagerly
+        built brief is a session load and up to four KV reads charged to every terminal
+        exit, disabled deployments included.
 
-                THE FACTORY IS ALSO GUARDED. `_judge_results` reads the session document, and a
-                transient store error there would otherwise propagate out of `_run_loop_body`
-                AND ABORT A TURN WHOSE ANSWER IS ALREADY IN HAND — the exact fail-open violation
-                this feature must never commit, arriving through the call site rather than
-                through `review()`. Degrading to `APPROVED` costs one un-judged answer.
+        THE FACTORY IS ALSO GUARDED. `_judge_results` reads the session document, and a
+        transient store error there would otherwise propagate out of `_run_loop_body`
+        AND ABORT A TURN WHOSE ANSWER IS ALREADY IN HAND — the exact fail-open violation
+        this feature must never commit, arriving through the call site rather than
+        through `review()`. Degrading to `APPROVED` costs one un-judged answer.
 
-                Every skip and every failure returns the SAME `APPROVED` object as the judge's
-                own fail-open paths, so no caller can branch on why (09 §E).
+        Every skip and every failure returns the SAME `APPROVED` object as the judge's
+        own fail-open paths, so no caller can branch on why (09 §E).
         """
         if not self._judge_would_run(guard=guard, gate=gate, kind=kind):
             return APPROVED
         try:
             brief = await make_brief()
         except Exception:
-            _logger.exception(
-                "could not assemble the answer-judge brief — approving and shipping"
-            )
+            _logger.exception("could not assemble the answer-judge brief — approving and shipping")
             self._observer(ANSWER_JUDGE_FAILED_EVENT, {"reason": "brief_failed"})
             return APPROVED
         assert self._answer_judge is not None  # `_judge_would_run` established it
@@ -1867,28 +1858,28 @@ class AgentLoop:
         include_all_successful: bool = False,
     ) -> tuple[tuple[Mapping[str, Any], ...], str | None, tuple[TrailEntry, ...]]:
         """This turn's data-bearing results as the MODEL saw them, plus the date anchor —
-                the two brief fields that cannot be read off a window-local (09 §D).
+        the two brief fields that cannot be read off a window-local (09 §D).
 
-                SCOPE-FILTERED FIRST, RENDERED SECOND, and the order is the contract
-                `context/budget.py` states for the model-request path: `render_entry` has no
-                scope information of its own and performs no filtering, so handing it a raw
-                trail would put warehouse rows the caller is not entitled to in front of the
-                judge. `filter_trail` is called with `current_turn_index=None` — the
-                current-turn exemption exists to let the MODEL see its own denials and
-                self-correct, and a judge has nothing to self-correct; a `None`-provenance
-                entry is undetermined and must stay dropped.
+        SCOPE-FILTERED FIRST, RENDERED SECOND, and the order is the contract
+        `context/budget.py` states for the model-request path: `render_entry` has no
+        scope information of its own and performs no filtering, so handing it a raw
+        trail would put warehouse rows the caller is not entitled to in front of the
+        judge. `filter_trail` is called with `current_turn_index=None` — the
+        current-turn exemption exists to let the MODEL see its own denials and
+        self-correct, and a judge has nothing to self-correct; a `None`-provenance
+        entry is undetermined and must stay dropped.
 
-                `DATA_ANSWER_TOOLS` ONLY, successful ones. Those are the results the answer was
-                written FROM; a `getTableSchema` grounds the model, not the answer, and a wide
-                one is ~4k tokens of column documentation the judge has no criterion for. The
-                set is imported rather than re-spelled so it cannot drift from the answer-shape
-                gate's.
+        `DATA_ANSWER_TOOLS` ONLY, successful ones. Those are the results the answer was
+        written FROM; a `getTableSchema` grounds the model, not the answer, and a wide
+        one is ~4k tokens of column documentation the judge has no criterion for. The
+        set is imported rather than re-spelled so it cannot drift from the answer-shape
+        gate's.
 
-                ⚠ ONE EXTRA `load_trail` PER JUDGED EXIT (issues-stack A3 already counts three
-                per window). It is paid ONLY when the judge is enabled AND reached a terminal
-                exit AND passed both skips — at most once per window — and the alternative is
-                threading a growing trail snapshot through `_run_loop_body` for a feature that
-                is off by default.
+        ⚠ ONE EXTRA `load_trail` PER JUDGED EXIT (issues-stack A3 already counts three
+        per window). It is paid ONLY when the judge is enabled AND reached a terminal
+        exit AND passed both skips — at most once per window — and the alternative is
+        threading a growing trail snapshot through `_run_loop_body` for a feature that
+        is off by default.
         """
         doc = await self._session_store.get_or_create_session(session_id)
         in_scope = scope_filter.filter_trail(doc.tool_trail, column_scope)
@@ -1923,28 +1914,28 @@ class AgentLoop:
         self, session_id: str, turn_index: int, prose: str, trail: Sequence[TrailEntry]
     ) -> bool | None:
         """`True` when a figure the prose reports is FOUND in what this turn's queries
-                actually returned; `None` when nothing was established. **Never `False`.**
+        actually returned; `None` when nothing was established. **Never `False`.**
 
-                THIS IS 05 §L.7's ESCAPE HATCH, BUILT AS AN ESCAPE HATCH. That section works
-                through why corroboration cannot be a TRIGGER and the reasoning is unchanged: a
-                derived figure never matches literally ("rose 12% year over year"), rounding
-                breaks it (`9184` reported as "about 9,200"), and formatting diverges. Every one
-                of those produces a NON-match on a perfectly good answer.
+        THIS IS 05 §L.7's ESCAPE HATCH, BUILT AS AN ESCAPE HATCH. That section works
+        through why corroboration cannot be a TRIGGER and the reasoning is unchanged: a
+        derived figure never matches literally ("rose 12% year over year"), rounding
+        breaks it (`9184` reported as "about 9,200"), and formatting diverges. Every one
+        of those produces a NON-match on a perfectly good answer.
 
-                So the absence of a match is not evidence and is never reported as any. A `False`
-                would be read by the judge as "this figure was looked for and is not in the
-                data", which is a finding the runtime cannot support and which would push it
-                toward `contradicts_result` on exactly the answers §L.7 lists. `True` is the only
-                thing this can honestly say, and it says it so a judge weighing a figure it
-                cannot verify from 20 preview rows has one fact it can trust.
+        So the absence of a match is not evidence and is never reported as any. A `False`
+        would be read by the judge as "this figure was looked for and is not in the
+        data", which is a finding the runtime cannot support and which would push it
+        toward `contradicts_result` on exactly the answers §L.7 lists. `True` is the only
+        thing this can honestly say, and it says it so a judge weighing a figure it
+        cannot verify from 20 preview rows has one fact it can trust.
 
-                IT READS `result_full`, the one place in this feature that does — and 09 §D.3's
-                rule survives it, because the judge never SEES the full result. It sees a
-                boolean derived from it. The full result is where a corroborating row lives when
-                the preview cap cut it, which is the entire reason for the read.
+        IT READS `result_full`, the one place in this feature that does — and 09 §D.3's
+        rule survives it, because the judge never SEES the full result. It sees a
+        boolean derived from it. The full result is where a corroborating row lives when
+        the preview cap cut it, which is the entire reason for the read.
 
-                COSTS ONE `read_full_result` PER DATA CALL, capped, and short-circuits on the
-                first match. Skipped entirely when the prose reports no figure — most answers.
+        COSTS ONE `read_full_result` PER DATA CALL, capped, and short-circuits on the
+        first match. Skipped entirely when the prose reports no figure — most answers.
         """
         figures = reported_figures(prose)
         if not figures:
@@ -1995,18 +1986,19 @@ class AgentLoop:
         results: tuple[Mapping[str, Any], ...] = (),
         designated_tables: tuple[tuple[str | None, str], ...] = (),
         figure_corroborated: bool | None = None,
+        ship_guard: JudgeShipGuard | None = None,
     ) -> JudgeBrief:
         """Assemble the judge's brief from what the loop already holds (09 §D.2).
 
-                PURE, AND NO STORE READS. Every field is a window-local or an accumulator at the
-                moment a terminal exit is reached, which is what keeps the common case at ~2-4k
-                tokens and one model round-trip rather than a re-assembly of the turn.
+        PURE, AND NO STORE READS. Every field is a window-local or an accumulator at the
+        moment a terminal exit is reached, which is what keeps the common case at ~2-4k
+        tokens and one model round-trip rather than a re-assembly of the turn.
 
-                `results` AND `date_anchor` ARE THE CALLER'S, from `_judge_results` — the only
-                two fields that need I/O and the only two that need a scope decision. Building
-                them here would put a `filter_trail` call inside a brief builder where nobody
-                would look for it, and would make this method impossible to test without a
-                store. The `ask_user` site passes neither.
+        `results` AND `date_anchor` ARE THE CALLER'S, from `_judge_results` — the only
+        two fields that need I/O and the only two that need a scope decision. Building
+        them here would put a `filter_trail` call inside a brief builder where nobody
+        would look for it, and would make this method impossible to test without a
+        store. The `ask_user` site passes neither.
         """
         return JudgeBrief(
             site=site,
@@ -2029,6 +2021,19 @@ class AgentLoop:
             figure_corroborated=figure_corroborated,
             pending_question=pending_question,
             pending_options=pending_options,
+            designated_tool_call_ids=tuple(
+                ref
+                for ref, sql in accum.result_sql_by_call_id.items()
+                if any(sql == ident for _, ident in designated_tables)
+            ),
+            assumptions_recorded_after_refusal=tuple(
+                item
+                for item in (accum.assumptions or ())
+                if ship_guard is not None
+                and ship_guard.unsafe_ship()
+                and item not in ship_guard.assumptions_before_refusal
+            ),
+            capability_presented=accum.capability_judge_context,
         )
 
     async def _finish(
@@ -2046,57 +2051,59 @@ class AgentLoop:
         persist_text: str | None = None,
         event: tuple[str, dict[str, Any]] | None = None,
         capability_cards: list[dict[str, Any]] | None = None,
+        ship_guard: JudgeShipGuard | None = None,
+        judge_site: str = "exit_prose",
     ) -> TurnOutcome:
         """THE ORDER every in-body `TurnOutcome` return performs its effects in, in one place:
-                checkpoint write, assistant-message append, envelope read, observer event, return.
+        checkpoint write, assistant-message append, envelope read, observer event, return.
 
-                THE ORDER IS THE POINT, because it is invisible at every call site and only one
-                reading is correct: `_compute_turn_provenance_union` must be read BEFORE the
-                message it tags is appended; the envelope must be read AFTER the round's folds;
-                and the observer must fire AFTER every store write, so an observer that reads the
-                session back never races the write it is announcing.
+        THE ORDER IS THE POINT, because it is invisible at every call site and only one
+        reading is correct: `_compute_turn_provenance_union` must be read BEFORE the
+        message it tags is appended; the envelope must be read AFTER the round's folds;
+        and the observer must fire AFTER every store write, so an observer that reads the
+        session back never races the write it is announcing.
 
-                THIS OWNS NO STATE, and is a method rather than an object for that reason — the
-                accumulators and the checkpoint are mutable locals of a running loop body.
+        THIS OWNS NO STATE, and is a method rather than an object for that reason — the
+        accumulators and the checkpoint are mutable locals of a running loop body.
 
-                NOTHING IS DERIVED, and the three parameters that look derivable are the point:
+        NOTHING IS DERIVED, and the three parameters that look derivable are the point:
 
-                  - *event* is passed, never computed from *status*: the budget-cap "stop" answer
-                    returns `status="done"` and emits NO event, so "done means loop_turn_done" is
-                    FALSE and any code assuming it starts emitting a spurious finish.
-                  - *provenance* is passed, never computed: it is non-`None` at the `done` exits
-                    ONLY, and computing it here would put a SECOND
-                    `_compute_turn_provenance_union` call in the codebase. The discipline is
-                    exactly one per done-exit, made at the site, whose single value tags the
-                    persisted message AND rides the outcome. A pause carries `None` deliberately —
-                    it has no persisted assistant message for a lineage tag to belong to.
-                  - *exit_label* is passed because `status="done"` is reached by BOTH done exits,
-                    so no derivation can tell a no-tool-calls finish from an `answerWithTable`
-                    one — which is exactly the distinction the answer-scrub telemetry is read for.
+          - *event* is passed, never computed from *status*: the budget-cap "stop" answer
+            returns `status="done"` and emits NO event, so "done means loop_turn_done" is
+            FALSE and any code assuming it starts emitting a spurious finish.
+          - *provenance* is passed, never computed: it is non-`None` at the `done` exits
+            ONLY, and computing it here would put a SECOND
+            `_compute_turn_provenance_union` call in the codebase. The discipline is
+            exactly one per done-exit, made at the site, whose single value tags the
+            persisted message AND rides the outcome. A pause carries `None` deliberately —
+            it has no persisted assistant message for a lineage tag to belong to.
+          - *exit_label* is passed because `status="done"` is reached by BOTH done exits,
+            so no derivation can tell a no-tool-calls finish from an `answerWithTable`
+            one — which is exactly the distinction the answer-scrub telemetry is read for.
 
-                THE ANSWER-PROSE SCRUB RUNS HERE, at the top: every exit that hands prose to a user
-                goes through this function, so one call covers all five and the SAME scrubbed
-                string necessarily feeds both the outcome and the persisted message.
+        THE ANSWER-PROSE SCRUB RUNS HERE, at the top: every exit that hands prose to a user
+        goes through this function, so one call covers all five and the SAME scrubbed
+        string necessarily feeds both the outcome and the persisted message.
 
-                *persist_text* is a value, not a flag, and BOTH `done` exits now pass it
-                unconditionally: the `answerWithTable` exit because `clean_answer_text` already
-                returned a non-empty string, the no-tool-calls exit because the empty-answer gate
-                (05 §K) substitutes `EMPTY_ANSWER_FALLBACK_TEXT` before the call. The invariant it
-                used to carry — no EMPTY assistant message in history, which `context/assembly.py`
-                would replay into every later turn — is unchanged and simply moved upstream to
-                that substitution. It stays a value rather than becoming unconditional here
-                because the PAUSE exits pass `None`: a pause has no answer to persist.
+        *persist_text* is a value, not a flag, and BOTH `done` exits now pass it
+        unconditionally: the `answerWithTable` exit because `clean_answer_text` already
+        returned a non-empty string, the no-tool-calls exit because the empty-answer gate
+        (05 §K) substitutes `EMPTY_ANSWER_FALLBACK_TEXT` before the call. The invariant it
+        used to carry — no EMPTY assistant message in history, which `context/assembly.py`
+        would replay into every later turn — is unchanged and simply moved upstream to
+        that substitution. It stays a value rather than becoming unconditional here
+        because the PAUSE exits pass `None`: a pause has no answer to persist.
 
-                WHAT STAYED AT THE SITES: everything whose POSITION relative to this call is the
-                behaviour — `_force_block_pending_intents` (unconditional at the hard ceiling, only
-                for a refused round at the budget cap), the provenance union, and the
-                `PauseCheckpoint` construction.
+        WHAT STAYED AT THE SITES: everything whose POSITION relative to this call is the
+        behaviour — `_force_block_pending_intents` (unconditional at the hard ceiling, only
+        for a refused round at the budget cap), the provenance union, and the
+        `PauseCheckpoint` construction.
 
-                TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately: `resume()`'s budget-cap "stop"
-                return, which happens before `_run_loop_body` is entered and builds its own
-                accumulators from the trail rebuild, so everything here is a no-op for it; and
-                `_pause_from_runtime_tool`, which is already a single-purpose finisher and receives
-                its `AnswerEnvelope` as a parameter.
+        TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately: `resume()`'s budget-cap "stop"
+        return, which happens before `_run_loop_body` is entered and builds its own
+        accumulators from the trail rebuild, so everything here is a no-op for it; and
+        `_pause_from_runtime_tool`, which is already a single-purpose finisher and receives
+        its `AnswerEnvelope` as a parameter.
         """
         # THE ANSWER-PROSE SCRUB (ISSUES I1) — FIRST, above every effect, so there
         # is exactly ONE scrubbed string and it is the one that reaches BOTH the
@@ -2111,9 +2118,42 @@ class AgentLoop:
         # decision): `sql_executed`, `answer_sql`, `blueprint_use`, `verification`
         # and `answer_tables` keep naming exactly what ran. Prose is the agent's
         # voice; those fields are the audit surface.
-        assistant_text, redaction_count = scrub_answer_prose(
-            assistant_text, provenance=provenance
-        )
+        ship_disposition = ship_guard.disposition(judge_site) if ship_guard is not None else None
+        retained_assumption_count = None
+        if assistant_text == HELP_UNAVAILABLE_TEXT:
+            ship_disposition = "decline_only"
+            accum.apply_ship_disposition(ship_disposition, ())
+            retained_assumption_count = 0
+            capability_cards = accum.capability_cards
+            persist_text = assistant_text
+        elif ship_disposition:
+            violation = ship_guard.unsafe_ship()[1]
+            accum.apply_ship_disposition(ship_disposition, ship_guard.assumptions_before_refusal)
+            retained_assumption_count = len(accum.assumptions or ())
+            capability_cards = accum.capability_cards
+            builder = {
+                "decline_only": ship_decline_text,
+                "ship_tables_with_hedge": table_hedge_text,
+                "ship_cards_with_hedge": capability_hedge_text,
+            }[ship_disposition]
+            assistant_text = builder(violation)
+            persist_text = assistant_text
+            self._observer(
+                "loop_answer_judge_ship_guarded",
+                {"violation": violation, "site": judge_site, "disposition": ship_disposition},
+            )
+        if capability_cards or accum.capability_cards:
+            coherent_text = coherent_capability_ship_text(
+                assistant_text,
+                capability_cards or accum.capability_cards,
+                ship_guard.unsafe_ship() if ship_guard else None,
+            )
+            if coherent_text != assistant_text:
+                ship_disposition = "ship_cards_with_hedge"
+                accum.apply_ship_disposition(ship_disposition, tuple(accum.assumptions or ()))
+                retained_assumption_count = len(accum.assumptions or ())
+                assistant_text = coherent_text
+        assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance)
         if persist_text is not None:
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
             # that persist pass the same string they pass as *assistant_text*, so
@@ -2131,6 +2171,8 @@ class AgentLoop:
                     content=persist_text,
                     ts=_now_iso(),
                     provenance=provenance,
+                    ship_disposition=ship_disposition,
+                    retained_assumption_count=retained_assumption_count,
                 ),
             )
         # AFTER every fold and `commit_round` of the round — this is called at the
@@ -2185,12 +2227,12 @@ class AgentLoop:
         serves_intent: str | None = None,
     ) -> TurnOutcome:
         """Honor a runtime tool's `ToolPause` — write the checkpoint (with the additive
-                `blueprint_*` mid-DAG state) and return `paused_ask_user`, the same terminal
-                contract as `askUser`. The loop owns `budget_window_count`; the tool cannot know it.
+        `blueprint_*` mid-DAG state) and return `paused_ask_user`, the same terminal
+        contract as `askUser`. The loop owns `budget_window_count`; the tool cannot know it.
 
-                The four enrichment accumulators are threaded through best-effort, so a "runQuery
-                succeeded, then runBlueprint paused on a slot question" turn surfaces the partial
-                SQL and table on this pause flavor too, matching a direct `askUser` pause.
+        The four enrichment accumulators are threaded through best-effort, so a "runQuery
+        succeeded, then runBlueprint paused on a slot question" turn surfaces the partial
+        SQL and table on this pause flavor too, matching a direct `askUser` pause.
         """
         pending_question = dict(pause.pending_question)
         pending_question["options"] = _ask_user_options(pending_question.get("options"))
@@ -2257,17 +2299,18 @@ class AgentLoop:
         window_count: int,
     ) -> TurnOutcome:
         """Re-enter the paused blueprint at `awaiting_node` (D45). The executor is stateless —
-                everything needed to continue is in the checkpoint, so a FRESH process resumes
-                identically. The outcome maps the same way `runBlueprint`'s first call does:
+        everything needed to continue is in the checkpoint, so a FRESH process resumes
+        identically. The outcome maps the same way `runBlueprint`'s first call does:
 
-                  - `Paused` (another approval or degrade) -> write a new checkpoint with the
-                    grown completed-nodes state and return `paused_ask_user`;
-                  - `Completed`/`Failed` -> persist a `runBlueprint` trail entry, so replay carries
-                    the result and provenance, and CONTINUE the model loop.
+          - `Paused` (another approval or degrade) -> write a new checkpoint with the
+            grown completed-nodes state and return `paused_ask_user`;
+          - `Completed`/`Failed` -> persist a `runBlueprint` trail entry, so replay carries
+            the result and provenance, and CONTINUE the model loop.
 
-                The executor re-fires the deterministic slot/rule resolves on resume for settled
-                bindings — accepted, since those probes are read-only and idempotent.
+        The executor re-fires the deterministic slot/rule resolves on resume for settled
+        bindings — accepted, since those probes are read-only and idempotent.
         """
+        resume_call_id = str(uuid.uuid4())
         try:
             slot_bindings = json.loads(checkpoint.slot_bindings_json or "{}")
             if not isinstance(slot_bindings, dict):
@@ -2294,12 +2337,12 @@ class AgentLoop:
                 )
                 return self._blueprint_outcome_to_tool_result(outcome)
             except Exception:
-                _logger.exception(
-                    "runBlueprint resume raised (session=%s)", credentials.session_id
-                )
+                _logger.exception("runBlueprint resume raised (session=%s)", credentials.session_id)
                 return _runtime_tool_internal_error("runBlueprint")
 
-        self._observer("tool_dispatch_start", {"tool_name": "runBlueprint"})
+        self._observer(
+            "tool_dispatch_start", {"tool_name": "runBlueprint", "tool_call_id": resume_call_id}
+        )
         # R7: the missing HALF of the runBlueprint TOOL span. A turn that paused for
         # approval reached Phoenix with a span for the first call and NOTHING for the
         # work the resume actually did. `in_tool_span` and not `tracing.tool_span`
@@ -2332,7 +2375,11 @@ class AgentLoop:
         )
         self._observer(
             "tool_dispatch_ok" if tool_result.status == "ok" else "tool_dispatch_error",
-            {"tool_name": "runBlueprint", "error_code": tool_result.error_code},
+            {
+                "tool_name": "runBlueprint",
+                "tool_call_id": resume_call_id,
+                "error_code": tool_result.error_code,
+            },
         )
 
         if tool_result.pause is not None:
@@ -2389,7 +2436,7 @@ class AgentLoop:
             )
         entry = TrailEntry(
             turn_index=turn_index,
-            tool_call_id=str(uuid.uuid4()),
+            tool_call_id=resume_call_id,
             tool_name="runBlueprint",
             args={"id": checkpoint.blueprint_id, "resumed": True},
             status=tool_result.status,
@@ -2426,9 +2473,7 @@ class AgentLoop:
         seed_answer_tables, trail_runs = await self._compute_turn_answer_tables(
             session_id, turn_index
         )
-        seed_capability_cards = await self._compute_turn_capability_cards(
-            session_id, turn_index
-        )
+        seed_capability_cards = await self._compute_turn_capability_cards(session_id, turn_index)
         seed_blueprint_runs = {**trail_runs, **seed_blueprint_runs}
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
@@ -2456,9 +2501,9 @@ class AgentLoop:
 
     def _blueprint_outcome_to_tool_result(self, outcome: Any) -> ToolResult:
         """Map a `BlueprintExecutor` `ExecOutcome` to a `ToolResult` — the SAME mapping
-                `RunBlueprintTool._execute` uses, reused here so a mid-DAG resume produces
-                byte-identical results, INCLUDING the verified `authoritative` marker. Sharing the
-                one mapper is what stops the resume path from silently losing it.
+        `RunBlueprintTool._execute` uses, reused here so a mid-DAG resume produces
+        byte-identical results, INCLUDING the verified `authoritative` marker. Sharing the
+        one mapper is what stops the resume path from silently losing it.
         """
         from data_agent.runtime.blueprint.tool import blueprint_outcome_to_tool_result
 
@@ -2478,38 +2523,38 @@ class AgentLoop:
     ) -> tuple[list[AnswerTable], str | None, bool]:
         """Resolve ONE `answerWithTable` call into its designated answer tables.
 
-                Returns `(tables, unresolved_blueprint_id, carried_designation)`.
+        Returns `(tables, unresolved_blueprint_id, carried_designation)`.
 
-                THE THIRD VALUE IS NOT DERIVABLE FROM THE FIRST TWO, which is why it is returned
-                rather than inferred. An empty `tables` list has two completely different causes
-                needing opposite handling: the model NAMED NOTHING (`carried_designation=False` —
-                a defect, and the caller nudges), or it named something the runtime then dropped
-                for a reason the model cannot act on (out of the caller's column scope, a
-                duplicate, an over-cap entry). Nudging the second would tell the model to fix a
-                payload that was already correct.
+        THE THIRD VALUE IS NOT DERIVABLE FROM THE FIRST TWO, which is why it is returned
+        rather than inferred. An empty `tables` list has two completely different causes
+        needing opposite handling: the model NAMED NOTHING (`carried_designation=False` —
+        a defect, and the caller nudges), or it named something the runtime then dropped
+        for a reason the model cannot act on (out of the caller's column scope, a
+        duplicate, an over-cap entry). Nudging the second would tell the model to fix a
+        payload that was already correct.
 
-                The order is fixed and each step is there for a measured reason:
+        The order is fixed and each step is there for a measured reason:
 
-                  1. Choose the source list — `tables` when it carries a designation, else the
-                     LEGACY top-level `sql`/`blueprint_id` pair folded in as one entry. The fold
-                     is there for a model working from a stale context, and for the replay paths
-                     that share this resolver and read pre-`tables` trail entries forever.
-                  2. Resolve each item through the EXISTING `resolve_designation`. There is no
-                     second resolution path, which is why multi-table costs no new resolver and
-                     cannot drift from the single-table one.
-                  3. An item naming a blueprint that did not run this turn REFUSES THE WHOLE CALL
-                     (the caller turns the returned id into the retryable
-                     `_answer_table_blueprint_not_run` nudge), after the dormant
-                     ON_ANSWER_TABLE_UNRESOLVED seam has had first refusal. Dropping it instead
-                     would silently lose a deliverable's table.
-                  4. Dedupe on resolved SQL, then cap at `MAX_ANSWER_TABLES`.
-                  5. Per-table provenance — an additive, positionally parallel read-path check,
-                     NOT this entry's provenance.
+          1. Choose the source list — `tables` when it carries a designation, else the
+             LEGACY top-level `sql`/`blueprint_id` pair folded in as one entry. The fold
+             is there for a model working from a stale context, and for the replay paths
+             that share this resolver and read pre-`tables` trail entries forever.
+          2. Resolve each item through the EXISTING `resolve_designation`. There is no
+             second resolution path, which is why multi-table costs no new resolver and
+             cannot drift from the single-table one.
+          3. An item naming a blueprint that did not run this turn REFUSES THE WHOLE CALL
+             (the caller turns the returned id into the retryable
+             `_answer_table_blueprint_not_run` nudge), after the dormant
+             ON_ANSWER_TABLE_UNRESOLVED seam has had first refusal. Dropping it instead
+             would silently lose a deliverable's table.
+          4. Dedupe on resolved SQL, then cap at `MAX_ANSWER_TABLES`.
+          5. Per-table provenance — an additive, positionally parallel read-path check,
+             NOT this entry's provenance.
 
-                THE HOOKS FIRE PER TABLE, NOT PER CALL. A hook-substituted query LOSES ITS
-                VERIFICATION AND ITS CHIP: the D56 gate verified a query that is no longer the one
-                being paged. Inert today (both seams are empty), stated in code so a future hook
-                cannot silently inherit a badge.
+        THE HOOKS FIRE PER TABLE, NOT PER CALL. A hook-substituted query LOSES ITS
+        VERIFICATION AND ITS CHIP: the D56 gate verified a query that is no longer the one
+        being paged. Inert today (both seams are empty), stated in code so a future hook
+        cannot silently inherit a badge.
         """
         event_base = {
             # D5: hashed, never the raw session id — a hook is never given one.
@@ -2533,9 +2578,7 @@ class AgentLoop:
                     session_id,
                 )
                 replacement = self._answer_table_hooks.resolve_unresolved(
-                    AnswerTableEvent(
-                        blueprint_id=item.named_blueprint, sql=None, **event_base
-                    )
+                    AnswerTableEvent(blueprint_id=item.named_blueprint, sql=None, **event_base)
                 )
                 if replacement is None:
                     if unresolved_blueprint_id is None:
@@ -2548,9 +2591,7 @@ class AgentLoop:
                 continue
             if references_scratch(item.sql):
                 durable = self._answer_table_hooks.resolve_ephemeral(
-                    AnswerTableEvent(
-                        blueprint_id=item.named_blueprint, sql=item.sql, **event_base
-                    )
+                    AnswerTableEvent(blueprint_id=item.named_blueprint, sql=item.sql, **event_base)
                 )
                 if durable is not None:
                     item = replace(item, sql=durable, blueprint_id=None)
@@ -2571,9 +2612,7 @@ class AgentLoop:
 
         tables: list[AnswerTable] = []
         for table in finalized.tables:
-            provenance = await self._tool_dispatcher.capture_sql_provenance(
-                table.sql, credentials
-            )
+            provenance = await self._tool_dispatcher.capture_sql_provenance(table.sql, credentials)
             enriched = enrich_table(table, blueprint_runs, provenance=provenance)
             # The read-path check, applied live through the SAME predicate
             # `session_history.project_history` uses. It bites only for a designated
@@ -2589,9 +2628,7 @@ class AgentLoop:
                 "loop_answer_tables_designated",
                 {
                     "table_count": len(tables),
-                    "blueprint_table_count": sum(
-                        1 for t in tables if t.blueprint_use is not None
-                    ),
+                    "blueprint_table_count": sum(1 for t in tables if t.blueprint_use is not None),
                     # J6: what an observer means by "verified" is the CLAIM, not the
                     # presence of a block. A blueprint that returned zero rows now
                     # carries an explicit `empty — unverifiable` block (`passed:
@@ -2621,20 +2658,20 @@ class AgentLoop:
         result_sql_by_call_id: Mapping[str, str],
     ) -> None:
         """Emit `loop_answer_table_intent_uncovered` when a COMPLETED intent's result is not
-                among the designated tables.
+        among the designated tables.
 
-                DERIVATION IS A CHECK HERE, NEVER A SOURCE. The tables are LISTED by the model
-                because the evidence call is the wrong query: a designated `sql` is deliberately
-                not required to be one the agent ran, because the executed query usually carries a
-                LIMIT the agent chose for its own reading and paging needs the un-capped shape.
-                Deriving the tables from the evidence would page that capped query and silently
-                truncate every grid. (`getTableSchema` evidence has no pageable SQL at all, and a
-                `blocked` intent's evidence is a denial.)
+        DERIVATION IS A CHECK HERE, NEVER A SOURCE. The tables are LISTED by the model
+        because the evidence call is the wrong query: a designated `sql` is deliberately
+        not required to be one the agent ran, because the executed query usually carries a
+        LIMIT the agent chose for its own reading and paging needs the un-capped shape.
+        Deriving the tables from the evidence would page that capped query and silently
+        truncate every grid. (`getTableSchema` evidence has no pageable SQL at all, and a
+        `blocked` intent's evidence is a denial.)
 
-                NOT A REFUSAL. A scalar part of a multi-part answer correctly belongs in the prose,
-                so this counts a signal, not an error. Best-effort by construction: an intent whose
-                evidence call ran in an EARLIER window contributes nothing, because
-                `result_sql_by_call_id` is window-local.
+        NOT A REFUSAL. A scalar part of a multi-part answer correctly belongs in the prose,
+        so this counts a signal, not an error. Best-effort by construction: an intent whose
+        evidence call ran in an EARLIER window contributes nothing, because
+        `result_sql_by_call_id` is window-local.
         """
         if state is None:
             return
@@ -2648,9 +2685,7 @@ class AgentLoop:
             and result_sql_by_call_id[intent.evidence_tool_call_id] not in designated
         )
         if uncovered:
-            self._observer(
-                "loop_answer_table_intent_uncovered", {"intent_count": uncovered}
-            )
+            self._observer("loop_answer_table_intent_uncovered", {"intent_count": uncovered})
 
     async def _run_loop_body(
         self,
@@ -2670,670 +2705,723 @@ class AgentLoop:
         # caller with nothing to carry) → a fresh, empty window.
         accumulators: TurnAccumulators | None = None,
     ) -> TurnOutcome:
-        """The turn-window driver. Its `try` opens as the FIRST statement, above the
-                tools/discovery preamble, so a `tools_provider` failure still runs the
-                straggler-summary cancel in the `finally` below.
-        """
-        try:
-            # The live MCP authenticates every request, including tools/list, so
-            # the tools_provider seam is called WITH this turn's credentials on
-            # every window (2026-07-01 fix) — it is expected to cache the fetched
-            # catalogue itself (see mcp/tool_schema.py::ToolSchemaCache) since the
-            # catalogue is scope-independent; this is not a live MCP round-trip
-            # on every call in practice, just a credentialed one the first time.
-            tools = await self._tools_provider(credentials)
+        """Run one turn window, with ordered summaries before each dispatch."""
+        # The live MCP authenticates every request, including tools/list, so
+        # the tools_provider seam is called WITH this turn's credentials on
+        # every window (2026-07-01 fix) — it is expected to cache the fetched
+        # catalogue itself (see mcp/tool_schema.py::ToolSchemaCache) since the
+        # catalogue is scope-independent; this is not a live MCP round-trip
+        # on every call in practice, just a credentialed one the first time.
+        tools = await self._tools_provider(credentials)
 
-            # The loop's OWN turn index, handed to every runtime tool (03 §C.1). It is
-            # built here, from the parameter `run`/`resume` computed, so no tool ever
-            # re-derives it or reads `app.py`'s explicitly non-load-bearing hint.
-            turn_context = TurnContext(turn_index=turn_index, question=question)
+        # The loop's OWN turn index, handed to every runtime tool (03 §C.1). It is
+        # built here, from the parameter `run`/`resume` computed, so no tool ever
+        # re-derives it or reads `app.py`'s explicitly non-load-bearing hint.
+        turn_context = TurnContext(turn_index=turn_index, question=question)
 
-            # Emulated-discovery injection (context/discovery_emulation.py): emulate
-            # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
-            # Both run() and resume() re-enter `_run_loop_body`, so "once per window" is the
-            # right cadence. It is computed HERE — next to `_tools_provider`, DELIBERATELY
-            # ABOVE the `BudgetGuard(...)` below — so its 1 + N MCP round-trips run OUTSIDE the
-            # budget window's wall clock and never consume `max_wall_clock_seconds` (nor
-            # re-charge it on every `continue` resume): this injected context is "never
-            # budgeted". Two effects, both ephemeral (never persisted):
-            #   1. `discovery_canonical` — the synthetic assistant/tool pairs, threaded
-            #      into every per-round-trip rebuild below as the earliest tool history.
-            #   2. `emulation_read_signatures` — seeded into the `ReadGuard` below so a
-            #      model RE-call of either tool is served locally (the "already served"
-            #      nudge) instead of hitting the MCP.
-            # Degrade-not-fail: any failure → no pairs + no seed, and the model falls
-            # back to calling the two tools itself. D5: the sweep goes through the
-            # dispatcher (credentials attached only at the MCP transport boundary),
-            # never through the context assembler.
-            discovery_canonical: list[dict[str, Any]] = []
-            emulation_read_signatures: set[tuple[str, str]] = set()
-            # `signature -> tool_call_id` for the emulated pairs, seeded into the
-            # `ReadGuard` below (see the loop that fills it for why).
-            emulated_served_call_ids: dict[tuple[str, str], str] = {}
-            if self._discovery_emulation_provider is not None:
-                emulation: EmulatedDiscovery | None = None
-                try:
-                    emulation = await self._discovery_emulation_provider(credentials)
-                except Exception:
-                    _logger.exception(
-                        "discovery-emulation provider failed (session=%s) — injecting nothing",
-                        credentials.session_id,
+        # Emulated-discovery injection (context/discovery_emulation.py): emulate
+        # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
+        # Both run() and resume() re-enter `_run_loop_body`, so "once per window" is the
+        # right cadence. It is computed HERE — next to `_tools_provider`, DELIBERATELY
+        # ABOVE the `BudgetGuard(...)` below — so its 1 + N MCP round-trips run OUTSIDE the
+        # budget window's wall clock and never consume `max_wall_clock_seconds` (nor
+        # re-charge it on every `continue` resume): this injected context is "never
+        # budgeted". Two effects, both ephemeral (never persisted):
+        #   1. `discovery_canonical` — the synthetic assistant/tool pairs, threaded
+        #      into every per-round-trip rebuild below as the earliest tool history.
+        #   2. `emulation_read_signatures` — seeded into the `ReadGuard` below so a
+        #      model RE-call of either tool is served locally (the "already served"
+        #      nudge) instead of hitting the MCP.
+        # Degrade-not-fail: any failure → no pairs + no seed, and the model falls
+        # back to calling the two tools itself. D5: the sweep goes through the
+        # dispatcher (credentials attached only at the MCP transport boundary),
+        # never through the context assembler.
+        discovery_canonical: list[dict[str, Any]] = []
+        emulation_read_signatures: set[tuple[str, str]] = set()
+        # `signature -> tool_call_id` for the emulated pairs, seeded into the
+        # `ReadGuard` below (see the loop that fills it for why).
+        emulated_served_call_ids: dict[tuple[str, str], str] = {}
+        if self._discovery_emulation_provider is not None:
+            emulation: EmulatedDiscovery | None = None
+            try:
+                emulation = await self._discovery_emulation_provider(credentials)
+            except Exception:
+                _logger.exception(
+                    "discovery-emulation provider failed (session=%s) — injecting nothing",
+                    credentials.session_id,
+                )
+            if emulation is not None:
+                for rendered_entry in emulation.entries:
+                    discovery_canonical.extend(_tool_trail_entry_to_canonical(rendered_entry))
+                    # Point each emulated signature at the synthetic entry that
+                    # serves it, so the trim-aware re-fetch exemption can see the
+                    # listing IS readable and lets the guard dedup a model re-call —
+                    # the whole point of the sweep. Without a pointer the exemption
+                    # would read "no readable source" and re-dispatch to the MCP,
+                    # undoing the saving. `fit_request_to_budget` pins these pairs by
+                    # id (invariant 7), so they stay readable for the whole window.
+                    emulated_sig = idempotent_read_signature(
+                        rendered_entry["tool_name"], rendered_entry.get("args") or {}
                     )
-                if emulation is not None:
-                    for rendered_entry in emulation.entries:
-                        discovery_canonical.extend(_tool_trail_entry_to_canonical(rendered_entry))
-                        # Point each emulated signature at the synthetic entry that
-                        # serves it, so the trim-aware re-fetch exemption can see the
-                        # listing IS readable and lets the guard dedup a model re-call —
-                        # the whole point of the sweep. Without a pointer the exemption
-                        # would read "no readable source" and re-dispatch to the MCP,
-                        # undoing the saving. `fit_request_to_budget` pins these pairs by
-                        # id (invariant 7), so they stay readable for the whole window.
-                        emulated_sig = idempotent_read_signature(
-                            rendered_entry["tool_name"], rendered_entry.get("args") or {}
-                        )
-                        emulated_served_call_ids[emulated_sig] = rendered_entry["tool_call_id"]
-                    emulation_read_signatures = emulation.read_signatures
+                    emulated_served_call_ids[emulated_sig] = rendered_entry["tool_call_id"]
+                emulation_read_signatures = emulation.read_signatures
 
-            # A FRESH window per `_run_loop_body` entry — the D55 "fresh window on continue"
-            # seam: both run() and resume() re-enter here, so a granted continue starts
-            # its iteration/token/wall-clock counters from zero.
-            guard = BudgetGuard(
-                max_iterations=self._max_loop_iterations,
-                max_wall_clock_seconds=self._max_wall_clock_seconds,
-                max_token_spend=self._max_token_spend,
-                clock=self._clock,
+        # A FRESH window per `_run_loop_body` entry — the D55 "fresh window on continue"
+        # seam: both run() and resume() re-enter here, so a granted continue starts
+        # its iteration/token/wall-clock counters from zero.
+        guard = BudgetGuard(
+            max_iterations=self._max_loop_iterations,
+            max_wall_clock_seconds=self._max_wall_clock_seconds,
+            max_token_spend=self._max_token_spend,
+            clock=self._clock,
+        )
+        tool_calls_made = 0
+        last_assistant_text: str | None = None
+        # Turn-window-local retrieval memo (design §3.3): keyed by
+        # (question, scope_hash) inside `assemble`, it makes the pipeline embed/
+        # recall at most ONCE across every round-trip of this window despite the
+        # D45 per-round-trip context rebuild. Not persisted — pure in-turn memo.
+        retrieval_memo: dict[tuple[str, str], Any] = {}
+        capability_memo: dict[str, Any] = {}
+        # D94 Part 2: turn-window-local de-dup for the withheld-provenance
+        # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
+        # not persisted) so the event fires at most once per stranded call.
+        withheld_call_ids: set[str] = set()
+        # Repeated-idempotent-read guard (generalizes D94), `loop/read_guard.py`: it
+        # holds the already-served read signatures for THIS turn plus the pointers
+        # and exemption counts the trim-aware re-fetch escape needs. Turn-window-local
+        # like the memos above, BUT seeded from the persisted trail below so it
+        # survives both the D45 per-round-trip rebuild (its state would otherwise
+        # reset every `send_turn`) AND a budget-window `continue` resume (a fresh
+        # `_run_loop_body` window starts here with an empty guard). Seeding from every
+        # prior `ok` idempotent-read entry of this turn is what lets it recognize a
+        # repeat it did not itself serve in the current window.
+        read_guard = ReadGuard(self._observer)
+        # The blueprint-definition gate, `loop/blueprint_gate.py`: it holds every
+        # blueprint id this turn has already EXPANDED with a successful
+        # `getBlueprint`, and `runBlueprint` for an id that is NOT in it is refused
+        # before the executor runs. Turn-window-local like the guard above, and
+        # seeded from the persisted trail below for the same two reasons — the D45
+        # per-round-trip rebuild would otherwise reset it on every `send_turn`, and a
+        # budget-window `continue` resume starts a fresh `_run_loop_body` window with an
+        # empty in-memory set, so a model that expanded the blueprint before the cap
+        # would be refused for work it had done. TURN-SCOPED (the walk below is
+        # turn-filtered); see the class docstring for why that cost is accepted.
+        blueprint_gate = BlueprintGate(self._observer)
+        # ONE read for the trail seed AND the live analysis state (05 §E): the
+        # session doc carries both, and `load_trail` is itself just a read of this
+        # same document, so this is that read — not an extra one.
+        session_doc = await self._session_store.get_or_create_session(session_id)
+        # FINALIZATION ENFORCEMENT reads from HERE (05 §E). The state changes
+        # mid-turn, so a once-per-window read would be wrong — but a store read at
+        # each terminal exit would cost a round-trip on EVERY turn, including the
+        # single-intent ones that never declare a state at all. So it is loaded
+        # once into this window-local and REFRESHED IN PLACE from each
+        # `updateAnalysisState` result below; 03 §E.2's partition guarantees state
+        # calls are dispatched first, so the local is current at both exits, and
+        # the fast path is an `is None` test on a local (`pending_intents`).
+        analysis_state = live_analysis_state(session_doc, turn_index)
+        # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3) and
+        # 08: this window's answer accumulators, `loop/turn_accumulators.py`. Same
+        # lifecycle as the memos above — fresh per window, never persisted, folded
+        # from each successful tool call below and read at every `TurnOutcome(...)`
+        # return site. Handed in ALREADY SEEDED by a resume (see the parameter), so
+        # the fallback here is the brand-new-turn case.
+        #
+        # CONSTRUCTED HERE, ABOVE THE GATES, because the answer-shape counter's seed
+        # is one of its reads: a resumed window that already has the user's table
+        # must not re-arm a gate whose whole job is to notice a missing one.
+        accum = accumulators if accumulators is not None else TurnAccumulators()
+        # --- ANSWER-SHAPE GATE state (05 §J), `loop/finalization.py` ---------
+        #
+        # How many SUCCESSFUL multi-row `runQuery`/`runBlueprint` calls this TURN has
+        # made, and whether any `answerWithTable` has put a table in front of the
+        # user. Both are TURN-scoped facts held in this window-scoped counter, so
+        # both are seeded — from the trail walk below for the reason the read guard
+        # is seeded (a budget-cap `continue`, an `askUser` resume and a mid-DAG
+        # blueprint resume each start a fresh `_run_loop_body` with an empty counter,
+        # and a gate that forgot the rows the model already has would go silent on
+        # exactly the long turns that produce several tables), and from
+        # the accumulators' seeded designations for the blueprint approval-resume
+        # path, whose designation was made before the pause.
+        #
+        # THE TRAIL WALK IS ALREADY TURN-FILTERED (`prior_entry.turn_index !=
+        # turn_index` skips below), which is also the cross-turn replay protection: a
+        # multi-row query from turn 3 cannot make turn 4's prose answer a defect, and
+        # the `claim_finalization_block` key is `(turn_index, window, kind)` too, so a stale
+        # refusal cannot be replayed onto a later turn.
+        answer_shape = AnswerShapeCounter(accum.has_answer_tables)
+        successful_text_evidence_tools: set[str] = set()
+        help_grounding = HelpGrounding()
+        # The finalization block allowance (05 §C.1/§C.2, §J.3), also
+        # `loop/finalization.py`: the per-round-trip refusal flag and the persisted
+        # per-window claim behind all four refusal sites below. Its three ids are
+        # constant for this whole window, so they are handed over once here rather
+        # than repeated at every call site.
+        finalization_gate = FinalizationGate(
+            self._session_store,
+            self._observer,
+            session_id=session_id,
+            turn_index=turn_index,
+            window_count=window_count,
+        )
+        for prior_entry in session_doc.tool_trail:
+            if prior_entry.turn_index != turn_index:
+                continue
+            if prior_entry.tool_name in HELP_TOOLS:
+                preview = prior_entry.result_preview
+                payload = (preview.preview_rows[0][0]
+                           if preview and preview.preview_rows and preview.preview_rows[0]
+                           else None)
+                help_grounding.observe(prior_entry.tool_name, prior_entry.status, payload)
+            if prior_entry.status != "ok":
+                continue
+            # Repeated-idempotent-read guard seed. Non-read entries are ignored
+            # inside `observe_prior_read` — "what counts as a read" is the guard's
+            # question, not this walk's. `data_free` marks the guard's OWN marker
+            # entry: it proves the signature was served, but the READ it deduped is
+            # where the result lives, so it must not become the pointer the
+            # readability test follows.
+            read_guard.observe_prior_read(
+                prior_entry.tool_name,
+                prior_entry.args,
+                prior_entry.tool_call_id,
+                data_free=prior_entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE,
             )
-            tool_calls_made = 0
-            last_assistant_text: str | None = None
-            # Turn-window-local retrieval memo (design §3.3): keyed by
-            # (question, scope_hash) inside `assemble`, it makes the pipeline embed/
-            # recall at most ONCE across every round-trip of this window despite the
-            # D45 per-round-trip context rebuild. Not persisted — pure in-turn memo.
-            retrieval_memo: dict[tuple[str, str], Any] = {}
-            capability_memo: dict[str, Any] = {}
-            # D94 Part 2: turn-window-local de-dup for the withheld-provenance
-            # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
-            # not persisted) so the event fires at most once per stranded call.
-            withheld_call_ids: set[str] = set()
-            # Repeated-idempotent-read guard (generalizes D94), `loop/read_guard.py`: it
-            # holds the already-served read signatures for THIS turn plus the pointers
-            # and exemption counts the trim-aware re-fetch escape needs. Turn-window-local
-            # like the memos above, BUT seeded from the persisted trail below so it
-            # survives both the D45 per-round-trip rebuild (its state would otherwise
-            # reset every `send_turn`) AND a budget-window `continue` resume (a fresh
-            # `_run_loop_body` window starts here with an empty guard). Seeding from every
-            # prior `ok` idempotent-read entry of this turn is what lets it recognize a
-            # repeat it did not itself serve in the current window.
-            read_guard = ReadGuard(self._observer)
-            # The blueprint-definition gate, `loop/blueprint_gate.py`: it holds every
-            # blueprint id this turn has already EXPANDED with a successful
-            # `getBlueprint`, and `runBlueprint` for an id that is NOT in it is refused
-            # before the executor runs. Turn-window-local like the guard above, and
-            # seeded from the persisted trail below for the same two reasons — the D45
-            # per-round-trip rebuild would otherwise reset it on every `send_turn`, and a
-            # budget-window `continue` resume starts a fresh `_run_loop_body` window with an
-            # empty in-memory set, so a model that expanded the blueprint before the cap
-            # would be refused for work it had done. TURN-SCOPED (the walk below is
-            # turn-filtered); see the class docstring for why that cost is accepted.
-            blueprint_gate = BlueprintGate(self._observer)
-            # ONE read for the trail seed AND the live analysis state (05 §E): the
-            # session doc carries both, and `load_trail` is itself just a read of this
-            # same document, so this is that read — not an extra one.
-            session_doc = await self._session_store.get_or_create_session(session_id)
-            # FINALIZATION ENFORCEMENT reads from HERE (05 §E). The state changes
-            # mid-turn, so a once-per-window read would be wrong — but a store read at
-            # each terminal exit would cost a round-trip on EVERY turn, including the
-            # single-intent ones that never declare a state at all. So it is loaded
-            # once into this window-local and REFRESHED IN PLACE from each
-            # `updateAnalysisState` result below; 03 §E.2's partition guarantees state
-            # calls are dispatched first, so the local is current at both exits, and
-            # the fast path is an `is None` test on a local (`pending_intents`).
-            analysis_state = live_analysis_state(session_doc, turn_index)
-            # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3) and
-            # 08: this window's answer accumulators, `loop/turn_accumulators.py`. Same
-            # lifecycle as the memos above — fresh per window, never persisted, folded
-            # from each successful tool call below and read at every `TurnOutcome(...)`
-            # return site. Handed in ALREADY SEEDED by a resume (see the parameter), so
-            # the fallback here is the brand-new-turn case.
-            #
-            # CONSTRUCTED HERE, ABOVE THE GATES, because the answer-shape counter's seed
-            # is one of its reads: a resumed window that already has the user's table
-            # must not re-arm a gate whose whole job is to notice a missing one.
-            accum = accumulators if accumulators is not None else TurnAccumulators()
-            # --- ANSWER-SHAPE GATE state (05 §J), `loop/finalization.py` ---------
-            #
-            # How many SUCCESSFUL multi-row `runQuery`/`runBlueprint` calls this TURN has
-            # made, and whether any `answerWithTable` has put a table in front of the
-            # user. Both are TURN-scoped facts held in this window-scoped counter, so
-            # both are seeded — from the trail walk below for the reason the read guard
-            # is seeded (a budget-cap `continue`, an `askUser` resume and a mid-DAG
-            # blueprint resume each start a fresh `_run_loop_body` with an empty counter,
-            # and a gate that forgot the rows the model already has would go silent on
-            # exactly the long turns that produce several tables), and from
-            # the accumulators' seeded designations for the blueprint approval-resume
-            # path, whose designation was made before the pause.
-            #
-            # THE TRAIL WALK IS ALREADY TURN-FILTERED (`prior_entry.turn_index !=
-            # turn_index` skips below), which is also the cross-turn replay protection: a
-            # multi-row query from turn 3 cannot make turn 4's prose answer a defect, and
-            # the `claim_finalization_block` key is `(turn_index, window, kind)` too, so a stale
-            # refusal cannot be replayed onto a later turn.
-            answer_shape = AnswerShapeCounter(accum.has_answer_tables)
-            successful_text_evidence_tools: set[str] = set()
-            # The finalization block allowance (05 §C.1/§C.2, §J.3), also
-            # `loop/finalization.py`: the per-round-trip refusal flag and the persisted
-            # per-window claim behind all four refusal sites below. Its three ids are
-            # constant for this whole window, so they are handed over once here rather
-            # than repeated at every call site.
-            finalization_gate = FinalizationGate(
-                self._session_store,
-                self._observer,
-                session_id=session_id,
-                turn_index=turn_index,
-                window_count=window_count,
+            # NOT an `elif`: `getBlueprint` is BOTH a guarded idempotent read and the
+            # thing the blueprint-definition gate is keyed on, so it seeds both.
+            if prior_entry.tool_name == "getBlueprint":
+                # `status == "ok"` is the whole predicate — no `found` check. The
+                # result body sits behind a D46 KV pointer, so reading it here would
+                # cost a store round-trip per entry, and a `{found: false}` expansion
+                # cannot make a `runBlueprint` succeed anyway (the executor re-fetches
+                # the definition and fails on its own merits). The gate's job is
+                # "did you look", not "did you find".
+                blueprint_gate.observe_prior_definition_read(prior_entry.args.get("id"))
+            # ANSWER-SHAPE GATE (05 §J), seeded from the same walk — BOTH of its
+            # facts, in one call. `status == "ok"` is guaranteed by the skip above,
+            # and is passed explicitly anyway so the multi-row predicate reads the
+            # same at both of its call sites. The `answerWithTable` half of that seed
+            # is deliberately ASYMMETRIC with the live site (name alone here,
+            # substance there); `AnswerShapeCounter.observe_prior_entry` carries the
+            # rationale, which is about what a persisted entry can cheaply be asked.
+            answer_shape.observe_prior_entry(
+                prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
             )
-            for prior_entry in session_doc.tool_trail:
-                if prior_entry.turn_index != turn_index or prior_entry.status != "ok":
+            if prior_entry.tool_name in _TEXT_ANSWER_EVIDENCE_TOOLS and (
+                prior_entry.tool_name != "getHelpCenterDocument" or help_grounding.document_fetched
+            ):
+                successful_text_evidence_tools.add(prior_entry.tool_name)
+        # Seed the guard with the emulated-discovery signatures swept above (outside
+        # the budget window) so a model re-call of listDatabases/listTables is served
+        # locally, not re-dispatched to the MCP — together with the pointers to the
+        # synthetic entries that serve them, or the trim-aware exemption would find no
+        # readable source and re-dispatch the very calls the sweep exists to avoid.
+        # Both empty when the feature is off/degraded.
+        read_guard.seed_emulation(emulation_read_signatures, emulated_served_call_ids)
+        # The finalization nudge (05 §B.2/§D), ephemeral and NEVER persisted. It
+        # lives EXACTLY ONE ROUND-TRIP: set when an exit-#1 finalization is
+        # refused, spliced into the next rebuild, and cleared immediately after
+        # that rebuild below.
+        finalization_nudge: str | None = (
+            "The user declined to answer the previous clarification. Do not ask that "
+            "question again. Use the safest reasonable interpretation and answer as far "
+            "as possible; if the request cannot be completed without it, end with a "
+            "concise, honest explanation of what is missing."
+            if declined_question
+            else None
+        )
+        declined_repeat_refused = False
+        blueprint_search_gate = BlueprintSearchGate(question, session_doc.tool_trail, turn_index)
+        empty_finishes = 0
+        ship_guard = JudgeShipGuard()
+        capability_advisory_used = False
+        navigation_refused = False
+        if self._answer_judge is not None and getattr(self._answer_judge, "enabled", True):
+            if any(
+                (session_doc.finalization_blocks or {}).get(
+                    f"{turn_index}:{window_count}:{kind}", 0
+                )
+                for kind in ("answer_judge", "help_center_grounding")
+            ):
+                ship_guard.arm_persisted_refusal()
+        # K2: the `tool_call_id`s whose next-round tool result must carry
+        # `_INTENT_TAG_DROPPED_NOTE`. Same ephemeral, never-persisted,
+        # EXACTLY-ONE-ROUND-TRIP lifetime as `finalization_nudge`: filled during
+        # this round's dispatch (the drop site below), read by the NEXT rebuild,
+        # and emptied immediately after that rebuild. The drop happens while the
+        # round's tool results do not exist yet, which is why the feedback is
+        # necessarily deferred one round rather than injected inline.
+        intent_note_call_ids: set[str] = set()
+        # K2, THE GATE ON THAT NOTE: has a SUBSTANTIVE tool run on this TURN? Once
+        # one has, `analysis_state.py` refuses a first declaration NON-RETRYABLY, so
+        # the note's "call updateAnalysisState before your next substantive call"
+        # becomes an instruction to earn a refusal — worse than the silence it
+        # replaces. The note is suppressed at the end of the dispatch batch below
+        # whenever this is true.
+        #
+        # TURN-SCOPED, NOT WINDOW-SCOPED, and therefore SEEDED — the lock it mirrors
+        # is a property of the persisted trail for this `turn_index`, and a budget-cap
+        # `continue`, an askUser resume and a blueprint resume each enter a fresh
+        # `_run_loop_body`. An unseeded window-local would read False in window 2 while
+        # window 1's runQuery had already closed the door, which is exactly the false
+        # advice this gate exists to prevent. `find_locking_tool` is the runtime's OWN
+        # predicate (so the two cannot drift), over the doc already loaded above — no
+        # extra store read. Note it does NOT filter on `status`: the walk below skips
+        # non-`ok` entries, but a FAILED runQuery locks late init just the same, which
+        # is why this is a separate call and not folded into that walk.
+        substantive_ran = find_locking_tool(session_doc.tool_trail, turn_index) is not None
+
+        while True:
+            request = await self._build_canonical_messages(
+                session_id,
+                credentials.column_scope,
+                turn_index,
+                question=question,
+                user_id=None,
+                retrieval_memo=retrieval_memo,
+                capability_memo=capability_memo,
+                withheld_call_ids=withheld_call_ids,
+                discovery_canonical=discovery_canonical,
+                finalization_nudge=finalization_nudge,
+                intent_note_call_ids=intent_note_call_ids,
+                user_jwt=credentials.jwt,
+            )
+            canonical_messages = request.messages
+            # ONE ROUND-TRIP ONLY (05 §D). `discovery_canonical` is computed once
+            # per window and re-spliced into every rebuild; copying THAT lifetime
+            # would repeat the nudge forever — including after the intents are
+            # closed — and, because it is ephemeral and sits at the tail, would
+            # migrate it to be the newest message on every rebuild, appearing
+            # after tool results it predates.
+            finalization_nudge = None
+            # K2, same one-round-trip rule: the note has now been rendered into the
+            # request the model is about to see. A REBIND, not `.clear()`, because
+            # the set was just handed to the builder.
+            intent_note_call_ids = set()
+            # Hand the guard every tool result the model can actually READ this
+            # round-trip — after `fit_request_to_budget` has had its say, and with
+            # data-free sentinels excluded (see `_CanonicalRequest`). That set is what
+            # the trim-aware re-fetch exemption asks whether an already-served read is
+            # still legible. `begin_round` also clears the guard's served-THIS-BATCH
+            # set; see its docstring for why that reset is load-bearing (a read
+            # dispatched moments ago cannot yet be in `readable_tool_call_ids`, and
+            # must not be mistaken for one the budget trimmed away).
+            read_guard.begin_round(request.readable_tool_call_ids)
+            # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
+            # terminal exit #2 below. Reset per iteration — a designation only ends
+            # the turn it was made in.
+            designated_answer_text: str | None = None
+            designated_text_answer: str | None = None
+            designated_text_has_evidence = False
+            capability_terminal_text: str | None = None
+            capability_finalization_refused = False
+            # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
+            # BATCH. Reset per iteration beside `designated_answer_text`, and for the
+            # same reason: it describes one response, not one turn.
+            #
+            # A model response can carry up to 8 tool calls, and a batch of two
+            # `answerWithTable`s is the shape 05 §C.2 built the per-round free-refusal
+            # path for. The judge cannot use that path — its cost-avoidance peek
+            # (`has_spent`) runs before `may_refuse` and turns the second call into a
+            # SKIP, which approves — so without this local the second call terminated
+            # the turn in the round the judge had just refused it.
+            judge_refusal_this_round: str | None = None
+            # Start the blueprint gate's response batch: it stages the ids expanded
+            # by a `getBlueprint` in THIS response and holds them apart from the
+            # committed set until the batch drains (`commit_round`, below the
+            # dispatch loop) — see that site for why a same-response
+            # `[getBlueprint(x), runBlueprint(x)]` pair must NOT pass the gate.
+            # Reset per iteration, beside `designated_answer_text`.
+            blueprint_gate.begin_round()
+            # The window's forced re-round is consumed PER ROUND-TRIP, not per
+            # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
+            # batch is refused twice and advances the persisted counter once. Reset
+            # here, beside `designated_answer_text`, for the same reason.
+            finalization_gate.begin_round()
+            self._observer("loop_model_call_start", {"window": window_count})
+            result = await model_client.send_turn(canonical_messages, tools)
+            last_assistant_text = result.assistant_text
+
+            # --- FINALIZATION ENFORCEMENT, terminal exit #1 (05 §B.2) ---------
+            #
+            # The model produced prose, not a tool call, so this turn is about to
+            # end `done` — and there is NO ERROR CHANNEL here: nothing to attach a
+            # denial to, because nothing was called. A synthetic tool message
+            # cannot stand alone either (`_assembled_to_canonical` only ever emits
+            # a `tool` message by expanding a trail entry into an
+            # `assistant(tool_calls) + tool` PAIR), and fabricating such a pair —
+            # which discovery emulation legitimately does — would mean naming a
+            # function the model can see in its tools list, re-splicing/deduping/
+            # pinning it on every rebuild, and routing its text through
+            # `classify_denial` anyway, all for something that should live one
+            # round-trip. So the refusal is an EPHEMERAL `user`-role injection.
+            #
+            # NOTHING IS PERSISTED on this path: not the refused answer, not the
+            # nudge. Both are within-turn control flow, and a persisted nudge would
+            # appear in `/session/history` as something the user said.
+            empty_finishes = (
+                empty_finishes + 1
+                if not result.tool_calls and not (result.assistant_text or "").strip()
+                else 0
+            )
+            if empty_finishes >= 2:
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    status="done",
+                    ship_guard=ship_guard,
+                    exit_label="runtime_fallback",
+                    assistant_text=EMPTY_ANSWER_FALLBACK_TEXT,
+                    tool_calls_made=tool_calls_made,
+                    accum=accum,
+                    provenance=frozenset(),
+                    persist_text=EMPTY_ANSWER_FALLBACK_TEXT,
+                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                )
+            if not result.tool_calls:
+                finalization_nudge = (
+                    "A normal assistant message cannot finish this turn. Put the complete "
+                    "answer in answerWithText, or use answerWithTable when rows must be "
+                    "shown. If the answer is grounded, list the exact successful supporting "
+                    "tool names in answerWithText.evidence."
+                )
+                last_assistant_text = None
+            # No dispatch occurs for an invalid plain response. It still reaches the
+            # budget accounting below, so repeated violations are bounded.
+
+            # --- analysisState: PARTITION BEFORE CAPPING (03 §E.2) ------------
+            #
+            # `capped_tool_calls = result.tool_calls[:max_tool_calls_per_iteration]`
+            # below SILENTLY DISCARDS the overflow — no error, no trail entry, no
+            # signal to the model. Partitioning the already-capped list would
+            # therefore lose a state call that follows eight substantive ones,
+            # BEFORE any reordering could help, and the turn would run unprotected
+            # with nothing to show for it. So the partition runs on the RAW list
+            # and only the substantive remainder is capped.
+            #
+            # State calls are EXEMPT from `max_tool_calls_per_iteration` but
+            # BOUNDED at `MAX_STATE_CALLS`: unbounded, N state calls in one
+            # response are N full session-doc CAS read-modify-writes and N trail
+            # entries inside `fit_request_to_budget`'s pinned region, with
+            # `guard.exceeded` checked only AFTER each one. Batching is already
+            # mandatory, so the surplus is the model misbehaving and is rejected
+            # (with a trail entry, so it learns) inside the dispatch loop.
+            #
+            # THE EXEMPTION IS BOUNDED ON THE LIST ITSELF, not only on how many are
+            # DISPATCHED. `MAX_STATE_CALLS` caps the state WRITES at two, but every
+            # surplus call still costs a `append_trail_entry` — a full CAS
+            # read-modify-write each, plus an entry pinned in the current-turn budget
+            # region — so a degenerate response with 20 state calls was 18 store
+            # writes in one round-trip, while over-cap `other_calls` are simply
+            # dropped. The first `_MAX_SURPLUS_STATE_REJECTIONS` surplus calls are
+            # still rejected WITH an entry (the model must learn why); the rest are
+            # dropped exactly as over-cap `other_calls` are — no trail entry, no
+            # response for that call id.
+            #
+            # Dispatching them FIRST reinstates the intent of the original
+            # "commit state, then dispatch" barrier in sequential form. That
+            # barrier was dropped along with bounded concurrency, but the
+            # ORDERING guarantee it carried was never the concurrency part.
+            state_calls = [
+                tc for tc in result.tool_calls if tc.name == UPDATE_ANALYSIS_STATE_TOOL_NAME
+            ][: MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS]
+            other_calls = [
+                tc for tc in result.tool_calls if tc.name != UPDATE_ANALYSIS_STATE_TOOL_NAME
+            ][: self._max_tool_calls_per_iteration]
+
+            # SCANNED OVER THE RAW LIST, for the same reason the state partition is
+            # (03 §E.2): `other_calls` is TRUNCATED to
+            # `max_tool_calls_per_iteration`, and capping silently discards the
+            # overflow. Selecting the pause from the capped list meant a batch like
+            # `[runQuery, runQuery, askUser]` at cap 2 dispatched both queries and
+            # NEVER ASKED THE USER — the model's clarifying question swallowed by the
+            # runtime, the turn finishing `done` on a question it should have paused
+            # on. Pre-Release-1 this scan ran over `result.tool_calls`; narrowing it
+            # was an unintended consequence of introducing the partition.
+            #
+            # Selecting it here changes nothing about ORDER: `capped_tool_calls`
+            # below still holds only the state calls when a pause is present, so
+            # state is committed first and the pause is honoured after the loop
+            # (03 §E.1) — an `askUser` past the cap now pauses exactly as one before
+            # the cap always did.
+            ask_user_call = next((tc for tc in result.tool_calls if tc.name == "askUser"), None)
+
+            # S3: never dispatch an unbounded number of tool calls from one
+            # model response — cap per iteration (RuntimeSettings-configurable,
+            # default 8), applied to `other_calls` above. Any calls beyond the cap
+            # are simply not dispatched this round (best-partial); nothing is
+            # persisted for them, so they leave no trail entry and are not
+            # "silently denied" — the model just does not see a response for them
+            # and may re-request on the next round-trip if it still wants them.
+            #
+            # E.1: when the response ALSO pauses, only the STATE calls are
+            # dispatched and the pause is honoured below — commit the state, then
+            # pause. `askUser` short-circuits the whole response, so a batch of
+            # `updateAnalysisState` + `askUser` (the natural round-1 shape for
+            # "three asks, one ambiguous") used to discard the state write
+            # entirely: no trail entry, no tool result, and D22 discards the
+            # surrounding free text, so after the resume the model had no record
+            # it ever tried, and "clarification cannot broaden the protected set"
+            # would bite on a set that was never created. Everything OTHER than
+            # the state calls still waits for the resume, exactly as before.
+            capped_tool_calls = (
+                list(state_calls) if ask_user_call is not None else [*state_calls, *other_calls]
+            )
+            state_calls_dispatched = 0
+            blueprint_search_gate.observe_batch(capped_tool_calls)
+            for tool_call in capped_tool_calls:
+                # K2 gate: this call, if it is one of the four, closes the late-init
+                # door for the rest of the turn. Recorded on the NAME and BEFORE
+                # dispatch, deliberately: `find_locking_tool` keys on the persisted
+                # entry's `tool_name` regardless of status, so a denial, an error and
+                # a guard-served repeat all lock it just as a success does. Erring
+                # toward suppression costs at most one note; erring the other way
+                # costs the model a non-retryable refusal it was told to walk into.
+                if tool_call.name in SUBSTANTIVE_TOOLS:
+                    substantive_ran = True
+                # --- CALL-TIME INTENT TAGGING: split the tag off FIRST ---------
+                #
+                # `serves_intent` is a runtime concept the model puts on a
+                # `runQuery`/`runBlueprint`/`getTableSchema` to say which tracked
+                # intent the call is for. It must come off the arguments BEFORE
+                # anything else looks at them, and this is the only place it is
+                # removed:
+                #
+                #   - the live MCP server rejects an argument its own schema does
+                #     not declare, and `runBlueprint`'s executor validates its
+                #     arguments too — so an un-stripped tag breaks the real call;
+                #   - the repeated-read guard computes the signature inside
+                #     `ReadGuard.classify` from the args handed to it below, and
+                #     two identical `getTableSchema` fetches tagged for different
+                #     intents must still dedup to one signature;
+                #   - `TrailEntry.args` is what replay re-renders, and the tag has
+                #     its own persisted field there.
+                #
+                # `analysis_state` is the CURRENT window-local, and 03 §E.2 puts
+                # every state call first in this same batch — so a model that
+                # declares its intents and tags its work in ONE message still has
+                # its tags validated against a state that exists by the time the
+                # tagged calls are reached. An unknown/stale tag is DROPPED, not
+                # refused: the work runs, the entry is untagged, and the drop is
+                # reported (never the offending value — D25: an invalid tag is
+                # arbitrary model text, unlike a valid one).
+                intent_handler = self._runtime_tools.get(tool_call.name)
+                call_args, serves_intent, tag_drop_reason = split_serves_intent(
+                    tool_call.name,
+                    tool_call.arguments,
+                    analysis_state,
+                    additional_taggable=bool(
+                        intent_handler is not None
+                        and getattr(intent_handler, "intent_taggable", False)
+                    ),
+                )
+                if tag_drop_reason is not None:
+                    self._observer(
+                        "loop_intent_tag_dropped",
+                        {"tool_name": tool_call.name, "reason": tag_drop_reason},
+                    )
+                    # K2: select this call to carry the corrective note on the
+                    # NEXT rebuild. `no_live_state` ONLY — the other two reasons
+                    # (`unknown_intent_id`, `not_a_string`) mean a state DOES
+                    # exist and the tag was merely wrong, for which "declare your
+                    # intents" is false advice. At most ONE per round: the set is
+                    # emptied after each rebuild, so an empty set here means no
+                    # call in THIS batch has claimed the note yet — a
+                    # `[getTableSchema, getTableSchema]` batch tagged against no
+                    # state says it once, not once per call.
+                    if tag_drop_reason == "no_live_state" and not intent_note_call_ids:
+                        intent_note_call_ids.add(tool_call.id)
+
+                # Repeated-idempotent-read guard (generalizes D94): the model
+                # re-issued an identical, already-served idempotent read (e.g.
+                # `getTableSchema(employee)` for the Nth time). Its result is
+                # DETERMINED provenance so the D94 ok+None sentinel never fires —
+                # yet re-fetching it is pure waste that can spin to the budget
+                # ceiling. Do NOT re-dispatch to the MCP; instead persist a
+                # data-free guard TrailEntry (ok+None, marked
+                # IDEMPOTENT_READ_ALREADY_SERVED_CODE) that `context/assembly.py`
+                # renders — via the SAME withheld-sentinel path D94 uses — as a
+                # "you already have this, proceed" nudge filling this repeat call's
+                # dangling tool-slot (keeping the OpenAI one-tool_call→one-result
+                # pairing valid). It is counted in `tool_calls_made` for reporting
+                # only; termination is bounded regardless because every round-trip
+                # still records an iteration against the budget window
+                # (`guard.record_iteration` below), so the worst case remains
+                # windows × iterations. The real served read stays in history under
+                # its own tool_call_id.
+                #
+                # AFTER the tag split, never before: two identical `getTableSchema`
+                # fetches tagged for different intents must dedup to ONE signature,
+                # so the guard is handed `call_args` (tag-stripped), not
+                # `tool_call.arguments`.
+                #
+                # `classify` also applies the TRIM-AWARE RE-FETCH EXEMPTION — a repeat
+                # whose serving result is no longer readable is re-dispatched for real,
+                # bounded per signature per window — and emits that decision's own
+                # events. See `ReadGuard.classify` for why the exemption exists and why
+                # it is bounded; `read_decision.declined` is the whole answer here.
+                read_decision = read_guard.classify(tool_call.name, call_args)
+                if read_decision.declined:
+                    # A guarded `getBlueprint` STILL SATISFIES the blueprint-definition
+                    # gate. Being deduped means the definition is already in the
+                    # model's context (the guard's trim-aware exemption is what makes
+                    # that true), which is exactly what the gate asks. Without this a
+                    # deadlock is reachable:
+                    # expand, run refused for an unrelated reason (a missing
+                    # slot), re-expand defensively, get a data-free marker, and never
+                    # satisfy the gate again.
+                    #
+                    # NOTE this is the OPPOSITE of 04 condition 5, which REJECTS the
+                    # same marker as completion evidence. The two gates ask different
+                    # questions — "does the model have the definition?" versus "did
+                    # work actually happen?" — and a dedup answers yes to the first
+                    # and no to the second.
+                    if tool_call.name == "getBlueprint":
+                        blueprint_gate.note_definition_in_context(call_args.get("id"))
+                    tool_calls_made += 1
+                    guard_entry = TrailEntry(
+                        turn_index=turn_index,
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        args=dict(call_args),
+                        status="ok",
+                        error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+                        # `None` (undetermined) is deliberate: it routes this
+                        # data-free entry through the D94 stranded-sentinel path.
+                        # `_compute_turn_provenance_union` excludes it by marker so
+                        # it never poisons the turn's replay provenance.
+                        provenance=None,
+                        result_preview=None,
+                        result_full_ref=None,
+                        ts=_now_iso(),
+                        # Recorded even though this entry can NEVER be valid
+                        # evidence (04 condition 5 rejects the guard marker): the
+                        # tag is what the model actually sent, and `resolve_tagged_
+                        # evidence` needs to SEE it to refuse it with the actionable
+                        # "cite the call that actually served this result" message
+                        # rather than the misleading "nothing is tagged for it".
+                        serves_intent=serves_intent,
+                    )
+                    await self._session_store.append_trail_entry(session_id, guard_entry)
+                    self._observer(
+                        "loop_repeated_idempotent_read_guarded",
+                        repeated_read_guard_event(tool_call.name, tool_call.id, call_args),
+                    )
+                    if guard.exceeded:
+                        break
                     continue
-                # Repeated-idempotent-read guard seed. Non-read entries are ignored
-                # inside `observe_prior_read` — "what counts as a read" is the guard's
-                # question, not this walk's. `data_free` marks the guard's OWN marker
-                # entry: it proves the signature was served, but the READ it deduped is
-                # where the result lives, so it must not become the pointer the
-                # readability test follows.
-                read_guard.observe_prior_read(
-                    prior_entry.tool_name,
-                    prior_entry.args,
-                    prior_entry.tool_call_id,
-                    data_free=prior_entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE,
-                )
-                # NOT an `elif`: `getBlueprint` is BOTH a guarded idempotent read and the
-                # thing the blueprint-definition gate is keyed on, so it seeds both.
-                if prior_entry.tool_name == "getBlueprint":
-                    # `status == "ok"` is the whole predicate — no `found` check. The
-                    # result body sits behind a D46 KV pointer, so reading it here would
-                    # cost a store round-trip per entry, and a `{found: false}` expansion
-                    # cannot make a `runBlueprint` succeed anyway (the executor re-fetches
-                    # the definition and fails on its own merits). The gate's job is
-                    # "did you look", not "did you find".
-                    blueprint_gate.observe_prior_definition_read(prior_entry.args.get("id"))
-                # ANSWER-SHAPE GATE (05 §J), seeded from the same walk — BOTH of its
-                # facts, in one call. `status == "ok"` is guaranteed by the skip above,
-                # and is passed explicitly anyway so the multi-row predicate reads the
-                # same at both of its call sites. The `answerWithTable` half of that seed
-                # is deliberately ASYMMETRIC with the live site (name alone here,
-                # substance there); `AnswerShapeCounter.observe_prior_entry` carries the
-                # rationale, which is about what a persisted entry can cheaply be asked.
-                answer_shape.observe_prior_entry(
-                    prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
-                )
-                if prior_entry.tool_name in _TEXT_ANSWER_EVIDENCE_TOOLS:
-                    successful_text_evidence_tools.add(prior_entry.tool_name)
-            # Seed the guard with the emulated-discovery signatures swept above (outside
-            # the budget window) so a model re-call of listDatabases/listTables is served
-            # locally, not re-dispatched to the MCP — together with the pointers to the
-            # synthetic entries that serve them, or the trim-aware exemption would find no
-            # readable source and re-dispatch the very calls the sweep exists to avoid.
-            # Both empty when the feature is off/degraded.
-            read_guard.seed_emulation(emulation_read_signatures, emulated_served_call_ids)
-            # The finalization nudge (05 §B.2/§D), ephemeral and NEVER persisted. It
-            # lives EXACTLY ONE ROUND-TRIP: set when an exit-#1 finalization is
-            # refused, spliced into the next rebuild, and cleared immediately after
-            # that rebuild below.
-            finalization_nudge: str | None = (
-                "The user declined to answer the previous clarification. Do not ask that "
-                "question again. Use the safest reasonable interpretation and answer as far "
-                "as possible; if the request cannot be completed without it, end with a "
-                "concise, honest explanation of what is missing."
-                if declined_question
-                else None
-            )
-            declined_repeat_refused = False
-            # K2: the `tool_call_id`s whose next-round tool result must carry
-            # `_INTENT_TAG_DROPPED_NOTE`. Same ephemeral, never-persisted,
-            # EXACTLY-ONE-ROUND-TRIP lifetime as `finalization_nudge`: filled during
-            # this round's dispatch (the drop site below), read by the NEXT rebuild,
-            # and emptied immediately after that rebuild. The drop happens while the
-            # round's tool results do not exist yet, which is why the feedback is
-            # necessarily deferred one round rather than injected inline.
-            intent_note_call_ids: set[str] = set()
-            # K2, THE GATE ON THAT NOTE: has a SUBSTANTIVE tool run on this TURN? Once
-            # one has, `analysis_state.py` refuses a first declaration NON-RETRYABLY, so
-            # the note's "call updateAnalysisState before your next substantive call"
-            # becomes an instruction to earn a refusal — worse than the silence it
-            # replaces. The note is suppressed at the end of the dispatch batch below
-            # whenever this is true.
-            #
-            # TURN-SCOPED, NOT WINDOW-SCOPED, and therefore SEEDED — the lock it mirrors
-            # is a property of the persisted trail for this `turn_index`, and a budget-cap
-            # `continue`, an askUser resume and a blueprint resume each enter a fresh
-            # `_run_loop_body`. An unseeded window-local would read False in window 2 while
-            # window 1's runQuery had already closed the door, which is exactly the false
-            # advice this gate exists to prevent. `find_locking_tool` is the runtime's OWN
-            # predicate (so the two cannot drift), over the doc already loaded above — no
-            # extra store read. Note it does NOT filter on `status`: the walk below skips
-            # non-`ok` entries, but a FAILED runQuery locks late init just the same, which
-            # is why this is a separate call and not folded into that walk.
-            substantive_ran = find_locking_tool(session_doc.tool_trail, turn_index) is not None
 
-            while True:
-                request = await self._build_canonical_messages(
-                    session_id,
-                    credentials.column_scope,
-                    turn_index,
-                    question=question,
-                    user_id=None,
-                    retrieval_memo=retrieval_memo,
-                    capability_memo=capability_memo,
-                    withheld_call_ids=withheld_call_ids,
-                    discovery_canonical=discovery_canonical,
-                    finalization_nudge=finalization_nudge,
-                    intent_note_call_ids=intent_note_call_ids,
-                )
-                canonical_messages = request.messages
-                # ONE ROUND-TRIP ONLY (05 §D). `discovery_canonical` is computed once
-                # per window and re-spliced into every rebuild; copying THAT lifetime
-                # would repeat the nudge forever — including after the intents are
-                # closed — and, because it is ephemeral and sits at the tail, would
-                # migrate it to be the newest message on every rebuild, appearing
-                # after tool results it predates.
-                finalization_nudge = None
-                # K2, same one-round-trip rule: the note has now been rendered into the
-                # request the model is about to see. A REBIND, not `.clear()`, because
-                # the set was just handed to the builder.
-                intent_note_call_ids = set()
-                # Hand the guard every tool result the model can actually READ this
-                # round-trip — after `fit_request_to_budget` has had its say, and with
-                # data-free sentinels excluded (see `_CanonicalRequest`). That set is what
-                # the trim-aware re-fetch exemption asks whether an already-served read is
-                # still legible. `begin_round` also clears the guard's served-THIS-BATCH
-                # set; see its docstring for why that reset is load-bearing (a read
-                # dispatched moments ago cannot yet be in `readable_tool_call_ids`, and
-                # must not be mistaken for one the budget trimmed away).
-                read_guard.begin_round(request.readable_tool_call_ids)
-                # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
-                # terminal exit #2 below. Reset per iteration — a designation only ends
-                # the turn it was made in.
-                designated_answer_text: str | None = None
-                designated_text_answer: str | None = None
-                designated_text_has_evidence = False
-                capability_terminal_text: str | None = None
-                capability_finalization_refused = False
-                # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
-                # BATCH. Reset per iteration beside `designated_answer_text`, and for the
-                # same reason: it describes one response, not one turn.
+                # --- BLUEPRINT-DEFINITION GATE ---------------------------------
                 #
-                # A model response can carry up to 8 tool calls, and a batch of two
-                # `answerWithTable`s is the shape 05 §C.2 built the per-round free-refusal
-                # path for. The judge cannot use that path — its cost-avoidance peek
-                # (`has_spent`) runs before `may_refuse` and turns the second call into a
-                # SKIP, which approves — so without this local the second call terminated
-                # the turn in the round the judge had just refused it.
-                judge_refusal_this_round: str | None = None
-                # Start the blueprint gate's response batch: it stages the ids expanded
-                # by a `getBlueprint` in THIS response and holds them apart from the
-                # committed set until the batch drains (`commit_round`, below the
-                # dispatch loop) — see that site for why a same-response
-                # `[getBlueprint(x), runBlueprint(x)]` pair must NOT pass the gate.
-                # Reset per iteration, beside `designated_answer_text`.
-                blueprint_gate.begin_round()
-                # The window's forced re-round is consumed PER ROUND-TRIP, not per
-                # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
-                # batch is refused twice and advances the persisted counter once. Reset
-                # here, beside `designated_answer_text`, for the same reason.
-                finalization_gate.begin_round()
-                self._observer("loop_model_call_start", {"window": window_count})
-                result = await model_client.send_turn(canonical_messages, tools)
-                last_assistant_text = result.assistant_text
-
-                # --- FINALIZATION ENFORCEMENT, terminal exit #1 (05 §B.2) ---------
+                # `runBlueprint` is refused unless this turn already holds a
+                # SUCCESSFUL `getBlueprint` for the same id. A card carries no SQL,
+                # so without this the model routes on an authored prose `intent`
+                # string and can run — and confidently report — an analysis that
+                # measures something else entirely. See `loop/blueprint_gate.py` for
+                # the full rationale; the decision and its event are ITS, and only
+                # the effects below are the loop's.
                 #
-                # The model produced prose, not a tool call, so this turn is about to
-                # end `done` — and there is NO ERROR CHANNEL here: nothing to attach a
-                # denial to, because nothing was called. A synthetic tool message
-                # cannot stand alone either (`_assembled_to_canonical` only ever emits
-                # a `tool` message by expanding a trail entry into an
-                # `assistant(tool_calls) + tool` PAIR), and fabricating such a pair —
-                # which discovery emulation legitimately does — would mean naming a
-                # function the model can see in its tools list, re-splicing/deduping/
-                # pinning it on every rebuild, and routing its text through
-                # `classify_denial` anyway, all for something that should live one
-                # round-trip. So the refusal is an EPHEMERAL `user`-role injection.
+                # DECIDED HERE, BEFORE `_maybe_start_summary` AND BEFORE DISPATCH, so
+                # the executor never runs, no inner `runQuery` is issued, and the
+                # only trail entry written for this call is the refusal itself.
                 #
-                # NOTHING IS PERSISTED on this path: not the refused answer, not the
-                # nudge. Both are within-turn control flow, and a persisted nudge would
-                # appear in `/session/history` as something the user said.
-                if not result.tool_calls:
-                    finalization_nudge = (
-                        "A normal assistant message cannot finish this turn. Put the complete "
-                        "answer in answerWithText, or use answerWithTable when rows must be "
-                        "shown. If the answer is grounded, list the exact successful supporting "
-                        "tool names in answerWithText.evidence."
+                # A DEDUP-GUARDED `getBlueprint` SATISFIES THE GATE (see the guard
+                # branch above, which folds a guarded repeat's id in): being deduped
+                # means the definition is already in the model's context, which is
+                # exactly what the gate asks. That is the OPPOSITE of 04 condition 5,
+                # which REJECTS the same marker as completion evidence — the two
+                # gates ask different questions ("does the model have the
+                # definition?" versus "did work actually happen?").
+                #
+                # THE RESUME PATH DOES NOT PASS THROUGH HERE. A mid-DAG checkpoint
+                # resume re-enters `self._blueprint_executor.resume(...)` directly from
+                # `_resume_blueprint` and appends its own `runBlueprint` trail entry;
+                # it never reaches this dispatch site, so a resumed blueprint is
+                # structurally ungated rather than exempted by a branch. A resume is
+                # the continuation of an already-gated invocation, not a fresh decision
+                # to run a blueprint, so that is the correct outcome — and
+                # `tests/runtime/loop/test_blueprint_definition_gate.py` pins it, so a
+                # refactor that routes resumes through dispatch cannot silently start
+                # gating them.
+                #
+                # NOT APPLIED TO AN UNWIRED `runBlueprint` (`handler is None`): there is
+                # no blueprint stack at all, so "expand it first" would send the model
+                # after a tool that cannot help it, replacing the honest
+                # `RUN_BLUEPRINT_UNAVAILABLE` → raw-loop fallback (§6) with a loop.
+                handler = self._runtime_tools.get(tool_call.name)
+                gate_refusal: ToolResult | None = None
+                if tool_call.name not in advertised_names(
+                    tools,
+                    self._runtime_tools,
+                    {"askUser", UPDATE_ANALYSIS_STATE_TOOL_NAME, *_RUNTIME_TOOL_UNAVAILABLE_CODE},
+                ):
+                    gate_refusal = refusal(tool_call.name, UNKNOWN_TOOL_CODE)
+                    self._observer(
+                        "loop_unknown_tool_rejected",
+                        {
+                            "tool_name": sanitize_text(tool_call.name, 64),
+                            "tool_call_id": tool_call.id,
+                            "reason": "name_not_in_advertised_catalog",
+                        },
                     )
-                    last_assistant_text = None
-                # No dispatch occurs for an invalid plain response. It still reaches the
-                # budget accounting below, so repeated violations are bounded.
-
-                # --- analysisState: PARTITION BEFORE CAPPING (03 §E.2) ------------
-                #
-                # `capped_tool_calls = result.tool_calls[:max_tool_calls_per_iteration]`
-                # below SILENTLY DISCARDS the overflow — no error, no trail entry, no
-                # signal to the model. Partitioning the already-capped list would
-                # therefore lose a state call that follows eight substantive ones,
-                # BEFORE any reordering could help, and the turn would run unprotected
-                # with nothing to show for it. So the partition runs on the RAW list
-                # and only the substantive remainder is capped.
-                #
-                # State calls are EXEMPT from `max_tool_calls_per_iteration` but
-                # BOUNDED at `MAX_STATE_CALLS`: unbounded, N state calls in one
-                # response are N full session-doc CAS read-modify-writes and N trail
-                # entries inside `fit_request_to_budget`'s pinned region, with
-                # `guard.exceeded` checked only AFTER each one. Batching is already
-                # mandatory, so the surplus is the model misbehaving and is rejected
-                # (with a trail entry, so it learns) inside the dispatch loop.
-                #
-                # THE EXEMPTION IS BOUNDED ON THE LIST ITSELF, not only on how many are
-                # DISPATCHED. `MAX_STATE_CALLS` caps the state WRITES at two, but every
-                # surplus call still costs a `append_trail_entry` — a full CAS
-                # read-modify-write each, plus an entry pinned in the current-turn budget
-                # region — so a degenerate response with 20 state calls was 18 store
-                # writes in one round-trip, while over-cap `other_calls` are simply
-                # dropped. The first `_MAX_SURPLUS_STATE_REJECTIONS` surplus calls are
-                # still rejected WITH an entry (the model must learn why); the rest are
-                # dropped exactly as over-cap `other_calls` are — no trail entry, no
-                # response for that call id.
-                #
-                # Dispatching them FIRST reinstates the intent of the original
-                # "commit state, then dispatch" barrier in sequential form. That
-                # barrier was dropped along with bounded concurrency, but the
-                # ORDERING guarantee it carried was never the concurrency part.
-                state_calls = [
-                    tc for tc in result.tool_calls if tc.name == UPDATE_ANALYSIS_STATE_TOOL_NAME
-                ][: MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS]
-                other_calls = [
-                    tc for tc in result.tool_calls if tc.name != UPDATE_ANALYSIS_STATE_TOOL_NAME
-                ][: self._max_tool_calls_per_iteration]
-
-                # SCANNED OVER THE RAW LIST, for the same reason the state partition is
-                # (03 §E.2): `other_calls` is TRUNCATED to
-                # `max_tool_calls_per_iteration`, and capping silently discards the
-                # overflow. Selecting the pause from the capped list meant a batch like
-                # `[runQuery, runQuery, askUser]` at cap 2 dispatched both queries and
-                # NEVER ASKED THE USER — the model's clarifying question swallowed by the
-                # runtime, the turn finishing `done` on a question it should have paused
-                # on. Pre-Release-1 this scan ran over `result.tool_calls`; narrowing it
-                # was an unintended consequence of introducing the partition.
-                #
-                # Selecting it here changes nothing about ORDER: `capped_tool_calls`
-                # below still holds only the state calls when a pause is present, so
-                # state is committed first and the pause is honoured after the loop
-                # (03 §E.1) — an `askUser` past the cap now pauses exactly as one before
-                # the cap always did.
-                ask_user_call = next(
-                    (tc for tc in result.tool_calls if tc.name == "askUser"), None
-                )
-
-                # S3: never dispatch an unbounded number of tool calls from one
-                # model response — cap per iteration (RuntimeSettings-configurable,
-                # default 8), applied to `other_calls` above. Any calls beyond the cap
-                # are simply not dispatched this round (best-partial); nothing is
-                # persisted for them, so they leave no trail entry and are not
-                # "silently denied" — the model just does not see a response for them
-                # and may re-request on the next round-trip if it still wants them.
-                #
-                # E.1: when the response ALSO pauses, only the STATE calls are
-                # dispatched and the pause is honoured below — commit the state, then
-                # pause. `askUser` short-circuits the whole response, so a batch of
-                # `updateAnalysisState` + `askUser` (the natural round-1 shape for
-                # "three asks, one ambiguous") used to discard the state write
-                # entirely: no trail entry, no tool result, and D22 discards the
-                # surrounding free text, so after the resume the model had no record
-                # it ever tried, and "clarification cannot broaden the protected set"
-                # would bite on a set that was never created. Everything OTHER than
-                # the state calls still waits for the resume, exactly as before.
-                capped_tool_calls = (
-                    list(state_calls)
-                    if ask_user_call is not None
-                    else [*state_calls, *other_calls]
-                )
-                state_calls_dispatched = 0
-                for tool_call in capped_tool_calls:
-                    # K2 gate: this call, if it is one of the four, closes the late-init
-                    # door for the rest of the turn. Recorded on the NAME and BEFORE
-                    # dispatch, deliberately: `find_locking_tool` keys on the persisted
-                    # entry's `tool_name` regardless of status, so a denial, an error and
-                    # a guard-served repeat all lock it just as a success does. Erring
-                    # toward suppression costs at most one note; erring the other way
-                    # costs the model a non-retryable refusal it was told to walk into.
-                    if tool_call.name in SUBSTANTIVE_TOOLS:
-                        substantive_ran = True
-                    # --- CALL-TIME INTENT TAGGING: split the tag off FIRST ---------
-                    #
-                    # `serves_intent` is a runtime concept the model puts on a
-                    # `runQuery`/`runBlueprint`/`getTableSchema` to say which tracked
-                    # intent the call is for. It must come off the arguments BEFORE
-                    # anything else looks at them, and this is the only place it is
-                    # removed:
-                    #
-                    #   - the live MCP server rejects an argument its own schema does
-                    #     not declare, and `runBlueprint`'s executor validates its
-                    #     arguments too — so an un-stripped tag breaks the real call;
-                    #   - the repeated-read guard computes the signature inside
-                    #     `ReadGuard.classify` from the args handed to it below, and
-                    #     two identical `getTableSchema` fetches tagged for different
-                    #     intents must still dedup to one signature;
-                    #   - `TrailEntry.args` is what replay re-renders, and the tag has
-                    #     its own persisted field there.
-                    #
-                    # `analysis_state` is the CURRENT window-local, and 03 §E.2 puts
-                    # every state call first in this same batch — so a model that
-                    # declares its intents and tags its work in ONE message still has
-                    # its tags validated against a state that exists by the time the
-                    # tagged calls are reached. An unknown/stale tag is DROPPED, not
-                    # refused: the work runs, the entry is untagged, and the drop is
-                    # reported (never the offending value — D25: an invalid tag is
-                    # arbitrary model text, unlike a valid one).
-                    intent_handler = self._runtime_tools.get(tool_call.name)
-                    call_args, serves_intent, tag_drop_reason = split_serves_intent(
-                        tool_call.name,
-                        tool_call.arguments,
-                        analysis_state,
-                        additional_taggable=bool(
-                            intent_handler is not None
-                            and getattr(intent_handler, "intent_taggable", False)
-                        ),
-                    )
-                    if tag_drop_reason is not None:
-                        self._observer(
-                            "loop_intent_tag_dropped",
-                            {"tool_name": tool_call.name, "reason": tag_drop_reason},
-                        )
-                        # K2: select this call to carry the corrective note on the
-                        # NEXT rebuild. `no_live_state` ONLY — the other two reasons
-                        # (`unknown_intent_id`, `not_a_string`) mean a state DOES
-                        # exist and the tag was merely wrong, for which "declare your
-                        # intents" is false advice. At most ONE per round: the set is
-                        # emptied after each rebuild, so an empty set here means no
-                        # call in THIS batch has claimed the note yet — a
-                        # `[getTableSchema, getTableSchema]` batch tagged against no
-                        # state says it once, not once per call.
-                        if tag_drop_reason == "no_live_state" and not intent_note_call_ids:
-                            intent_note_call_ids.add(tool_call.id)
-
-                    # Repeated-idempotent-read guard (generalizes D94): the model
-                    # re-issued an identical, already-served idempotent read (e.g.
-                    # `getTableSchema(employee)` for the Nth time). Its result is
-                    # DETERMINED provenance so the D94 ok+None sentinel never fires —
-                    # yet re-fetching it is pure waste that can spin to the budget
-                    # ceiling. Do NOT re-dispatch to the MCP; instead persist a
-                    # data-free guard TrailEntry (ok+None, marked
-                    # IDEMPOTENT_READ_ALREADY_SERVED_CODE) that `context/assembly.py`
-                    # renders — via the SAME withheld-sentinel path D94 uses — as a
-                    # "you already have this, proceed" nudge filling this repeat call's
-                    # dangling tool-slot (keeping the OpenAI one-tool_call→one-result
-                    # pairing valid). It is counted in `tool_calls_made` for reporting
-                    # only; termination is bounded regardless because every round-trip
-                    # still records an iteration against the budget window
-                    # (`guard.record_iteration` below), so the worst case remains
-                    # windows × iterations. The real served read stays in history under
-                    # its own tool_call_id.
-                    #
-                    # AFTER the tag split, never before: two identical `getTableSchema`
-                    # fetches tagged for different intents must dedup to ONE signature,
-                    # so the guard is handed `call_args` (tag-stripped), not
-                    # `tool_call.arguments`.
-                    #
-                    # `classify` also applies the TRIM-AWARE RE-FETCH EXEMPTION — a repeat
-                    # whose serving result is no longer readable is re-dispatched for real,
-                    # bounded per signature per window — and emits that decision's own
-                    # events. See `ReadGuard.classify` for why the exemption exists and why
-                    # it is bounded; `read_decision.declined` is the whole answer here.
-                    read_decision = read_guard.classify(tool_call.name, call_args)
-                    if read_decision.declined:
-                        # A guarded `getBlueprint` STILL SATISFIES the blueprint-definition
-                        # gate. Being deduped means the definition is already in the
-                        # model's context (the guard's trim-aware exemption is what makes
-                        # that true), which is exactly what the gate asks. Without this a
-                        # deadlock is reachable:
-                        # expand, run refused for an unrelated reason (a missing
-                        # slot), re-expand defensively, get a data-free marker, and never
-                        # satisfy the gate again.
-                        #
-                        # NOTE this is the OPPOSITE of 04 condition 5, which REJECTS the
-                        # same marker as completion evidence. The two gates ask different
-                        # questions — "does the model have the definition?" versus "did
-                        # work actually happen?" — and a dedup answers yes to the first
-                        # and no to the second.
-                        if tool_call.name == "getBlueprint":
-                            blueprint_gate.note_definition_in_context(call_args.get("id"))
-                        tool_calls_made += 1
-                        guard_entry = TrailEntry(
-                            turn_index=turn_index,
-                            tool_call_id=tool_call.id,
-                            tool_name=tool_call.name,
-                            args=dict(call_args),
-                            status="ok",
-                            error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
-                            # `None` (undetermined) is deliberate: it routes this
-                            # data-free entry through the D94 stranded-sentinel path.
-                            # `_compute_turn_provenance_union` excludes it by marker so
-                            # it never poisons the turn's replay provenance.
-                            provenance=None,
-                            result_preview=None,
-                            result_full_ref=None,
-                            ts=_now_iso(),
-                            # Recorded even though this entry can NEVER be valid
-                            # evidence (04 condition 5 rejects the guard marker): the
-                            # tag is what the model actually sent, and `resolve_tagged_
-                            # evidence` needs to SEE it to refuse it with the actionable
-                            # "cite the call that actually served this result" message
-                            # rather than the misleading "nothing is tagged for it".
-                            serves_intent=serves_intent,
-                        )
-                        await self._session_store.append_trail_entry(session_id, guard_entry)
-                        self._observer(
-                            "loop_repeated_idempotent_read_guarded",
-                            repeated_read_guard_event(
-                                tool_call.name, tool_call.id, call_args
-                            ),
-                        )
-                        if guard.exceeded:
-                            break
-                        continue
-
-                    # --- BLUEPRINT-DEFINITION GATE ---------------------------------
-                    #
-                    # `runBlueprint` is refused unless this turn already holds a
-                    # SUCCESSFUL `getBlueprint` for the same id. A card carries no SQL,
-                    # so without this the model routes on an authored prose `intent`
-                    # string and can run — and confidently report — an analysis that
-                    # measures something else entirely. See `loop/blueprint_gate.py` for
-                    # the full rationale; the decision and its event are ITS, and only
-                    # the effects below are the loop's.
-                    #
-                    # DECIDED HERE, BEFORE `_maybe_start_summary` AND BEFORE DISPATCH, so
-                    # the executor never runs, no inner `runQuery` is issued, and the
-                    # only trail entry written for this call is the refusal itself.
-                    #
-                    # A DEDUP-GUARDED `getBlueprint` SATISFIES THE GATE (see the guard
-                    # branch above, which folds a guarded repeat's id in): being deduped
-                    # means the definition is already in the model's context, which is
-                    # exactly what the gate asks. That is the OPPOSITE of 04 condition 5,
-                    # which REJECTS the same marker as completion evidence — the two
-                    # gates ask different questions ("does the model have the
-                    # definition?" versus "did work actually happen?").
-                    #
-                    # THE RESUME PATH DOES NOT PASS THROUGH HERE. A mid-DAG checkpoint
-                    # resume re-enters `self._blueprint_executor.resume(...)` directly from
-                    # `_resume_blueprint` and appends its own `runBlueprint` trail entry;
-                    # it never reaches this dispatch site, so a resumed blueprint is
-                    # structurally ungated rather than exempted by a branch. A resume is
-                    # the continuation of an already-gated invocation, not a fresh decision
-                    # to run a blueprint, so that is the correct outcome — and
-                    # `tests/runtime/loop/test_blueprint_definition_gate.py` pins it, so a
-                    # refactor that routes resumes through dispatch cannot silently start
-                    # gating them.
-                    #
-                    # NOT APPLIED TO AN UNWIRED `runBlueprint` (`handler is None`): there is
-                    # no blueprint stack at all, so "expand it first" would send the model
-                    # after a tool that cannot help it, replacing the honest
-                    # `RUN_BLUEPRINT_UNAVAILABLE` → raw-loop fallback (§6) with a loop.
-                    handler = self._runtime_tools.get(tool_call.name)
-                    gate_refusal: ToolResult | None = None
-                    if tool_call.name == "runBlueprint" and handler is not None:
-                        gate_refusal = blueprint_gate.check_run_blueprint(call_args)
-
-                    # LLM-generated progress summary (opt-in, `progress_summary_enabled`):
-                    # fire the value-rich present-tense line CONCURRENTLY, BEFORE dispatch
-                    # and WITHOUT awaiting it, so it never adds latency to the tool. The
-                    # instant `tool_dispatch_start` template label still fires as today
-                    # (inside the dispatcher / the runtime tools); this line is additive,
-                    # arriving when ready. No-op when the feature is off. Skipped for a
-                    # gated call: nothing is about to run, so narrating it would be a lie.
-                    if gate_refusal is None:
-                        self._maybe_start_summary(tool_call.name, tool_call.id, call_args)
-
-                    # Runtime-tool registry (read-tools-design §2): a runtime tool
-                    # (`resolveValues` + the three read tools) is intercepted here —
-                    # it never reaches `dispatch` under its own name (only any inner
-                    # tool it issues does). It returns the SAME `ToolResult`
-                    # dataclass, so the trail/budget path below is unchanged and it
-                    # counts as exactly one `tool_calls_made`. An advertised runtime
-                    # tool that is not wired returns a clean local unavailable error
-                    # (§6), never an incoherent MCP unknown-tool denial.
-                    # `handler` was resolved above, at the gate.
+                else:
+                    gate_refusal = blueprint_search_gate.check(tool_call.name)
                     if gate_refusal is not None:
-                        # First in the chain: nothing else may dispatch this call.
-                        tool_result = gate_refusal
-                    elif tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
-                        # 03 §E.2: the cap exemption is BOUNDED. The surplus is
-                        # REJECTED rather than dropped — it gets a trail entry through
-                        # the normal path below, so the model sees why and batches
-                        # next time, instead of silently losing a write.
-                        #
-                        # Only the FIRST `_MAX_SURPLUS_STATE_REJECTIONS` of them reach
-                        # here at all: the partition above truncates `state_calls` to
-                        # `MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS`, so the
-                        # number of store writes a single response can force is fixed,
-                        # not proportional to how many calls the model emitted.
-                        state_calls_dispatched += 1
-                        if state_calls_dispatched > MAX_STATE_CALLS:
-                            tool_result = surplus_state_call_rejected()
-                            self._observer(
-                                "loop_analysis_state_rejected",
-                                {"reason": "surplus_state_call", "intent_count": 0},
-                            )
-                        elif handler is not None:
-                            tool_result = await self._run_runtime_tool(
-                                handler,
-                                tool_call.name,
-                                call_args,
-                                credentials,
-                                turn_context,
-                            )
-                        else:  # pragma: no cover - always wired by app.py
-                            tool_result = _runtime_tool_internal_error(tool_call.name)
+                        self._observer("loop_blueprint_search_suggested", {"tool_name": "runQuery"})
+                if (
+                    gate_refusal is None
+                    and tool_call.name == "runBlueprint"
+                    and handler is not None
+                ):
+                    gate_refusal = blueprint_gate.check_run_blueprint(call_args)
+
+                # A gated call does not run. Otherwise summarize before its start event.
+                if gate_refusal is None:
+                    await self._maybe_start_summary(tool_call.name, tool_call.id, call_args)
+
+                # Runtime-tool registry (read-tools-design §2): a runtime tool
+                # (`resolveValues` + the three read tools) is intercepted here —
+                # it never reaches `dispatch` under its own name (only any inner
+                # tool it issues does). It returns the SAME `ToolResult`
+                # dataclass, so the trail/budget path below is unchanged and it
+                # counts as exactly one `tool_calls_made`. An advertised runtime
+                # tool that is not wired returns a clean local unavailable error
+                # (§6), never an incoherent MCP unknown-tool denial.
+                # `handler` was resolved above, at the gate.
+                local_dispatch = gate_refusal is None and (
+                    (
+                        tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME
+                        and (handler is None or state_calls_dispatched >= MAX_STATE_CALLS)
+                    )
+                    or (handler is None and tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE)
+                )
+                if local_dispatch:
+                    self._observer(
+                        "tool_dispatch_start",
+                        {"tool_name": tool_call.name, "tool_call_id": tool_call.id},
+                    )
+                if gate_refusal is not None:
+                    # First in the chain: nothing else may dispatch this call.
+                    tool_result = gate_refusal
+                elif tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
+                    # 03 §E.2: the cap exemption is BOUNDED. The surplus is
+                    # REJECTED rather than dropped — it gets a trail entry through
+                    # the normal path below, so the model sees why and batches
+                    # next time, instead of silently losing a write.
+                    #
+                    # Only the FIRST `_MAX_SURPLUS_STATE_REJECTIONS` of them reach
+                    # here at all: the partition above truncates `state_calls` to
+                    # `MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS`, so the
+                    # number of store writes a single response can force is fixed,
+                    # not proportional to how many calls the model emitted.
+                    state_calls_dispatched += 1
+                    if state_calls_dispatched > MAX_STATE_CALLS:
+                        tool_result = surplus_state_call_rejected()
+                        self._observer(
+                            "loop_analysis_state_rejected",
+                            {"reason": "surplus_state_call", "intent_count": 0},
+                        )
                     elif handler is not None:
                         tool_result = await self._run_runtime_tool(
                             handler,
@@ -3341,827 +3429,1005 @@ class AgentLoop:
                             call_args,
                             credentials,
                             turn_context,
+                            tool_call.id,
                         )
-                    elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
-                        tool_result = _runtime_tool_unavailable(
-                            tool_call.name, _RUNTIME_TOOL_UNAVAILABLE_CODE[tool_call.name]
-                        )
-                    else:
-                        # `question` (this turn's raw user text) is handed over for
-                        # ONE purpose: an over-cap `getTableSchema` keeps every column
-                        # NAMED and spends its remaining detail budget on the columns
-                        # the question is about (`dispatch/schema_preview.py`). It
-                        # orders that fit and nothing else — it is never written into
-                        # the result, the trail, or a span (D25). This is the only
-                        # dispatch call site that supplies it.
-                        tool_result = await self._tool_dispatcher.dispatch(
-                            tool_call.name,
-                            call_args,
-                            credentials,
-                            tool_call_id=tool_call.id,
-                            question=question,
-                        )
+                    else:  # pragma: no cover - always wired by app.py
+                        tool_result = _runtime_tool_internal_error(tool_call.name)
+                elif handler is not None:
+                    tool_result = await self._run_runtime_tool(
+                        handler,
+                        tool_call.name,
+                        call_args,
+                        credentials,
+                        turn_context,
+                        tool_call.id,
+                    )
+                elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
+                    tool_result = _runtime_tool_unavailable(
+                        tool_call.name, _RUNTIME_TOOL_UNAVAILABLE_CODE[tool_call.name]
+                    )
+                else:
+                    # `question` (this turn's raw user text) is handed over for
+                    # ONE purpose: an over-cap `getTableSchema` keeps every column
+                    # NAMED and spends its remaining detail budget on the columns
+                    # the question is about (`dispatch/schema_preview.py`). It
+                    # orders that fit and nothing else — it is never written into
+                    # the result, the trail, or a span (D25). This is the only
+                    # dispatch call site that supplies it.
+                    tool_result = await self._tool_dispatcher.dispatch(
+                        tool_call.name,
+                        call_args,
+                        credentials,
+                        tool_call_id=tool_call.id,
+                        question=question,
+                    )
 
-                    # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote
-                    # the state and returned it in full, so the local is updated from
-                    # the result rather than re-read from the store. A rejected call
-                    # (or an unreadable result) leaves the loaded value standing.
-                    if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
-                        refreshed = refreshed_analysis_state(tool_result, turn_index)
-                        if refreshed is not None:
-                            analysis_state = refreshed
+                if local_dispatch:
+                    self._observer(
+                        "tool_dispatch_" + tool_result.status,
+                        {
+                            "tool_name": tool_call.name,
+                            "tool_call_id": tool_call.id,
+                            "error_code": tool_result.error_code,
+                        },
+                    )
 
-                    # --- FINALIZATION ENFORCEMENT, terminal exit #2 (05 §B.1) -----
-                    #
-                    # A successful `answerWithTable` carrying non-blank prose ENDS the
-                    # turn once the batch drains. Refuse it here — BEFORE the trail
-                    # entry is written, so the persisted entry IS the refusal — and
-                    # crucially BEFORE `_resolve_answer_sql` below, which fires the two
-                    # dormant `hooks/answer_table.py` seams: a designation that is
-                    # about to be refused must not fire the answer-table lifecycle,
-                    # and checking afterwards would also clobber the more actionable
-                    # blueprint-not-run message with this one.
-                    #
-                    # The full terminal condition is mirrored exactly (`ok` + a `dict`
-                    # of arguments + non-blank `answer`), because a call that would NOT
-                    # have terminated the turn is not a finalization and must not be
-                    # refused as one.
-                    if (
-                        tool_call.name == ANSWER_TABLE_TOOL_NAME
-                        and tool_result.status == "ok"
-                        and isinstance(call_args, dict)
+                if tool_result.status == "ok" and (
+                    tool_call.name in {ANSWER_TABLE_TOOL_NAME, ANSWER_TEXT_TOOL_NAME}
+                    or tool_result.terminal
+                ):
+                    draft = clean_answer_text(call_args.get("answer"))
+                    rule = first_match(
+                        draft,
+                        accum.sql_executed,
+                        question,
+                        has_alternative_evidence=bool(
+                            successful_text_evidence_tools
+                            or accum.capability_cards
+                            or tool_result.terminal
+                            or (
+                                tool_call.name == ANSWER_TABLE_TOOL_NAME and call_args.get("tables")
+                            )
+                        ),
+                        declined_clarification=declined_question,
+                    )
+                    if rule is not None:
+                        if await finalization_gate.may_refuse(rule.charges_to):
+                            self._observer(ANSWER_RULE_REFUSED_EVENT, {"rule": rule.name})
+                            finalization_nudge = rule.nudge(draft)
+                            tool_result = answer_judge_rejected(finalization_nudge)
+                        elif rule.refusal is not None:
+                            call_args = {**call_args, "answer": rule.refusal}
+
+                # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote
+                # the state and returned it in full, so the local is updated from
+                # the result rather than re-read from the store. A rejected call
+                # (or an unreadable result) leaves the loaded value standing.
+                if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
+                    refreshed = refreshed_analysis_state(tool_result, turn_index)
+                    if refreshed is not None:
+                        analysis_state = refreshed
+
+                # --- FINALIZATION ENFORCEMENT, terminal exit #2 (05 §B.1) -----
+                #
+                # A successful `answerWithTable` carrying non-blank prose ENDS the
+                # turn once the batch drains. Refuse it here — BEFORE the trail
+                # entry is written, so the persisted entry IS the refusal — and
+                # crucially BEFORE `_resolve_answer_sql` below, which fires the two
+                # dormant `hooks/answer_table.py` seams: a designation that is
+                # about to be refused must not fire the answer-table lifecycle,
+                # and checking afterwards would also clobber the more actionable
+                # blueprint-not-run message with this one.
+                #
+                # The full terminal condition is mirrored exactly (`ok` + a `dict`
+                # of arguments + non-blank `answer`), because a call that would NOT
+                # have terminated the turn is not a finalization and must not be
+                # refused as one.
+                if (
+                    tool_call.name == ANSWER_TABLE_TOOL_NAME
+                    and tool_result.status == "ok"
+                    and isinstance(call_args, dict)
+                    and clean_answer_text(call_args.get("answer")) is not None
+                ):
+                    pending_at_answer = pending_intents(analysis_state)
+                    if pending_at_answer:
+                        if await finalization_gate.may_refuse("intents"):
+                            self._observer(
+                                "loop_finalization_refused",
+                                {
+                                    "exit": "answer_with_table",
+                                    "pending_count": len(pending_at_answer),
+                                },
+                            )
+                            # A RETRYABLE error, so the turn continues and the
+                            # batch drains normally: `tool_result` is no longer
+                            # `ok`, so neither `_resolve_answer_tables` below nor
+                            # the terminal-exit check fires for this call.
+                            tool_result = finalization_blocked(pending_at_answer)
+                        else:
+                            analysis_state = await self._force_block_pending_intents(
+                                session_id=session_id,
+                                turn_index=turn_index,
+                                state=analysis_state,
+                                reason_code="ENFORCEMENT_EXHAUSTED",
+                            )
+                            self._observer(
+                                "loop_enforcement_exhausted",
+                                {"intent_count": len(pending_at_answer)},
+                            )
+
+                # answerWithTable naming a blueprint it never ran: turn the call
+                # into a retryable NUDGE rather than letting it terminate the turn
+                # with no table. Done HERE, before the trail entry is written, so the
+                # persisted entry IS the nudge and the model sees it on the next
+                # round-trip. Only when there is no raw `sql` to fall back on, and
+                # only after `_resolve_answer_tables` has had its go — which includes
+                # giving the dormant ON_ANSWER_TABLE_UNRESOLVED hook first refusal, so
+                # a registered hook that supplies a replacement wins over the nudge.
+                #
+                # AN ITEM OF `tables` IS TREATED EXACTLY LIKE THE TOP-LEVEL PAIR: it
+                # names a blueprint that did not run, the whole call is refused, and
+                # the model is told which one. Dropping the item instead would
+                # silently lose a deliverable's table, which is the failure
+                # multi-table exists to fix.
+                resolved_answer_tables: list[AnswerTable] = []
+                if (
+                    tool_call.name == ANSWER_TABLE_TOOL_NAME
+                    and tool_result.status == "ok"
+                    and isinstance(call_args, dict)
+                ):
+                    # Resolved ONCE — the hooks fire here and nowhere else.
+                    (
+                        resolved_answer_tables,
+                        unresolved_blueprint,
+                        carried_designation,
+                    ) = await self._resolve_answer_tables(
+                        call_args,
+                        blueprint_runs=accum.blueprint_runs,
+                        credentials=credentials,
+                        session_id=session_id,
+                        turn_index=turn_index,
+                    )
+                    if unresolved_blueprint is not None:
+                        _logger.info(
+                            "answerWithTable named blueprint %r that did not run this "
+                            "turn — nudging the model to run it first (session=%s)",
+                            unresolved_blueprint,
+                            session_id,
+                        )
+                        tool_result = _answer_table_blueprint_not_run(unresolved_blueprint)
+                    elif (
+                        not carried_designation
+                        and answer_shape.multi_row_calls
                         and clean_answer_text(call_args.get("answer")) is not None
                     ):
-                        pending_at_answer = pending_intents(analysis_state)
-                        if pending_at_answer:
-                            if await finalization_gate.may_refuse("intents"):
+                        # THE EMPTY DESIGNATION (08 §O). The model called the table
+                        # tool, named no table, and — because the call carries prose
+                        # — would TERMINATE the turn right here, through the exit the
+                        # 05 §J shape gate does not watch. Measured live as
+                        # `status=done`, no table, no event, no log: the user asked
+                        # for a breakdown, the turn held six rows of it, and the
+                        # answer was prose. See `answer_table_no_table_designated`.
+                        #
+                        # `answer_shape.multi_row_calls` SCOPES IT, and the scope is the
+                        # whole of the false-positive protection: with nothing
+                        # multi-row in hand there is no table being withheld, and a
+                        # zero-row "none found" answered in prose is CORRECT (live
+                        # q6). Nudging that would charge a right answer a round-trip.
+                        #
+                        # THE NON-BLANK `answer` CHECK MIRRORS THE TERMINAL
+                        # CONDITION, for the reason the pending-intents refusal just
+                        # above states: a call that would NOT have ended the turn is
+                        # not a finalization and must not be refused as one. A
+                        # blank-`answer` empty call is a habit call, not an answer —
+                        # it does not terminate anything, so nothing is being
+                        # silently lost, and refusing it would burn this window's
+                        # allowance on it and leave the REAL prose finish that
+                        # follows unrefusable. The flag fix below is what covers that
+                        # case: it stops the empty call disarming the exit-#1 gate.
+                        #
+                        # SAME ALLOWANCE AS THE SHAPE GATE (`kind="answer_shape"`),
+                        # because it is the same complaint arriving through the other
+                        # exit — otherwise one mistake could be refused twice in a
+                        # window, once per exit. When the grant is spent the prose
+                        # PASSES and the turn ends: never a hard lock, the posture
+                        # `ENFORCEMENT_EXHAUSTED` takes for intents. The event is
+                        # emitted in `_resolve_answer_tables` either way, so the
+                        # behaviour stays visible after the allowance is gone.
+                        if await finalization_gate.may_refuse("answer_shape"):
+                            _logger.info(
+                                "answerWithTable designated no table while %d "
+                                "multi-row result(s) went untabled — nudging "
+                                "(session=%s)",
+                                answer_shape.multi_row_calls,
+                                session_id,
+                            )
+                            self._observer(
+                                ANSWER_SHAPE_REFUSED_EVENT,
+                                {"multi_row_calls": answer_shape.multi_row_calls},
+                            )
+                            tool_result = answer_table_no_table_designated()
+                        else:
+                            self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
+                    else:
+                        self._observe_uncovered_intents(
+                            analysis_state,
+                            tables=resolved_answer_tables,
+                            result_sql_by_call_id=accum.result_sql_by_call_id,
+                        )
+                # --- THE ANSWER JUDGE, exit #2 (09 §C.2) --------------------
+                #
+                # THE SITE THAT MATTERS MOST, and the one 05 §L.9 leaves
+                # entirely unchecked today: no answer rule runs here, so a
+                # multi-part answer that closes both intents, designates one
+                # table and discusses one subject ends `done` with no event and
+                # no log line. That is the population where "was every part
+                # answered" has teeth — and §L.5 records the route into it, the
+                # `markdown_table` nudge telling the model to call
+                # answerWithTable instead.
+                #
+                # THE TERMINAL CONDITION IS MIRRORED EXACTLY (`ok` + a `dict` of
+                # arguments + non-blank `answer`), as the pending-intents
+                # refusal above mirrors it: a call that would NOT have ended the
+                # turn is not a finalization and must not be judged as one. The
+                # `ok` half also means every refusal above — pending intents,
+                # blueprint-not-run, empty designation, the unrun query — has
+                # already rewritten `tool_result` and the judge is not paid for.
+                #
+                # THE ALLOWANCE IS SHARED WITH EXIT #1 (`kind="answer_judge"`):
+                # the two exits are two doors out of ONE finish, so a model
+                # pushed here by an exit-#1 nudge must not be judged twice for
+                # the same answer.
+                if (
+                    tool_call.name == ANSWER_TABLE_TOOL_NAME
+                    and tool_result.status == "ok"
+                    and isinstance(call_args, dict)
+                    and clean_answer_text(call_args.get("answer")) is not None
+                ):
+                    table_draft = clean_answer_text(call_args.get("answer")) or ""
+                    if judge_refusal_this_round is not None:
+                        # A SECOND `answerWithTable` IN THE SAME BATCH, after the
+                        # judge already refused one. It gets the SAME refusal for
+                        # free — no second model call, no second claim.
+                        #
+                        # THIS BRANCH IS THE WHOLE FIX for a defect that shipped
+                        # past review once. Without it the sequence was: call A
+                        # judged and refused (which records the grant), call B
+                        # reaches `_judge`, `has_spent` reports the allowance gone,
+                        # the judge is SKIPPED, and skipping returns APPROVED — so
+                        # B stayed `ok` and TERMINATED THE TURN in the very round
+                        # the judge had refused it. The user received a near-copy of
+                        # the refused answer and the feedback reached the model
+                        # never. `may_refuse`'s own free-refusal path exists for
+                        # exactly this shape (05 §C.2) and the judge could not reach
+                        # it, because its cost-avoidance peek runs first.
+                        tool_result = answer_judge_rejected(judge_refusal_this_round)
+                    elif finalization_gate.refused_this_round:
+                        # ANOTHER gate refused earlier in this same round-trip (the
+                        # empty-designation nudge, say). One refusal per round-trip
+                        # is the rule the whole chain expresses, so the judge does
+                        # not run — and, unlike the shape above, has nothing to
+                        # re-issue. Skipping here also keeps the judge off the
+                        # free-grant path, where a refusal would be issued without a
+                        # claim and the window's bound would quietly become two.
+                        self._observer(ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "round_refused"})
+                    else:
+
+                        async def _table_brief(
+                            _q: str = question,
+                            _state: AnalysisState | None = analysis_state,
+                            _draft: str = table_draft,
+                            _tables: tuple[AnswerTable, ...] = tuple(resolved_answer_tables),
+                        ) -> JudgeBrief:
+                            results, anchor, in_scope = await self._judge_results(
+                                session_id, turn_index, credentials.column_scope
+                            )
+                            return self._judge_brief(
+                                "exit_table",
+                                question=_q,
+                                accum=accum,
+                                ship_guard=ship_guard,
+                                analysis_state=_state,
+                                date_anchor=anchor,
+                                draft=_draft,
+                                results=results,
+                                designated_tables=tuple(
+                                    (table.caption, table.sql) for table in _tables
+                                ),
+                                figure_corroborated=await self._corroborated_figures(
+                                    session_id, turn_index, _draft, in_scope
+                                ),
+                            )
+
+                        table_verdict = await self._judge(
+                            _table_brief,
+                            guard=guard,
+                            gate=finalization_gate,
+                            kind="answer_judge",
+                        )
+                        if table_verdict.approved and table_verdict.reviewed:
+                            ship_guard.note_approval()
+                        if not table_verdict.approved:
+                            ship_guard.note_refusal(
+                                "exit_table", table_verdict.violation, assumptions=accum.assumptions
+                            )
+                            refusal_kind = _answer_judge_refusal_kind(table_verdict)
+                            if await finalization_gate.may_refuse(refusal_kind):
                                 self._observer(
-                                    "loop_finalization_refused",
+                                    ANSWER_JUDGE_REFUSED_EVENT,
                                     {
-                                        "exit": "answer_with_table",
-                                        "pending_count": len(pending_at_answer),
+                                        "violation": table_verdict.violation,
+                                        "site": "exit_table",
                                     },
                                 )
                                 # A RETRYABLE error, so the turn continues and the
-                                # batch drains normally: `tool_result` is no longer
-                                # `ok`, so neither `_resolve_answer_tables` below nor
-                                # the terminal-exit check fires for this call.
-                                tool_result = finalization_blocked(pending_at_answer)
+                                # batch drains normally — `tool_result` is no longer
+                                # `ok`, so the terminal-exit check below does not
+                                # fire for this call and the persisted entry IS the
+                                # refusal. NO DRAFT CLEAR is needed: exit #2 keeps
+                                # the model's prose in `TrailEntry.args`.
+                                tool_result = answer_judge_rejected(table_verdict.feedback)
+                                # Remembered for the REST OF THIS BATCH, so a second
+                                # answerWithTable is refused with the same words
+                                # rather than sailing through the skip above.
+                                judge_refusal_this_round = table_verdict.feedback
                             else:
-                                analysis_state = await self._force_block_pending_intents(
-                                    session_id=session_id,
-                                    turn_index=turn_index,
-                                    state=analysis_state,
-                                    reason_code="ENFORCEMENT_EXHAUSTED",
-                                )
+                                # THE ANSWER PASSES. §J.5/§L.8's posture — the runtime
+                                # never hard-locks a turn, and this check reads MEANING
+                                # rather than truth.
+                                #
+                                # ⚠ THIS `else` BINDS TO `may_refuse`, NOT TO
+                                # `approved`. It sat one level out for a while and the
+                                # consequence was invisible offline: an APPROVED answer
+                                # took this branch and published
+                                # `loop_answer_judge_exhausted` with an empty
+                                # `violation`, so the metric that says "the judge was
+                                # overruled" fired on every clean tabled answer. Caught
+                                # by reading a live Phoenix trace, not by a test.
                                 self._observer(
-                                    "loop_enforcement_exhausted",
-                                    {"intent_count": len(pending_at_answer)},
+                                    ANSWER_JUDGE_EXHAUSTED_EVENT,
+                                    {
+                                        "violation": table_verdict.violation,
+                                        "site": "exit_table",
+                                    },
                                 )
 
-                    # answerWithTable naming a blueprint it never ran: turn the call
-                    # into a retryable NUDGE rather than letting it terminate the turn
-                    # with no table. Done HERE, before the trail entry is written, so the
-                    # persisted entry IS the nudge and the model sees it on the next
-                    # round-trip. Only when there is no raw `sql` to fall back on, and
-                    # only after `_resolve_answer_tables` has had its go — which includes
-                    # giving the dormant ON_ANSWER_TABLE_UNRESOLVED hook first refusal, so
-                    # a registered hook that supplies a replacement wins over the nudge.
-                    #
-                    # AN ITEM OF `tables` IS TREATED EXACTLY LIKE THE TOP-LEVEL PAIR: it
-                    # names a blueprint that did not run, the whole call is refused, and
-                    # the model is told which one. Dropping the item instead would
-                    # silently lose a deliverable's table, which is the failure
-                    # multi-table exists to fix.
-                    resolved_answer_tables: list[AnswerTable] = []
-                    if (
-                        tool_call.name == ANSWER_TABLE_TOOL_NAME
-                        and tool_result.status == "ok"
-                        and isinstance(call_args, dict)
-                    ):
-                        # Resolved ONCE — the hooks fire here and nowhere else.
-                        (
-                            resolved_answer_tables,
-                            unresolved_blueprint,
-                            carried_designation,
-                        ) = await self._resolve_answer_tables(
-                            call_args,
-                            blueprint_runs=accum.blueprint_runs,
-                            credentials=credentials,
-                            session_id=session_id,
-                            turn_index=turn_index,
-                        )
-                        if unresolved_blueprint is not None:
-                            _logger.info(
-                                "answerWithTable named blueprint %r that did not run this "
-                                "turn — nudging the model to run it first (session=%s)",
-                                unresolved_blueprint,
-                                session_id,
-                            )
-                            tool_result = _answer_table_blueprint_not_run(unresolved_blueprint)
-                        elif (
-                            not carried_designation
-                            and answer_shape.multi_row_calls
-                            and clean_answer_text(call_args.get("answer")) is not None
-                        ):
-                            # THE EMPTY DESIGNATION (08 §O). The model called the table
-                            # tool, named no table, and — because the call carries prose
-                            # — would TERMINATE the turn right here, through the exit the
-                            # 05 §J shape gate does not watch. Measured live as
-                            # `status=done`, no table, no event, no log: the user asked
-                            # for a breakdown, the turn held six rows of it, and the
-                            # answer was prose. See `answer_table_no_table_designated`.
-                            #
-                            # `answer_shape.multi_row_calls` SCOPES IT, and the scope is the
-                            # whole of the false-positive protection: with nothing
-                            # multi-row in hand there is no table being withheld, and a
-                            # zero-row "none found" answered in prose is CORRECT (live
-                            # q6). Nudging that would charge a right answer a round-trip.
-                            #
-                            # THE NON-BLANK `answer` CHECK MIRRORS THE TERMINAL
-                            # CONDITION, for the reason the pending-intents refusal just
-                            # above states: a call that would NOT have ended the turn is
-                            # not a finalization and must not be refused as one. A
-                            # blank-`answer` empty call is a habit call, not an answer —
-                            # it does not terminate anything, so nothing is being
-                            # silently lost, and refusing it would burn this window's
-                            # allowance on it and leave the REAL prose finish that
-                            # follows unrefusable. The flag fix below is what covers that
-                            # case: it stops the empty call disarming the exit-#1 gate.
-                            #
-                            # SAME ALLOWANCE AS THE SHAPE GATE (`kind="answer_shape"`),
-                            # because it is the same complaint arriving through the other
-                            # exit — otherwise one mistake could be refused twice in a
-                            # window, once per exit. When the grant is spent the prose
-                            # PASSES and the turn ends: never a hard lock, the posture
-                            # `ENFORCEMENT_EXHAUSTED` takes for intents. The event is
-                            # emitted in `_resolve_answer_tables` either way, so the
-                            # behaviour stays visible after the allowance is gone.
-                            if await finalization_gate.may_refuse("answer_shape"):
-                                _logger.info(
-                                    "answerWithTable designated no table while %d "
-                                    "multi-row result(s) went untabled — nudging "
-                                    "(session=%s)",
-                                    answer_shape.multi_row_calls,
-                                    session_id,
-                                )
-                                self._observer(
-                                    ANSWER_SHAPE_REFUSED_EVENT,
-                                    {"multi_row_calls": answer_shape.multi_row_calls},
-                                )
-                                tool_result = answer_table_no_table_designated()
-                            else:
-                                self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
-                        else:
-                            self._observe_uncovered_intents(
-                                analysis_state,
-                                tables=resolved_answer_tables,
-                                result_sql_by_call_id=accum.result_sql_by_call_id,
-                            )
-                    # --- THE ANSWER JUDGE, exit #2 (09 §C.2) --------------------
-                    #
-                    # THE SITE THAT MATTERS MOST, and the one 05 §L.9 leaves
-                    # entirely unchecked today: no answer rule runs here, so a
-                    # multi-part answer that closes both intents, designates one
-                    # table and discusses one subject ends `done` with no event and
-                    # no log line. That is the population where "was every part
-                    # answered" has teeth — and §L.5 records the route into it, the
-                    # `markdown_table` nudge telling the model to call
-                    # answerWithTable instead.
-                    #
-                    # THE TERMINAL CONDITION IS MIRRORED EXACTLY (`ok` + a `dict` of
-                    # arguments + non-blank `answer`), as the pending-intents
-                    # refusal above mirrors it: a call that would NOT have ended the
-                    # turn is not a finalization and must not be judged as one. The
-                    # `ok` half also means every refusal above — pending intents,
-                    # blueprint-not-run, empty designation, the unrun query — has
-                    # already rewritten `tool_result` and the judge is not paid for.
-                    #
-                    # THE ALLOWANCE IS SHARED WITH EXIT #1 (`kind="answer_judge"`):
-                    # the two exits are two doors out of ONE finish, so a model
-                    # pushed here by an exit-#1 nudge must not be judged twice for
-                    # the same answer.
-                    if (
-                        tool_call.name == ANSWER_TABLE_TOOL_NAME
-                        and tool_result.status == "ok"
-                        and isinstance(call_args, dict)
-                        and clean_answer_text(call_args.get("answer")) is not None
-                    ):
-                        table_draft = clean_answer_text(call_args.get("answer")) or ""
-                        if judge_refusal_this_round is not None:
-                            # A SECOND `answerWithTable` IN THE SAME BATCH, after the
-                            # judge already refused one. It gets the SAME refusal for
-                            # free — no second model call, no second claim.
-                            #
-                            # THIS BRANCH IS THE WHOLE FIX for a defect that shipped
-                            # past review once. Without it the sequence was: call A
-                            # judged and refused (which records the grant), call B
-                            # reaches `_judge`, `has_spent` reports the allowance gone,
-                            # the judge is SKIPPED, and skipping returns APPROVED — so
-                            # B stayed `ok` and TERMINATED THE TURN in the very round
-                            # the judge had refused it. The user received a near-copy of
-                            # the refused answer and the feedback reached the model
-                            # never. `may_refuse`'s own free-refusal path exists for
-                            # exactly this shape (05 §C.2) and the judge could not reach
-                            # it, because its cost-avoidance peek runs first.
-                            tool_result = answer_judge_rejected(judge_refusal_this_round)
-                        elif finalization_gate.refused_this_round:
-                            # ANOTHER gate refused earlier in this same round-trip (the
-                            # empty-designation nudge, say). One refusal per round-trip
-                            # is the rule the whole chain expresses, so the judge does
-                            # not run — and, unlike the shape above, has nothing to
-                            # re-issue. Skipping here also keeps the judge off the
-                            # free-grant path, where a refusal would be issued without a
-                            # claim and the window's bound would quietly become two.
-                            self._observer(
-                                ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "round_refused"}
-                            )
-                        else:
-
-                            async def _table_brief(
-                                _q: str = question,
-                                _state: AnalysisState | None = analysis_state,
-                                _draft: str = table_draft,
-                                _tables: tuple[AnswerTable, ...] = tuple(
-                                    resolved_answer_tables
-                                ),
-                            ) -> JudgeBrief:
-                                results, anchor, in_scope = await self._judge_results(
-                                    session_id, turn_index, credentials.column_scope
-                                )
-                                return self._judge_brief(
-                                    "exit_table",
-                                    question=_q,
-                                    accum=accum,
-                                    analysis_state=_state,
-                                    date_anchor=anchor,
-                                    draft=_draft,
-                                    results=results,
-                                    designated_tables=tuple(
-                                        (table.caption, table.sql) for table in _tables
-                                    ),
-                                    figure_corroborated=await self._corroborated_figures(
-                                        session_id, turn_index, _draft, in_scope
-                                    ),
-                                )
-
-                            table_verdict = await self._judge(
-                                _table_brief,
-                                guard=guard,
-                                gate=finalization_gate,
-                                kind="answer_judge",
-                            )
-                            if not table_verdict.approved:
-                                refusal_kind = _answer_judge_refusal_kind(table_verdict)
-                                if await finalization_gate.may_refuse(refusal_kind):
-                                    self._observer(
-                                        ANSWER_JUDGE_REFUSED_EVENT,
-                                        {
-                                            "violation": table_verdict.violation,
-                                            "site": "exit_table",
-                                        },
-                                    )
-                                    # A RETRYABLE error, so the turn continues and the
-                                    # batch drains normally — `tool_result` is no longer
-                                    # `ok`, so the terminal-exit check below does not
-                                    # fire for this call and the persisted entry IS the
-                                    # refusal. NO DRAFT CLEAR is needed: exit #2 keeps
-                                    # the model's prose in `TrailEntry.args`.
-                                    tool_result = answer_judge_rejected(
-                                        table_verdict.feedback
-                                    )
-                                    # Remembered for the REST OF THIS BATCH, so a second
-                                    # answerWithTable is refused with the same words
-                                    # rather than sailing through the skip above.
-                                    judge_refusal_this_round = table_verdict.feedback
-                                else:
-                                    # THE ANSWER PASSES. §J.5/§L.8's posture — the runtime
-                                    # never hard-locks a turn, and this check reads MEANING
-                                    # rather than truth.
-                                    #
-                                    # ⚠ THIS `else` BINDS TO `may_refuse`, NOT TO
-                                    # `approved`. It sat one level out for a while and the
-                                    # consequence was invisible offline: an APPROVED answer
-                                    # took this branch and published
-                                    # `loop_answer_judge_exhausted` with an empty
-                                    # `violation`, so the metric that says "the judge was
-                                    # overruled" fired on every clean tabled answer. Caught
-                                    # by reading a live Phoenix trace, not by a test.
-                                    self._observer(
-                                        ANSWER_JUDGE_EXHAUSTED_EVENT,
-                                        {
-                                            "violation": table_verdict.violation,
-                                            "site": "exit_table",
-                                        },
-                                    )
-
-                    # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
-                    # pause (today only `runBlueprint`, on a slot-resolution
-                    # `askUser`). This GENERALIZES the terminal `askUser` branch
-                    # above — the loop writes the checkpoint and returns
-                    # `paused_ask_user` exactly as for `askUser`, before persisting a
-                    # trail entry or counting the call (a paused tool did not
-                    # complete, mirroring `askUser`). A dispatched MCP tool never
-                    # sets `.pause`, so this is inert on the normal path.
-                    if tool_result.pause is not None:
-                        # Computed INSIDE the branch that consumes it. It used to be
-                        # read once per tool call and used on the ~0.1% of them that
-                        # pause; `TurnAccumulators.envelope` is pure (no store, no
-                        # observer — `turn_accumulators.answer_envelope` and
-                        # `rollup_verification`/`AnswerTable.to_doc` below it only build
-                        # values), so where it is called cannot be observed, only how
-                        # often. `tests/runtime/loop/test_turn_exit_contract.py::
-                        # test_an_in_loop_pause_carries_the_envelope_of_the_same_batch`
-                        # pins that it is still read LATE — after the folds of the
-                        # calls that drained before this one.
-                        envelope = accum.envelope()
-                        return await self._pause_from_runtime_tool(
-                            session_id=session_id,
-                            pause=tool_result.pause,
-                            window_count=window_count,
-                            assistant_text=result.assistant_text,
-                            tool_calls_made=tool_calls_made,
-                            # Fix 2: surface whatever succeeded earlier in this window.
-                            sql_executed=accum.sql_executed,
-                            envelope=envelope,
-                            assumptions=accum.assumptions,
-                            # Carry this call's intent tag onto the checkpoint (see
-                            # `_pause_from_runtime_tool`): the trail entry for this work
-                            # is written after the resume, under a new id.
-                            serves_intent=serves_intent,
-                        )
-                    tool_calls_made += 1
-
-                    result_full_ref: str | None = None
-                    if tool_result.result_full is not None:
-                        result_full_ref = await self._session_store.write_full_result(
-                            session_id, str(uuid.uuid4()), tool_result.result_full
-                        )
-
-                    entry = TrailEntry(
-                        turn_index=turn_index,
-                        tool_call_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        args=dict(call_args),
-                        status=tool_result.status,
-                        error_code=tool_result.error_code,
-                        provenance=tool_result.provenance,
-                        result_preview=tool_result.result_preview,
-                        result_full_ref=result_full_ref,
-                        ts=_now_iso(),
-                        authoritative=tool_result.authoritative,
-                        denial_detail=tool_result.denial_detail,
-                        # J7 — set only by a `runBlueprint` whose blueprint DECLARES a
-                        # data-anchored window; `None` for every other call, so every other
-                        # entry serialises byte-identically.
-                        window_note=tool_result.window_note,
-                        capability_terminal=tool_result.terminal,
-                        # The validated tag (or `None`). Persisted on the entry rather
-                        # than left in `args`, so it survives replay/resume and is
-                        # readable by `updateAnalysisState` without re-parsing
-                        # arguments — and so it never re-enters the model's own
-                        # rendered tool call, where it would be noise.
+                # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
+                # pause (today only `runBlueprint`, on a slot-resolution
+                # `askUser`). This GENERALIZES the terminal `askUser` branch
+                # above — the loop writes the checkpoint and returns
+                # `paused_ask_user` exactly as for `askUser`, before persisting a
+                # trail entry or counting the call (a paused tool did not
+                # complete, mirroring `askUser`). A dispatched MCP tool never
+                # sets `.pause`, so this is inert on the normal path.
+                if tool_result.pause is not None:
+                    # Computed INSIDE the branch that consumes it. It used to be
+                    # read once per tool call and used on the ~0.1% of them that
+                    # pause; `TurnAccumulators.envelope` is pure (no store, no
+                    # observer — `turn_accumulators.answer_envelope` and
+                    # `rollup_verification`/`AnswerTable.to_doc` below it only build
+                    # values), so where it is called cannot be observed, only how
+                    # often. `tests/runtime/loop/test_turn_exit_contract.py::
+                    # test_an_in_loop_pause_carries_the_envelope_of_the_same_batch`
+                    # pins that it is still read LATE — after the folds of the
+                    # calls that drained before this one.
+                    envelope = accum.envelope()
+                    return await self._pause_from_runtime_tool(
+                        session_id=session_id,
+                        pause=tool_result.pause,
+                        window_count=window_count,
+                        assistant_text=result.assistant_text,
+                        tool_calls_made=tool_calls_made,
+                        # Fix 2: surface whatever succeeded earlier in this window.
+                        sql_executed=accum.sql_executed,
+                        envelope=envelope,
+                        assumptions=accum.assumptions,
+                        # Carry this call's intent tag onto the checkpoint (see
+                        # `_pause_from_runtime_tool`): the trail entry for this work
+                        # is written after the resume, under a new id.
                         serves_intent=serves_intent,
-                        # 08 §D.2 — ADDITIVE, and deliberately NOT this entry's own
-                        # `provenance` (which stays `frozenset()`): the D44 USES set of
-                        # each designated query, positionally parallel to the tables
-                        # `resolve_designations` reads back out of `args`. It exists so
-                        # a scope narrowing on RELOAD can drop the out-of-scope tables
-                        # instead of nothing, and it must never reach
-                        # `_compute_turn_provenance_union` — that union is fail-closed,
-                        # so one unparseable designated query would collapse it and
-                        # drop the turn's whole answer from every later replay.
-                        answer_table_provenance=(
-                            tuple(table.provenance for table in resolved_answer_tables)
-                            if resolved_answer_tables
-                            else None
-                        ),
                     )
-                    await self._session_store.append_trail_entry(session_id, entry)
+                tool_calls_made += 1
 
-                    # UI Slice 1 (§3.2): accumulate the enriched-result fields from
-                    # this SUCCESSFUL tool call (runQuery arg SQL + preview; runBlueprint
-                    # `result_full` SQL/blueprint_id/verify + preview). Shared with the
-                    # blueprint approval-resume seed path via `accumulate_enrichment`.
-                    accum.note_enrichment(tool_call.name, call_args, tool_result)
-                    accum.capture_blueprint_run(
-                        tool_call.name,
-                        tool_result,
-                        arguments=call_args if isinstance(call_args, dict) else None,
+                result_full_ref: str | None = None
+                if tool_result.result_full is not None:
+                    result_full_ref = await self._session_store.write_full_result(
+                        session_id, str(uuid.uuid4()), tool_result.result_full
                     )
-                    # The intent-coverage CHECK's raw material (08 §B.1): which query's
-                    # rows this call produced, keyed by the id an intent cites as its
-                    # evidence. NOT a source for the tables themselves — deriving those
-                    # from the evidence call would page the agent's own LIMIT-ed reading
-                    # query and silently truncate every grid.
-                    accum.note_result_sql(tool_call.name, tool_call.id, call_args, tool_result)
-                    # ANSWER-SHAPE GATE (05 §J): count this call if it is a successful
-                    # data-returning call with more than one row. Read from the same
-                    # `result_preview` that was just persisted on the entry above, so the
-                    # in-window count and the trail seed can never disagree about what
-                    # happened. Counted AFTER the finalization/blueprint-not-run rewrites
-                    # of `tool_result`, so a refused call (now non-`ok`) is not counted.
-                    answer_shape.note_call(
-                        tool_call.name, tool_result.status, tool_result.result_preview
+
+                entry = TrailEntry(
+                    turn_index=turn_index,
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    args=dict(call_args),
+                    status=tool_result.status,
+                    error_code=tool_result.error_code,
+                    provenance=tool_result.provenance,
+                    result_preview=tool_result.result_preview,
+                    result_full_ref=result_full_ref,
+                    ts=_now_iso(),
+                    authoritative=tool_result.authoritative,
+                    denial_detail=tool_result.denial_detail,
+                    # J7 — set only by a `runBlueprint` whose blueprint DECLARES a
+                    # data-anchored window; `None` for every other call, so every other
+                    # entry serialises byte-identically.
+                    window_note=tool_result.window_note,
+                    capability_terminal=tool_result.terminal,
+                    # The validated tag (or `None`). Persisted on the entry rather
+                    # than left in `args`, so it survives replay/resume and is
+                    # readable by `updateAnalysisState` without re-parsing
+                    # arguments — and so it never re-enters the model's own
+                    # rendered tool call, where it would be noise.
+                    serves_intent=serves_intent,
+                    # 08 §D.2 — ADDITIVE, and deliberately NOT this entry's own
+                    # `provenance` (which stays `frozenset()`): the D44 USES set of
+                    # each designated query, positionally parallel to the tables
+                    # `resolve_designations` reads back out of `args`. It exists so
+                    # a scope narrowing on RELOAD can drop the out-of-scope tables
+                    # instead of nothing, and it must never reach
+                    # `_compute_turn_provenance_union` — that union is fail-closed,
+                    # so one unparseable designated query would collapse it and
+                    # drop the turn's whole answer from every later replay.
+                    answer_table_provenance=(
+                        tuple(table.provenance for table in resolved_answer_tables)
+                        if resolved_answer_tables
+                        else None
+                    ),
+                )
+                await self._session_store.append_trail_entry(session_id, entry)
+
+                # UI Slice 1 (§3.2): accumulate the enriched-result fields from
+                # this SUCCESSFUL tool call (runQuery arg SQL + preview; runBlueprint
+                # `result_full` SQL/blueprint_id/verify + preview). Shared with the
+                # blueprint approval-resume seed path via `accumulate_enrichment`.
+                accum.note_enrichment(tool_call.name, call_args, tool_result)
+                accum.capture_blueprint_run(
+                    tool_call.name,
+                    tool_result,
+                    arguments=call_args if isinstance(call_args, dict) else None,
+                )
+                # The intent-coverage CHECK's raw material (08 §B.1): which query's
+                # rows this call produced, keyed by the id an intent cites as its
+                # evidence. NOT a source for the tables themselves — deriving those
+                # from the evidence call would page the agent's own LIMIT-ed reading
+                # query and silently truncate every grid.
+                accum.note_result_sql(tool_call.name, tool_call.id, call_args, tool_result)
+                # ANSWER-SHAPE GATE (05 §J): count this call if it is a successful
+                # data-returning call with more than one row. Read from the same
+                # `result_preview` that was just persisted on the entry above, so the
+                # in-window count and the trail seed can never disagree about what
+                # happened. Counted AFTER the finalization/blueprint-not-run rewrites
+                # of `tool_result`, so a refused call (now non-`ok`) is not counted.
+                answer_shape.note_call(
+                    tool_call.name, tool_result.status, tool_result.result_preview
+                )
+                # recordAssumptions (docs/decisions/ui-assumptions-contract.md):
+                # fold a SUCCESSFUL call's plain-English assumptions into the
+                # turn accumulator, same discipline as the enrichment above.
+                accum.note_assumptions(tool_call.name, call_args, tool_result)
+                accum.note_loaded_capability(tool_call.name, tool_result)
+                # answerWithTable (composite/answer_with_table.py): the
+                # model-designated answer tables. Same discipline again — read from
+                # the call ARGUMENTS on success — except LAST designation wins,
+                # over the whole SET, since a turn has one answer.
+                accum.note_answer_tables(tool_call.name, tool_result, resolved_answer_tables)
+                help_grounding.observe(tool_call.name, tool_result.status, tool_result.result_full)
+                if tool_result.status == "ok" and tool_call.name in _TEXT_ANSWER_EVIDENCE_TOOLS and (
+                    tool_call.name != "getHelpCenterDocument" or help_grounding.document_fetched
+                ):
+                    successful_text_evidence_tools.add(tool_call.name)
+                if tool_call.name == ANSWER_TEXT_TOOL_NAME and tool_result.status == "ok":
+                    designated_text_answer = (
+                        clean_answer_text(call_args.get("answer"))
+                        if isinstance(call_args, dict)
+                        else None
                     )
-                    # recordAssumptions (docs/decisions/ui-assumptions-contract.md):
-                    # fold a SUCCESSFUL call's plain-English assumptions into the
-                    # turn accumulator, same discipline as the enrichment above.
-                    accum.note_assumptions(tool_call.name, call_args, tool_result)
-                    accum.note_loaded_capability(tool_call.name, tool_result)
-                    # answerWithTable (composite/answer_with_table.py): the
-                    # model-designated answer tables. Same discipline again — read from
-                    # the call ARGUMENTS on success — except LAST designation wins,
-                    # over the whole SET, since a turn has one answer.
-                    accum.note_answer_tables(
-                        tool_call.name, tool_result, resolved_answer_tables
+                    declared_evidence = clean_evidence(
+                        call_args.get("evidence") if isinstance(call_args, dict) else None
                     )
-                    if (
-                        tool_result.status == "ok"
-                        and tool_call.name in _TEXT_ANSWER_EVIDENCE_TOOLS
-                    ):
-                        successful_text_evidence_tools.add(tool_call.name)
-                    if tool_call.name == ANSWER_TEXT_TOOL_NAME and tool_result.status == "ok":
-                        designated_text_answer = (
-                            clean_answer_text(call_args.get("answer"))
-                            if isinstance(call_args, dict)
-                            else None
-                        )
-                        declared_evidence = clean_evidence(
-                            call_args.get("evidence") if isinstance(call_args, dict) else None
-                        )
-                        designated_text_has_evidence = bool(declared_evidence) and set(
-                            declared_evidence
-                        ).issubset(successful_text_evidence_tools)
-                    if tool_result.status == "ok" and tool_result.terminal:
-                        card_answer = accum.note_capability_card(tool_result)
-                        if card_answer is not None:
-                            capability_terminal_text = card_answer
-                    # TERMINAL: a successful `answerWithTable` carries the final prose,
-                    # so the turn ends on it. Recorded here and acted on AFTER the whole
-                    # tool batch drains, so a model that batches recordAssumptions +
-                    # answerWithTable still gets both folded before the turn closes.
-                    if (
-                        tool_call.name == ANSWER_TABLE_TOOL_NAME
-                        and tool_result.status == "ok"
-                    ):
-                        # ANSWER-SHAPE GATE (05 §J): the turn HAS tabled its answer, so
-                        # the gate is done for this turn.
-                        #
-                        # SET FROM SUBSTANCE, NOT FROM THE CALL (08 §O). This read
-                        # `status == "ok"` alone, and a live probe showed what that
-                        # bought: a mid-turn `{answer: "", tables: []}` succeeds — the
-                        # tool is stateless and refuses nothing — disarmed the gate with
-                        # ZERO designations, and the model's later bare-prose finish then
-                        # passed unrefused. The flag is supposed to mean "the user has a
-                        # grid", so it is set only when one exists.
-                        #
-                        # `accum.has_answer_tables` (the accumulator, folded just above)
-                        # rather than `resolved_answer_tables` alone, because a LATER
-                        # call that designates nothing deliberately leaves an EARLIER
-                        # good set intact (`note_answer_tables`: "a malformed retry
-                        # cannot silently drop a good table"). Reading only this call's
-                        # resolution would re-arm the gate on that retry and refuse a
-                        # turn that has its table.
-                        #
-                        # Still set for the blank-`answer` call that does not terminate,
-                        # PROVIDED it designated something: those tables reach the user
-                        # through the envelope, which is what the gate protects.
-                        if resolved_answer_tables or accum.has_answer_tables:
-                            answer_shape.note_answer_succeeded()
-                        designated_answer_text = (
-                            clean_answer_text(call_args.get("answer"))
-                            if isinstance(call_args, dict)
-                            else None
-                        )
-
-                    # Record a SUCCESSFUL idempotent read so an identical repeat later
-                    # this turn is caught by the guard above. Only `ok` reads are
-                    # "already served" — a denied/errored read is NOT recorded, so a
-                    # legitimate retry after a transient failure is never suppressed.
-                    # The DECISION is handed back rather than the arguments, so the
-                    # signature recorded is provably the one that was tested.
-                    if read_decision.is_idempotent_read and tool_result.status == "ok":
-                        read_guard.record_served(read_decision, tool_call.id)
-
-                    # Record a SUCCESSFUL `getBlueprint` so the blueprint-definition gate
-                    # lets that id run. STAGED in the gate's per-response set, not
-                    # committed until the batch drains (see `commit_round` below the
-                    # loop).
-                    if (
-                        tool_call.name == "getBlueprint"
-                        and tool_result.status == "ok"
-                        and isinstance(call_args, dict)
-                    ):
-                        blueprint_gate.note_definition_in_context(call_args.get("id"))
-
-                    # S3: also check the budget INSIDE the per-tool-call loop (not only
-                    # once per outer iteration) so a slow batch of capped calls that
-                    # blows the wall-clock window mid-dispatch stops cleanly instead of
-                    # finishing the whole batch regardless.
+                    designated_text_has_evidence = bool(declared_evidence) and set(
+                        declared_evidence
+                    ).issubset(successful_text_evidence_tools)
+                if tool_result.status == "ok" and tool_result.terminal:
+                    card_answer = accum.note_capability_card(tool_result)
+                    if card_answer is not None:
+                        capability_terminal_text = card_answer
+                # TERMINAL: a successful `answerWithTable` carries the final prose,
+                # so the turn ends on it. Recorded here and acted on AFTER the whole
+                # tool batch drains, so a model that batches recordAssumptions +
+                # answerWithTable still gets both folded before the turn closes.
+                if tool_call.name == ANSWER_TABLE_TOOL_NAME and tool_result.status == "ok":
+                    # ANSWER-SHAPE GATE (05 §J): the turn HAS tabled its answer, so
+                    # the gate is done for this turn.
                     #
-                    # WHAT THIS CAN ACTUALLY TRIP ON: the WALL CLOCK, and only it (A2).
-                    # `guard.exceeded` reads three counters, but the other two cannot
-                    # change here — this round's `record_iteration` runs AFTER the batch
-                    # drains (below, once the round-trip's `total_tokens` is known), and
-                    # if the iteration or token-spend arm had already been over its cap
-                    # on a PREVIOUS round the loop would have ended that round instead of
-                    # dispatching this batch. Elapsed time is the one input that advances
-                    # while tools run, so it is the one arm that can newly trip mid-batch.
+                    # SET FROM SUBSTANCE, NOT FROM THE CALL (08 §O). This read
+                    # `status == "ok"` alone, and a live probe showed what that
+                    # bought: a mid-turn `{answer: "", tables: []}` succeeds — the
+                    # tool is stateless and refuses nothing — disarmed the gate with
+                    # ZERO designations, and the model's later bare-prose finish then
+                    # passed unrefused. The flag is supposed to mean "the user has a
+                    # grid", so it is set only when one exists.
                     #
-                    # That is the intended behaviour, not a gap to close: iterations and
-                    # spend are charged per ROUND-TRIP, so charging them mid-batch would
-                    # mean charging a round the model has not been billed for yet.
-                    # Documented because the plain reading of "check the budget" promises
-                    # all three, and a future reader debugging a batch that ran past an
-                    # iteration cap should not have to re-derive this from the ordering.
-                    if guard.exceeded:
-                        break
+                    # `accum.has_answer_tables` (the accumulator, folded just above)
+                    # rather than `resolved_answer_tables` alone, because a LATER
+                    # call that designates nothing deliberately leaves an EARLIER
+                    # good set intact (`note_answer_tables`: "a malformed retry
+                    # cannot silently drop a good table"). Reading only this call's
+                    # resolution would re-arm the gate on that retry and refuse a
+                    # turn that has its table.
+                    #
+                    # Still set for the blank-`answer` call that does not terminate,
+                    # PROVIDED it designated something: those tables reach the user
+                    # through the envelope, which is what the gate protects.
+                    if resolved_answer_tables or accum.has_answer_tables:
+                        answer_shape.note_answer_succeeded()
+                    designated_answer_text = (
+                        clean_answer_text(call_args.get("answer"))
+                        if isinstance(call_args, dict)
+                        else None
+                    )
 
-                # K2 SUPPRESSION, the fold. HERE, once the batch has drained, and NOT at
-                # the drop site: within one batch the tagged call and the substantive one
-                # can arrive in EITHER order — `[tagged getTableSchema, untagged runQuery]`
-                # selects the note before the runQuery is seen, and the tagged call may
-                # itself BE the runQuery — so a decision made per call would be right only
-                # half the time. Draining first makes the batch's ordering irrelevant.
+                # Record a SUCCESSFUL idempotent read so an identical repeat later
+                # this turn is caught by the guard above. Only `ok` reads are
+                # "already served" — a denied/errored read is NOT recorded, so a
+                # legitimate retry after a transient failure is never suppressed.
+                # The DECISION is handed back rather than the arguments, so the
+                # signature recorded is provably the one that was tested.
+                if read_decision.is_idempotent_read and tool_result.status == "ok":
+                    read_guard.record_served(read_decision, tool_call.id)
+
+                # Record a SUCCESSFUL `getBlueprint` so the blueprint-definition gate
+                # lets that id run. STAGED in the gate's per-response set, not
+                # committed until the batch drains (see `commit_round` below the
+                # loop).
+                if (
+                    tool_call.name == "getBlueprint"
+                    and tool_result.status == "ok"
+                    and isinstance(call_args, dict)
+                ):
+                    blueprint_gate.note_definition_in_context(call_args.get("id"))
+
+                # S3: also check the budget INSIDE the per-tool-call loop (not only
+                # once per outer iteration) so a slow batch of capped calls that
+                # blows the wall-clock window mid-dispatch stops cleanly instead of
+                # finishing the whole batch regardless.
                 #
-                # The note is dropped, not reworded: with the door shut there is no true
-                # corrective advice to give, and the pre-slice behaviour (silent drop, plus
-                # `loop_intent_tag_dropped`, which fired above and is untouched) is the
-                # correct fallback.
-                if substantive_ran:
-                    intent_note_call_ids.clear()
+                # WHAT THIS CAN ACTUALLY TRIP ON: the WALL CLOCK, and only it (A2).
+                # `guard.exceeded` reads three counters, but the other two cannot
+                # change here — this round's `record_iteration` runs AFTER the batch
+                # drains (below, once the round-trip's `total_tokens` is known), and
+                # if the iteration or token-spend arm had already been over its cap
+                # on a PREVIOUS round the loop would have ended that round instead of
+                # dispatching this batch. Elapsed time is the one input that advances
+                # while tools run, so it is the one arm that can newly trip mid-batch.
+                #
+                # That is the intended behaviour, not a gap to close: iterations and
+                # spend are charged per ROUND-TRIP, so charging them mid-batch would
+                # mean charging a round the model has not been billed for yet.
+                # Documented because the plain reading of "check the budget" promises
+                # all three, and a future reader debugging a batch that ran past an
+                # iteration cap should not have to re-derive this from the ordering.
+                if guard.exceeded:
+                    break
 
-                # BLUEPRINT-DEFINITION GATE, the fold. HERE, once the batch has drained,
-                # and deliberately not mid-batch: ids expanded in THIS response become
-                # runnable only from the NEXT one, because the result of a `getBlueprint`
-                # issued in this response does not reach the model until the next
-                # round-trip. See `BlueprintGate.commit_round` for the full rationale —
-                # the position of this call is the half of it that lives here.
-                blueprint_gate.commit_round()
+            # K2 SUPPRESSION, the fold. HERE, once the batch has drained, and NOT at
+            # the drop site: within one batch the tagged call and the substantive one
+            # can arrive in EITHER order — `[tagged getTableSchema, untagged runQuery]`
+            # selects the note before the runQuery is seen, and the tagged call may
+            # itself BE the runQuery — so a decision made per call would be right only
+            # half the time. Draining first makes the batch's ordering irrelevant.
+            #
+            # The note is dropped, not reworded: with the door shut there is no true
+            # corrective advice to give, and the pre-slice behaviour (silent drop, plus
+            # `loop_intent_tag_dropped`, which fired above and is untouched) is the
+            # correct fallback.
+            if substantive_ran:
+                intent_note_call_ids.clear()
 
-                # TERMINATION: pause. Honoured AFTER the state calls above have been
-                # committed (03 §E.1) and BEFORE anything else in the batch is
-                # dispatched — `capped_tool_calls` held only the state calls on this
-                # path, so every other call still waits for the resume exactly as it
-                # always did.
-                if ask_user_call is not None:
-                    if (
-                        accum.unpresented_capability_names
-                        and await finalization_gate.may_refuse("ask_user_judge")
-                    ):
-                        capability_names = ", ".join(accum.unpresented_capability_names)
+            # BLUEPRINT-DEFINITION GATE, the fold. HERE, once the batch has drained,
+            # and deliberately not mid-batch: ids expanded in THIS response become
+            # runnable only from the NEXT one, because the result of a `getBlueprint`
+            # issued in this response does not reach the model until the next
+            # round-trip. See `BlueprintGate.commit_round` for the full rationale —
+            # the position of this call is the half of it that lives here.
+            blueprint_gate.commit_round()
+
+            # TERMINATION: pause. Honoured AFTER the state calls above have been
+            # committed (03 §E.1) and BEFORE anything else in the batch is
+            # dispatched — `capped_tool_calls` held only the state calls on this
+            # path, so every other call still waits for the resume exactly as it
+            # always did.
+            if ask_user_call is not None:
+                if (
+                    accum.unpresented_capability_names
+                    and not capability_advisory_used
+                    and not ship_guard.unsafe_ship()
+                ):
+                    capability_names = ", ".join(accum.unpresented_capability_names)
+                    capability_advisory_used = True
+                    self._observer(
+                        "loop_capability_present_suggested",
+                        {"count": len(accum.unpresented_capability_names)},
+                    )
+                    finalization_nudge = (
+                        f"You loaded the UI option {capability_names} but did not present it. "
+                        "Call it if you want to show it; a definition lookup is not visible. "
+                        "If you intentionally chose not to present it, finish normally with an answer tool."
+                    )
+                    continue
+                raw_question = str(ask_user_call.arguments.get("question", ""))
+                declined_key = _question_key(declined_question) if declined_question else ""
+                if declined_key and _question_key(raw_question) == declined_key:
+                    if not declined_repeat_refused:
+                        declined_repeat_refused = True
                         finalization_nudge = (
-                            "Do not ask for optional inputs before presenting the loaded UI "
-                            f"option. Call {capability_names} now, omitting values the user did "
-                            "not supply. The UI can collect them. Put any completed Help Center "
-                            "answer in the capability call's answer field."
+                            "You repeated the clarification the user declined. Do not ask it "
+                            "again. Answer using a safe assumption, or finish now with the "
+                            "specific reason an answer is not possible."
                         )
                         continue
-                    raw_question = str(ask_user_call.arguments.get("question", ""))
-                    declined_key = _question_key(declined_question) if declined_question else ""
-                    if declined_key and _question_key(raw_question) == declined_key:
-                        if not declined_repeat_refused:
-                            declined_repeat_refused = True
-                            finalization_nudge = (
-                                "You repeated the clarification the user declined. Do not ask it "
-                                "again. Answer using a safe assumption, or finish now with the "
-                                "specific reason an answer is not possible."
-                            )
-                            continue
-                        honest = (
-                            "I can’t complete this reliably without the information you chose "
-                            "not to provide, so I’m stopping instead of asking the same question "
-                            "again."
-                        )
-                        await self._force_block_pending_intents(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            state=analysis_state,
-                            reason_code="USER_STOPPED",
-                        )
-                        return await self._finish(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            status="done",
-                            exit_label="declined_clarification",
-                            assistant_text=honest,
-                            tool_calls_made=tool_calls_made,
-                            accum=accum,
-                            persist_text=honest,
-                            provenance=await self._compute_turn_provenance_union(
-                                session_id, turn_index
-                            ),
-                        )
-                    # --- THE askUser JUDGE (09 §C.3) ------------------------
-                    #
-                    # THE CHEAPEST SITE IN THE DESIGN TO REJECT AT, and the only one
-                    # where the proposed "the question names a COLUMN instead of a
-                    # THING" complaint can be made at all: `askUser` is intercepted
-                    # here and never reaches either terminal exit, so 05 §L.9's
-                    # "pauses are not gated" leaves it unchecked today.
-                    #
-                    # NOTHING IS AT RISK. The pause has not happened, so the user has
-                    # seen nothing; a rejection costs one round-trip that is invisible
-                    # to them, where a rejection at an answer exit risks an answer the
-                    # model already had.
-                    #
-                    # JUDGED ON THE RAW ARGUMENT, BEFORE THE SCRUB BELOW, and the
-                    # ordering is the whole point. `scrub_answer_prose` already turns
-                    # "which AnnualSalary did you mean?" into "which [schema detail
-                    # withheld] did you mean?" — 05 §L.3's trap exactly, a
-                    # half-redacted string that is neither usable nor honest. Judging
-                    # the scrubbed form would ask the model to repair a string it did
-                    # not write; judging the raw one gets a question that never needed
-                    # redacting.
-                    async def _ask_brief(
-                        _q: str = question,
-                        _state: AnalysisState | None = analysis_state,
-                        _asked: str = raw_question,
-                        _options: tuple[str, ...] = tuple(
-                            _ask_user_options(ask_user_call.arguments.get("options")) or ()
-                        ),
-                    ) -> JudgeBrief:
-                        results, anchor, _ = await self._judge_results(
-                            session_id,
-                            turn_index,
-                            credentials.column_scope,
-                            include_all_successful=True,
-                        )
-                        return self._judge_brief(
-                            "ask_user",
-                            question=_q,
-                            accum=accum,
-                            analysis_state=_state,
-                            date_anchor=anchor,
-                            results=results,
-                            pending_question=_asked,
-                            pending_options=_options,
-                        )
-
-                    ask_verdict = await self._judge(
-                        _ask_brief,
-                        guard=guard,
-                        gate=finalization_gate,
-                        kind="ask_user_judge",
+                    honest = (
+                        "I can’t complete this reliably without the information you chose "
+                        "not to provide, so I’m stopping instead of asking the same question "
+                        "again."
                     )
-                    if not ask_verdict.approved:
-                        # ITS OWN ALLOWANCE (`ask_user_judge`), never the answer
-                        # judge's: a rejected ANSWER earlier in this window must not
-                        # silence the check that keeps a schema-worded question off
-                        # the user's screen, and the two complaints are made at
-                        # different moments about different text.
-                        if await finalization_gate.may_refuse("ask_user_judge"):
-                            self._observer(
-                                ASK_USER_JUDGE_REFUSED_EVENT,
-                                {"violation": ask_verdict.violation},
-                            )
-                            finalization_nudge = ask_user_judge_nudge_text(
-                                raw_question, ask_verdict.feedback
-                            )
-                            # NO DRAFT TO CLEAR — `last_assistant_text` belongs to the
-                            # ANSWER exits and this path does not finish. What is
-                            # discarded is the `askUser` call itself, which was never
-                            # persisted (it is intercepted, never dispatched), so the
-                            # nudge's echo is the model's only surviving copy.
-                            #
-                            # The state calls of this batch HAVE been dispatched and
-                            # persisted already (03 §E.1) — they are on the trail and
-                            # replay normally on the next round-trip, so re-rounding
-                            # here does not lose the ledger update that rode along.
-                            continue
-                        # THE WINDOW'S ALLOWANCE IS SPENT. THE PAUSE PROCEEDS — the
-                        # runtime never hard-locks a turn (05 §J.5), and here shipping
-                        # the question is strictly better than the alternatives:
-                        # refusing again spends the window on a disagreement, and
-                        # suppressing the pause would end the turn with no answer and
-                        # no question.
-                        #
-                        # ⚠ REACHED ONLY WHEN THE PERSISTED CLAIM IS SPENT AND THIS
-                        # GATE DOES NOT KNOW IT. Within one `_run_loop_body` the
-                        # `has_spent` peek inside `_judge` pre-empts this branch and no
-                        # model call is made at all — so the ordinary
-                        # refuse-then-ask-again sequence emits `..._skipped`, NOT this
-                        # event. What lands here is the askUser RESUME: `window_count`
-                        # is unchanged across one (D55), a fresh gate is built on
-                        # re-entry, and the claim it finds was spent by the previous
-                        # invocation. Keeping both is deliberate — the peek is the
-                        # cheap common case, and this is the honest handler for the
-                        # case the peek cannot see, which would otherwise drop a
-                        # judged rejection with no event at all.
-                        self._observer(
-                            ASK_USER_JUDGE_EXHAUSTED_EVENT,
-                            {"violation": ask_verdict.violation},
-                        )
-                    # THE QUESTION IS MODEL PROSE SHOWN TO THE USER, so it is
-                    # scrubbed exactly like an answer (ISSUES I1) — "which
-                    # department_id did you mean?" discloses as much as an answer
-                    # would. Scrubbed HERE, at the single point the string is
-                    # extracted, so the persisted `PauseCheckpoint`, the
-                    # `TurnOutcome.pending_question` projected from it, and the
-                    # `loop_paused_ask_user` event below all carry the same text —
-                    # a resume replays the checkpoint, so a question scrubbed only
-                    # on the way out would come back unscrubbed. `provenance=None`:
-                    # this is a pause, and none is computed on this path.
-                    #
-                    # `options` are NOT scrubbed: they are the answer choices the
-                    # user clicks, and are values by construction.
-                    question, question_redactions = scrub_answer_prose(
-                        str(ask_user_call.arguments.get("question", "")), provenance=None
+                    await self._force_block_pending_intents(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        state=analysis_state,
+                        reason_code="USER_STOPPED",
                     )
-                    if question_redactions:
-                        self._observer(
-                            ANSWER_PROSE_REDACTED_EVENT,
-                            {
-                                "redaction_count": question_redactions,
-                                "exit": "ask_user_question",
-                            },
-                        )
-                    options = _ask_user_options(ask_user_call.arguments.get("options"))
-                    checkpoint = PauseCheckpoint(
-                        reason="askUser",
-                        pending_question={"question": question, "options": options},
-                        awaiting="user_answer",
-                        consumed=False,
-                        budget_window_count=window_count,
-                    )
-                    # Best-effort partials (§1) ride along; `provenance` is left unset
-                    # (the fail-closed union is reused only on the `done` returns).
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
-                        status="paused_ask_user",
-                        exit_label="pause",
-                        assistant_text=result.assistant_text,
+                        status="done",
+                        exit_label="declined_clarification",
+                        assistant_text=honest,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
-                        checkpoint=checkpoint,
-                        event=("loop_paused_ask_user", {"question": question}),
+                        persist_text=honest,
+                        provenance=await self._compute_turn_provenance_union(
+                            session_id, turn_index
+                        ),
                     )
 
-                if designated_text_answer is not None:
-                    designated_text_has_evidence = (
-                        designated_text_has_evidence or bool(accum.capability_cards)
+                # --- THE askUser JUDGE (09 §C.3) ------------------------
+                #
+                # THE CHEAPEST SITE IN THE DESIGN TO REJECT AT, and the only one
+                # where the proposed "the question names a COLUMN instead of a
+                # THING" complaint can be made at all: `askUser` is intercepted
+                # here and never reaches either terminal exit, so 05 §L.9's
+                # "pauses are not gated" leaves it unchecked today.
+                #
+                # NOTHING IS AT RISK. The pause has not happened, so the user has
+                # seen nothing; a rejection costs one round-trip that is invisible
+                # to them, where a rejection at an answer exit risks an answer the
+                # model already had.
+                #
+                # JUDGED ON THE RAW ARGUMENT, BEFORE THE SCRUB BELOW, and the
+                # ordering is the whole point. `scrub_answer_prose` already turns
+                # "which AnnualSalary did you mean?" into "which [schema detail
+                # withheld] did you mean?" — 05 §L.3's trap exactly, a
+                # half-redacted string that is neither usable nor honest. Judging
+                # the scrubbed form would ask the model to repair a string it did
+                # not write; judging the raw one gets a question that never needed
+                # redacting.
+                async def _ask_brief(
+                    _q: str = question,
+                    _state: AnalysisState | None = analysis_state,
+                    _asked: str = raw_question,
+                    _options: tuple[str, ...] = tuple(
+                        _ask_user_options(ask_user_call.arguments.get("options")) or ()
+                    ),
+                ) -> JudgeBrief:
+                    results, anchor, _ = await self._judge_results(
+                        session_id,
+                        turn_index,
+                        credentials.column_scope,
+                        include_all_successful=True,
                     )
-                    pending_at_text = pending_intents(analysis_state)
-                    if (
-                        accum.unpresented_capability_names
-                        and await finalization_gate.may_refuse("help_center_grounding")
-                    ):
-                        capability_names = ", ".join(accum.unpresented_capability_names)
-                        finalization_nudge = (
-                            "You loaded a matching UI option but did not present it. Call "
-                            f"{capability_names} now; definition lookup alone is not visible "
-                            "to the user. Put the completed text answer in that call's answer "
-                            "field and do not call getCapabilityTool again."
-                        )
-                        designated_text_answer = None
-                        capability_finalization_refused = True
-                    elif pending_at_text and await finalization_gate.may_refuse("intents"):
-                        self._observer(
-                            "loop_finalization_refused",
-                            {"exit": "answer_with_text", "pending_count": len(pending_at_text)},
-                        )
-                        finalization_nudge = finalization_nudge_text(
-                            designated_text_answer, pending_at_text
-                        )
-                        designated_text_answer = None
-                        capability_finalization_refused = True
-                    elif (
-                        not designated_text_has_evidence
-                        and await finalization_gate.may_refuse("ungrounded_answer")
-                    ):
-                        self._observer(
-                            ANSWER_RULE_REFUSED_EVENT, {"rule": "ungrounded_text_answer"}
-                        )
-                        finalization_nudge = (
-                            "You tried to finish with answerWithText without valid current-turn "
-                            "evidence. Are you sure this answer can be given without runQuery, "
-                            "runBlueprint, getTableSchema, or a complete Help Center document? "
-                            "If evidence is available, use it and list its exact tool name in "
-                            "answerWithText.evidence. Otherwise call answerWithText again with "
-                            "an empty evidence list and give a concise, honest answer that makes "
-                            "no unsupported claim."
-                        )
-                        designated_text_answer = None
-                        capability_finalization_refused = True
+                    return self._judge_brief(
+                        "ask_user",
+                        question=_q,
+                        accum=accum,
+                        ship_guard=ship_guard,
+                        analysis_state=_state,
+                        date_anchor=anchor,
+                        results=results,
+                        pending_question=_asked,
+                        pending_options=_options,
+                    )
 
+                ask_verdict = await self._judge(
+                    _ask_brief,
+                    guard=guard,
+                    gate=finalization_gate,
+                    kind="ask_user_judge",
+                )
+                if not ask_verdict.approved:
+                    # ITS OWN ALLOWANCE (`ask_user_judge`), never the answer
+                    # judge's: a rejected ANSWER earlier in this window must not
+                    # silence the check that keeps a schema-worded question off
+                    # the user's screen, and the two complaints are made at
+                    # different moments about different text.
+                    if await finalization_gate.may_refuse("ask_user_judge"):
+                        self._observer(
+                            ASK_USER_JUDGE_REFUSED_EVENT,
+                            {"violation": ask_verdict.violation},
+                        )
+                        finalization_nudge = ask_user_judge_nudge_text(
+                            raw_question, ask_verdict.feedback
+                        )
+                        # NO DRAFT TO CLEAR — `last_assistant_text` belongs to the
+                        # ANSWER exits and this path does not finish. What is
+                        # discarded is the `askUser` call itself, which was never
+                        # persisted (it is intercepted, never dispatched), so the
+                        # nudge's echo is the model's only surviving copy.
+                        #
+                        # The state calls of this batch HAVE been dispatched and
+                        # persisted already (03 §E.1) — they are on the trail and
+                        # replay normally on the next round-trip, so re-rounding
+                        # here does not lose the ledger update that rode along.
+                        continue
+                    # THE WINDOW'S ALLOWANCE IS SPENT. THE PAUSE PROCEEDS — the
+                    # runtime never hard-locks a turn (05 §J.5), and here shipping
+                    # the question is strictly better than the alternatives:
+                    # refusing again spends the window on a disagreement, and
+                    # suppressing the pause would end the turn with no answer and
+                    # no question.
+                    #
+                    # ⚠ REACHED ONLY WHEN THE PERSISTED CLAIM IS SPENT AND THIS
+                    # GATE DOES NOT KNOW IT. Within one `_run_loop_body` the
+                    # `has_spent` peek inside `_judge` pre-empts this branch and no
+                    # model call is made at all — so the ordinary
+                    # refuse-then-ask-again sequence emits `..._skipped`, NOT this
+                    # event. What lands here is the askUser RESUME: `window_count`
+                    # is unchanged across one (D55), a fresh gate is built on
+                    # re-entry, and the claim it finds was spent by the previous
+                    # invocation. Keeping both is deliberate — the peek is the
+                    # cheap common case, and this is the honest handler for the
+                    # case the peek cannot see, which would otherwise drop a
+                    # judged rejection with no event at all.
+                    self._observer(
+                        ASK_USER_JUDGE_EXHAUSTED_EVENT,
+                        {"violation": ask_verdict.violation},
+                    )
+                # THE QUESTION IS MODEL PROSE SHOWN TO THE USER, so it is
+                # scrubbed exactly like an answer (ISSUES I1) — "which
+                # department_id did you mean?" discloses as much as an answer
+                # would. Scrubbed HERE, at the single point the string is
+                # extracted, so the persisted `PauseCheckpoint`, the
+                # `TurnOutcome.pending_question` projected from it, and the
+                # `loop_paused_ask_user` event below all carry the same text —
+                # a resume replays the checkpoint, so a question scrubbed only
+                # on the way out would come back unscrubbed. `provenance=None`:
+                # this is a pause, and none is computed on this path.
+                #
+                # `options` are NOT scrubbed: they are the answer choices the
+                # user clicks, and are values by construction.
+                question, question_redactions = scrub_answer_prose(
+                    str(ask_user_call.arguments.get("question", "")), provenance=None
+                )
+                if question_redactions:
+                    self._observer(
+                        ANSWER_PROSE_REDACTED_EVENT,
+                        {
+                            "redaction_count": question_redactions,
+                            "exit": "ask_user_question",
+                        },
+                    )
+                options = _ask_user_options(ask_user_call.arguments.get("options"))
+                checkpoint = PauseCheckpoint(
+                    reason="askUser",
+                    pending_question={"question": question, "options": options},
+                    awaiting="user_answer",
+                    consumed=False,
+                    budget_window_count=window_count,
+                )
+                # Best-effort partials (§1) ride along; `provenance` is left unset
+                # (the fail-closed union is reused only on the `done` returns).
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    status="paused_ask_user",
+                    exit_label="pause",
+                    assistant_text=result.assistant_text,
+                    tool_calls_made=tool_calls_made,
+                    accum=accum,
+                    checkpoint=checkpoint,
+                    event=("loop_paused_ask_user", {"question": question}),
+                )
+
+            if (
+                designated_text_answer is not None
+                and answer_shape.armed
+                and not accum.has_answer_tables
+            ):
+                if await finalization_gate.may_refuse("answer_shape"):
+                    finalization_nudge = answer_shape_nudge_text(
+                        designated_text_answer,
+                        answer_shape.multi_row_calls,
+                        refusal_actioned=bool(ship_guard.unsafe_ship()),
+                        cards_present=bool(accum.capability_cards),
+                        capability_repick_used=ship_guard.repick_used,
+                        capability_engaged=bool(
+                            accum.unpresented_capability_names or accum.capability_cards
+                        ),
+                    )
+                    designated_text_answer = None
+                    capability_finalization_refused = True
+
+            if designated_text_answer is not None and help_grounding.needs_decline(
+                successful_text_evidence_tools, bool(accum.capability_cards or accum.has_answer_tables)
+            ):
+                designated_text_answer = HELP_UNAVAILABLE_TEXT
+                self._observer("loop_help_center_grounding_declined", {})
+
+            if designated_text_answer is not None:
+                designated_text_has_evidence = designated_text_has_evidence or bool(
+                    accum.capability_cards
+                )
+                pending_at_text = pending_intents(analysis_state)
                 if (
-                    designated_text_answer is not None
-                    and not finalization_gate.refused_this_round
+                    accum.unpresented_capability_names
+                    and not capability_advisory_used
+                    and not ship_guard.unsafe_ship()
                 ):
-                    async def _text_tool_brief(
+                    capability_names = ", ".join(accum.unpresented_capability_names)
+                    capability_advisory_used = True
+                    self._observer(
+                        "loop_capability_present_suggested",
+                        {"count": len(accum.unpresented_capability_names)},
+                    )
+                    finalization_nudge = (
+                        f"You loaded the UI option {capability_names} but did not present it. "
+                        "Call it if you want to show it; a definition lookup is not visible. "
+                        "If you intentionally chose not to present it, finish normally with an answer tool."
+                    )
+                    designated_text_answer = None
+                    capability_finalization_refused = True
+                elif pending_at_text and await finalization_gate.may_refuse("intents"):
+                    self._observer(
+                        "loop_finalization_refused",
+                        {"exit": "answer_with_text", "pending_count": len(pending_at_text)},
+                    )
+                    finalization_nudge = finalization_nudge_text(
+                        designated_text_answer, pending_at_text
+                    )
+                    designated_text_answer = None
+                    capability_finalization_refused = True
+                elif (
+                    not designated_text_has_evidence
+                    and not declined_question
+                    and not is_scope_decline(designated_text_answer)
+                    and await finalization_gate.may_refuse("ungrounded_answer")
+                ):
+                    self._observer(ANSWER_RULE_REFUSED_EVENT, {"rule": "ungrounded_text_answer"})
+                    finalization_nudge = (
+                        "You tried to finish with answerWithText without valid current-turn "
+                        "evidence. Are you sure this answer can be given without runQuery, "
+                        "runBlueprint, getTableSchema, or a complete Help Center document? "
+                        "If evidence is available, use it and list its exact tool name in "
+                        "answerWithText.evidence. Otherwise call answerWithText again with "
+                        "an empty evidence list and give a concise, honest answer that makes "
+                        "no unsupported claim."
+                    )
+                    designated_text_answer = None
+                    capability_finalization_refused = True
+
+            if designated_text_answer is not None and not finalization_gate.refused_this_round:
+
+                async def _text_tool_brief(
+                    _q: str = question,
+                    _state: AnalysisState | None = analysis_state,
+                    _draft: str = designated_text_answer,
+                ) -> JudgeBrief:
+                    results, anchor, in_scope = await self._judge_results(
+                        session_id, turn_index, credentials.column_scope
+                    )
+                    return self._judge_brief(
+                        "exit_prose",
+                        question=_q,
+                        accum=accum,
+                        ship_guard=ship_guard,
+                        analysis_state=_state,
+                        date_anchor=anchor,
+                        draft=_draft,
+                        results=results,
+                        figure_corroborated=await self._corroborated_figures(
+                            session_id, turn_index, _draft, in_scope
+                        ),
+                    )
+
+                text_verdict = await self._judge(
+                    _text_tool_brief,
+                    guard=guard,
+                    gate=finalization_gate,
+                    kind="answer_judge",
+                )
+                if text_verdict.approved and text_verdict.reviewed:
+                    ship_guard.note_approval()
+                if not text_verdict.approved:
+                    ship_guard.note_refusal(
+                        "exit_prose", text_verdict.violation, assumptions=accum.assumptions
+                    )
+                    refusal_kind = _answer_judge_refusal_kind(text_verdict)
+                    if await finalization_gate.may_refuse(refusal_kind):
+                        self._observer(
+                            ANSWER_JUDGE_REFUSED_EVENT,
+                            {"violation": text_verdict.violation, "site": "exit_prose"},
+                        )
+                        finalization_nudge = answer_judge_nudge_text(
+                            designated_text_answer, text_verdict.feedback
+                        )
+                        designated_text_answer = None
+                        capability_finalization_refused = True
+                    else:
+                        self._observer(
+                            ANSWER_JUDGE_EXHAUSTED_EVENT,
+                            {"violation": text_verdict.violation, "site": "exit_prose"},
+                        )
+
+            if accum.capability_cards and answer_shape.armed and not accum.has_answer_tables:
+                if await finalization_gate.may_refuse("answer_shape"):
+                    capability_finalization_refused = True
+                    self._observer(
+                        ANSWER_SHAPE_REFUSED_EVENT,
+                        {"multi_row_calls": answer_shape.multi_row_calls},
+                    )
+                    finalization_nudge = answer_shape_nudge_text(
+                        result.assistant_text,
+                        answer_shape.multi_row_calls,
+                        refusal_actioned=ship_guard.unsafe_ship() is not None,
+                        cards_present=True,
+                        capability_repick_used=ship_guard.repick_used,
+                        capability_engaged=True,
+                    )
+                    last_assistant_text = None
+                else:
+                    self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
+
+            if accum.capability_cards and not capability_finalization_refused:
+                capability_approved = False
+                final_text = (
+                    designated_answer_text
+                    or designated_text_answer
+                    or capability_terminal_text
+                    or "Here are the requested options."
+                )
+                if _claims_navigation_was_performed(final_text, accum.capability_cards):
+                    ship_guard.note_refusal(
+                        "exit_capability",
+                        NAVIGATION_CLAIM_VIOLATION,
+                        assumptions=accum.assumptions,
+                        card_fatal=False,
+                    )
+                    if not navigation_refused:
+                        navigation_refused = True
+                        capability_finalization_refused = True
+                        self._observer(
+                            "loop_navigation_claim_refused",
+                            {"violation": NAVIGATION_CLAIM_VIOLATION, "site": "exit_capability"},
+                        )
+                        finalization_nudge = "Navigation requires a user click. Rewrite using answerWithText without claiming you navigated or will navigate. The option is prepared; do not call it again."
+                        last_assistant_text = designated_answer_text = designated_text_answer = None
+                    else:
+                        final_text = capability_hedge_text(NAVIGATION_CLAIM_VIOLATION)
+                if not finalization_gate.refused_this_round and not capability_finalization_refused:
+
+                    async def _capability_brief(
                         _q: str = question,
                         _state: AnalysisState | None = analysis_state,
-                        _draft: str = designated_text_answer,
+                        _draft: str = final_text,
                     ) -> JudgeBrief:
                         results, anchor, in_scope = await self._judge_results(
                             session_id, turn_index, credentials.column_scope
                         )
                         return self._judge_brief(
-                            "exit_prose",
+                            "exit_capability",
                             question=_q,
                             accum=accum,
+                            ship_guard=ship_guard,
                             analysis_state=_state,
                             date_anchor=anchor,
                             draft=_draft,
@@ -4171,307 +4437,226 @@ class AgentLoop:
                             ),
                         )
 
-                    text_verdict = await self._judge(
-                        _text_tool_brief,
+                    capability_verdict = await self._judge(
+                        _capability_brief,
                         guard=guard,
                         gate=finalization_gate,
                         kind="answer_judge",
                     )
-                    if not text_verdict.approved:
-                        refusal_kind = _answer_judge_refusal_kind(text_verdict)
+                    if capability_verdict.approved and capability_verdict.reviewed:
+                        capability_approved = True
+                        ship_guard.note_approval()
+                    if not capability_verdict.approved:
+                        ship_guard.note_refusal(
+                            "exit_capability",
+                            capability_verdict.violation,
+                            assumptions=accum.assumptions,
+                        )
+                        refusal_kind = _answer_judge_refusal_kind(capability_verdict)
                         if await finalization_gate.may_refuse(refusal_kind):
+                            capability_finalization_refused = True
                             self._observer(
                                 ANSWER_JUDGE_REFUSED_EVENT,
-                                {"violation": text_verdict.violation, "site": "exit_prose"},
+                                {
+                                    "violation": capability_verdict.violation,
+                                    "site": "exit_capability",
+                                },
                             )
                             finalization_nudge = answer_judge_nudge_text(
-                                designated_text_answer, text_verdict.feedback
+                                final_text, capability_verdict.feedback
                             )
+                            if is_card_fatal("exit_capability", capability_verdict.violation):
+                                accum.clear_capabilities()
+                                if not ship_guard.repick_used and not finalization_gate.has_spent(
+                                    "answer_judge"
+                                ):
+                                    ship_guard.repick_used = True
+                                    finalization_nudge += " You may select one different UI option only if its declared coverage fits: searchCapabilityTools, getCapabilityTool, then present it. Otherwise decline through answerWithText."
+                                else:
+                                    finalization_nudge += " Do not re-pick an unreviewed option; give an honest decline through answerWithText."
                             designated_text_answer = None
-                            capability_finalization_refused = True
+                            last_assistant_text = None
+                            designated_answer_text = None
                         else:
                             self._observer(
                                 ANSWER_JUDGE_EXHAUSTED_EVENT,
-                                {"violation": text_verdict.violation, "site": "exit_prose"},
+                                {
+                                    "violation": capability_verdict.violation,
+                                    "site": "exit_capability",
+                                },
                             )
-
-                if accum.capability_cards and answer_shape.armed and not accum.has_answer_tables:
-                    if await finalization_gate.may_refuse("answer_shape"):
-                        capability_finalization_refused = True
-                        self._observer(
-                            ANSWER_SHAPE_REFUSED_EVENT,
-                            {"multi_row_calls": answer_shape.multi_row_calls},
-                        )
-                        finalization_nudge = (
-                            answer_shape_nudge_text(
-                                result.assistant_text, answer_shape.multi_row_calls
-                            )
-                            + " The capability cards are already prepared; do not call those "
-                            "capabilities again. Call answerWithTable now so the same final "
-                            "response contains both the table and the cards."
-                        )
-                        last_assistant_text = None
-                    else:
-                        self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
-
-                if accum.capability_cards and not capability_finalization_refused:
-                    final_text = (
-                        designated_answer_text
-                        or designated_text_answer
-                        or capability_terminal_text
-                        or "Here are the requested options."
-                    )
-                    if _claims_navigation_was_performed(final_text, accum.capability_cards):
-                        if await finalization_gate.may_refuse("help_center_grounding"):
-                            capability_finalization_refused = True
-                            self._observer(
-                                ANSWER_JUDGE_REFUSED_EVENT,
-                                {"violation": "unsupported_by_evidence", "site": "exit_capability"},
-                            )
-                            finalization_nudge = (
-                                "Navigation requires the user to click the displayed option. "
-                                "Rewrite the answer without claiming that you opened, will open, "
-                                "navigated, took, sent, or redirected the user. Do not call the "
-                                "capability again; it is already prepared."
-                            )
-                            last_assistant_text = None
-                            designated_answer_text = None
-                    if not finalization_gate.refused_this_round:
-
-                        async def _capability_brief(
-                            _q: str = question,
-                            _state: AnalysisState | None = analysis_state,
-                            _draft: str = final_text,
-                        ) -> JudgeBrief:
-                            results, anchor, in_scope = await self._judge_results(
-                                session_id, turn_index, credentials.column_scope
-                            )
-                            return self._judge_brief(
-                                "exit_capability",
-                                question=_q,
-                                accum=accum,
-                                analysis_state=_state,
-                                date_anchor=anchor,
-                                draft=_draft,
-                                results=results,
-                                figure_corroborated=await self._corroborated_figures(
-                                    session_id, turn_index, _draft, in_scope
-                                ),
-                            )
-
-                        capability_verdict = await self._judge(
-                            _capability_brief,
-                            guard=guard,
-                            gate=finalization_gate,
-                            kind="answer_judge",
-                        )
-                        if not capability_verdict.approved:
-                            refusal_kind = _answer_judge_refusal_kind(capability_verdict)
-                            if await finalization_gate.may_refuse(refusal_kind):
-                                capability_finalization_refused = True
-                                self._observer(
-                                    ANSWER_JUDGE_REFUSED_EVENT,
-                                    {
-                                        "violation": capability_verdict.violation,
-                                        "site": "exit_capability",
-                                    },
-                                )
-                                finalization_nudge = answer_judge_nudge_text(
-                                    final_text, capability_verdict.feedback
-                                )
-                                last_assistant_text = None
-                                designated_answer_text = None
-                            else:
-                                self._observer(
-                                    ANSWER_JUDGE_EXHAUSTED_EVENT,
-                                    {
-                                        "violation": capability_verdict.violation,
-                                        "site": "exit_capability",
-                                    },
-                                )
-                    if not capability_finalization_refused:
-                        return await self._finish(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            status="done",
-                            exit_label=(
-                                "answer_with_text"
-                                if designated_text_answer is not None
-                                else "capability"
-                            ),
-                            assistant_text=final_text,
-                            tool_calls_made=tool_calls_made,
-                            accum=accum,
-                            provenance=await self._compute_turn_provenance_union(
-                                session_id, turn_index
-                            ),
-                            persist_text=final_text,
-                            event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
-                            capability_cards=accum.capability_cards,
-                        )
-
-                # Explicit answer tools are checked after the whole batch drains, so
-                # batched bookkeeping and finalization calls are folded together.
-                # answerWithTable carries its final prose in the call. It is checked
-                # AFTER the whole batch drains so a batched recordAssumptions +
-                # answerWithTable still folds both before the turn closes.
-                #
-                # Everything below mirrors the no-tool-calls exit exactly — the same
-                # `_compute_turn_provenance_union` (the single fail-closed source of
-                # truth) and the same persisted assistant `TurnMessage` — because
-                # replay, `session_history`, and the D44 scope gate all read that
-                # message. A divergence here would make history disagree with the live
-                # answer for exactly the turns that produced a table.
-                if designated_answer_text is not None:
-                    turn_provenance = await self._compute_turn_provenance_union(
-                        session_id, turn_index
-                    )
+                if not capability_finalization_refused:
+                    if (self._answer_judge is not None and getattr(self._answer_judge, "enabled", True)
+                            and not capability_approved
+                            and any(card["kind"] != "navigation" for card in accum.capability_judge_context)):
+                        ship_guard.refuse_unreviewed_data_card(assumptions=accum.assumptions)
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
                         status="done",
-                        exit_label="answer_with_table",
-                        assistant_text=designated_answer_text,
+                        exit_label=(
+                            "answer_with_text"
+                            if designated_text_answer is not None
+                            else "capability"
+                        ),
+                        assistant_text=final_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
-                        provenance=turn_provenance,
-                        persist_text=designated_answer_text,
+                        provenance=await self._compute_turn_provenance_union(
+                            session_id, turn_index
+                        ),
+                        persist_text=final_text,
                         event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                        capability_cards=accum.capability_cards,
+                        ship_guard=ship_guard,
+                        judge_site="exit_capability",
                     )
 
-                if designated_text_answer is not None:
-                    turn_provenance = await self._compute_turn_provenance_union(
-                        session_id, turn_index
+            # Explicit answer tools are checked after the whole batch drains, so
+            # batched bookkeeping and finalization calls are folded together.
+            # answerWithTable carries its final prose in the call. It is checked
+            # AFTER the whole batch drains so a batched recordAssumptions +
+            # answerWithTable still folds both before the turn closes.
+            #
+            # Everything below mirrors the no-tool-calls exit exactly — the same
+            # `_compute_turn_provenance_union` (the single fail-closed source of
+            # truth) and the same persisted assistant `TurnMessage` — because
+            # replay, `session_history`, and the D44 scope gate all read that
+            # message. A divergence here would make history disagree with the live
+            # answer for exactly the turns that produced a table.
+            if designated_answer_text is not None:
+                turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    status="done",
+                    exit_label="answer_with_table",
+                    ship_guard=ship_guard,
+                    judge_site="exit_table",
+                    assistant_text=designated_answer_text,
+                    tool_calls_made=tool_calls_made,
+                    accum=accum,
+                    provenance=turn_provenance,
+                    persist_text=designated_answer_text,
+                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                )
+
+            if designated_text_answer is not None:
+                turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    status="done",
+                    exit_label="answer_with_text",
+                    ship_guard=ship_guard,
+                    judge_site="exit_prose",
+                    assistant_text=designated_text_answer,
+                    tool_calls_made=tool_calls_made,
+                    accum=accum,
+                    provenance=turn_provenance,
+                    persist_text=designated_text_answer,
+                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                )
+
+            # SPEND, not occupancy: `total_tokens` is this round-trip's prompt +
+            # completion, and every round replays the conversation, so the sum is
+            # what the window COST — not how full the model's context is. It is
+            # measured against `max_token_spend` (a spend ceiling), never against
+            # the context window; occupancy is enforced per-request by
+            # `fit_request_to_budget` above. Cached prompt tokens are counted at
+            # full weight on purpose (loop/budget_guard.py module docstring).
+            guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
+
+            if guard.exceeded:
+                if window_count >= self._max_budget_windows:
+                    # 05 §F: `stopped_hard_ceiling` IS a terminal outcome, so the
+                    # scoped invariant applies — every surviving `pending` intent
+                    # is recorded `BUDGET_EXHAUSTED` before the turn ends. A no-op
+                    # (no write, no telemetry) when there is no live state or
+                    # nothing pending, which is every ordinary turn.
+                    analysis_state = await self._force_block_pending_intents(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        state=analysis_state,
+                        reason_code="BUDGET_EXHAUSTED",
                     )
+                    # Best-effort partials (§1): whatever succeeded before the hard
+                    # ceiling; `provenance` is left unset (done-only).
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
-                        status="done",
-                        exit_label="answer_with_text",
-                        assistant_text=designated_text_answer,
-                        tool_calls_made=tool_calls_made,
-                        accum=accum,
-                        provenance=turn_provenance,
-                        persist_text=designated_text_answer,
-                        event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
-                    )
-
-                # SPEND, not occupancy: `total_tokens` is this round-trip's prompt +
-                # completion, and every round replays the conversation, so the sum is
-                # what the window COST — not how full the model's context is. It is
-                # measured against `max_token_spend` (a spend ceiling), never against
-                # the context window; occupancy is enforced per-request by
-                # `fit_request_to_budget` above. Cached prompt tokens are counted at
-                # full weight on purpose (loop/budget_guard.py module docstring).
-                guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
-
-                if guard.exceeded:
-                    if window_count >= self._max_budget_windows:
-                        # 05 §F: `stopped_hard_ceiling` IS a terminal outcome, so the
-                        # scoped invariant applies — every surviving `pending` intent
-                        # is recorded `BUDGET_EXHAUSTED` before the turn ends. A no-op
-                        # (no write, no telemetry) when there is no live state or
-                        # nothing pending, which is every ordinary turn.
-                        analysis_state = await self._force_block_pending_intents(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            state=analysis_state,
-                            reason_code="BUDGET_EXHAUSTED",
-                        )
-                        # Best-effort partials (§1): whatever succeeded before the hard
-                        # ceiling; `provenance` is left unset (done-only).
-                        return await self._finish(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            status="stopped_hard_ceiling",
-                            exit_label="pause",
-                            assistant_text=last_assistant_text,
-                            tool_calls_made=tool_calls_made,
-                            accum=accum,
-                            event=("loop_hard_ceiling_stop", {"window": window_count}),
-                        )
-                    # 05 §F, fourth forced path: the budget cap reached DURING A
-                    # REFUSED ROUND. §C.3 created it — the forced re-round is charged,
-                    # so the charge itself can trip the cap, and the model's answer was
-                    # refused a moment ago and its nudge (ephemeral) is already gone.
-                    #
-                    # GATED ON THE REFUSAL, deliberately. An ORDINARY budget-cap pause
-                    # is NOT finalization (§G): it returns a non-`done` status with
-                    # intents legitimately pending, the user may still answer
-                    # "continue", and force-blocking there would write a terminal
-                    # disposition onto a turn that is still running. Only the refused
-                    # round gets it — and if the user answers "stop" instead, `resume()`
-                    # force-blocks with `USER_STOPPED` on its own path.
-                    #
-                    # `ENFORCEMENT_EXHAUSTED`, NOT `BUDGET_EXHAUSTED` (05 §F, reversed
-                    # 2026-08-12 on live evidence). What ran out here is ENFORCEMENT,
-                    # not capacity: the measured turn had its answer at 25s and capped
-                    # at 61.6s on the WALL clock while tokens moved +385 across the
-                    # final three rounds — the 36 seconds went to two rejected
-                    # `updateAnalysisState` calls and one refused `answerWithTable`.
-                    # More budget would have changed nothing, so labelling it
-                    # `BUDGET_EXHAUSTED` told 07 §E.2's reader a capacity story and sent
-                    # them to raise a ceiling that was not the problem. The capacity
-                    # fact is real and is kept — as `budget_cap_reached` on the
-                    # telemetry event, where it informs without misattributing.
-                    # The hard-ceiling branch ABOVE is untouched and still writes
-                    # `BUDGET_EXHAUSTED`: there the ceiling genuinely is the cause.
-                    if finalization_gate.refused_this_round:
-                        # The gate's round flag is now set by the ANSWER-SHAPE
-                        # gate too (05 §J) — which is correct and needs no branch here:
-                        # that gate only fires when NOTHING is pending, so
-                        # `_force_block_pending_intents` finds no pending intent, writes
-                        # nothing and emits nothing. A shape refusal that runs into the
-                        # cap therefore leaves the ledger and the telemetry byte-identical
-                        # to a cap with no refusal at all.
-                        analysis_state = await self._force_block_pending_intents(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            state=analysis_state,
-                            reason_code="ENFORCEMENT_EXHAUSTED",
-                            budget_cap_reached=True,
-                        )
-                    checkpoint = PauseCheckpoint(
-                        reason="budget_cap",
-                        pending_question={
-                            "question": _BUDGET_CAP_QUESTION,
-                            "options": _BUDGET_CAP_OPTIONS,
-                        },
-                        awaiting="user_answer",
-                        consumed=False,
-                        budget_window_count=window_count,
-                    )
-                    # Best-effort partials (§1): whatever succeeded before the cap;
-                    # `provenance` is left unset (done-only).
-                    return await self._finish(
-                        session_id=session_id,
-                        turn_index=turn_index,
-                        status="paused_budget_cap",
+                        status="stopped_hard_ceiling",
                         exit_label="pause",
                         assistant_text=last_assistant_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
-                        checkpoint=checkpoint,
-                        event=("loop_paused_budget_cap", {"window": window_count}),
+                        event=("loop_hard_ceiling_stop", {"window": window_count}),
                     )
-                # Under budget — loop back to 3a within the same window.
-        finally:
-            # Give any ALREADY-FINISHED fire-and-forget summary task a single
-            # event-loop tick to land its emit before we cancel stragglers. This
-            # does NOT wait on an in-flight/slow summary (one `sleep(0)` is one
-            # scheduler iteration — a still-suspended summary stays pending and is
-            # cancelled just below, so the turn result never blocks on it); it only
-            # lets a summary that already completed during dispatch deliver its
-            # line. Gated on a non-empty task set so the feature-off path adds no
-            # extra tick and stays byte-identical. The drain-tick is itself nested
-            # in try/finally so that if the TURN task is being cancelled during
-            # shutdown (the `sleep(0)` then raises CancelledError), the straggler
-            # cancel still ALWAYS runs — a summary task must never outlive the turn.
-            try:
-                if self._summary_tasks:
-                    await asyncio.sleep(0)
-            finally:
-                self._cancel_pending_summaries()
+                # 05 §F, fourth forced path: the budget cap reached DURING A
+                # REFUSED ROUND. §C.3 created it — the forced re-round is charged,
+                # so the charge itself can trip the cap, and the model's answer was
+                # refused a moment ago and its nudge (ephemeral) is already gone.
+                #
+                # GATED ON THE REFUSAL, deliberately. An ORDINARY budget-cap pause
+                # is NOT finalization (§G): it returns a non-`done` status with
+                # intents legitimately pending, the user may still answer
+                # "continue", and force-blocking there would write a terminal
+                # disposition onto a turn that is still running. Only the refused
+                # round gets it — and if the user answers "stop" instead, `resume()`
+                # force-blocks with `USER_STOPPED` on its own path.
+                #
+                # `ENFORCEMENT_EXHAUSTED`, NOT `BUDGET_EXHAUSTED` (05 §F, reversed
+                # 2026-08-12 on live evidence). What ran out here is ENFORCEMENT,
+                # not capacity: the measured turn had its answer at 25s and capped
+                # at 61.6s on the WALL clock while tokens moved +385 across the
+                # final three rounds — the 36 seconds went to two rejected
+                # `updateAnalysisState` calls and one refused `answerWithTable`.
+                # More budget would have changed nothing, so labelling it
+                # `BUDGET_EXHAUSTED` told 07 §E.2's reader a capacity story and sent
+                # them to raise a ceiling that was not the problem. The capacity
+                # fact is real and is kept — as `budget_cap_reached` on the
+                # telemetry event, where it informs without misattributing.
+                # The hard-ceiling branch ABOVE is untouched and still writes
+                # `BUDGET_EXHAUSTED`: there the ceiling genuinely is the cause.
+                if finalization_gate.refused_this_round:
+                    # The gate's round flag is now set by the ANSWER-SHAPE
+                    # gate too (05 §J) — which is correct and needs no branch here:
+                    # that gate only fires when NOTHING is pending, so
+                    # `_force_block_pending_intents` finds no pending intent, writes
+                    # nothing and emits nothing. A shape refusal that runs into the
+                    # cap therefore leaves the ledger and the telemetry byte-identical
+                    # to a cap with no refusal at all.
+                    analysis_state = await self._force_block_pending_intents(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        state=analysis_state,
+                        reason_code="ENFORCEMENT_EXHAUSTED",
+                        budget_cap_reached=True,
+                    )
+                checkpoint = PauseCheckpoint(
+                    reason="budget_cap",
+                    pending_question={
+                        "question": _BUDGET_CAP_QUESTION,
+                        "options": _BUDGET_CAP_OPTIONS,
+                    },
+                    awaiting="user_answer",
+                    consumed=False,
+                    budget_window_count=window_count,
+                )
+                # Best-effort partials (§1): whatever succeeded before the cap;
+                # `provenance` is left unset (done-only).
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    status="paused_budget_cap",
+                    exit_label="pause",
+                    assistant_text=last_assistant_text,
+                    tool_calls_made=tool_calls_made,
+                    accum=accum,
+                    checkpoint=checkpoint,
+                    event=("loop_paused_budget_cap", {"window": window_count}),
+                )
+            # Under budget — loop back to 3a within the same window.
 
 
 __all__ = [

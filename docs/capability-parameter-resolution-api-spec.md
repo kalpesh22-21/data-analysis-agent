@@ -258,7 +258,7 @@ The endpoint shape remains unchanged:
 
 ```http
 POST /v1/capabilities/tools/submit_paf_transaction/hydrate
-Authorization: Bearer <service-api-key>
+Authorization: Bearer <end-user-jwt>
 X-End-User-Authorization: Bearer <end-user-jwt>
 ```
 

@@ -31,3 +31,5 @@ tests/e2e/*.log
 # the source says otherwise. Re-run the command instead of committing the output.
 deploy/helm/*/charts/*.tgz
 deploy/helm/*/Chart.lock
+
+remote-developer.md

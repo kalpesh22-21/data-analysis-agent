@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -40,6 +41,8 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
 SESSION_ID = "sess-disable-redaction-app"
 HEADERS = {"Authorization": "Bearer test-jwt", "X-Session-Id": SESSION_ID}
@@ -201,7 +204,9 @@ def _read_tools_app(monkeypatch, *, disable_redaction: bool, pii_query: str) -> 
             [
                 ModelTurnResult(
                     tool_calls=[
-                        ToolCallRequest(id="sb1", name="searchBlueprints", arguments={"query": pii_query})
+                        ToolCallRequest(
+                            id="sb1", name="searchBlueprints", arguments={"query": pii_query}
+                        )
                     ]
                 ),
                 ModelTurnResult(assistant_text="Found it."),
@@ -219,9 +224,7 @@ def test_app_wires_flag_into_read_tools(monkeypatch) -> None:
     default and reveals it when the flag is on."""
     pii_query = "overtime paid to Jane Doe"
     for disable_redaction, expected in ((False, "<redacted>"), (True, pii_query)):
-        app = _read_tools_app(
-            monkeypatch, disable_redaction=disable_redaction, pii_query=pii_query
-        )
+        app = _read_tools_app(monkeypatch, disable_redaction=disable_redaction, pii_query=pii_query)
         client = TestClient(app)
         resp = client.post("/turn", json={"message": "overtime?"}, headers=HEADERS)
         assert resp.status_code == 200
@@ -238,9 +241,7 @@ def test_flag_is_telemetry_only_same_answer_both_ways(monkeypatch) -> None:
     way."""
     outcomes = []
     for disable_redaction in (False, True):
-        app = _build_app(
-            monkeypatch, disable_redaction=disable_redaction, span_exporter=None
-        )
+        app = _build_app(monkeypatch, disable_redaction=disable_redaction, span_exporter=None)
         client = TestClient(app)
         resp = client.post("/turn", json={"message": "look it up"}, headers=HEADERS)
         assert resp.status_code == 200

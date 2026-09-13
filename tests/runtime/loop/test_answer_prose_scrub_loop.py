@@ -168,7 +168,19 @@ async def test_the_answer_with_table_exit_scrubs_prose_and_leaves_the_sql_alone(
                         },
                     )
                 ]
-            )
+            ),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="a2",
+                        name="answerWithTable",
+                        arguments={
+                            "answer": f"Grouped {_E} by department_name.",
+                            "tables": [{"sql": _SQL}],
+                        },
+                    )
+                ]
+            ),
         ],
         runtime_tools={"answerWithTable": AnswerWithTableTool()},
     )
@@ -178,9 +190,7 @@ async def test_the_answer_with_table_exit_scrubs_prose_and_leaves_the_sql_alone(
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == (
-        f"Grouped {SCHEMA_DETAIL_MARKER} by {SCHEMA_DETAIL_MARKER}."
-    )
+    assert outcome.assistant_text == (f"Grouped {SCHEMA_DETAIL_MARKER} by {SCHEMA_DETAIL_MARKER}.")
     assert await _assistant_messages(store) == [outcome.assistant_text]
     # I2: the structured payload still names exactly what ran.
     assert outcome.answer_sql == _SQL
@@ -199,6 +209,7 @@ class _FakeBlueprintTool:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id=None,
     ) -> ToolResult:
         return ToolResult(
             status="ok",
@@ -280,6 +291,7 @@ class _PausingTool:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id=None,
     ) -> ToolResult:
         return ToolResult(
             status="ok",
@@ -312,9 +324,7 @@ async def test_a_runtime_tool_pause_scrubs_its_partial_prose() -> None:
         runtime_tools={"resolveValues": _PausingTool()},
     )
 
-    paused = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    paused = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert paused.status == "paused_ask_user"
     assert paused.assistant_text == (
@@ -378,11 +388,7 @@ async def test_the_event_carries_a_count_and_a_label_and_never_a_token() -> None
     redaction through the side door, so the payload is asserted by its WHOLE
     contents, not by "the token is absent"."""
     loop, _store, events = _build(
-        [
-            ModelTurnResult(
-                assistant_text=f"From {_E} and employee_master, via {_BP}."
-            )
-        ]
+        [ModelTurnResult(assistant_text=f"From {_E} and employee_master, via {_BP}.")]
     )
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q?")

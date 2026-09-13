@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
@@ -47,6 +49,8 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
 SESSION_ID = "sess-turn-exit"
 _E = "dbpcm_warehouse.employee"
@@ -139,26 +143,18 @@ async def test_the_resume_stop_exit_returns_done_and_emits_no_loop_turn_done() -
     this exit shares with the two that DO emit, so any consolidation that reads the
     event off the status makes this one emit too — and it would look like a fix.
     """
-    loop, _store, events = _build(
-        [_query_turn("c1")], max_loop_iterations=1, max_budget_windows=3
-    )
+    loop, _store, events = _build([_query_turn("c1")], max_loop_iterations=1, max_budget_windows=3)
 
-    paused = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    paused = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
     assert paused.status == "paused_budget_cap"
     assert "loop_paused_budget_cap" in _names(events)
 
     before = len(events)
-    stopped = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="stop"
-    )
+    stopped = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     assert stopped.status == "done"
     assert stopped.tool_calls_made == 0
-    assert stopped.assistant_text == (
-        "Stopping here — here is what I found before the budget cap."
-    )
+    assert stopped.assistant_text == ("Stopping here — here is what I found before the budget cap.")
     # The whole point: a `done` return that emits NO `loop_turn_done`, ever.
     assert "loop_turn_done" not in _names(events)
     # And nothing else sneaks in either — the only events this resume may emit are
@@ -171,9 +167,7 @@ async def test_the_two_in_body_done_exits_do_emit_loop_turn_done() -> None:
     the event having been deleted outright."""
     loop, _store, events = _build([ModelTurnResult(assistant_text="Here it is.")])
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert outcome.status == "done"
     assert [p for n, p in events if n == "loop_turn_done"] == [{"tool_calls_made": 0}]
@@ -253,17 +247,13 @@ async def test_an_ask_user_pause_carries_no_provenance_even_when_determined() ->
         ]
     )
 
-    paused = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    paused = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
     assert paused.status == "paused_ask_user"
     assert paused.provenance is None
     # Best-effort partials DO cross the pause — it is `provenance` alone that does not.
     assert paused.sql_executed == [_SQL]
 
-    done = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="Sales"
-    )
+    done = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="Sales")
     assert done.status == "done"
     # The union the pause declined to surface, on the same turn, from the same trail.
     assert done.provenance is not None
@@ -274,13 +264,9 @@ async def test_a_hard_ceiling_stop_carries_no_provenance() -> None:
     """`stopped_hard_ceiling` is TERMINAL but not `done`: it force-blocks pending
     intents and returns the best partial. `provenance` stays `None` — there is no
     assistant message it could be the tag of."""
-    loop, store, _events = _build(
-        [_query_turn("c1")], max_loop_iterations=1, max_budget_windows=1
-    )
+    loop, store, _events = _build([_query_turn("c1")], max_loop_iterations=1, max_budget_windows=1)
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert outcome.status == "stopped_hard_ceiling"
     assert outcome.provenance is None
@@ -291,13 +277,9 @@ async def test_a_hard_ceiling_stop_carries_no_provenance() -> None:
 
 async def test_a_budget_cap_pause_carries_no_provenance() -> None:
     """Same rule at the fourth exit."""
-    loop, store, _events = _build(
-        [_query_turn("c1")], max_loop_iterations=1, max_budget_windows=3
-    )
+    loop, store, _events = _build([_query_turn("c1")], max_loop_iterations=1, max_budget_windows=3)
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert outcome.status == "paused_budget_cap"
     assert outcome.provenance is None
@@ -322,6 +304,7 @@ class _PausingTool:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id=None,
     ) -> ToolResult:
         return ToolResult(
             status="ok",
@@ -370,9 +353,7 @@ async def test_an_in_loop_pause_carries_the_envelope_of_the_same_batch() -> None
         },
     )
 
-    paused = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    paused = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert paused.status == "paused_ask_user"
     assert paused.pending_question == {"question": "Which region?", "options": None}
@@ -428,9 +409,7 @@ async def test_a_pause_exit_writes_its_checkpoint_before_it_announces_it() -> No
         events=log,
     )
 
-    paused = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="go"
-    )
+    paused = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert paused.status == "paused_ask_user"
     tail = [name for name, _p in events][-2:]

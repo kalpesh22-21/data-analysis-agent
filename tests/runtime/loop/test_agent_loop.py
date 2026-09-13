@@ -30,7 +30,7 @@ from data_agent.runtime.loop.agent_loop import (
     _declines_clarification,
     _tool_trail_entry_to_canonical,
 )
-from data_agent.runtime.loop.answer_judge import APPROVED, JudgeBrief, JudgeVerdict
+from data_agent.runtime.loop.answer_judge import JudgeBrief, JudgeVerdict
 from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -38,6 +38,8 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError
+
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
@@ -80,9 +82,7 @@ def _build_loop(
 ) -> tuple[AgentLoop, InMemorySessionStore]:
     store = store or InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
-    assembler = ContextAssembler(
-        store, base_system_prompt=base_system_prompt
-    )
+    assembler = ContextAssembler(store, base_system_prompt=base_system_prompt)
     loop = AgentLoop(
         model_client=model_client,
         tool_dispatcher=dispatcher,
@@ -104,19 +104,29 @@ def _build_loop(
 
 
 async def test_normal_response_is_rejected_until_answer_with_text_is_called() -> None:
-    model = ScriptedModelClient([
-        ModelTurnResult(assistant_text="Here is your answer."),
-        ModelTurnResult(tool_calls=[ToolCallRequest(
-            id="answer_1",
-            name="answerWithText",
-            arguments={"answer": "Here is your answer.", "evidence": []},
-        )]),
-        ModelTurnResult(tool_calls=[ToolCallRequest(
-            id="answer_2",
-            name="answerWithText",
-            arguments={"answer": "Here is your answer.", "evidence": []},
-        )]),
-    ])
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(assistant_text="Here is your answer."),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="answer_1",
+                        name="answerWithText",
+                        arguments={"answer": "Here is your answer.", "evidence": []},
+                    )
+                ]
+            ),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="answer_2",
+                        name="answerWithText",
+                        arguments={"answer": "Here is your answer.", "evidence": []},
+                    )
+                ]
+            ),
+        ]
+    )
     mcp = FakeMCPClient()
     loop, store = _build_loop(model_client=model, mcp_client=mcp)
 
@@ -132,7 +142,7 @@ async def test_normal_response_is_rejected_until_answer_with_text_is_called() ->
     roles = [m.role for m in doc.messages]
     assert roles == ["user", "assistant"]
     assert "cannot finish this turn" in model.calls[1].messages[-1]["content"]
-    assert "Are you sure" in model.calls[2].messages[-1]["content"]
+    assert "Ground the answer" in model.calls[2].messages[-1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +229,13 @@ async def test_declined_clarification_is_not_shown_again_and_agent_answers_best_
                 ]
             ),
             repeated,
-            ModelTurnResult(assistant_text="I used all departments because you skipped that choice."),
+            ModelTurnResult(
+                assistant_text="I used all departments because you skipped that choice."
+            ),
         ]
     )
     loop, _ = _build_loop(model_client=model, mcp_client=FakeMCPClient())
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll."
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll.")
 
     outcome = await loop.resume(
         session_id=SESSION_ID, credentials=_credentials(), answer="Prefer not to answer"
@@ -267,13 +277,9 @@ async def test_repeated_declined_clarification_ends_honestly_instead_of_looping(
 
     model = ScriptedModelClient([ask("first"), ask("repeat-1"), ask("repeat-2")])
     loop, _ = _build_loop(model_client=model, mcp_client=FakeMCPClient())
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll."
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll.")
 
-    outcome = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="skip"
-    )
+    outcome = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="skip")
 
     assert outcome.status == "done"
     assert outcome.pending_question is None
@@ -1083,7 +1089,12 @@ def test_verified_blueprint_tool_message_carries_authoritative_marker() -> None:
         "status": "ok",
         "error_code": None,
         "user_message": None,
-        "result_preview": {"columns": ["n"], "row_count": 1, "truncated": False, "preview_rows": [[42]]},
+        "result_preview": {
+            "columns": ["n"],
+            "row_count": 1,
+            "truncated": False,
+            "preview_rows": [[42]],
+        },
         "authoritative": True,
     }
 
@@ -1108,7 +1119,12 @@ def test_non_authoritative_tool_messages_carry_no_marker() -> None:
         "status": "ok",
         "error_code": None,
         "user_message": None,
-        "result_preview": {"columns": ["n"], "row_count": 1, "truncated": False, "preview_rows": [[42]]},
+        "result_preview": {
+            "columns": ["n"],
+            "row_count": 1,
+            "truncated": False,
+            "preview_rows": [[42]],
+        },
     }
     denied_bp = {
         "tool_call_id": "bp_denied",
@@ -1465,7 +1481,7 @@ class _StubRuntimeTool:
         self.calls: list[tuple[dict, RuntimeCredentials]] = []
 
     async def run(
-        self, model_args: dict, credentials: RuntimeCredentials, turn=None
+        self, model_args: dict, credentials: RuntimeCredentials, turn=None, tool_call_id=None
     ) -> ToolResult:
         self.calls.append((model_args, credentials))
         return ToolResult(
@@ -1488,7 +1504,7 @@ class _StubCapabilityCardTool:
         self.calls = 0
 
     async def run(
-        self, model_args: dict, credentials: RuntimeCredentials, turn=None
+        self, model_args: dict, credentials: RuntimeCredentials, turn=None, tool_call_id=None
     ) -> ToolResult:
         self.calls += 1
         return ToolResult(
@@ -1511,12 +1527,12 @@ class _RecordingJudge:
 
     async def review(self, brief: JudgeBrief):  # noqa: ANN201
         self.briefs.append(brief)
-        return self.verdicts.pop(0) if self.verdicts else APPROVED
+        return self.verdicts.pop(0) if self.verdicts else JudgeVerdict(approved=True, reviewed=True)
 
 
 class _StubHelpCenterDocumentTool:
     async def run(
-        self, model_args: dict, credentials: RuntimeCredentials, turn=None
+        self, model_args: dict, credentials: RuntimeCredentials, turn=None, tool_call_id=None
     ) -> ToolResult:
         return ToolResult(
             status="ok",
@@ -1622,9 +1638,7 @@ async def test_capability_terminal_reaches_judge_with_capability_evidence() -> N
     model = ScriptedModelClient(
         [
             ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(id="cap_1", name=capability.name, arguments={})
-                ]
+                tool_calls=[ToolCallRequest(id="cap_1", name=capability.name, arguments={})]
             )
         ]
     )
@@ -1645,7 +1659,7 @@ async def test_capability_terminal_reaches_judge_with_capability_evidence() -> N
 
 async def test_internal_capability_evidence_is_not_sent_to_the_ui() -> None:
     class _EvidenceCapability(_StubCapabilityCardTool):
-        async def run(self, model_args, credentials, turn=None):  # noqa: ANN001, ANN201
+        async def run(self, model_args, credentials, turn=None, tool_call_id=None):  # noqa: ANN001, ANN201
             result = await super().run(model_args, credentials, turn)
             result.result_full["_agent_evidence"] = {
                 "description": "Shows employee position.",
@@ -1694,18 +1708,20 @@ async def test_capability_judge_rejection_retries_without_losing_ui_payload() ->
     model = ScriptedModelClient(
         [
             ModelTurnResult(
+                tool_calls=[ToolCallRequest(id="cap_1", name=capability.name, arguments={})]
+            ),
+            ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="cap_1", name=capability.name, arguments={})
+                    ToolCallRequest(
+                        id="answer_1",
+                        name="answerWithText",
+                        arguments={
+                            "answer": "You can use this option to manage positions.",
+                            "evidence": [],
+                        },
+                    )
                 ]
             ),
-            ModelTurnResult(tool_calls=[ToolCallRequest(
-                id="answer_1",
-                name="answerWithText",
-                arguments={
-                    "answer": "You can use this option to manage positions.",
-                    "evidence": [],
-                },
-            )]),
         ]
     )
     loop, store = _registry_loop(
@@ -1718,7 +1734,8 @@ async def test_capability_judge_rejection_retries_without_losing_ui_payload() ->
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "You can use this option to manage positions."
+    assert outcome.assistant_text.startswith("I wasn't able to fully answer your question")
+    # The general judge allowance is exhausted; a skipped review cannot approve the rewrite.
     assert [card["tool_name"] for card in outcome.capability_cards or []] == [capability.name]
     assert [brief.site for brief in judge.briefs] == ["exit_capability"]
     assert capability.calls == 1
@@ -1738,14 +1755,18 @@ async def test_help_center_answer_reaches_judge_without_sql_grounding_refusal() 
                     )
                 ]
             ),
-            ModelTurnResult(tool_calls=[ToolCallRequest(
-                id="answer_1",
-                name="answerWithText",
-                arguments={
-                    "answer": "The documented limit is 1,000.",
-                    "evidence": ["getHelpCenterDocument"],
-                },
-            )]),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="answer_1",
+                        name="answerWithText",
+                        arguments={
+                            "answer": "The documented limit is 1,000.",
+                            "evidence": ["getHelpCenterDocument"],
+                        },
+                    )
+                ]
+            ),
         ]
     )
     loop, _ = _registry_loop(
@@ -1762,9 +1783,7 @@ async def test_help_center_answer_reaches_judge_without_sql_grounding_refusal() 
     assert len(model.calls) == 2
     assert len(judge.briefs) == 1
     assert judge.briefs[0].site == "exit_prose"
-    assert [result["tool_name"] for result in judge.briefs[0].results] == [
-        "getHelpCenterDocument"
-    ]
+    assert [result["tool_name"] for result in judge.briefs[0].results] == ["getHelpCenterDocument"]
 
 
 async def test_help_center_grounding_rejection_preserves_general_judge_allowance() -> None:
@@ -1775,7 +1794,7 @@ async def test_help_center_grounding_rejection_preserves_general_judge_allowance
                 violation="unsupported_by_evidence",
                 feedback="Remove the unsupported limit.",
             ),
-            APPROVED,
+            JudgeVerdict(approved=True, reviewed=True),
         ]
     )
     model = ScriptedModelClient(
@@ -1789,19 +1808,30 @@ async def test_help_center_grounding_rejection_preserves_general_judge_allowance
                     )
                 ]
             ),
-            ModelTurnResult(tool_calls=[ToolCallRequest(
-                id="answer_1",
-                name="answerWithText",
-                arguments={"answer": "The limit is 2,000.", "evidence": ["getHelpCenterDocument"]},
-            )]),
-            ModelTurnResult(tool_calls=[ToolCallRequest(
-                id="answer_2",
-                name="answerWithText",
-                arguments={
-                    "answer": "The documented limit is 1,000.",
-                    "evidence": ["getHelpCenterDocument"],
-                },
-            )]),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="answer_1",
+                        name="answerWithText",
+                        arguments={
+                            "answer": "The limit is 2,000.",
+                            "evidence": ["getHelpCenterDocument"],
+                        },
+                    )
+                ]
+            ),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="answer_2",
+                        name="answerWithText",
+                        arguments={
+                            "answer": "The documented limit is 1,000.",
+                            "evidence": ["getHelpCenterDocument"],
+                        },
+                    )
+                ]
+            ),
         ]
     )
     loop, store = _registry_loop(
@@ -1816,9 +1846,7 @@ async def test_help_center_grounding_rejection_preserves_general_judge_allowance
     assert outcome.status == "done"
     assert outcome.assistant_text == "The documented limit is 1,000."
     assert len(judge.briefs) == 2
-    assert await store.claim_finalization_block(
-        SESSION_ID, 0, 1, "help_center_grounding"
-    ) is False
+    assert await store.claim_finalization_block(SESSION_ID, 0, 1, "help_center_grounding") is False
     assert await store.claim_finalization_block(SESSION_ID, 0, 1, "answer_judge") is True
 
 
@@ -1828,14 +1856,10 @@ async def test_capability_card_waits_for_required_answer_table() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(id="query_1", name="runQuery", arguments={"sql": sql})
-                ]
+                tool_calls=[ToolCallRequest(id="query_1", name="runQuery", arguments={"sql": sql})]
             ),
             ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(id="cap_1", name=capability.name, arguments={})
-                ]
+                tool_calls=[ToolCallRequest(id="cap_1", name=capability.name, arguments={})]
             ),
             ModelTurnResult(
                 tool_calls=[
@@ -1881,15 +1905,14 @@ async def test_capability_card_waits_for_required_answer_table() -> None:
     assert outcome.status == "done"
     assert outcome.answer_tables is not None
     assert outcome.answer_tables[0]["sql"] == sql
-    assert [card["tool_name"] for card in outcome.capability_cards or []] == [
-        capability.name
-    ]
+    assert [card["tool_name"] for card in outcome.capability_cards or []] == [capability.name]
     assert capability.calls == 1
     assert len(model.calls) == 3
     assert any(
-        "capability cards are already prepared" in str(message.get("content") or "")
+        "The options are prepared" in str(message.get("content") or "")
         for message in model.calls[2].messages
     )
+
 
 async def test_unwired_retrieval_tool_returns_unavailable_never_dispatched() -> None:
     model = ScriptedModelClient(

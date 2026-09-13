@@ -10,6 +10,7 @@ deterministically loses — the real Couchbase race, without threads or a contai
 from __future__ import annotations
 
 import copy
+import logging
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -42,7 +43,7 @@ class InMemorySessionStore:
         # (matching CouchbaseSessionStore's flat `session_results` collection
         # keying — see couchbase_store.py's `_result_key`). This is what
         # `write_full_result`'s `session_id` parameter is for below.
-        self._results: dict[str, dict[str, dict[str, Any]]] = {}
+        self._results: dict[str, dict[str, dict[str, Any] | list[Any]]] = {}
 
     def _bump_version(self, session_id: str) -> None:
         self._versions[session_id] = self._versions.get(session_id, 0) + 1
@@ -78,10 +79,10 @@ class InMemorySessionStore:
         self._bump_version(session_id)
 
     async def write_full_result(
-        self, session_id: str, result_id: str, result_full: dict[str, Any]
+        self, session_id: str, result_id: str, result_full: dict[str, Any] | list[Any]
     ) -> str:
         ref = f"result::{result_id}"
-        self._results.setdefault(session_id, {})[ref] = result_full
+        self._results.setdefault(session_id, {})[ref] = copy.deepcopy(result_full)
         return ref
 
     async def read_full_result(
@@ -92,7 +93,13 @@ class InMemorySessionStore:
         # a caller mutating the returned dict cannot corrupt store state (LOW-a —
         # parity with Couchbase's fresh-parse + `get_session_with_cas`'s deepcopy).
         stored = self._results.get(session_id, {}).get(result_full_ref)
-        return copy.deepcopy(stored) if stored is not None else None
+        if stored is not None and not isinstance(stored, dict):
+            logging.getLogger(__name__).warning(
+                "Full result %r decoded as %s; using preview",
+                result_full_ref,
+                type(stored).__name__,
+            )
+        return copy.deepcopy(stored) if isinstance(stored, dict) else None
 
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
         doc = await self.get_or_create_session(session_id)
@@ -108,11 +115,11 @@ class InMemorySessionStore:
     ) -> AnalysisState:
         """In-memory counterpart of the merge-callback contract.
 
-                There is no CAS retry to drive here (this fake is single-writer by
-                construction), but the ORDER matters and mirrors the real store: *merge* runs
-                FIRST against the live state and may raise, and only a merge that returned
-                normally mutates the doc — so a rejected call leaves the document
-                byte-identical in both implementations.
+        There is no CAS retry to drive here (this fake is single-writer by
+        construction), but the ORDER matters and mirrors the real store: *merge* runs
+        FIRST against the live state and may raise, and only a merge that returned
+        normally mutates the doc — so a rejected call leaves the document
+        byte-identical in both implementations.
         """
         doc = await self.get_or_create_session(session_id)
         new_state = merge(live_analysis_state(doc, turn_index))
@@ -129,8 +136,8 @@ class InMemorySessionStore:
         kind: FinalizationBlockKind,
     ) -> bool:
         """In-memory counterpart of the claim. The limit is checked and the counter
-                incremented in ONE step, so two claimants for the same (turn, window, kind) can
-                never both succeed — and two claimants for DIFFERENT kinds never contend at all.
+        incremented in ONE step, so two claimants for the same (turn, window, kind) can
+        never both succeed — and two claimants for DIFFERENT kinds never contend at all.
         """
         doc = await self.get_or_create_session(session_id)
         blocks = dict(doc.finalization_blocks or {})

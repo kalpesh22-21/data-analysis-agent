@@ -1,0 +1,139 @@
+[
+  {
+    "name": "direct_deposit_adjacent_banking",
+    "brief": {
+      "site": "exit_capability",
+      "question": "How do I update my direct deposit information?",
+      "draft": "Use the displayed banking option to update your direct deposit.",
+      "capability_presented": [
+        {
+          "tool_name": "banking_overview",
+          "kind": "navigation",
+          "description": "Company banking overview. Cannot edit employee direct deposit.",
+          "data": [
+            "Company bank accounts"
+          ],
+          "parameters": [],
+          "filters": []
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "capability_intent_mismatch",
+      "unsupported_by_evidence"
+    ]
+  },
+  {
+    "name": "pay_stub_adjacent_totals",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Where can I view my pay stubs?",
+      "draft": "Use the displayed option to view your pay stubs.",
+      "capability_presented": [
+        {
+          "tool_name": "payroll_totals",
+          "kind": "data_widget",
+          "description": "Aggregate gross and net payroll totals. No pay stub documents or navigation.",
+          "data": [
+            "Gross payroll",
+            "Net payroll"
+          ],
+          "parameters": [],
+          "filters": []
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "capability_intent_mismatch"
+    ]
+  },
+  {
+    "name": "disclosure_does_not_justify_adjacent_totals",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Where can I view my pay stubs?",
+      "draft": "This option shows payroll totals, but cannot show or take you to your pay stubs.",
+      "capability_presented": [
+        {
+          "tool_name": "payroll_totals",
+          "kind": "data_widget",
+          "description": "Aggregate gross and net payroll totals. No pay stub documents or navigation.",
+          "data": [
+            "Gross payroll",
+            "Net payroll"
+          ],
+          "parameters": [],
+          "filters": []
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "capability_intent_mismatch"
+    ]
+  },
+  {
+    "name": "unsupported_assumption_after_refusal",
+    "brief": {
+      "site": "exit_prose",
+      "question": "How do I clock in using the mobile app?",
+      "draft": "I can't provide verified product instructions from the information available right now.",
+      "assumptions": [
+        "Open Time Clock, then select Start Shift."
+      ],
+      "assumptions_recorded_after_refusal": [
+        "Open Time Clock, then select Start Shift."
+      ],
+      "results": [
+        {
+          "tool_name": "searchHelpCenter",
+          "status": "error",
+          "error_code": "HELP_CENTER_UNAVAILABLE"
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "unsupported_by_evidence"
+    ]
+  },
+  {
+    "name": "honest_help_unavailable",
+    "brief": {
+      "site": "exit_prose",
+      "question": "How do I clock in using the mobile app?",
+      "draft": "I can't provide verified product instructions from the information available right now.",
+      "results": [
+        {
+          "tool_name": "searchHelpCenter",
+          "status": "error",
+          "error_code": "HELP_CENTER_UNAVAILABLE"
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": []
+  },
+  {
+    "name": "fetched_document_grounding",
+    "brief": {
+      "site": "exit_prose",
+      "question": "How do I clock in using the mobile app?",
+      "draft": "Open Time, select Clock In, and wait for confirmation.",
+      "results": [
+        {
+          "tool_name": "getHelpCenterDocument",
+          "status": "ok",
+          "result_full": {
+            "found": true,
+            "content": "Synthetic test guide: open Time, select Clock In, and wait for confirmation."
+          }
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": []
+  }
+]

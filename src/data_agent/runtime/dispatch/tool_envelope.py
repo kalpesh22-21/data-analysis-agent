@@ -124,6 +124,7 @@ class RuntimeToolBase(ABC):
     guard, the error `ToolResult` shape — is inherited and is the same on every site.
     """
 
+    emits_dispatch_events = True
     tool_name: str = ""
 
     # The last-resort code/message for a crash that slipped every inner guard. PER-TOOL,
@@ -184,11 +185,14 @@ class RuntimeToolBase(ABC):
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id: str | None = None,
     ) -> ToolResult:
         """The envelope. *turn* (03 §C.1) is threaded to `_execute` by every site; the
         tools that do not need it accept and ignore it, so the `RuntimeTool` protocol has
         ONE signature rather than two shapes the dispatch site has to tell apart."""
-        self._observer("tool_dispatch_start", {"tool_name": self.tool_name})
+        self._observer(
+            "tool_dispatch_start", {"tool_name": self.tool_name, "tool_call_id": tool_call_id}
+        )
         result = await in_tool_span(
             self._tracer,
             tool_name=self.tool_name,
@@ -197,11 +201,17 @@ class RuntimeToolBase(ABC):
             work=lambda: self._guarded(model_args, credentials, turn),
         )
         if result.status == "ok":
-            self._observer("tool_dispatch_ok", {"tool_name": self.tool_name})
+            self._observer(
+                "tool_dispatch_ok", {"tool_name": self.tool_name, "tool_call_id": tool_call_id}
+            )
         else:
             self._observer(
-                "tool_dispatch_error",
-                {"tool_name": self.tool_name, "error_code": result.error_code},
+                "tool_dispatch_denied" if result.status == "denied" else "tool_dispatch_error",
+                {
+                    "tool_name": self.tool_name,
+                    "tool_call_id": tool_call_id,
+                    "error_code": result.error_code,
+                },
             )
         return result
 

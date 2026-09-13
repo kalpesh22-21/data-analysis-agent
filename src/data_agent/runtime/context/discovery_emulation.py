@@ -31,6 +31,7 @@ D5: no credential enters this module's output — the JWT is consumed only by
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -69,18 +70,18 @@ __all__ = ["EmulatedDiscovery", "EmulatedDiscoveryCache", "build_emulated_discov
 class EmulatedDiscoveryCache:
     """Process-wide, session-keyed, bounded cache of the ONCE-PER-SESSION sweep.
 
-        `_run_loop_body` is re-entered by `run()`, `resume()` AND the blueprint
-        approval-resume, so an uncached sweep re-dispatches both tools on every budget
-        window — and, because the pairs are re-spliced per rebuild, the model watches a
-        fresh block of discovery calls appear mid-session.
+    `_run_loop_body` is re-entered by `run()`, `resume()` AND the blueprint
+    approval-resume, so an uncached sweep re-dispatches both tools on every budget
+    window — and, because the pairs are re-spliced per rebuild, the model watches a
+    fresh block of discovery calls appear mid-session.
 
-        Only a NON-EMPTY sweep is cached: memoizing a degraded one (MCP blip, denial, base
-        database absent) would disable discovery for the whole remaining session on one
-        transient failure, so the next window retries instead.
+    Only a NON-EMPTY sweep is cached: memoizing a degraded one (MCP blip, denial, base
+    database absent) would disable discovery for the whole remaining session on one
+    transient failure, so the next window retries instead.
 
-        Bounded by `max_size` with FIFO eviction — an evicted session simply re-sweeps once.
-        The lock is double-checked, so concurrent windows of the SAME session issue at most
-        one in-flight sweep and the first result wins. D5: only `session_id` is a key.
+    Bounded by `max_size` with FIFO eviction — an evicted session simply re-sweeps once.
+    The lock is double-checked, so concurrent windows of the SAME session issue at most
+    one in-flight sweep and the first result wins. D5: only `session_id` is a key.
     """
 
     def __init__(self, max_size: int = 512) -> None:
@@ -116,12 +117,12 @@ class EmulatedDiscoveryCache:
 class EmulatedDiscovery:
     """The output of one `build_emulated_discovery` sweep.
 
-        `entries` are synthetic rendered-entry dicts in the exact `_render_entry` shape
-        `loop/agent_loop.py::_tool_trail_entry_to_canonical` consumes — `listDatabases`
-        first, then a single `listTables` for the base database; empty means nothing to
-        inject. `read_signatures` are the matching `idempotent_read_signature(tool_name,
-        args)` values, used to SEED the loop's repeated-idempotent-read guard, and are kept
-        1:1 with `entries` (a skipped or failed call contributes neither).
+    `entries` are synthetic rendered-entry dicts in the exact `_render_entry` shape
+    `loop/agent_loop.py::_tool_trail_entry_to_canonical` consumes — `listDatabases`
+    first, then a single `listTables` for the base database; empty means nothing to
+    inject. `read_signatures` are the matching `idempotent_read_signature(tool_name,
+    args)` values, used to SEED the loop's repeated-idempotent-read guard, and are kept
+    1:1 with `entries` (a skipped or failed call contributes neither).
     """
 
     entries: list[dict[str, Any]] = field(default_factory=list)
@@ -156,9 +157,9 @@ def _rendered_entry(
     preview_row_count: int,
 ) -> dict[str, Any]:
     """Render one dispatched `ok` discovery result into the SAME model-facing dict a real
-        replayed read produces, by feeding a `TrailEntry` through `_render_entry` rather
-        than duplicating its JSON logic. *preview_row_count* is threaded from settings so
-        the emulated entry re-truncates to the SAME row count a real replayed read would.
+    replayed read produces, by feeding a `TrailEntry` through `_render_entry` rather
+    than duplicating its JSON logic. *preview_row_count* is threaded from settings so
+    the emulated entry re-truncates to the SAME row count a real replayed read would.
     """
     entry = TrailEntry(
         turn_index=0,
@@ -177,9 +178,9 @@ def _rendered_entry(
 
 def _emit_degraded(observer: Observer | None) -> EmulatedDiscovery:
     """Emit the shape-only `discovery_emulated` event on a degrade path (zero counts +
-        `degraded: true`) and return the EMPTY result. The event fires on BOTH success and
-        degrade, so a silent MCP blip is observable in a trace at the same shape-only
-        posture (integer counts + the flag, no SQL or PII).
+    `degraded: true`) and return the EMPTY result. The event fires on BOTH success and
+    degrade, so a silent MCP blip is observable in a trace at the same shape-only
+    posture (integer counts + the flag, no SQL or PII).
     """
     if observer is not None:
         observer(
@@ -198,21 +199,21 @@ async def build_emulated_discovery(
     observer: Observer | None = None,
 ) -> EmulatedDiscovery:
     """Sweep `listDatabases` + `listTables(base_database)` through *dispatcher* and build
-        the synthetic rendered entries + guard signatures, or an EMPTY result to degrade.
+    the synthetic rendered entries + guard signatures, or an EMPTY result to degrade.
 
-        *base_database* is the ONE database whose tables are emulated; only the `listTables`
-        fan-out is narrowed, `listDatabases` is still emulated in full.
+    *base_database* is the ONE database whose tables are emulated; only the `listTables`
+    fan-out is narrowed, `listDatabases` is still emulated in full.
 
-        *preview_row_count* is the row count each emulated entry re-truncates to, so it
-        matches a real replayed read under a non-default setting — otherwise a listing
-        longer than the preview would be capped while the guard seed blocked the model's
-        same-args re-call, making the tail undiscoverable for the turn.
+    *preview_row_count* is the row count each emulated entry re-truncates to, so it
+    matches a real replayed read under a non-default setting — otherwise a listing
+    longer than the preview would be capped while the guard seed blocked the model's
+    same-args re-call, making the tail undiscoverable for the turn.
 
-        Never raises. Returns an empty result when `listDatabases` is not `ok`, empty, or
-        not a list, and on any unexpected exception. When *base_database* is absent from the
-        result, or its `listTables` call is not `ok`, the `listDatabases` pair is STILL
-        injected on its own. Every degrade path emits `discovery_emulated` with
-        `degraded: true`.
+    Never raises. Returns an empty result when `listDatabases` is not `ok`, empty, or
+    not a list, and on any unexpected exception. When *base_database* is absent from the
+    result, or its `listTables` call is not `ok`, the `listDatabases` pair is STILL
+    injected on its own. Every degrade path emits `discovery_emulated` with
+    `degraded: true`.
     """
     try:
         # `emit_progress=False` on BOTH sweep dispatches (ratified): this is
@@ -237,7 +238,11 @@ async def build_emulated_discovery(
 
         entries: list[dict[str, Any]] = [
             _rendered_entry(
-                "emulated-listDatabases", "listDatabases", {}, db_result, preview_row_count
+                _opaque_discovery_call_id(credentials.session_id, "databases"),
+                "listDatabases",
+                {},
+                db_result,
+                preview_row_count,
             )
         ]
         read_signatures: set[tuple[str, str]] = {idempotent_read_signature("listDatabases", {})}
@@ -269,7 +274,9 @@ async def build_emulated_discovery(
             else:
                 entries.append(
                     _rendered_entry(
-                        f"emulated-listTables-{base_database}",
+                        _opaque_discovery_call_id(
+                            credentials.session_id, f"tables:{base_database}"
+                        ),
                         "listTables",
                         args,
                         table_result,
@@ -291,3 +298,10 @@ async def build_emulated_discovery(
         # falls back to calling listDatabases/listTables itself.
         _logger.exception("emulated discovery failed — injecting nothing")
         return _emit_degraded(observer)
+
+
+def _opaque_discovery_call_id(session_id: str, target: str) -> str:
+    digest = hashlib.sha256(
+        f"data-agent/discovery-emulation/v1\x00{session_id}\x00{target}".encode()
+    ).hexdigest()
+    return "syn_" + digest[:24]

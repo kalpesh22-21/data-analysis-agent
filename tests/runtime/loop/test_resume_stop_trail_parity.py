@@ -92,6 +92,7 @@ class _PausingTool:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id=None,
     ) -> ToolResult:
         return ToolResult(
             status="ok",
@@ -195,9 +196,7 @@ async def _pause_at_the_budget_cap_with_a_designated_table(
     # window HAD these, and the whole bug was that the next window's stop did not.
     assert paused.answer_sql == HEADCOUNT_SQL
 
-    capped = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="EMEA"
-    )
+    capped = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="EMEA")
     assert capped.status == "paused_budget_cap"
 
 
@@ -207,9 +206,7 @@ async def test_a_stop_returns_the_answer_tables_and_assumptions_from_the_trail()
     loop, _store, _events = _build([_designating_round(), _probe_round("q1")])
     await _pause_at_the_budget_cap_with_a_designated_table(loop)
 
-    stopped = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="stop"
-    )
+    stopped = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     assert stopped.status == "done"
     assert stopped.assumptions == [ASSUMPTION]
@@ -232,9 +229,7 @@ async def test_a_stops_derived_envelope_fields_follow_its_rebuilt_tables() -> No
     loop, _store, _events = _build([_designating_round(), _probe_round("q1")])
     await _pause_at_the_budget_cap_with_a_designated_table(loop)
 
-    stopped = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="stop"
-    )
+    stopped = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     assert stopped.answer_sql == HEADCOUNT_SQL
     assert stopped.blueprint_use is None
@@ -257,9 +252,7 @@ async def test_a_stop_over_an_empty_trail_still_returns_none_not_empty() -> None
     )
     assert paused.status == "paused_budget_cap"
 
-    stopped = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="stop"
-    )
+    stopped = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     assert stopped.status == "done"
     assert stopped.assumptions is None
@@ -281,14 +274,10 @@ async def test_the_stop_exit_still_emits_nothing_and_makes_no_extra_round_trip()
     await _pause_at_the_budget_cap_with_a_designated_table(loop)
 
     before = len(events)
-    stopped = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="stop"
-    )
+    stopped = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     assert stopped.tool_calls_made == 0
-    assert stopped.assistant_text == (
-        "Stopping here — here is what I found before the budget cap."
-    )
+    assert stopped.assistant_text == ("Stopping here — here is what I found before the budget cap.")
     assert [name for name, _p in events[before:]] == []
 
 

@@ -131,20 +131,20 @@ The UI, not the runtime, executes the user's later interaction with a card. The 
 
 ## Authentication and security
 
-We accept the entity-resolution-only exception for forwarding the end-user JWT.
+Runtime integration revision (2026-09-13): the per-request end-user JWT now authenticates all capability endpoints. Provider audience compatibility still needs confirmation; see `followup.md`.
 
-- Search and GET use only the service API key.
-- Hydrate uses the service API key for service authentication and the end-user JWT solely for Torch entity resolution.
+- Search and GET use `Authorization: Bearer <end-user-jwt>`.
+- Hydrate uses the same Authorization header and adds `X-End-User-Authorization` only for entity resolution.
 - The CL service must not log, persist, reflect, or trace the end-user JWT.
 - The JWT must not be included in a JSON request body or response.
-- The Data Analysis Agent will attach the JWT only at the outbound hydration HTTP boundary. It will never place it in model context, tool results, session history, or telemetry.
+- The Data Analysis Agent attaches the JWT only at outbound capability HTTP boundaries. It will never place it in model context, tool results, session history, or telemetry.
 
 ### Required clarification 1: forwarded JWT header
 
 Please confirm the exact header used to carry the end-user JWT. Our proposed contract is:
 
 ```http
-Authorization: Bearer <service-api-key>
+Authorization: Bearer <end-user-jwt>
 X-End-User-Authorization: Bearer <end-user-jwt>
 ```
 

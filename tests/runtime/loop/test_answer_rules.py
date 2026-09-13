@@ -482,7 +482,7 @@ def test_the_quantity_predicate_is_deliberately_narrow() -> None:
     assert asserts_quantity("Average tenure is 4.25 years.")
 
     assert not asserts_quantity("Overtime is paid at 1.5 times the base hourly rate.")
-    assert not asserts_quantity("Hours beyond 40 in a single work week count as overtime.")
+    assert asserts_quantity("Hours beyond 40 in a single work week count as overtime.")
     assert not asserts_quantity("There are 3 pay frequencies in use.")
     assert not asserts_quantity("The warehouse covers pay, time and hiring.")
 
@@ -549,7 +549,7 @@ def test_first_match_returns_at_most_one_rule() -> None:
     structurally, and the registry must not break it."""
     assert first_match("", None) is None
     assert first_match("   ", None) is None
-    assert first_match("Sales leads on headcount.", None) is None
+    assert first_match("Sales leads on headcount.", None).name == "no_evidence"
     assert first_match(_FABRICATED, None).name == "ungrounded_quantity"
     assert first_match(_FABRICATED, None, has_alternative_evidence=True) is None
     assert first_match(_FABRICATED, ["SELECT 1"]) is None

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.config import RuntimeSettings
@@ -43,6 +45,8 @@ from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import live_analysis_state
+
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
 SESSION_ID = "sess-window-token-spend"
 _E = "dbpcm_warehouse.employee"
@@ -360,9 +364,7 @@ async def test_a_spend_cap_pause_grants_a_fresh_spend_window_on_continue() -> No
     calls_per_window.append(model.calls - seen)
     seen = model.calls
     while outcome.status == "paused_budget_cap":
-        outcome = await loop.resume(
-            session_id=SESSION_ID, credentials=_creds(), answer="continue"
-        )
+        outcome = await loop.resume(session_id=SESSION_ID, credentials=_creds(), answer="continue")
         statuses.append(outcome.status)
         calls_per_window.append(model.calls - seen)
         seen = model.calls
@@ -426,6 +428,7 @@ async def test_a_spend_triggered_hard_ceiling_still_force_blocks_pending_intents
     doc = await store.get_or_create_session(SESSION_ID)
     state = live_analysis_state(doc, 0)
     assert [(i.status, i.reason_code) for i in state.intents] == [("blocked", "BUDGET_EXHAUSTED")]
-    assert ("loop_intent_force_blocked", {"intent_id": "i1", "reason_code": "BUDGET_EXHAUSTED"}) in [
-        (name, payload) for name, payload in events
-    ]
+    assert (
+        "loop_intent_force_blocked",
+        {"intent_id": "i1", "reason_code": "BUDGET_EXHAUSTED"},
+    ) in [(name, payload) for name, payload in events]

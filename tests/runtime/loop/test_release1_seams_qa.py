@@ -52,6 +52,8 @@ from data_agent.runtime.session.models import live_analysis_state
 from data_agent.runtime.session.store import CASMismatchError
 from tests._blueprint_gate import expand_blueprint
 
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+
 SESSION_ID = "sess-r1-seams"
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -76,7 +78,7 @@ def _creds() -> RuntimeCredentials:
 
 
 async def _tools_provider(_c: RuntimeCredentials) -> list[dict]:
-    return []
+    return [{"type": "function", "name": "runQuery", "parameters": {}}]
 
 
 def _rq(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
@@ -251,7 +253,10 @@ async def test_the_window_local_state_governs_after_a_blueprint_mid_dag_resume()
     paused = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two things")
     assert paused.status == "paused_ask_user"
     # 03 §E.1: the state call was committed BEFORE the pause.
-    assert [i.status for i in live_analysis_state(await store.get_or_create_session(SESSION_ID), 0).intents] == [
+    assert [
+        i.status
+        for i in live_analysis_state(await store.get_or_create_session(SESSION_ID), 0).intents
+    ] == [
         "pending",
         "pending",
     ]
@@ -374,9 +379,7 @@ async def test_the_intent_tag_survives_a_mid_dag_blueprint_pause() -> None:
     )
     # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
     await expand_blueprint(store, SESSION_ID, _BID)
-    paused = await loop.run(
-        session_id=SESSION_ID, credentials=_creds(), user_message="two things"
-    )
+    paused = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two things")
     assert paused.status == "paused_ask_user"
     checkpoint = (await store.get_or_create_session(SESSION_ID)).pause_checkpoint
     assert checkpoint is not None and checkpoint.serves_intent == "i1"

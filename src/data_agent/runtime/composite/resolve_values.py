@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -88,9 +89,9 @@ class ResolveOutcome:
 def parse_period(raw: Any) -> Period | None:
     """Parse the model's optional structured `period` arg into a `Period`.
 
-        Fail-closed: a present-but-malformed `period` (not an object, missing or blank `column`,
-        non-string `start`/`end`) raises `TargetValidationError` rather than being silently
-        dropped.
+    Fail-closed: a present-but-malformed `period` (not an object, missing or blank `column`,
+    non-string `start`/`end`) raises `TargetValidationError` rather than being silently
+    dropped.
     """
     if raw is None:
         return None
@@ -155,15 +156,16 @@ class ResolveValuesComposite:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id: str | None = None,
     ) -> ToolResult:
         """Model tool-call path: validate args, resolve, wrap as a `ToolResult`.
 
-                Emits one `TOOL` span with `concept` redacted and `period` literals masked — unless
-                the access-controlled `otlp_disable_redaction` switch reveals the real values,
-                telemetry-only — and the inner `runQuery` span nests inside it via the ambient OTel
-                context. The whole pipeline is wrapped in a crash guard: an UNEXPECTED exception
-                never propagates out to abort the turn or leak `str(exc)`, degrading instead to a
-                clean `status="error"` result, logged server-side only.
+        Emits one `TOOL` span with `concept` redacted and `period` literals masked — unless
+        the access-controlled `otlp_disable_redaction` switch reveals the real values,
+        telemetry-only — and the inner `runQuery` span nests inside it via the ambient OTel
+        context. The whole pipeline is wrapped in a crash guard: an UNEXPECTED exception
+        never propagates out to abort the turn or leak `str(exc)`, degrading instead to a
+        clean `status="error"` result, logged server-side only.
         """
         # The SPAN HALF only, from the shared envelope. This tool does not subclass
         # `RuntimeToolBase`: its progress events fire DEEP inside `resolve()` at their own
@@ -175,19 +177,19 @@ class ResolveValuesComposite:
         outcome = await in_tool_span(
             self._tracer,
             tool_name=TOOL_NAME,
-            args=tool_span_args(
-                TOOL_NAME, model_args, disable_redaction=self._disable_redaction
-            ),
+            args=tool_span_args(TOOL_NAME, model_args, disable_redaction=self._disable_redaction),
             reveal_complex_args=self._disable_redaction,
-            work=lambda: self._safe_run_inner(model_args, credentials),
+            work=lambda: self._safe_run_inner(
+                model_args, credentials, tool_call_id or str(uuid.uuid4())
+            ),
         )
         return self._outcome_to_tool_result(outcome)
 
     async def _safe_run_inner(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials, tool_call_id: str
     ) -> ResolveOutcome:
         try:
-            return await self._run_inner(model_args, credentials)
+            return await self._run_inner(model_args, credentials, tool_call_id)
         except Exception:
             # B4-parity: the composite has no equivalent of ToolDispatcher's
             # transport-exception guard, so an unguarded crash here (a malformed
@@ -197,7 +199,11 @@ class ResolveValuesComposite:
             _logger.exception("resolveValues internal error (session=%s)", credentials.session_id)
             self._observer(
                 "tool_dispatch_error",
-                {"tool_name": TOOL_NAME, "error_code": INTERNAL_ERROR_CODE},
+                {
+                    "tool_name": TOOL_NAME,
+                    "tool_call_id": tool_call_id,
+                    "error_code": INTERNAL_ERROR_CODE,
+                },
             )
             return ResolveOutcome(
                 status="error",
@@ -207,7 +213,7 @@ class ResolveValuesComposite:
             )
 
     async def _run_inner(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials, tool_call_id: str
     ) -> ResolveOutcome:
         table = model_args.get("table")
         column = model_args.get("column")
@@ -223,10 +229,16 @@ class ResolveValuesComposite:
             or not isinstance(concept, str)
             or not concept
         ):
-            self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
+            self._observer(
+                "tool_dispatch_start", {"tool_name": TOOL_NAME, "tool_call_id": tool_call_id}
+            )
             self._observer(
                 "tool_dispatch_error",
-                {"tool_name": TOOL_NAME, "error_code": UNKNOWN_TARGET_CODE},
+                {
+                    "tool_name": TOOL_NAME,
+                    "tool_call_id": tool_call_id,
+                    "error_code": UNKNOWN_TARGET_CODE,
+                },
             )
             missing = (
                 "table"
@@ -239,10 +251,16 @@ class ResolveValuesComposite:
         try:
             period = parse_period(model_args.get("period"))
         except TargetValidationError as exc:
-            self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
+            self._observer(
+                "tool_dispatch_start", {"tool_name": TOOL_NAME, "tool_call_id": tool_call_id}
+            )
             self._observer(
                 "tool_dispatch_error",
-                {"tool_name": TOOL_NAME, "error_code": UNKNOWN_TARGET_CODE},
+                {
+                    "tool_name": TOOL_NAME,
+                    "tool_call_id": tool_call_id,
+                    "error_code": UNKNOWN_TARGET_CODE,
+                },
             )
             return self._target_error(exc.message)
 
@@ -252,6 +270,7 @@ class ResolveValuesComposite:
             concept=concept,
             period=period,
             credentials=credentials,
+            tool_call_id=tool_call_id,
         )
 
     # -- programmatic path (D67 hook, design §1.4) ----------------------------
@@ -264,13 +283,53 @@ class ResolveValuesComposite:
         concept: str,
         period: Period | None,
         credentials: RuntimeCredentials,
+        tool_call_id: str | None = None,
     ) -> ResolveOutcome:
         """Typed in, typed out — no `ToolResult` wrapping.
 
-                Emits `tool_dispatch_start` at the top so every terminal event (ok/denied/error) has
-                a matching start, on BOTH the model tool-call path and the programmatic path.
+        Emits `tool_dispatch_start` at the top so every terminal event (ok/denied/error) has
+        a matching start, on BOTH the model tool-call path and the programmatic path.
         """
-        self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
+        tool_call_id = tool_call_id or str(uuid.uuid4())
+        self._observer(
+            "tool_dispatch_start", {"tool_name": TOOL_NAME, "tool_call_id": tool_call_id}
+        )
+        try:
+            return await self._resolve_values(
+                table=table,
+                column=column,
+                concept=concept,
+                period=period,
+                credentials=credentials,
+                tool_call_id=tool_call_id,
+            )
+        except Exception:
+            _logger.exception("resolveValues internal error (session=%s)", credentials.session_id)
+            self._observer(
+                "tool_dispatch_error",
+                {
+                    "tool_name": TOOL_NAME,
+                    "tool_call_id": tool_call_id,
+                    "error_code": INTERNAL_ERROR_CODE,
+                },
+            )
+            return ResolveOutcome(
+                status="error",
+                error_code=INTERNAL_ERROR_CODE,
+                user_message=_INTERNAL_ERROR_MESSAGE,
+                retryable=False,
+            )
+
+    async def _resolve_values(
+        self,
+        *,
+        table: str,
+        column: str,
+        concept: str,
+        period: Period | None,
+        credentials: RuntimeCredentials,
+        tool_call_id: str,
+    ) -> ResolveOutcome:
         catalog = await self._resolve_catalog(credentials)
         try:
             target = sql_builder.resolve_target(
@@ -283,7 +342,11 @@ class ResolveValuesComposite:
         except TargetValidationError as exc:
             self._observer(
                 "tool_dispatch_error",
-                {"tool_name": TOOL_NAME, "error_code": UNKNOWN_TARGET_CODE},
+                {
+                    "tool_name": TOOL_NAME,
+                    "tool_call_id": tool_call_id,
+                    "error_code": UNKNOWN_TARGET_CODE,
+                },
             )
             return self._target_error(exc.message)
 
@@ -296,7 +359,11 @@ class ResolveValuesComposite:
         # SQL over an internal table. Spans and control flow are unaffected; the
         # inner denial/error is still passed through verbatim below.
         inner = await self._tool_dispatcher.dispatch(
-            "runQuery", {"sql": sql, "limit": None}, credentials, emit_progress=False
+            "runQuery",
+            {"sql": sql, "limit": None},
+            credentials,
+            tool_call_id=tool_call_id,
+            emit_progress=False,
         )
 
         if inner.status != "ok":
@@ -304,7 +371,11 @@ class ResolveValuesComposite:
             denial = classify_denial(inner.error_code) if inner.status == "denied" else None
             self._observer(
                 f"tool_dispatch_{'denied' if inner.status == 'denied' else 'error'}",
-                {"tool_name": TOOL_NAME, "error_code": inner.error_code},
+                {
+                    "tool_name": TOOL_NAME,
+                    "tool_call_id": tool_call_id,
+                    "error_code": inner.error_code,
+                },
             )
             return ResolveOutcome(
                 status=inner.status,
@@ -319,13 +390,15 @@ class ResolveValuesComposite:
 
         rows = _extract_rows(inner.result_full, target)
         if not rows:
-            self._observer("tool_dispatch_ok", {"tool_name": TOOL_NAME})
+            self._observer(
+                "tool_dispatch_ok", {"tool_name": TOOL_NAME, "tool_call_id": tool_call_id}
+            )
             return ResolveOutcome(
                 status="ok", values=[], provenance=inner.provenance, degraded=False
             )
 
         ranked, degraded = await self._rank(concept, rows)
-        self._observer("tool_dispatch_ok", {"tool_name": TOOL_NAME})
+        self._observer("tool_dispatch_ok", {"tool_name": TOOL_NAME, "tool_call_id": tool_call_id})
         return ResolveOutcome(
             status="ok",
             values=ranked,
@@ -417,11 +490,11 @@ class ResolveValuesComposite:
 
 def _validate_embed_shape(vectors: Any, *, expected: int) -> list[list[float]] | None:
     """Return *vectors* iff it is a well-shaped batch of *expected* equal-length numeric
-        vectors; else `None`, a signal to degrade.
+    vectors; else `None`, a signal to degrade.
 
-        Guards against a protocol-violating embedding client (wrong count, ragged or non-list
-        vectors, non-numeric elements) crashing `ranking.cosine` or `vectors[0]`. Ranking
-        degradation is always safe — enforcement already happened on the inner query.
+    Guards against a protocol-violating embedding client (wrong count, ragged or non-list
+    vectors, non-numeric elements) crashing `ranking.cosine` or `vectors[0]`. Ranking
+    degradation is always safe — enforcement already happened on the inner query.
     """
     if not isinstance(vectors, list) or len(vectors) != expected:
         return None
@@ -443,10 +516,10 @@ def _validate_embed_shape(vectors: Any, *, expected: int) -> list[list[float]] |
 def _extract_rows(raw_result: Any, target: sql_builder.ResolvedTarget) -> list[RowValue]:
     """Map the backing `runQuery` `{columns, rows, ...}` result into `RowValue`s.
 
-        A MALFORMED backing result never crashes the turn: every structural surprise (missing
-        keys, wrong types, short rows, dict rows, non-numeric freq) is skipped or defaulted, so
-        the call degrades to a valid — possibly empty — result rather than raising. Pure
-        defense-in-depth against a faulty backend; the composite issues the inner SQL itself.
+    A MALFORMED backing result never crashes the turn: every structural surprise (missing
+    keys, wrong types, short rows, dict rows, non-numeric freq) is skipped or defaulted, so
+    the call degrades to a valid — possibly empty — result rather than raising. Pure
+    defense-in-depth against a faulty backend; the composite issues the inner SQL itself.
     """
     if not isinstance(raw_result, dict):
         return []

@@ -34,7 +34,13 @@ from tests._blueprint_gate import expand_blueprint
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
-    {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    {
+        _E: {
+            "EmployeeCode": "String",
+            "Department": "Nullable(String)",
+            "AnnualSalary": "Nullable(Float64)",
+        }
+    }
 )
 SESSION_ID = "sess-bp-loop"
 _BID = "bp-average-salary-by-department"
@@ -96,9 +102,24 @@ def _run_blueprint_tool_with_real_executor() -> tuple[RunBlueprintTool, FakeMCPC
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                {"columns": ["Department"], "rows": [["Sales"]], "row_count": 1, "truncated": False},
-                {"columns": ["department", "avg_salary", "headcount"], "rows": [["Sales", 60000.0, 4]], "row_count": 1, "truncated": False},
-                {"columns": ["__bp_n", "__bp_d"], "rows": [[1, 1]], "row_count": 1, "truncated": False},
+                {
+                    "columns": ["Department"],
+                    "rows": [["Sales"]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
+                {
+                    "columns": ["department", "avg_salary", "headcount"],
+                    "rows": [["Sales", 60000.0, 4]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
+                {
+                    "columns": ["__bp_n", "__bp_d"],
+                    "rows": [[1, 1]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
             ]
         }
     )
@@ -119,7 +140,11 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {"department": "Sales"}})
+                    ToolCallRequest(
+                        id="c1",
+                        name="runBlueprint",
+                        arguments={"id": _BID, "slot_bindings": {"department": "Sales"}},
+                    )
                 ]
             ),
             ModelTurnResult(assistant_text="The average salary in Sales is $60,000."),
@@ -132,7 +157,9 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
     # production one (tests/_blueprint_gate.py).
     await expand_blueprint(store, SESSION_ID, _BID)
 
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="avg salary in Sales?")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(), user_message="avg salary in Sales?"
+    )
 
     assert outcome.status == "done"
     assert outcome.tool_calls_made == 1  # ONE model-facing call...
@@ -153,13 +180,20 @@ class _PausingTool:
     tool_name = "runBlueprint"
 
     async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn=None,
+        tool_call_id=None,
     ):
         from data_agent.runtime.dispatch.tool_dispatcher import ToolPause, ToolResult
 
         paused = ExecPaused(
             reason="blueprint_slot",
-            pending_question={"question": "Which department did you mean?", "options": ["Sales", "Support"]},
+            pending_question={
+                "question": "Which department did you mean?",
+                "options": ["Sales", "Support"],
+            },
             blueprint_id=model_args["id"],
             slot_bindings_json='{"department": "S"}',
         )
@@ -186,7 +220,11 @@ async def test_slot_askuser_pauses_the_turn_via_the_seam() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {"department": "S"}})
+                    ToolCallRequest(
+                        id="c1",
+                        name="runBlueprint",
+                        arguments={"id": _BID, "slot_bindings": {"department": "S"}},
+                    )
                 ]
             ),
         ]
@@ -198,7 +236,9 @@ async def test_slot_askuser_pauses_the_turn_via_the_seam() -> None:
     # production one (tests/_blueprint_gate.py).
     await expand_blueprint(store, SESSION_ID, _BID)
 
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="avg salary?")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(), user_message="avg salary?"
+    )
 
     assert outcome.status == "paused_ask_user"
     assert outcome.pending_question["question"] == "Which department did you mean?"
@@ -223,7 +263,9 @@ async def test_pause_checkpoint_round_trips_blueprint_fields() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
         ]
@@ -255,7 +297,9 @@ async def test_unwired_run_blueprint_is_clean_unavailable() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
             ModelTurnResult(assistant_text="I'll answer from the raw tools instead."),

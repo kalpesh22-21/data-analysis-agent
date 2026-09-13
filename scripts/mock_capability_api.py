@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from data_agent.http_daemon import run_http_daemon
@@ -123,6 +123,59 @@ TOOLS: dict[str, dict[str, Any]] = {
 }
 
 
+# Synthetic UI fixture: describes the supplied capability but never fetches or
+# returns real personal identifiers. Resolution produces mock entity references.
+TOOLS["get_employee_personal_identifier"] = {
+    "name": "get_employee_personal_identifier",
+    "version": "1",
+    "kind": "data_widget",
+    "description": "Returns the personal identifiers for each employee. Social Security Number (SSN) (also referred to simply as 'Social') if they are US employee, or various Country Specific Fields if they are non-US employee.",
+    "summary": "Display employee personal identifiers, including SSN or country-specific fields.",
+    "parameters": [
+        {"name": "employees", "description": "The employee or employees.", "type": "employee",
+         "collection": True, "default": "all", "resolution": {"strategy": "torch", "entity_type": "employee"}},
+        {"name": "department", "description": "Filters results by department names.", "type": "department",
+         "collection": True, "default": "all", "resolution": {"strategy": "resolve_values", "semantic_type": "department"}},
+        {"name": "position", "description": "Filters results by position names.", "type": "position",
+         "collection": True, "default": "all", "resolution": {"strategy": "resolve_values", "semantic_type": "position"}},
+        {"name": "work_location", "description": "Filters results by who work at the given work location.", "type": "work_location",
+         "collection": True, "default": "all", "resolution": {"strategy": "resolve_values", "semantic_type": "work_location"}},
+    ],
+    "metadata": {"preamble_url": "ember:PersonalIdentifierCard", "gql": [{"mapping": [
+        {"fieldName": "Employee", "description": "Employee name"},
+        {"fieldName": "Social Security Number", "description": "US SSN or country-specific personal identifier"},
+    ]}]},
+    "presentation": {"title": "Personal identifiers", "preamble_url": "ember:PersonalIdentifierCard",
+                     "fields": [{"name": "Social Security Number", "description": "US SSN or country-specific personal identifier"}]},
+    "questions": ["Show personal identifiers for employees", "Show me the SSN of every employee named Smith"],
+    "actions": ["View employee personal identifiers"],
+    "data_points": ["Employee Social Security Number", "SSN", "Country-specific personal identifier"],
+}
+
+
+# Deliberately adjacent fixtures for the direct-deposit and pay-stub probes.
+# Their descriptions state their actual coverage; neither supplies the requested task.
+TOOLS["navigate_to_banking_center"] = {
+    "name": "navigate_to_banking_center", "version": "1", "kind": "navigation",
+    "description": "Open a banking-center overview of company banking information. This option does not edit an employee's direct deposit.",
+    "summary": "Open the company banking overview.", "parameters": [],
+    "metadata": {"preamble_url": "ember:GenericButton", "arguments": {"links": [
+        {"webPage": "Banking Center", "description": "Company banking overview", "clRedirect": "mock/banking-overview"}
+    ]}},
+    "questions": ["How do I view banking information?"], "actions": ["Open Banking Center"], "data_points": ["Company banking overview"],
+}
+TOOLS["get_payroll_totals"] = {
+    "name": "get_payroll_totals", "version": "1", "kind": "data_widget",
+    "description": "Display aggregate payroll gross and net totals. Does not show or link to individual pay stubs.",
+    "summary": "Display payroll totals.", "parameters": [],
+    "metadata": {"preamble_url": "ember:PayrollTotalsCard", "gql": [{"mapping": [
+        {"fieldName": "Gross pay", "description": "Aggregate payroll total"},
+        {"fieldName": "Net pay", "description": "Aggregate payroll total"}
+    ]}]},
+    "questions": ["Where can I view payroll totals?"], "actions": ["View payroll totals"], "data_points": ["Gross pay total", "Net pay total"],
+}
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2_000)
     kinds: list[Kind]
@@ -144,6 +197,11 @@ def _score(query: str, values: list[str]) -> float:
     return max((len(terms & _terms(value)) / max(len(terms), 1) for value in values), default=0)
 
 
+def require_user_auth(authorization: str | None = Header(default=None)) -> None:
+    if not authorization or not authorization.startswith("Bearer ") or not authorization[7:].strip():
+        raise HTTPException(status_code=401, detail="End-user authorization required")
+
+
 app = FastAPI(title="Mock Capability API")
 _logger = logging.getLogger(__name__)
 
@@ -153,7 +211,7 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/capabilities/search")
+@app.post("/v1/capabilities/search", dependencies=[Depends(require_user_auth)])
 async def search(request: SearchRequest) -> dict[str, list[dict[str, Any]]]:
     ranked = []
     for tool in TOOLS.values():
@@ -178,12 +236,13 @@ async def search(request: SearchRequest) -> dict[str, list[dict[str, Any]]]:
                 "matched_questions": tool["questions"][:5] if scores["questions"] else [],
                 "matched_actions": tool["actions"][:5] if scores["actions"] else [],
                 "matched_data_points": tool["data_points"][:5] if scores["data_points"] else [],
+                **({"presentation": tool["presentation"]} if "presentation" in tool else {}),
             }
         )
     return {"cards": cards}
 
 
-@app.get("/v1/capabilities/tools/{tool_name}")
+@app.get("/v1/capabilities/tools/{tool_name}", dependencies=[Depends(require_user_auth)])
 async def get_tool(tool_name: str) -> dict[str, Any]:
     tool = TOOLS.get(tool_name)
     if tool is None:
@@ -194,7 +253,7 @@ async def get_tool(tool_name: str) -> dict[str, Any]:
     }
 
 
-@app.post("/v1/capabilities/tools/{tool_name}/hydrate")
+@app.post("/v1/capabilities/tools/{tool_name}/hydrate", dependencies=[Depends(require_user_auth)])
 async def hydrate_tool(
     tool_name: str,
     request: HydrateRequest,
@@ -206,7 +265,7 @@ async def hydrate_tool(
     entity_params = {
         parameter["name"]
         for parameter in tool["parameters"]
-        if parameter["collection"] and parameter["type"] not in {"string", "date", "dateRange"}
+        if parameter.get("resolution", {}).get("strategy") == "torch"
     }
     known_params = {parameter["name"] for parameter in tool["parameters"]}
     unknown_params = request.raw_arguments.keys() - known_params
@@ -242,6 +301,29 @@ async def hydrate_tool(
         "resolved_entities": resolved_entities,
         "additional_arguments": {},
     }
+
+
+# Separate, explicitly synthetic Help Center fixture for the healthy-article probe.
+# The normal /help-center/* URLs remain unavailable to exercise the failure branch.
+_MOBILE_ARTICLE_ID = "acceptance-mobile-clock-in"
+_MOBILE_ARTICLE = (
+    "Synthetic acceptance guide: mobile clock-in. In this test product, open Time, "
+    "select Clock In, and wait for the confirmation. Availability is managed by the employer."
+)
+
+
+@app.post("/probe-help-center/search", dependencies=[Depends(require_user_auth)])
+async def probe_help_search(request: dict[str, Any]) -> dict[str, Any]:
+    query = str(request.get("query", "")).lower()
+    return {"documents": [{"id": _MOBILE_ARTICLE_ID, "score": 1.0, "snippet": _MOBILE_ARTICLE}]
+            if "clock" in query or "mobile" in query else []}
+
+
+@app.get("/probe-help-center/documents/{article_id}", dependencies=[Depends(require_user_auth)])
+async def probe_help_document(article_id: str) -> dict[str, str]:
+    if article_id != _MOBILE_ARTICLE_ID:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"id": article_id, "content": _MOBILE_ARTICLE}
 
 
 if __name__ == "__main__":

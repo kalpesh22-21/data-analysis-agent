@@ -21,6 +21,7 @@ from data_agent.runtime.context.budget import _render_entry
 from data_agent.runtime.context.discovery_emulation import (
     EmulatedDiscovery,
     EmulatedDiscoveryCache,
+    _opaque_discovery_call_id,
     build_emulated_discovery,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
@@ -137,15 +138,13 @@ async def test_happy_path_lists_tables_for_the_base_database_only() -> None:
         }
     )
 
-    discovery = await build_emulated_discovery(
-        dispatcher, _CREDS, base_database="warehouse_a"
-    )
+    discovery = await build_emulated_discovery(dispatcher, _CREDS, base_database="warehouse_a")
 
     # listDatabases (in full) + exactly ONE listTables, for the base database.
     assert [e["tool_name"] for e in discovery.entries] == ["listDatabases", "listTables"]
     assert [e["tool_call_id"] for e in discovery.entries] == [
-        "emulated-listDatabases",
-        "emulated-listTables-warehouse_a",
+        _opaque_discovery_call_id(_CREDS.session_id, "databases"),
+        _opaque_discovery_call_id(_CREDS.session_id, "tables:warehouse_a"),
     ]
     assert [e["args"] for e in discovery.entries] == [{}, {"database": "warehouse_a"}]
 
@@ -159,10 +158,13 @@ async def test_happy_path_lists_tables_for_the_base_database_only() -> None:
     # Each entry is byte-identical to a REAL replayed read's rendered shape,
     # including the result_preview sub-shape (status/error_code/user_message).
     assert discovery.entries[0] == _expected_rendered(
-        "emulated-listDatabases", "listDatabases", {}, db_result
+        _opaque_discovery_call_id(_CREDS.session_id, "databases"), "listDatabases", {}, db_result
     )
     assert discovery.entries[1] == _expected_rendered(
-        "emulated-listTables-warehouse_a", "listTables", {"database": "warehouse_a"}, tables_a
+        _opaque_discovery_call_id(_CREDS.session_id, "tables:warehouse_a"),
+        "listTables",
+        {"database": "warehouse_a"},
+        tables_a,
     )
     # An ok entry carries no denial user_message and a real result_preview.
     assert discovery.entries[1]["user_message"] is None
@@ -224,7 +226,9 @@ async def test_base_db_list_tables_failure_still_injects_the_listdatabases_pair(
 
     discovery = await build_emulated_discovery(dispatcher, _CREDS, base_database="base_db")
 
-    assert [e["tool_call_id"] for e in discovery.entries] == ["emulated-listDatabases"]
+    assert [e["tool_call_id"] for e in discovery.entries] == [
+        _opaque_discovery_call_id(_CREDS.session_id, "databases")
+    ]
     assert discovery.read_signatures == {idempotent_read_signature("listDatabases", {})}
     assert idempotent_read_signature("listTables", {"database": "base_db"}) not in (
         discovery.read_signatures
@@ -239,11 +243,11 @@ async def test_base_db_absent_from_listdatabases_skips_the_listtables_dispatch()
         {("listDatabases", None): _ok("listDatabases", [{"name": "some_other_db"}])}
     )
 
-    discovery = await build_emulated_discovery(
-        dispatcher, _CREDS, base_database="dbpcm_warehouse"
-    )
+    discovery = await build_emulated_discovery(dispatcher, _CREDS, base_database="dbpcm_warehouse")
 
-    assert [e["tool_call_id"] for e in discovery.entries] == ["emulated-listDatabases"]
+    assert [e["tool_call_id"] for e in discovery.entries] == [
+        _opaque_discovery_call_id(_CREDS.session_id, "databases")
+    ]
     assert discovery.read_signatures == {idempotent_read_signature("listDatabases", {})}
     # No listTables round-trip was spent at all.
     assert [c[0] for c in dispatcher.calls] == ["listDatabases"]
@@ -482,9 +486,7 @@ async def test_the_sweep_emits_no_ui_progress_events() -> None:
         mcp, CatalogHandle({}), observer=lambda e, p: events.append((e, dict(p)))
     )
 
-    discovery = await build_emulated_discovery(
-        dispatcher, _CREDS, base_database="dbpcm_warehouse"
-    )
+    discovery = await build_emulated_discovery(dispatcher, _CREDS, base_database="dbpcm_warehouse")
 
     # The sweep really ran (both round-trips), and injected both entries.
     assert [c.tool_name for c in mcp.calls] == ["listDatabases", "listTables"]

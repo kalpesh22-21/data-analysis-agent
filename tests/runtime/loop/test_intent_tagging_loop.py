@@ -77,6 +77,7 @@ class _RecordingBlueprintTool:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id=None,
     ) -> ToolResult:
         self.seen.append(dict(model_args))
         return ToolResult(
@@ -717,9 +718,7 @@ async def test_the_gate_survives_a_pause_because_it_is_seeded_from_the_trail() -
         session_id=SESSION_ID, credentials=_credentials(), user_message="one thing"
     )
     assert paused.status == "paused_ask_user"
-    resumed = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="Sales"
-    )
+    resumed = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="Sales")
 
     assert resumed.status == "done"
     assert _events(events, "loop_intent_tag_dropped") == [

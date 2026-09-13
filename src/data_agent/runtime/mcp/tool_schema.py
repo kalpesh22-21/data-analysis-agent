@@ -356,7 +356,7 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
         "EVERY TABLE GOES IN 'tables', AND THERE IS NOWHERE ELSE TO PUT ONE. A "
         "single-table answer is ONE entry: 'tables': [{sql: \"…\"}]. "
         "ONE TABLE PER PART. If you answered three parts, send three entries in "
-        "'tables': [{blueprint_id: \"…\"}, {blueprint_id: \"…\"}, {sql: \"…\"}], in the "
+        '\'tables\': [{blueprint_id: "…"}, {blueprint_id: "…"}, {sql: "…"}], in the '
         "order you answered them, each with a short 'caption' naming its part. Send the "
         "result you ALREADY produced for each part — a blueprint result goes in as its "
         "blueprint_id, unchanged. If one query you ran already covered two parts, that is "
@@ -382,7 +382,8 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
         "properties": {
             "answer": {
                 "type": "string",
-                "description": "Your complete final answer to the user, in plain prose. "
+                "description": "Your complete final answer to the user, in plain prose. Do not narrate internal "
+                "retries, tool selection, judge reviews, or other internal processing. "
                 "Describes the tables rather than reproducing their rows.",
             },
             # 08. THREE STRINGS, NO ENUM — deliberately, and 03 §C.3.1 is why: a
@@ -458,7 +459,8 @@ ANSWER_WITH_TEXT_TOOL_SCHEMA: dict[str, Any] = {
         "properties": {
             "answer": {
                 "type": "string",
-                "description": "The complete final answer shown to the user.",
+                "description": "The complete final answer shown to the user. Do not narrate internal retries, "
+                "tool selection, judge reviews, or other internal processing.",
             },
             "evidence": {
                 "type": "array",
@@ -603,7 +605,10 @@ SEARCH_HELP_CENTER_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "name": "searchHelpCenter",
     "description": (
-        "Search Paycom Help Center articles and return the five most relevant excerpts."
+        "Search Paycom product-usage documentation and return the five most relevant excerpts. "
+        "Use for product how-to, workflow, feature, or terminology questions. Do not use to "
+        "retrieve or enumerate a company’s employees, salaries, departments, or live records. "
+        "For mixed requests, use this tool only for the product-help portion."
     ),
     "parameters": {
         "type": "object",
@@ -681,9 +686,9 @@ _LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCH
 class ToolNameCollisionError(RuntimeError):
     """A locally-authored tool name collides with an MCP-advertised one.
 
-        Raised at schema fetch (startup), fail-closed and LOUD: two schemas with the same
-        name would make the loop's `runtime_tools` interception silently SHADOW the MCP
-        tool, or vice versa, depending on dispatch order.
+    Raised at schema fetch (startup), fail-closed and LOUD: two schemas with the same
+    name would make the loop's `runtime_tools` interception silently SHADOW the MCP
+    tool, or vice versa, depending on dispatch order.
     """
 
 
@@ -700,11 +705,11 @@ def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
 def augment_with_serves_intent(schema: dict[str, Any]) -> dict[str, Any]:
     """Add the optional `serves_intent` property to a TRANSLATED MCP schema.
 
-        NON-MUTATING: `MCPToolSpec.input_schema` is the client's own object and the
-        translated schemas are cached by `ToolSchemaCache`, so this rebuilds
-        `parameters`/`properties` rather than writing into either. A schema whose
-        `parameters`/`properties` are not dicts is returned UNCHANGED — the tag is an
-        optimisation for the model, never a precondition for calling the tool.
+    NON-MUTATING: `MCPToolSpec.input_schema` is the client's own object and the
+    translated schemas are cached by `ToolSchemaCache`, so this rebuilds
+    `parameters`/`properties` rather than writing into either. A schema whose
+    `parameters`/`properties` are not dicts is returned UNCHANGED — the tag is an
+    optimisation for the model, never a precondition for calling the tool.
     """
     if schema.get("name") not in _INTENT_TAGGABLE_MCP_TOOLS:
         return schema
@@ -732,9 +737,9 @@ async def fetch_function_schemas(
 ) -> list[dict[str, Any]]:
     """Fetch `list_tools()` from *mcp_client*, translate, and append `askUser`.
 
-        *jwt*/*session_id* are required because the live MCP authenticates every request,
-        including `tools/list`; no credential appears in the returned schemas (D5). No
-        caching here — see `ToolSchemaCache` for the cached variant used at runtime.
+    *jwt*/*session_id* are required because the live MCP authenticates every request,
+    including `tools/list`; no credential appears in the returned schemas (D5). No
+    caching here — see `ToolSchemaCache` for the cached variant used at runtime.
     """
     tools = await mcp_client.list_tools(jwt=jwt, session_id=session_id)
     # §6.1 name-collision guard: the locally-authored tool names MUST be disjoint
@@ -767,12 +772,12 @@ async def fetch_function_schemas(
 class ToolSchemaCache:
     """Caches the translated tool-schema list, refreshed on explicit reload.
 
-        `get_schemas` takes the CURRENT turn's `jwt`/`session_id` because the live MCP
-        authenticates `tools/list` too, but the catalogue never varies by scope — so the
-        FIRST successful fetch populates the cache for every later call, turn, session and
-        column scope until `force_reload=True`. Those credentials authenticate that one
-        fetch and are never retained or reflected in the cached schemas (D5). The first
-        call requires the MCP to be reachable.
+    `get_schemas` takes the CURRENT turn's `jwt`/`session_id` because the live MCP
+    authenticates `tools/list` too, but the catalogue never varies by scope — so the
+    FIRST successful fetch populates the cache for every later call, turn, session and
+    column scope until `force_reload=True`. Those credentials authenticate that one
+    fetch and are never retained or reflected in the cached schemas (D5). The first
+    call requires the MCP to be reachable.
     """
 
     def __init__(

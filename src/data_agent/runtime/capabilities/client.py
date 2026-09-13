@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
@@ -10,6 +10,27 @@ from .resolution import CapabilityResolutionRegistry
 from .router import PrefetchRoute
 
 CapabilityKind = Literal["navigation", "data_widget"]
+KNOWN_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "TOOL_NOT_FOUND",
+        "INVALID_ARGUMENTS",
+        "ENTITY_LIMIT_EXCEEDED",
+        "PAYLOAD_TOO_LARGE",
+        "UNAUTHORIZED",
+        "FORBIDDEN",
+        "SERVICE_UNAVAILABLE",
+        "TIMEOUT",
+        "INTERNAL_ERROR",
+        "UNAVAILABLE",
+        "SERVICE_ERROR",
+    }
+)
+
+
+def safe_provider_code(code: Any) -> str:
+    return code if isinstance(code, str) and code in KNOWN_PROVIDER_ERROR_CODES else "SERVICE_ERROR"
+
+
 ResolutionStrategy = Literal["torch", "resolve_values", "direct", "service"]
 
 
@@ -25,6 +46,110 @@ class CapabilityServiceError(CapabilityError):
 
 
 @dataclass(frozen=True)
+class PresentationField:
+    name: str
+    description: str
+    type: str | None = None
+    enum_display: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class PresentationSource:
+    text: str
+    cl_link: str | tuple[str, ...] | None = None
+    m2g_link: str | tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class PresentationLink:
+    web_page: str | None = None
+    description: str | None = None
+    cl_redirect: str | None = None
+
+
+@dataclass(frozen=True)
+class PresentationInfo:
+    title: str | None = None
+    preamble_url: str | None = None
+    extra_ui_messages: tuple[str, ...] = ()
+    sources: tuple[PresentationSource, ...] = ()
+    fields: tuple[PresentationField, ...] = ()
+    links: tuple[PresentationLink, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        def lists(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: lists(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [lists(item) for item in value]
+            return value
+
+        return lists(asdict(self))
+
+
+def _decode_presentation(raw: Any) -> PresentationInfo | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise CapabilityError("Malformed capability presentation.")
+
+    def text(value: Any, *, required: bool = False) -> str | None:
+        if value is None and not required:
+            return None
+        if not isinstance(value, str):
+            raise CapabilityError("Malformed capability presentation text.")
+        return value
+
+    def items(key: str) -> list:
+        value = raw.get(key, [])
+        if not isinstance(value, list):
+            raise CapabilityError("Malformed capability presentation list.")
+        return value[:25]
+
+    def objects(key: str) -> list[dict]:
+        value = items(key)
+        if any(not isinstance(item, dict) for item in value):
+            raise CapabilityError("Malformed capability presentation item.")
+        return value
+
+    def link(value: Any) -> str | tuple[str, ...] | None:
+        if isinstance(value, list):
+            return tuple(text(item, required=True) for item in value[:25])
+        return text(value)
+
+    return PresentationInfo(
+        title=text(raw.get("title")),
+        preamble_url=text(raw.get("preamble_url")),
+        extra_ui_messages=tuple(text(item, required=True) for item in items("extra_ui_messages")),
+        fields=tuple(
+            PresentationField(
+                name=text(item.get("name"), required=True),
+                description=text(item.get("description"), required=True),
+                type=text(item.get("type")),
+                enum_display=_optional_string_map(item.get("enum_display")),
+            )
+            for item in objects("fields")
+        ),
+        sources=tuple(
+            PresentationSource(
+                text=text(item.get("text"), required=True),
+                cl_link=link(item.get("cl_link")),
+                m2g_link=link(item.get("m2g_link")),
+            )
+            for item in objects("sources")
+        ),
+        links=tuple(
+            PresentationLink(
+                web_page=text(item.get("web_page")),
+                description=text(item.get("description")),
+                cl_redirect=text(item.get("cl_redirect")),
+            )
+            for item in objects("links")
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class CapabilityCard:
     id: str
     tool_name: str
@@ -33,6 +158,7 @@ class CapabilityCard:
     matched_questions: tuple[str, ...]
     matched_actions: tuple[str, ...]
     matched_data_points: tuple[str, ...]
+    presentation: PresentationInfo | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +169,11 @@ class CapabilityCard:
             "matched_questions": list(self.matched_questions),
             "matched_actions": list(self.matched_actions),
             "matched_data_points": list(self.matched_data_points),
+            **(
+                {"presentation": self.presentation.to_dict()}
+                if self.presentation is not None
+                else {}
+            ),
         }
 
 
@@ -101,9 +232,7 @@ class ToolParam:
             target = resolution_registry.get(self.semantic_type) if resolution_registry else None
             if target is not None:
                 period = (
-                    f" and period column {target.period_column}"
-                    if target.period_column
-                    else ""
+                    f" and period column {target.period_column}" if target.period_column else ""
                 )
                 description = (
                     f"{description} First call resolveValues with table {target.table}, "
@@ -154,7 +283,10 @@ class CapabilityDefinition:
                 "UI option. Omit when the UI option alone answers the request. Never mention "
                 "cards, widgets, capabilities, tools, or hydration to the user. Navigation "
                 "is never automatic: say the user can use the displayed option, never that "
-                "you are opening, navigating, taking, or redirecting them."
+                "you are opening, navigating, taking, or redirecting them. Present this option "
+                "ONLY when its declared coverage explicitly answers the request — never present "
+                "the nearest related option and bridge the gap here. If this option cannot "
+                "answer, do not force it: say what it cannot do instead."
             ),
         }
         properties["serves_intent"] = {
@@ -178,10 +310,17 @@ class CapabilityPrefetch:
 
 class CapabilityClient(Protocol):
     async def search(
-        self, query: str, kinds: tuple[CapabilityKind, ...], limit: int = 5
+        self,
+        query: str,
+        kinds: tuple[CapabilityKind, ...],
+        limit: int = 5,
+        *,
+        end_user_jwt: str | None = None,
     ) -> list[CapabilityCard]: ...
 
-    async def get_definition(self, tool_name: str) -> CapabilityDefinition | None: ...
+    async def get_definition(
+        self, tool_name: str, *, end_user_jwt: str | None = None
+    ) -> CapabilityDefinition | None: ...
 
     async def hydrate(
         self,
@@ -189,7 +328,8 @@ class CapabilityClient(Protocol):
         *,
         query: str,
         raw_arguments: dict[str, Any],
-        end_user_jwt: str | None,
+        end_user_jwt: str | None = None,
+        forward_end_user: bool = False,
     ) -> dict[str, Any] | None: ...
 
 
@@ -198,25 +338,31 @@ class HttpCapabilityClient:
         self,
         *,
         base_url: str,
-        api_key: str = "",
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._transport = transport
 
-    def _headers(self, end_user_jwt: str | None = None) -> dict[str, str]:
+    def _headers(
+        self, end_user_jwt: str | None = None, *, forward_end_user: bool = False
+    ) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
         if end_user_jwt:
-            headers["X-End-User-Authorization"] = f"Bearer {end_user_jwt}"
+            headers["Authorization"] = f"Bearer {end_user_jwt}"
+            if forward_end_user:
+                headers["X-End-User-Authorization"] = f"Bearer {end_user_jwt}"
         return headers
 
     async def _request(
-        self, method: str, path: str, *, end_user_jwt: str | None = None, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        end_user_jwt: str | None = None,
+        forward_end_user: bool = False,
+        **kwargs: Any,
     ) -> Any:
         try:
             async with httpx.AsyncClient(
@@ -225,20 +371,21 @@ class HttpCapabilityClient:
                 response = await client.request(
                     method,
                     f"{self._base_url}{path}",
-                    headers=self._headers(end_user_jwt),
+                    headers=self._headers(end_user_jwt, forward_end_user=forward_end_user),
                     **kwargs,
                 )
                 if response.status_code == 404:
                     return None
                 if response.is_error:
                     try:
-                        error = response.json().get("error", {})
+                        body = response.json()
+                        error = body.get("error", {}) if isinstance(body, dict) else {}
                     except ValueError:
                         error = {}
                     code = error.get("code") if isinstance(error, dict) else None
                     raise CapabilityServiceError(
                         status_code=response.status_code,
-                        code=code if isinstance(code, str) and code else "SERVICE_ERROR",
+                        code=safe_provider_code(code),
                     )
                 response.raise_for_status()
                 return response.json()
@@ -248,11 +395,17 @@ class HttpCapabilityClient:
             raise CapabilityError(f"Capability request failed: {type(exc).__name__}") from exc
 
     async def search(
-        self, query: str, kinds: tuple[CapabilityKind, ...], limit: int = 5
+        self,
+        query: str,
+        kinds: tuple[CapabilityKind, ...],
+        limit: int = 5,
+        *,
+        end_user_jwt: str | None = None,
     ) -> list[CapabilityCard]:
         body = await self._request(
             "POST",
             "/search",
+            end_user_jwt=end_user_jwt,
             json={
                 "query": query,
                 "kinds": list(kinds),
@@ -265,8 +418,12 @@ class HttpCapabilityClient:
             raise CapabilityError("Malformed capability search response.")
         return [_decode_card(raw) for raw in raw_cards[:limit]]
 
-    async def get_definition(self, tool_name: str) -> CapabilityDefinition | None:
-        body = await self._request("GET", f"/tools/{quote(tool_name, safe='')}")
+    async def get_definition(
+        self, tool_name: str, *, end_user_jwt: str | None = None
+    ) -> CapabilityDefinition | None:
+        body = await self._request(
+            "GET", f"/tools/{quote(tool_name, safe='')}", end_user_jwt=end_user_jwt
+        )
         if body is None:
             return None
         return _decode_definition(body)
@@ -277,12 +434,14 @@ class HttpCapabilityClient:
         *,
         query: str,
         raw_arguments: dict[str, Any],
-        end_user_jwt: str | None,
+        end_user_jwt: str | None = None,
+        forward_end_user: bool = False,
     ) -> dict[str, Any] | None:
         body = await self._request(
             "POST",
             f"/tools/{quote(tool_name, safe='')}/hydrate",
             end_user_jwt=end_user_jwt,
+            forward_end_user=forward_end_user,
             json={"query": query, "raw_arguments": raw_arguments},
         )
         if body is None:
@@ -314,6 +473,7 @@ def _decode_card(raw: Any) -> CapabilityCard:
         matched_questions=_strings(raw, "matched_questions"),
         matched_actions=_strings(raw, "matched_actions"),
         matched_data_points=_strings(raw, "matched_data_points"),
+        presentation=_decode_presentation(raw.get("presentation")),
     )
 
 
@@ -345,15 +505,16 @@ def _decode_param(raw: Any) -> ToolParam:
     resolution = raw.get("resolution")
     strategy = semantic_type = entity_type = None
     if not isinstance(resolution, dict) or resolution.get("strategy") not in {
-        "torch", "resolve_values", "direct", "service"
+        "torch",
+        "resolve_values",
+        "direct",
+        "service",
     }:
         raise CapabilityError("Capability parameter resolution is required.")
     strategy = resolution["strategy"]
     semantic_type = resolution.get("semantic_type")
     entity_type = resolution.get("entity_type")
-    if strategy == "resolve_values" and (
-        not isinstance(semantic_type, str) or not semantic_type
-    ):
+    if strategy == "resolve_values" and (not isinstance(semantic_type, str) or not semantic_type):
         raise CapabilityError("Capability value resolution requires semantic_type.")
     if strategy == "torch" and (not isinstance(entity_type, str) or not entity_type):
         raise CapabilityError("Capability Torch resolution requires entity_type.")

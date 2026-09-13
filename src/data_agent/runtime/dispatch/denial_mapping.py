@@ -115,7 +115,27 @@ ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE = "ANSWER_TABLE_NO_TABLE_DESIGNATED"
 ANSWER_JUDGE_REJECTED_CODE = "ANSWER_JUDGE_REJECTED"
 
 
+UNKNOWN_TOOL_CODE = "UNKNOWN_TOOL"
+BLUEPRINT_NOT_SEARCHED_CODE = "BLUEPRINT_NOT_SEARCHED"
+BLUEPRINT_NOT_SEARCHED_MESSAGE = (
+    "Blueprint-first check: no blueprint has been searched or used this turn. "
+    "Call searchBlueprints to look for an expert-authored blueprint first. If nothing "
+    "fits or the corpus is unavailable, re-issue runQuery and it will proceed."
+)
+
 _DENIAL_TABLE: dict[str, DenialInfo] = {
+    UNKNOWN_TOOL_CODE: DenialInfo(
+        code=UNKNOWN_TOOL_CODE,
+        retryable=True,
+        kind=DenialKind.GATE,
+        user_message="That tool is not available. Call only an advertised tool by its exact name; never use a tool-call ID as a tool name.",
+    ),
+    BLUEPRINT_NOT_SEARCHED_CODE: DenialInfo(
+        code=BLUEPRINT_NOT_SEARCHED_CODE,
+        retryable=True,
+        kind=DenialKind.GATE,
+        user_message=BLUEPRINT_NOT_SEARCHED_MESSAGE,
+    ),
     # COLUMN_SCOPE_VIOLATION: on the LIVE turn the dispatcher
     # (`dispatch/tool_dispatcher.py`) surfaces the MCP's author-controlled
     # `ColumnScopeError` message instead of this string — that message NAMES the
@@ -293,9 +313,7 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         # WORK_JUDGED: the SQL itself could not be parsed/validated. The verdict is on
         # the query the model wrote.
         kind=DenialKind.WORK_JUDGED,
-        user_message=(
-            "I couldn't validate that query safely — let me try explainQuery first."
-        ),
+        user_message=("I couldn't validate that query safely — let me try explainQuery first."),
     ),
     "DATABASE_NOT_ALLOWED": DenialInfo(
         code="DATABASE_NOT_ALLOWED",
@@ -562,10 +580,10 @@ INFRA_FAILURE_CODES = frozenset(
 def classify_denial(code: str | None) -> DenialInfo:
     """Classify a `ToolError` code into `{retryable, user_message}`.
 
-        An unrecognized or missing (`None`) code — an unexpected/internal MCP error whose
-        `[{CODE}]` prefix could not be parsed — is treated conservatively: not retryable,
-        surfaced as a generic failure. This never raises, so the dispatcher can always
-        classify whatever `MCPToolError.code` it receives.
+    An unrecognized or missing (`None`) code — an unexpected/internal MCP error whose
+    `[{CODE}]` prefix could not be parsed — is treated conservatively: not retryable,
+    surfaced as a generic failure. This never raises, so the dispatcher can always
+    classify whatever `MCPToolError.code` it receives.
     """
     if code is not None and code in _DENIAL_TABLE:
         return _DENIAL_TABLE[code]

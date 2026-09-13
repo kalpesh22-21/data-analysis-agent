@@ -64,14 +64,14 @@ _CARD_DETAIL_INDENT = "  "
 def _card_detail_lines(card: ThinCard) -> list[str]:
     """Render one card's enrichment fields as indented sub-lines.
 
-        Every interpolated piece goes through `_sanitize` (H2) for the same reason the intent
-        does: these strings come from the same corpus, so a newline in a slot name, a resolved
-        column or a grain entry could forge a bullet or a fake section header inside the
-        pre-injected block.
+    Every interpolated piece goes through `_sanitize` (H2) for the same reason the intent
+    does: these strings come from the same corpus, so a newline in a slot name, a resolved
+    column or a grain entry could forge a bullet or a fake section header inside the
+    pre-injected block.
 
-        Per-field capping does not bound a CARD, so the slot COLLECTION is capped upstream and
-        the overflow is rendered here as `(+K more)` — the model must never be told a 12-slot
-        blueprint has 6.
+    Per-field capping does not bound a CARD, so the slot COLLECTION is capped upstream and
+    the overflow is rendered here as `(+K more)` — the model must never be told a 12-slot
+    blueprint has 6.
     """
     lines: list[str] = []
     if card.slots:
@@ -101,8 +101,8 @@ def _card_detail_lines(card: ThinCard) -> list[str]:
 def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None:
     """Render *context* to one `user`-role message, or `None` when it is empty.
 
-        `None` means "prepend nothing": the assembler then behaves exactly as if retrieval had
-        not run, keeping the empty-retrieval path byte-identical to the unconfigured path.
+    `None` means "prepend nothing": the assembler then behaves exactly as if retrieval had
+    not run, keeping the empty-retrieval path byte-identical to the unconfigured path.
     """
     if context.is_empty():
         return None
@@ -135,6 +135,9 @@ def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None
             kind = _sanitize(item.kind, _MAX_FIELD_CHARS)
             lines.append(f"- ({kind}) {_sanitize(item.text, _MAX_FIELD_CHARS)}")
 
+    lines.append(
+        "These are the closest recalled matches. If none clearly fits, call searchBlueprints before writing raw SQL; the corpus may contain additional blueprints."
+    )
     return {"role": "user", "content": _USER_CONTEXT_PREFIX + "\n".join(lines)}
 
 

@@ -177,15 +177,14 @@ def build_real_app():
         # flips the master telemetry debug switch (real SQL + values + result +
         # LLM Q/A into Phoenix) — access-controlled debugging only.
         otlp_disable_redaction=disable_redaction,
-        # Production loop tunables (NOT the scripted demo's low caps).
-        max_loop_iterations=15,
-        max_wall_clock_seconds=60,
-        max_budget_windows=3,
+        # Use RuntimeSettings production budgets; do not pin obsolete launcher values.
         answer_judge_enabled=answer_judge_on,
         # Value-rich progress lines via a cheap side LLM (openai_summary_model);
-        # fire-and-forget, never blocks dispatch. Explicitly wired (this launcher
+        # ordered before dispatch, bounded by the summary timeout. Explicitly wired (this launcher
         # sets _env_file=None, so the flag must not rely on `.env`).
         progress_summary_enabled=progress_summaries_on,
+        openai_summary_base_url=os.environ.get("OPENAI_SUMMARY_BASE_URL") or None,
+        openai_summary_api_key=os.environ.get("OPENAI_SUMMARY_API_KEY") or None,
         progress_summary_timeout_seconds=float(
             os.environ.get("PROGRESS_SUMMARY_TIMEOUT_SECONDS", "") or 10.0
         ),

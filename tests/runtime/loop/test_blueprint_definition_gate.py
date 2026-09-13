@@ -70,6 +70,7 @@ class _RecordingGetBlueprint:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id=None,
     ) -> ToolResult:
         blueprint_id = str(model_args.get("id") or "")
         self.calls.append(blueprint_id)
@@ -105,6 +106,7 @@ class _RecordingRunBlueprint:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
+        tool_call_id=None,
     ) -> ToolResult:
         blueprint_id = str(model_args.get("id") or "")
         self.calls.append(blueprint_id)
@@ -289,7 +291,10 @@ async def test_a_prior_get_blueprint_for_the_same_id_lets_it_run() -> None:
     assert outcome.status == "done"
     assert run_tool.calls == [BP_A]
     trail = await store.load_trail(SESSION_ID)
-    assert [(e.tool_name, e.status) for e in trail] == [("getBlueprint", "ok"), ("runBlueprint", "ok")]
+    assert [(e.tool_name, e.status) for e in trail] == [
+        ("getBlueprint", "ok"),
+        ("runBlueprint", "ok"),
+    ]
 
 
 async def test_get_blueprint_for_a_different_id_does_not_satisfy_the_gate() -> None:
@@ -322,7 +327,8 @@ async def test_a_get_blueprint_from_a_prior_turn_does_not_satisfy_the_gate() -> 
     re-runs the same blueprint with a different slot value."""
     store = InMemorySessionStore()
     await store.append_message(
-        SESSION_ID, TurnMessage(turn_index=0, role="user", content="turn 0", ts="2026-01-01T00:00:00Z")
+        SESSION_ID,
+        TurnMessage(turn_index=0, role="user", content="turn 0", ts="2026-01-01T00:00:00Z"),
     )
     await store.append_trail_entry(
         SESSION_ID,
@@ -405,6 +411,7 @@ async def test_a_failed_get_blueprint_does_not_satisfy_the_gate() -> None:
             model_args: dict[str, Any],
             credentials: RuntimeCredentials,
             turn: TurnContext | None = None,
+            tool_call_id=None,
         ) -> ToolResult:
             return ToolResult(
                 status="error",
@@ -477,12 +484,8 @@ async def test_batched_expand_then_run_costs_two_round_trips_for_n_deliverables(
     ids = [f"bp-{n}" for n in range(deliverables)]
     model = ScriptedModelClient(
         [
-            ModelTurnResult(
-                tool_calls=[_get_call(f"g{n}", bp) for n, bp in enumerate(ids)]
-            ),
-            ModelTurnResult(
-                tool_calls=[_run_call(f"b{n}", bp) for n, bp in enumerate(ids)]
-            ),
+            ModelTurnResult(tool_calls=[_get_call(f"g{n}", bp) for n, bp in enumerate(ids)]),
+            ModelTurnResult(tool_calls=[_run_call(f"b{n}", bp) for n, bp in enumerate(ids)]),
             ModelTurnResult(assistant_text="here are all of them."),
         ]
     )
@@ -784,6 +787,7 @@ async def test_expand_refused_run_defensive_re_expand_then_run_succeeds() -> Non
             model_args: dict[str, Any],
             credentials: RuntimeCredentials,
             turn: TurnContext | None = None,
+            tool_call_id=None,
         ) -> ToolResult:
             result = await super().run(model_args, credentials, turn)
             if len(self.calls) == 1:

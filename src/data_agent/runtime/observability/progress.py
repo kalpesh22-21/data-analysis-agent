@@ -54,6 +54,7 @@ _STEP_LABELS: dict[str, str] = {
     "tool_dispatch_start": "running {tool_name}…",
     "tool_dispatch_ok": "step complete: {tool_name}",
     "tool_dispatch_denied": "step denied: {tool_name}",
+    "tool_dispatch_error": "step failed: {tool_name}",
     "loop_model_call_start": "thinking…",
     "loop_turn_done": "done",
     "loop_paused_ask_user": "waiting for your answer…",
@@ -98,8 +99,8 @@ _PROGRESS_SUMMARY_EVENT = "tool_progress_summary"
 def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | None:
     """Translate one observer `(event, payload)` call into a `ProgressEvent`.
 
-        Returns `None` for observer events that have no user-facing progress label; callers
-        simply drop those.
+    Returns `None` for observer events that have no user-facing progress label; callers
+    simply drop those.
     """
     if event == _PROGRESS_SUMMARY_EVENT:
         # Value-rich, LLM-authored line → straight into `step` (verbatim, never
@@ -162,13 +163,16 @@ def combine_observers(
 ) -> Callable[[str, dict[str, Any]], None]:
     """Fan one `(event, payload)` call out to multiple observers.
 
-        `app.py` wires a tracing-span observer and a `ProgressEmitter.observe` together into
-        the single callback `ToolDispatcher`/`AgentLoop` accept.
+    `app.py` wires a tracing-span observer and a `ProgressEmitter.observe` together into
+    the single callback `ToolDispatcher`/`AgentLoop` accept.
     """
 
     def _combined(event: str, payload: dict[str, Any]) -> None:
         for observer in observers:
-            observer(event, payload)
+            try:
+                observer(event, payload)
+            except Exception:
+                continue  # An observer must not prevent other subscribers or the tool.
 
     return _combined
 

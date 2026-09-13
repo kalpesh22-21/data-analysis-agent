@@ -14,6 +14,7 @@ access-controlled like the session store.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -72,11 +73,11 @@ DEFAULT_DROP_SPAN_NAMES: frozenset[str] = frozenset(
 class _NameFilteringSpanExporter(SpanExporter):
     """A `SpanExporter` decorator that DROPS spans by NAME before forwarding.
 
-        Wraps every real exporter (the OTLP one AND any injected test exporter), so a single
-        denylist (`RuntimeSettings.otlp_drop_span_names`) governs both paths and no
-        instrumentation call site changes. A dropped span's CHILDREN are still exported with
-        their original `parent_span_id`, which a trace UI renders under the trace root —
-        dropping a mid-tree span flattens the tree, never severs it.
+    Wraps every real exporter (the OTLP one AND any injected test exporter), so a single
+    denylist (`RuntimeSettings.otlp_drop_span_names`) governs both paths and no
+    instrumentation call site changes. A dropped span's CHILDREN are still exported with
+    their original `parent_span_id`, which a trace UI renders under the trace root —
+    dropping a mid-tree span flattens the tree, never severs it.
     """
 
     def __init__(self, inner: SpanExporter, drop_names: frozenset[str]) -> None:
@@ -101,13 +102,13 @@ class _NameFilteringSpanExporter(SpanExporter):
 class LLMExceptionEventScrubber(SpanProcessor):
     """Strip content-bearing EVENTS off the auto-instrumented OpenAI `LLM` span (D25).
 
-        `instrument_openai(hide_content=True)` masks span ATTRIBUTES but not span EVENTS,
-        and the instrumentor calls `record_exception`, so a response error body can land as
-        `exception.message`/`exception.stacktrace`. `on_end` rebinds the `ReadableSpan`'s
-        `_events` to an empty tuple, dropping them from what the exporter later reads without
-        mutating the live span. Must be wired FIRST, ahead of any `SimpleSpanProcessor`
-        (which exports synchronously in `on_end`). Only OpenInference `LLM`-kind spans are
-        touched; the manual AGENT/TOOL/CHAIN/GUARDRAIL spans stay byte-identical.
+    `instrument_openai(hide_content=True)` masks span ATTRIBUTES but not span EVENTS,
+    and the instrumentor calls `record_exception`, so a response error body can land as
+    `exception.message`/`exception.stacktrace`. `on_end` rebinds the `ReadableSpan`'s
+    `_events` to an empty tuple, dropping them from what the exporter later reads without
+    mutating the live span. Must be wired FIRST, ahead of any `SimpleSpanProcessor`
+    (which exports synchronously in `on_end`). Only OpenInference `LLM`-kind spans are
+    touched; the manual AGENT/TOOL/CHAIN/GUARDRAIL spans stay byte-identical.
     """
 
     def on_start(
@@ -147,25 +148,25 @@ def configure_tracing(
     batch_max_export_size: int = 2_048,
 ) -> TracerProvider:
     """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a no-op
-        provider (no span processor) when *otlp_endpoint* is empty.
+    provider (no span processor) when *otlp_endpoint* is empty.
 
-        Does NOT call `trace.set_tracer_provider(...)`: that process-global side effect
-        belongs to the composition root, and keeping it out makes this function safely
-        callable many times in tests.
+    Does NOT call `trace.set_tracer_provider(...)`: that process-global side effect
+    belongs to the composition root, and keeping it out makes this function safely
+    callable many times in tests.
 
-        Args:
-            project_name: the Phoenix PROJECT, set as `openinference.project.name` —
-                Phoenix groups traces by that resource attribute, NOT by `service.name`.
-                Defaults to *service_name*, so it is never empty.
-            hide_llm_content: install `LLMExceptionEventScrubber` as the FIRST span
-                processor. Pair with `instrument_openai(hide_content=True)`; both are gated
-                on `otlp_hide_llm_content`, whose system default is REVEAL.
-            span_exporter: test-only seam, attached via a `SimpleSpanProcessor` so spans
-                flush synchronously; `None` (production) installs no processor for it.
-            drop_span_names: names dropped by wrapping EVERY real exporter in
-                `_NameFilteringSpanExporter`. Empty ⇒ no wrapper is installed at all.
-            id_generator: a custom `IdGenerator`; the learning session-trace projection
-                passes a deterministic one so a re-export upserts rather than duplicates.
+    Args:
+        project_name: the Phoenix PROJECT, set as `openinference.project.name` —
+            Phoenix groups traces by that resource attribute, NOT by `service.name`.
+            Defaults to *service_name*, so it is never empty.
+        hide_llm_content: install `LLMExceptionEventScrubber` as the FIRST span
+            processor. Pair with `instrument_openai(hide_content=True)`; both are gated
+            on `otlp_hide_llm_content`, whose system default is REVEAL.
+        span_exporter: test-only seam, attached via a `SimpleSpanProcessor` so spans
+            flush synchronously; `None` (production) installs no processor for it.
+        drop_span_names: names dropped by wrapping EVERY real exporter in
+            `_NameFilteringSpanExporter`. Empty ⇒ no wrapper is installed at all.
+        id_generator: a custom `IdGenerator`; the learning session-trace projection
+            passes a deterministic one so a re-export upserts rather than duplicates.
     """
     drop_names = frozenset(drop_span_names)
 
@@ -213,14 +214,14 @@ def configure_tracing(
 
 def llm_content_trace_config(hide_content: bool) -> TraceConfig | None:
     """The OpenInference `TraceConfig` governing the auto-instrumented `LLM` span's
-        CONTENT capture (D25).
+    CONTENT capture (D25).
 
-        `None` when *hide_content* is False — the library default, where the span carries
-        the raw prompt and completion. Otherwise every content channel is suppressed while
-        the shape/timing attributes (`llm.model_name`, `llm.token_count.*`, `llm.provider`)
-        stay intact. The SYSTEM default is REVEAL (`otlp_hide_llm_content=False`), so the
-        online Phoenix project is entity-bearing by default and must be access-controlled
-        like the audit/session store; hiding is the explicit opt-out.
+    `None` when *hide_content* is False — the library default, where the span carries
+    the raw prompt and completion. Otherwise every content channel is suppressed while
+    the shape/timing attributes (`llm.model_name`, `llm.token_count.*`, `llm.provider`)
+    stay intact. The SYSTEM default is REVEAL (`otlp_hide_llm_content=False`), so the
+    online Phoenix project is entity-bearing by default and must be access-controlled
+    like the audit/session store; hiding is the explicit opt-out.
     """
     if not hide_content:
         return None
@@ -236,22 +237,20 @@ def llm_content_trace_config(hide_content: bool) -> TraceConfig | None:
 def instrument_openai(provider: TracerProvider, *, hide_content: bool = True) -> None:
     """Auto-instrument the OpenAI SDK (D24) — idempotent, best-effort.
 
-        FIRST-CALLER-WINS: `OpenAIInstrumentor` is a process-global singleton, so the first
-        call's *hide_content* config wins for the whole process and a later call with a
-        different value silently no-ops. The paired `LLMExceptionEventScrubber` is not
-        subject to this — each provider gets its own.
+    FIRST-CALLER-WINS: `OpenAIInstrumentor` is a process-global singleton, so the first
+    call's *hide_content* config wins for the whole process and a later call with a
+    different value silently no-ops. The paired `LLMExceptionEventScrubber` is not
+    subject to this — each provider gets its own.
 
-        *hide_content* True emits no raw prompt/completion, only shape/timing/model-name/
-        token-counts. The SYSTEM default is REVEAL: `app.py` resolves `otlp_hide_llm_content`
-        (defaulting False) and passes it here, making the runtime Phoenix project
-        entity-bearing. This PARAM's default stays True; call sites drive it.
+    *hide_content* True emits no raw prompt/completion, only shape/timing/model-name/
+    token-counts. The SYSTEM default is REVEAL: `app.py` resolves `otlp_hide_llm_content`
+    (defaulting False) and passes it here, making the runtime Phoenix project
+    entity-bearing. This PARAM's default stays True; call sites drive it.
     """
     instrumentor = OpenAIInstrumentor()
     if instrumentor.is_instrumented_by_opentelemetry:
         return
-    instrumentor.instrument(
-        tracer_provider=provider, config=llm_content_trace_config(hide_content)
-    )
+    instrumentor.instrument(tracer_provider=provider, config=llm_content_trace_config(hide_content))
 
 
 def get_tracer(provider: TracerProvider, name: str = _TRACER_NAME) -> Tracer:
@@ -269,17 +268,17 @@ def span(
     record_exception: bool = True,
 ) -> Iterator[Span]:
     """Generic span helper — sets the OpenInference span-kind attribute plus whatever
-        *attributes* the caller supplies (already redacted).
+    *attributes* the caller supplies (already redacted).
 
-        *context* is the OTel parent to start under (`None` ⇒ the ambient current context).
-        Passing one rehydrated from a W3C `traceparent` makes this span a CHILD of that
-        remote parent, so a session's spans join ONE trace across process boundaries.
+    *context* is the OTel parent to start under (`None` ⇒ the ambient current context).
+    Passing one rehydrated from a W3C `traceparent` makes this span a CHILD of that
+    remote parent, so a session's spans join ONE trace across process boundaries.
 
-        *record_exception* defaults True. Callers that wrap real work AND must stay
-        content-free even on error MUST pass `record_exception=False`: an SDK error embeds
-        response bodies and a landing error references entity-bearing spans, so recording it
-        leaks content even with verbose off. The span STATUS is still set on exception, so
-        the error stays visible in traces — only the detail is withheld.
+    *record_exception* defaults True. Callers that wrap real work AND must stay
+    content-free even on error MUST pass `record_exception=False`: an SDK error embeds
+    response bodies and a landing error references entity-bearing spans, so recording it
+    leaks content even with verbose off. The span STATUS is still set on exception, so
+    the error stays visible in traces — only the detail is withheld.
     """
     with tracer.start_as_current_span(
         name,
@@ -306,8 +305,8 @@ _PROPAGATOR = TraceContextTextMapPropagator()
 
 def inject_current_traceparent() -> str | None:
     """Serialize the CURRENT span's context to a W3C `traceparent` string, or `None` when
-        no span is recording. Call it INSIDE the span that should become the cross-process
-        parent; the value rides the outgoing envelope for `context_from_traceparent`.
+    no span is recording. Call it INSIDE the span that should become the cross-process
+    parent; the value rides the outgoing envelope for `context_from_traceparent`.
     """
     carrier: dict[str, str] = {}
     inject(carrier)
@@ -316,13 +315,13 @@ def inject_current_traceparent() -> str | None:
 
 def context_from_traceparent(traceparent: str | None) -> Context | None:
     """Rehydrate a parent `Context` from a `traceparent` carried on an incoming envelope,
-        for `span(..., context=...)`.
+    for `span(..., context=...)`.
 
-        FAIL-OPEN by two DIFFERENT mechanisms: MISSING (`None`/`""`) returns `None` and the
-        span starts as a normal ROOT; MALFORMED returns a non-`None` but EMPTY `Context`
-        (the W3C propagator does not raise on garbage), which is also a root. The guarantee
-        callers depend on is "no VALID remote parent, and never a crash" — a bad value costs
-        the cross-process chaining and nothing else.
+    FAIL-OPEN by two DIFFERENT mechanisms: MISSING (`None`/`""`) returns `None` and the
+    span starts as a normal ROOT; MALFORMED returns a non-`None` but EMPTY `Context`
+    (the W3C propagator does not raise on garbage), which is also a root. The guarantee
+    callers depend on is "no VALID remote parent, and never a crash" — a bad value costs
+    the cross-process chaining and nothing else.
     """
     if not traceparent:
         return None
@@ -333,20 +332,22 @@ def context_from_traceparent(traceparent: str | None) -> Context | None:
 
 
 def agent_span(
-    tracer: Tracer, *, scope_hash: str, turn_index: int
+    tracer: Tracer, *, scope_hash: str, turn_index: int, session_id: str | None = None
 ) -> Any:
     """One turn (`AGENT`; `session.id` / `scope_hash` / turn index)."""
     return span(
         tracer,
         "agent.turn",
         OpenInferenceSpanKindValues.AGENT,
-        {"scope_hash": scope_hash, "turn.index": turn_index},
+        {
+            **({"session.id": session_id} if session_id is not None else {}),
+            "scope_hash": scope_hash,
+            "turn.index": turn_index,
+        },
     )
 
 
-def chain_span(
-    tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None
-) -> Any:
+def chain_span(tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None) -> Any:
     """Context assembly / budget-guard-adjacent chain stages (`CHAIN`)."""
     return span(tracer, name, OpenInferenceSpanKindValues.CHAIN, attributes)
 
@@ -364,28 +365,28 @@ def tool_span(
 ) -> Any:
     """Each tool call (`TOOL`).
 
-        DEFAULT (D25) posture: *args* are already SQL-literal-masked by the caller,
-        *result_preview* is `None`, and *reveal_complex_args* is False — tool RESULTS never
-        reach a span and nested dict/list args are skipped entirely.
+    DEFAULT (D25) posture: *args* are already SQL-literal-masked by the caller,
+    *result_preview* is `None`, and *reveal_complex_args* is False — tool RESULTS never
+    reach a span and nested dict/list args are skipped entirely.
 
-        DEBUG posture (`RuntimeSettings.otlp_disable_redaction=True`): the caller passes the
-        REAL args, a *result_preview*, and `reveal_complex_args=True`, which makes the
-        project ENTITY-BEARING and requires it to be access-controlled like the audit store.
-        This module does not itself redact; it forwards whatever the caller supplies.
+    DEBUG posture (`RuntimeSettings.otlp_disable_redaction=True`): the caller passes the
+    REAL args, a *result_preview*, and `reveal_complex_args=True`, which makes the
+    project ENTITY-BEARING and requires it to be access-controlled like the audit store.
+    This module does not itself redact; it forwards whatever the caller supplies.
 
-        *result_preview* columns/shape land as scalar attributes and its rows are
-        JSON-serialized onto `tool.result.preview_rows`, because a span attribute cannot
-        hold a ragged list-of-lists — the same reason *reveal_complex_args* JSON-serializes
-        each non-scalar arg value onto `tool.args.{key}`.
+    *result_preview* columns/shape land as scalar attributes and its rows are
+    JSON-serialized onto `tool.result.preview_rows`, because a span attribute cannot
+    hold a ragged list-of-lists — the same reason *reveal_complex_args* JSON-serializes
+    each non-scalar arg value onto `tool.args.{key}`.
 
-        *record_exception* is forwarded to `span` and every caller that WRAPS REAL WORK
-        passes False (`dispatch/tool_envelope.py`). A tool crash-guard means an exception
-        normally never reaches the span, but OTel's default would write
-        `exception.message`/`exception.stacktrace` — free text derived from a query, a slot
-        value or a row — onto a TOOL span if one ever did. The span status is still set on
-        exception, so the error stays visible; only the content-bearing detail is withheld.
-        It stays True by default for the POST-HOC callers, which open the span around
-        nothing and so have no exception to record either way.
+    *record_exception* is forwarded to `span` and every caller that WRAPS REAL WORK
+    passes False (`dispatch/tool_envelope.py`). A tool crash-guard means an exception
+    normally never reaches the span, but OTel's default would write
+    `exception.message`/`exception.stacktrace` — free text derived from a query, a slot
+    value or a row — onto a TOOL span if one ever did. The span status is still set on
+    exception, so the error stays visible; only the content-bearing detail is withheld.
+    It stays True by default for the POST-HOC callers, which open the span around
+    nothing and so have no exception to record either way.
     """
     attributes: dict[str, Any] = {"tool.name": tool_name, "tool.status": status}
     if error_code is not None:
@@ -418,9 +419,7 @@ def tool_span(
     )
 
 
-def guardrail_span(
-    tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None
-) -> Any:
+def guardrail_span(tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None) -> Any:
     """Budget-cap checks / denial classification (`GUARDRAIL`)."""
     return span(tracer, name, OpenInferenceSpanKindValues.GUARDRAIL, attributes)
 
@@ -428,24 +427,24 @@ def guardrail_span(
 def answer_judge_span(tracer: Tracer, *, site: str) -> Any:
     """The ANSWER JUDGE's own model call (`CHAIN`, doc 09).
 
-        WHY A SPAN OF ITS OWN, when the auto-instrumentor already covers the call. The
-        judge goes through the same `AsyncOpenAI` client as the agent, so `instrument_openai`
-        emits an `LLM` span for it either way — and that is exactly the problem: in the turn
-        trace it is INDISTINGUISHABLE from the agent's own round-trips. A turn that made five
-        model calls and a turn that made four plus a judgement look the same, which is the
-        one thing an operator watching judge cost or judge latency needs to tell apart.
+    WHY A SPAN OF ITS OWN, when the auto-instrumentor already covers the call. The
+    judge goes through the same `AsyncOpenAI` client as the agent, so `instrument_openai`
+    emits an `LLM` span for it either way — and that is exactly the problem: in the turn
+    trace it is INDISTINGUISHABLE from the agent's own round-trips. A turn that made five
+    model calls and a turn that made four plus a judgement look the same, which is the
+    one thing an operator watching judge cost or judge latency needs to tell apart.
 
-        Opening this span makes the auto LLM span its CHILD (ambient context), so the trace
-        reads `agent.turn -> answer_judge -> LLM` and the judge's tokens and latency are
-        attributable without any new plumbing at the model seam.
+    Opening this span makes the auto LLM span its CHILD (ambient context), so the trace
+    reads `agent.turn -> answer_judge -> LLM` and the judge's tokens and latency are
+    attributable without any new plumbing at the model seam.
 
-        SHAPE ONLY (D25). `site` here, and `approved`/`violation`/`tokens` set on the span
-        after the verdict is parsed — every one of them a runtime-authored closed vocabulary
-        or a count. `feedback` is model-composed prose about the user's question and MUST
-        NEVER be set on this span; nor is the brief, which carries the draft answer and
-        warehouse rows. This is the same rule `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` enforces
-        for the events, restated here because a span attribute bypasses that allowlist
-        entirely.
+    SHAPE ONLY (D25). `site` here, and `approved`/`violation`/`tokens` set on the span
+    after the verdict is parsed — every one of them a runtime-authored closed vocabulary
+    or a count. `feedback` is model-composed prose about the user's question and MUST
+    NEVER be set on this span; nor is the brief, which carries the draft answer and
+    warehouse rows. This is the same rule `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` enforces
+    for the events, restated here because a span attribute bypasses that allowlist
+    entirely.
     """
     return span(tracer, "answer_judge", OpenInferenceSpanKindValues.CHAIN, {"site": site})
 
@@ -453,9 +452,9 @@ def answer_judge_span(tracer: Tracer, *, site: str) -> Any:
 def embedding_span(tracer: Tracer, *, model: str, input_count: int) -> Any:
     """The custom embedding-API call (`resolveValues` ranking, D24/D71).
 
-        The auto-instrumentor covers only the agent LLM, not this custom endpoint, so
-        `HttpEmbeddingClient` wraps its POST here manually. Vector counts, model id and
-        latency only — the embedded TEXT is never logged (D25).
+    The auto-instrumentor covers only the agent LLM, not this custom endpoint, so
+    `HttpEmbeddingClient` wraps its POST here manually. Vector counts, model id and
+    latency only — the embedded TEXT is never logged (D25).
     """
     return span(
         tracer,
@@ -474,11 +473,11 @@ def rerank_span(
 ) -> Any:
     """The custom reranker-API call and the retrieval-pipeline rerank stage (D24/D71).
 
-        Two call sites share it: `HttpRerankerClient` wraps its POST (no `reranked` flag —
-        the transport knows nothing of pipeline-level degrade), and `retrieval/pipeline.py`
-        wraps the STAGE, passing `reranked=False` on the degrade path so a skipped rerank is
-        still visible in traces. Document counts, model id and the flag only — never the
-        reranker QUERY or the DOCUMENT text (D25).
+    Two call sites share it: `HttpRerankerClient` wraps its POST (no `reranked` flag —
+    the transport knows nothing of pipeline-level degrade), and `retrieval/pipeline.py`
+    wraps the STAGE, passing `reranked=False` on the degrade path so a skipped rerank is
+    still visible in traces. Document counts, model id and the flag only — never the
+    reranker QUERY or the DOCUMENT text (D25).
     """
     return span(
         tracer,
@@ -502,10 +501,10 @@ def recall_span(
 ) -> Any:
     """The retrieval-pipeline vector-recall stage, per corpus (`CHAIN`).
 
-        Structural counters only: corpus name, the recall fan-out `k`, how many candidates
-        the index returned, and how many blueprint candidates the scope pre-filter dropped.
-        The QUESTION TEXT is never an attribute (D25), nor are candidate ids, intent, or
-        chunk text.
+    Structural counters only: corpus name, the recall fan-out `k`, how many candidates
+    the index returned, and how many blueprint candidates the scope pre-filter dropped.
+    The QUESTION TEXT is never an attribute (D25), nor are candidate ids, intent, or
+    chunk text.
     """
     return span(
         tracer,
@@ -684,15 +683,17 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     # exactly what was withheld from the answer. The `exit` that produced the
     # prose is already allowlisted above.
     "redaction_count",
+    "disposition",  # Closed runtime ship disposition; never model-authored text.
+    "count",
 )
 
 
 def guardrail_observer(tracer: Tracer) -> Callable[[str, dict[str, Any]], None]:
     """Build a `(event, payload) -> None` observer emitting one GUARDRAIL span per `loop_*`
-        `AgentLoop` stage-boundary event.
+    `AgentLoop` stage-boundary event.
 
-        Factored out of `app.py`'s composition root so this exact redaction-allowlist
-        behavior is unit-testable without spinning up the HTTP app.
+    Factored out of `app.py`'s composition root so this exact redaction-allowlist
+    behavior is unit-testable without spinning up the HTTP app.
     """
 
     def _observe(event: str, payload: dict[str, Any]) -> None:
@@ -726,6 +727,8 @@ __all__ = [
     "llm_content_trace_config",
     "recall_span",
     "rerank_span",
+    "shutdown_tracing",
+    "SHUTDOWN_FLUSH_TIMEOUT_MILLIS",
     "span",
     "tool_span",
 ]
@@ -733,3 +736,23 @@ __all__ = [
 # Re-exported for callers that need to install the process-global provider
 # (`trace.set_tracer_provider`) without importing `opentelemetry.trace` twice.
 set_global_tracer_provider = trace.set_tracer_provider
+
+
+SHUTDOWN_FLUSH_TIMEOUT_MILLIS = 10_000
+
+
+def shutdown_tracing(
+    provider: TracerProvider | None, *, flush_timeout_millis: int = SHUTDOWN_FLUSH_TIMEOUT_MILLIS
+) -> None:
+    """Best-effort drain and shutdown. The SDK may not enforce the flush timeout."""
+    if provider is None:
+        return
+    try:
+        if not provider.force_flush(timeout_millis=flush_timeout_millis):
+            logging.getLogger(__name__).warning("Tracer flush did not complete")
+    except Exception:
+        logging.getLogger(__name__).warning("Tracer flush failed; proceeding to shutdown")
+    try:
+        provider.shutdown()
+    except Exception:
+        logging.getLogger(__name__).warning("Tracer shutdown failed")

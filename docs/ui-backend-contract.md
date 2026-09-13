@@ -154,6 +154,7 @@ interface ProgressEvent {
 | tool start | `running {tool_name}…` |
 | tool ok | `step complete: {tool_name}` |
 | tool denied | `step denied: {tool_name}` |
+| tool error | `step failed: {tool_name}` |
 | model call | `thinking…` |
 | turn done | `done` |
 | paused (askUser) | `waiting for your answer…` |
@@ -163,6 +164,14 @@ interface ProgressEvent {
 > **One exception to the label table:** when `progress_summary_enabled` is on server-side, an *additional* progress event may arrive whose `step` is a free-form LLM-authored sentence ("Querying overtime pay by department for January"). It is **not** from the table and **may contain concrete parameter values**. Its `shape` is still allowlist-governed. Render `step` as untrusted text.
 
 **No internal database structure in `step`.** Neither the table above nor the summary channel ever names a database, table or column, nor carries SQL: the summarizer is shown only per-tool **allowlisted** arguments (business values — a department, a period, a search phrase — never `sql`/`database`/`table`/`column`, and nothing at all for a tool that is not explicitly listed), and a produced line that repeats a withheld identifier anyway is replaced by a static safe line. See `observability/progress_summarizer.py`.
+
+**Progress ordering and correlation.** When enabled, a summary arrives before dispatch start.
+Every executed model tool call has one start and one terminal (ok, denied, or error) with
+the same `shape.tool_call_id`. Blueprint approval resume allocates one new ID for its
+progress pair and persisted trail entry. Locally refused unknown names, blueprint-first
+advisories, and read guards perform no work and emit no dispatch start. Advertised but
+unwired runtime tools emit a matching start/error pair. Summary timeouts drop the summary;
+they do not prevent dispatch. There is no asynchronous-progress compatibility switch.
 
 **A composite tool is ONE step, and setup is no step at all.** Nested dispatches made on the runtime's own initiative emit **no** `tool start`/`ok`/`denied` events (`ToolDispatcher.dispatch(emit_progress=False)`); denials and errors still propagate to the result exactly as before. Three places do this: `runBlueprint`'s internal nodes/slot probes/grain probe (the UI sees one `running runBlueprint…`, not a `running runQuery…` per node), `resolveValues`'s inner lookup query (narrated once, under `resolveValues`), and the emulated discovery sweep at turn start (`listDatabases`/`listTables` replay the model never asked for — no progress at all).
 

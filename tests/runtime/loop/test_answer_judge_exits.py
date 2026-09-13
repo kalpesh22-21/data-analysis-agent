@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -33,7 +35,6 @@ from data_agent.runtime.loop.answer_judge import (
     ANSWER_JUDGE_EXHAUSTED_EVENT,
     ANSWER_JUDGE_REFUSED_EVENT,
     ANSWER_JUDGE_SKIPPED_EVENT,
-    APPROVED,
     JudgeBrief,
     JudgeVerdict,
 )
@@ -44,6 +45,8 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import FinalizationBlockKind
+
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
 SESSION_ID = "sess-answer-judge-exits"
 _E = "hr.employee"
@@ -60,7 +63,10 @@ _JUDGE_NUDGE_MARK = "That answer was NOT sent."
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in ("runQuery", "getTableSchema", "listDatabases", "listTables")
+    ]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -77,7 +83,9 @@ class _ScriptedJudge:
 
     async def review(self, brief: JudgeBrief) -> JudgeVerdict:
         self.briefs.append(brief)
-        return self._verdicts.pop(0) if self._verdicts else APPROVED
+        return (
+            self._verdicts.pop(0) if self._verdicts else JudgeVerdict(approved=True, reviewed=True)
+        )
 
     @property
     def calls_made(self) -> int:
@@ -393,9 +401,7 @@ async def test_a_cheaper_rule_wins_the_round_and_the_judge_is_not_paid_for() -> 
         ],
         judge,
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     assert _events(events, ANSWER_RULE_REFUSED_EVENT) == [{"rule": "markdown_table"}]
     assert judge.calls_made == 1, "the SECOND, clean finish is judged; the refused one is not"
     assert store.claims == ["answer_shape"]
@@ -409,9 +415,7 @@ async def test_a_silent_finish_never_reaches_the_judge() -> None:
         [ModelTurnResult(assistant_text=""), ModelTurnResult(assistant_text="Sales leads.")],
         judge,
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     assert judge.calls_made == 1, "only the non-blank finish is judged"
     assert judge.briefs[0].draft == "Sales leads."
 
@@ -533,9 +537,7 @@ async def test_the_brief_carries_only_data_bearing_results_of_this_turn() -> Non
             ModelTurnResult(
                 tool_calls=[
                     _query("q1"),
-                    ToolCallRequest(
-                        id="s1", name="getTableSchema", arguments={"table": _E}
-                    ),
+                    ToolCallRequest(id="s1", name="getTableSchema", arguments={"table": _E}),
                 ]
             ),
             ModelTurnResult(assistant_text="Sales leads with 3."),
@@ -543,9 +545,7 @@ async def test_the_brief_carries_only_data_bearing_results_of_this_turn() -> Non
         judge,
         mcp=_rows_mcp(1),
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     (brief,) = judge.briefs
     assert [entry["tool_name"] for entry in brief.results] == ["runQuery"]
     assert brief.sql_executed == (RAN_SQL,)
@@ -565,9 +565,7 @@ async def test_the_brief_previews_are_capped_exactly_as_the_models_are() -> None
         judge,
         mcp=_rows_mcp(50),
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     (brief,) = judge.briefs
     (entry,) = brief.results
     assert entry["result_preview"]["row_count"] == 50
@@ -607,9 +605,7 @@ async def test_a_figure_absent_from_the_results_is_not_reported_as_false() -> No
         judge,
         mcp=_rows_mcp(1),
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="growth?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="growth?")
     (brief,) = judge.briefs
     assert brief.figure_corroborated is None
     assert brief.figure_corroborated is not False
@@ -625,9 +621,7 @@ async def test_prose_with_no_figure_is_not_checked_at_all() -> None:
         judge,
         mcp=_rows_mcp(0),
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="anyone?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="anyone?")
     (brief,) = judge.briefs
     assert brief.figure_corroborated is None
 
@@ -655,7 +649,7 @@ async def test_exit_two_rejection_persists_the_refusal_and_the_turn_continues() 
         session_id=SESSION_ID, credentials=_credentials(), user_message="headcount and tenure"
     )
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Headcount and tenure by department."
+    assert outcome.assistant_text.startswith("I wasn't able to fully verify the answer")
     assert _events(events, ANSWER_JUDGE_REFUSED_EVENT) == [
         {"violation": "unexplained_gap", "site": "exit_table"}
     ]
@@ -737,9 +731,7 @@ async def test_the_exit_two_brief_carries_the_designated_tables() -> None:
         judge,
         mcp=_rows_mcp(1),
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     (brief,) = judge.briefs
     assert brief.site == "exit_table"
     assert brief.draft == "Headcount by department."
@@ -777,7 +769,8 @@ async def test_two_answer_calls_in_one_batch_are_both_refused_once() -> None:
         session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
     )
 
-    assert outcome.assistant_text == "Fixed.", "the refused batch must not end the turn"
+    assert outcome.assistant_text.startswith("I wasn't able to fully verify the answer")
+    # The corrected draft had no fresh approval once the review allowance was spent.
     assert store.claims.count("answer_judge") == 1, "one claim"
     assert judge.calls_made == 1, "one model call"
 
@@ -814,9 +807,7 @@ async def test_a_refusal_by_another_gate_keeps_the_judge_out_of_the_round() -> N
         judge,
         mcp=_rows_mcp(3, 3),
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     assert judge.calls_made == 0, "another gate owned this round"
     assert "answer_judge" not in store.claims
     assert {"reason": "round_refused"} in _events(events, ANSWER_JUDGE_SKIPPED_EVENT)
@@ -844,9 +835,7 @@ async def test_a_blank_answer_call_is_not_a_finalization_and_is_not_judged() -> 
         judge,
         mcp=_rows_mcp(1),
     )
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     assert [b.site for b in judge.briefs] == ["exit_prose"]
 
 

@@ -60,9 +60,11 @@ class SessionStore(Protocol):
         ...
 
     async def write_full_result(
-        self, session_id: str, result_id: str, result_full: dict[str, Any]
+        self, session_id: str, result_id: str, result_full: dict[str, Any] | list[Any]
     ) -> str:
-        """Persist a full (non-preview) tool result to the results side-collection.
+        """Persist an object or array full result to the results side-collection.
+
+        Object-only consumers degrade array reads to preview via read_full_result.
 
                 Returns the `result_full_ref` string to store on the owning `TrailEntry`, and
                 applies the same `SESSION_TTL` as the parent session doc.
@@ -73,10 +75,10 @@ class SessionStore(Protocol):
         self, session_id: str, result_full_ref: str
     ) -> dict[str, Any] | None:
         """Return the full (non-preview) tool result at *result_full_ref*, or `None` if
-                absent or expired.
+        absent or expired.
 
-                READ-ONLY (D72): never mutates the session or the result doc. A TTL-expired
-                result is a tolerated `None`, not an error.
+        READ-ONLY (D72): never mutates the session or the result doc. A TTL-expired
+        result is a tolerated `None`, not an error.
         """
         ...
 
@@ -92,16 +94,16 @@ class SessionStore(Protocol):
     ) -> AnalysisState:
         """Read-modify-write the turn's `analysis_state`, returning the new value.
 
-                Takes the MERGE, not the result: the CAS retry re-runs the callback against a
-                freshly re-read document, so a caller that computed a merged object outside and
-                handed it in would, on a conflict, clobber the winner with a value derived from
-                the stale read.
+        Takes the MERGE, not the result: the CAS retry re-runs the callback against a
+        freshly re-read document, so a caller that computed a merged object outside and
+        handed it in would, on a conflict, clobber the winner with a value derived from
+        the stale read.
 
-                *merge* receives the LIVE state (`live_analysis_state`, so `None` when absent OR
-                from another turn) and returns the state to persist. It runs INSIDE the retry, so
-                it is the right place for validation that depends on the current state — raising
-                from it aborts the write with nothing persisted. Validation that depends only on
-                the payload or the trail belongs outside, before the call.
+        *merge* receives the LIVE state (`live_analysis_state`, so `None` when absent OR
+        from another turn) and returns the state to persist. It runs INSIDE the retry, so
+        it is the right place for validation that depends on the current state — raising
+        from it aborts the write with nothing persisted. Validation that depends only on
+        the payload or the trail belongs outside, before the call.
         """
         ...
 
@@ -114,24 +116,24 @@ class SessionStore(Protocol):
     ) -> bool:
         """Claim THE forced finalization re-round of *kind* for (*turn_index*, *window_count*).
 
-                Returns `True` when this caller got it, `False` when that turn-and-window's
-                allowance for that KIND (`MAX_FINALIZATION_BLOCKS_PER_WINDOW`) is spent.
+        Returns `True` when this caller got it, `False` when that turn-and-window's
+        allowance for that KIND (`MAX_FINALIZATION_BLOCKS_PER_WINDOW`) is spent.
 
-                *kind* IS PART OF THE KEY, NOT A LABEL: `intents` and `answer_shape` hold
-                INDEPENDENT per-window allowances, so a turn refused for pending intents can
-                still be refused once for answer shape in the same window. It is REQUIRED with no
-                default — a defaulted parameter is exactly what a hand-written proxy forwards
-                silently and wrongly.
+        *kind* IS PART OF THE KEY, NOT A LABEL: `intents` and `answer_shape` hold
+        INDEPENDENT per-window allowances, so a turn refused for pending intents can
+        still be refused once for answer shape in the same window. It is REQUIRED with no
+        default — a defaulted parameter is exactly what a hand-written proxy forwards
+        silently and wrongly.
 
-                IT MUST BE PERSISTED, and that is why this method exists. `_run_loop_body` is
-                re-entered once per `run()` AND once per resume of any kind, with `window_count`
-                unchanged, so a local counter resets on every resume while the window number
-                stands still and forced re-rounds become unbounded. An exit-#1 refusal leaves no
-                persisted artifact by design, so it cannot be reconstructed from the trail either.
+        IT MUST BE PERSISTED, and that is why this method exists. `_run_loop_body` is
+        re-entered once per `run()` AND once per resume of any kind, with `window_count`
+        unchanged, so a local counter resets on every resume while the window number
+        stands still and forced re-rounds become unbounded. An exit-#1 refusal leaves no
+        persisted artifact by design, so it cannot be reconstructed from the trail either.
 
-                Keyed by (TURN, WINDOW, KIND) on `SessionDoc.finalization_blocks` via
-                `models.finalization_block_key`, NOT on `AnalysisState`, which is model-writable
-                and unknown-key-rejecting.
+        Keyed by (TURN, WINDOW, KIND) on `SessionDoc.finalization_blocks` via
+        `models.finalization_block_key`, NOT on `AnalysisState`, which is model-writable
+        and unknown-key-rejecting.
         """
         ...
 
@@ -163,12 +165,12 @@ class SessionStore(Protocol):
         limit: int,
     ) -> list[tuple[SessionDoc, Any]]:
         """Return `(doc, cas)` for sessions whose `learning_status` is in *statuses* and whose
-                `last_activity` is strictly older than *last_activity_before* (an ISO-8601
-                cutoff), capped at *limit*.
+        `last_activity` is strictly older than *last_activity_before* (an ISO-8601
+        cutoff), capped at *limit*.
 
-                Each returned CAS is a best-effort snapshot for the caller's subsequent
-                CAS-guarded `transition_learning_status`; a doc that changes between the scan and
-                the transition simply mismatches and is skipped.
+        Each returned CAS is a best-effort snapshot for the caller's subsequent
+        CAS-guarded `transition_learning_status`; a doc that changes between the scan and
+        the transition simply mismatches and is skipped.
         """
         ...
 
@@ -184,13 +186,13 @@ class SessionStore(Protocol):
     ) -> Any:
         """CAS-guarded `learning_status` transition (D96 single-writer-per-session).
 
-                Reads the doc under *cas*, asserts `learning_status == expected_from` (unless
-                *assert_from* is False — the `* -> dead_letter` transition has no `from`
-                assertion), sets `learning_status = to`, optionally records *content_hash*, and
-                writes back CAS-guarded. Returns the new CAS token on success.
+        Reads the doc under *cas*, asserts `learning_status == expected_from` (unless
+        *assert_from* is False — the `* -> dead_letter` transition has no `from`
+        assertion), sets `learning_status = to`, optionally records *content_hash*, and
+        writes back CAS-guarded. Returns the new CAS token on success.
 
-                Raises `CASMismatchError` both when the CAS no longer matches and when
-                *assert_from* is set and the current status is not *expected_from* — both mean
-                "skip this session", so callers treat them identically.
+        Raises `CASMismatchError` both when the CAS no longer matches and when
+        *assert_from* is set and the current status is not *expected_from* — both mean
+        "skip this session", so callers treat them identically.
         """
         ...

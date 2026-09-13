@@ -67,7 +67,6 @@ config:
   HELP_CENTER_SEARCH_TOP_K: "5"
 
   # Capability tools are controlled independently from automatic prefetch.
-  # CAPABILITY_API_KEY belongs in the referenced Secret, never in this file.
   CAPABILITY_TOOLS_ENABLED: "false"
   CAPABILITY_PREFETCH_ENABLED: "false"
   CAPABILITY_API_URL: "https://ai-api.acme.com/v1/capabilities"
@@ -143,7 +142,6 @@ config:
 #     --from-literal=TOKEN_ISSUER_API_KEY=... \
 #     --from-literal=EMBEDDING_API_KEY=... \
 #     --from-literal=RERANKER_API_KEY=...
-#     --from-literal=CAPABILITY_API_KEY=...
 # Leaving `existingSecret` empty does not make the chart create one; it just makes
 # the pods look for `<release>-data-agent-secret` instead.
 #

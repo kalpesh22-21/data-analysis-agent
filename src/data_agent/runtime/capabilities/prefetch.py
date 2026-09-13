@@ -5,6 +5,7 @@ from typing import Any
 from data_agent.runtime.sanitize import sanitize_text
 
 from .client import CapabilityClient, CapabilityKind, CapabilityPrefetch
+from .digest import card_display_fields, join_digest, presentation_detail_label
 from .router import PrefetchRouter
 
 _KINDS: dict[str, tuple[CapabilityKind, ...]] = {
@@ -18,10 +19,14 @@ _KINDS: dict[str, tuple[CapabilityKind, ...]] = {
 
 
 async def prefetch_capabilities(
-    client: CapabilityClient, query: str, router: PrefetchRouter | None = None
+    client: CapabilityClient,
+    query: str,
+    router: PrefetchRouter | None = None,
+    *,
+    end_user_jwt: str | None = None,
 ) -> CapabilityPrefetch:
     route = (router or PrefetchRouter()).route(query)
-    cards = await client.search(query, _KINDS[route], limit=5)
+    cards = await client.search(query, _KINDS[route], limit=5, end_user_jwt=end_user_jwt)
     return CapabilityPrefetch(route=route, cards=tuple(cards))
 
 
@@ -49,6 +54,14 @@ def render_capability_prefetch(prefetch: CapabilityPrefetch) -> dict[str, Any] |
                 lines.append(
                     f"  {label}: " + "; ".join(sanitize_text(value, 300) for value in values)
                 )
+        shows = card_display_fields(card)
+        if shows:
+            lines.append(f"  shows: {join_digest(shows)}")
+        detail = presentation_detail_label(
+            card.kind, preamble_url=card.presentation.preamble_url if card.presentation else None
+        )
+        if detail:
+            lines.append(f"  presentation: {detail}")
     return {"role": "user", "content": "\n".join(lines)}
 
 

@@ -87,9 +87,7 @@ class _CountingStore:
     state. `granted` scripts the answers; `raises` makes the claim blow up the way a
     real Couchbase CAS can."""
 
-    def __init__(
-        self, *, granted: list[bool] | None = None, raises: bool = False
-    ) -> None:
+    def __init__(self, *, granted: list[bool] | None = None, raises: bool = False) -> None:
         self.calls: list[tuple[str, int, int, str]] = []
         self._granted = list(granted or [])
         self._raises = raises
@@ -107,7 +105,9 @@ class _CountingStore:
         return self._granted.pop(0) if self._granted else True
 
 
-def _gate(store: _CountingStore | None = None) -> tuple[FinalizationGate, _CountingStore, _Recorder]:
+def _gate(
+    store: _CountingStore | None = None,
+) -> tuple[FinalizationGate, _CountingStore, _Recorder]:
     """A gate with its round already begun — the loop always calls `begin_round`
     before the model round-trip, so a test that skipped it would be testing a state
     the production path never reaches."""
@@ -458,9 +458,9 @@ def test_the_two_judge_kinds_are_claimable_and_independent() -> None:
     assert finalization_block_key(TURN, WINDOW, "answer_judge") != finalization_block_key(
         TURN, WINDOW, "ask_user_judge"
     )
-    assert finalization_block_key(
-        TURN, WINDOW, "help_center_grounding"
-    ) != finalization_block_key(TURN, WINDOW, "answer_judge")
+    assert finalization_block_key(TURN, WINDOW, "help_center_grounding") != finalization_block_key(
+        TURN, WINDOW, "answer_judge"
+    )
 
 
 async def test_both_answer_exits_share_one_judge_allowance() -> None:
@@ -593,7 +593,7 @@ def test_the_answer_shape_nudge_says_the_turn_is_not_over() -> None:
     assert "This turn produced 2 multi-row result(s)" in text
     assert "The turn is NOT over and answerWithTable is still available to you" in text
     # THE ESCAPE HATCH IS NOT DECORATION: the gate reads row counts, not meaning.
-    assert "re-send your full answer with no tool call and it will be accepted" in text
+    assert "re-send your full answer through answerWithText" in text
 
 
 def test_the_answer_shape_nudge_marks_its_truncation() -> None:
@@ -607,12 +607,10 @@ def test_the_answer_shape_nudge_marks_its_truncation() -> None:
     assert "x" * 2001 not in text
 
 
-def test_the_pending_intents_nudge_truncates_without_a_marker() -> None:
-    """Deliberately different from the shape nudge, whose instruction is to reproduce
-    the quoted answer. This one's instruction is to resolve intents and re-send, so
-    the wording was left alone when the marker landed."""
+def test_the_pending_intents_nudge_marks_a_truncated_draft() -> None:
+    """Re-sending a draft needs visible truncation even while resolving pending intents."""
     text = finalization_nudge_text("y" * 2500, (_intent("i1", "attrition"),))
-    assert "…[truncated]" not in text
+    assert "…[truncated]" in text
     assert "y" * 2000 in text
     assert "y" * 2001 not in text
 

@@ -49,14 +49,14 @@ class ResultPreview:
 class TurnMessage:
     """A persisted user/assistant message (D22 — thinking is discarded).
 
-        `provenance` (load-bearing): the D44 replay filter gates assistant messages too, so
-        a prior turn's free-text answer is never replayed once the user's `column_scope`
-        narrows past what that answer was derived from. `user` messages carry no
-        warehouse-derived data — always `frozenset()`, never `None`, never dropped.
-        `assistant` messages are tagged at write time with the UNION of every `TrailEntry`
-        provenance in that `turn_index`, or `None` if ANY of them was `None` (fail-closed);
-        a turn with no tool calls yields `frozenset()`. Wire encoding is identical to
-        `TrailEntry.provenance`.
+    `provenance` (load-bearing): the D44 replay filter gates assistant messages too, so
+    a prior turn's free-text answer is never replayed once the user's `column_scope`
+    narrows past what that answer was derived from. `user` messages carry no
+    warehouse-derived data — always `frozenset()`, never `None`, never dropped.
+    `assistant` messages are tagged at write time with the UNION of every `TrailEntry`
+    provenance in that `turn_index`, or `None` if ANY of them was `None` (fail-closed);
+    a turn with no tool calls yields `frozenset()`. Wire encoding is identical to
+    `TrailEntry.provenance`.
     """
 
     turn_index: int
@@ -65,6 +65,9 @@ class TurnMessage:
     ts: str  # ISO-8601
     provenance: frozenset[tuple[str, str]] | None = field(default_factory=frozenset)
 
+    ship_disposition: str | None = None
+    retained_assumption_count: int | None = None
+
     def to_doc(self) -> dict[str, Any]:
         return {
             "turn_index": self.turn_index,
@@ -72,6 +75,14 @@ class TurnMessage:
             "content": self.content,
             "ts": self.ts,
             "provenance": _provenance_to_doc(self.provenance),
+            **(
+                {
+                    "ship_disposition": self.ship_disposition,
+                    "retained_assumption_count": self.retained_assumption_count,
+                }
+                if self.ship_disposition is not None
+                else {}
+            ),
         }
 
     @classmethod
@@ -82,6 +93,15 @@ class TurnMessage:
             content=doc["content"],
             ts=doc["ts"],
             provenance=_provenance_from_doc(doc.get("provenance")),
+            ship_disposition=doc.get("ship_disposition")
+            if isinstance(doc.get("ship_disposition"), str)
+            and doc.get("ship_disposition")
+            in {"decline_only", "ship_tables_with_hedge", "ship_cards_with_hedge"}
+            else None,
+            retained_assumption_count=doc.get("retained_assumption_count")
+            if type(doc.get("retained_assumption_count")) is int
+            and doc["retained_assumption_count"] >= 0
+            else None,
         )
 
 
@@ -99,13 +119,13 @@ def _provenance_from_doc(doc: list[list[str]] | None) -> frozenset[tuple[str, st
 
 def _answer_table_provenance_item(item: Any) -> frozenset[tuple[str, str]] | None:
     """One table position's USES set, or `None` when this position's payload is not a
-        well-formed list of `[db_table, column]` pairs.
+    well-formed list of `[db_table, column]` pairs.
 
-        The totality has to reach the PAIRS, not just the outer list: a malformed inner pair
-        raised `IndexError` out of `from_doc` and so out of EVERY subsequent read of that
-        session. `None` is the right degrade — this field is an additive optimisation that
-        lets a narrowed scope drop out-of-scope tables individually, and `None` means "no
-        per-table lineage here", which the reader already handles as the legacy case.
+    The totality has to reach the PAIRS, not just the outer list: a malformed inner pair
+    raised `IndexError` out of `from_doc` and so out of EVERY subsequent read of that
+    session. `None` is the right degrade — this field is an additive optimisation that
+    lets a narrowed scope drop out-of-scope tables individually, and `None` means "no
+    per-table lineage here", which the reader already handles as the legacy case.
     """
     if not isinstance(item, list):
         return None
@@ -119,15 +139,15 @@ def _answer_table_provenance_from_doc(
 ) -> tuple[frozenset[tuple[str, str]] | None, ...] | None:
     """Load `TrailEntry.answer_table_provenance`.
 
-        Total on any shape: a legacy document has no such key, anything that is not a list
-        is treated the same way, and a malformed table POSITION degrades to `None` on its
-        own rather than raising into a store read — the field is an additive optimisation,
-        so a malformed one must cost the per-table filter, never the session.
+    Total on any shape: a legacy document has no such key, anything that is not a list
+    is treated the same way, and a malformed table POSITION degrades to `None` on its
+    own rather than raising into a store read — the field is an additive optimisation,
+    so a malformed one must cost the per-table filter, never the session.
 
-        Its sibling `_provenance_from_doc` is deliberately STRICT: that field is what
-        `scope_filter` reads to decide whether an entry may be shown at all, `None` there
-        means UNDETERMINED and is treated fail-closed, and manufacturing it from a malformed
-        payload would turn a corrupt document into a quiet scope decision.
+    Its sibling `_provenance_from_doc` is deliberately STRICT: that field is what
+    `scope_filter` reads to decide whether an entry may be shown at all, `None` there
+    means UNDETERMINED and is treated fail-closed, and manufacturing it from a malformed
+    payload would turn a corrupt document into a quiet scope decision.
     """
     if not isinstance(doc, list):
         return None
@@ -359,31 +379,28 @@ FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = (
 )
 
 
-def finalization_block_key(
-    turn_index: int, window_count: int, kind: FinalizationBlockKind
-) -> str:
+def finalization_block_key(turn_index: int, window_count: int, kind: FinalizationBlockKind) -> str:
     """The `SessionDoc.finalization_blocks` key — `"0:1:intents"` for turn 0, window 1,
-        the pending-intents allowance.
+    the pending-intents allowance.
 
-        THE TURN INDEX IS LOAD-BEARING: `finalization_blocks` persists on the session
-        document and is never cleared at a turn boundary, but every external turn restarts
-        at `window_count=1`, so a window-only key collides across turns and refuses each
-        later turn a re-round it never had — silently, with `ENFORCEMENT_EXHAUSTED` written
-        for an intent the model was never asked twice about.
+    THE TURN INDEX IS LOAD-BEARING: `finalization_blocks` persists on the session
+    document and is never cleared at a turn boundary, but every external turn restarts
+    at `window_count=1`, so a window-only key collides across turns and refuses each
+    later turn a re-round it never had — silently, with `ENFORCEMENT_EXHAUSTED` written
+    for an intent the model was never asked twice about.
 
-        THE KIND IS THE SAME ARGUMENT ONE LEVEL DOWN: two gates that share a key share an
-        allowance, and the intents nudge spends it first, starving the shape gate.
+    THE KIND IS THE SAME ARGUMENT ONE LEVEL DOWN: two gates that share a key share an
+    allowance, and the intents nudge spends it first, starving the shape gate.
 
-        `kind` is VALIDATED here rather than trusted. This is the single point where a
-        persisted allowance key is minted, so an unrecognised kind — a typo, a stale caller
-        after a rename — must not quietly create an eighth unbounded budget. Raising is safe:
-        `_grant_forced_reround` treats any exception from the claim as "no re-round" and
-        finalizes.
+    `kind` is VALIDATED here rather than trusted. This is the single point where a
+    persisted allowance key is minted, so an unrecognised kind — a typo, a stale caller
+    after a rename — must not quietly create an eighth unbounded budget. Raising is safe:
+    `_grant_forced_reround` treats any exception from the claim as "no re-round" and
+    finalizes.
     """
     if kind not in FINALIZATION_BLOCK_KINDS:
         raise ValueError(
-            f"unknown finalization block kind {kind!r}; expected one of "
-            f"{FINALIZATION_BLOCK_KINDS}"
+            f"unknown finalization block kind {kind!r}; expected one of {FINALIZATION_BLOCK_KINDS}"
         )
     return f"{turn_index}:{window_count}:{kind}"
 
@@ -392,11 +409,11 @@ def finalization_block_key(
 class TrackedIntent:
     """One tracked deliverable of a multi-intent question.
 
-        `intent_id` is RUNTIME-assigned (`i1`, `i2`, … in proposal order) and never
-        model-supplied; `description` is FROZEN after initialization, so an update may only
-        move `status`/`evidence_tool_call_id`/`reason_code`. Both rules exist so the model
-        cannot silently DROP an ask it decided not to answer; neither closes manufactured
-        evidence, which is a known-open hole.
+    `intent_id` is RUNTIME-assigned (`i1`, `i2`, … in proposal order) and never
+    model-supplied; `description` is FROZEN after initialization, so an update may only
+    move `status`/`evidence_tool_call_id`/`reason_code`. Both rules exist so the model
+    cannot silently DROP an ask it decided not to answer; neither closes manufactured
+    evidence, which is a known-open hole.
     """
 
     intent_id: str
@@ -428,12 +445,12 @@ class TrackedIntent:
 @dataclass(frozen=True)
 class AnalysisState:
     """The intent ledger for ONE turn — latest-wins on a single `SessionDoc` field, never
-        an append-only stream of trail entries (N rounds would put N copies inside
-        `fit_request_to_budget`'s pinned region).
+    an append-only stream of trail entries (N rounds would put N copies inside
+    `fit_request_to_budget`'s pinned region).
 
-        It carries its own `turn_index` because the field is NOT cleared at the turn
-        boundary: every reader goes through `live_analysis_state` below, which makes a state
-        from any other turn inert.
+    It carries its own `turn_index` because the field is NOT cleared at the turn
+    boundary: every reader goes through `live_analysis_state` below, which makes a state
+    from any other turn inert.
     """
 
     turn_index: int
@@ -457,10 +474,10 @@ class AnalysisState:
 class PauseCheckpoint:
     """`pause_checkpoint` — the D45 exactly-once resume checkpoint.
 
-        The four `blueprint_*` fields are ADDITIVE and default to `None`, so an
-        `askUser`/`budget_cap` checkpoint is byte-identical without them. They carry the
-        blueprint id + slot bindings of a slot-resolution pause and the mid-DAG resume state
-        (`completed_nodes_json`/`awaiting_node`) of a multi-node or approval pause.
+    The four `blueprint_*` fields are ADDITIVE and default to `None`, so an
+    `askUser`/`budget_cap` checkpoint is byte-identical without them. They carry the
+    blueprint id + slot bindings of a slot-resolution pause and the mid-DAG resume state
+    (`completed_nodes_json`/`awaiting_node`) of a multi-node or approval pause.
     """
 
     reason: str  # "askUser" | "budget_cap" | "blueprint_slot" (Slice C: approval/when_ask)
@@ -470,7 +487,9 @@ class PauseCheckpoint:
     budget_window_count: int = 0
     # --- additive, the runBlueprint brick (D45 mid-DAG durability, §2.5) ---
     blueprint_id: str | None = None
-    slot_bindings_json: str | None = None  # the raw model-proposed slot_bindings (deterministic re-fill)
+    slot_bindings_json: str | None = (
+        None  # the raw model-proposed slot_bindings (deterministic re-fill)
+    )
     # [{order, output, provenance, sql, table, row_count}] — the executor's completed-node
     # records (Slice C). OPAQUE here: the loop persists and returns the string VERBATIM,
     # with no key whitelist, so the executor owns its shape end-to-end and re-validates the
@@ -570,13 +589,9 @@ class SessionDoc:
             "learning_status": self.learning_status,
             "messages": [m.to_doc() for m in self.messages],
             "tool_trail": [e.to_doc() for e in self.tool_trail],
-            "pause_checkpoint": (
-                self.pause_checkpoint.to_doc() if self.pause_checkpoint else None
-            ),
+            "pause_checkpoint": (self.pause_checkpoint.to_doc() if self.pause_checkpoint else None),
             "learning_content_hash": self.learning_content_hash,
-            "analysis_state": (
-                self.analysis_state.to_doc() if self.analysis_state else None
-            ),
+            "analysis_state": (self.analysis_state.to_doc() if self.analysis_state else None),
             "finalization_blocks": (
                 dict(self.finalization_blocks) if self.finalization_blocks is not None else None
             ),
@@ -599,24 +614,22 @@ class SessionDoc:
             # `.get` (not `[...]`): a document written before these fields existed
             # loads with `None` and behaves exactly as it always did.
             analysis_state=AnalysisState.from_doc(as_doc) if as_doc else None,
-            finalization_blocks=(
-                {str(k): int(v) for k, v in fb_doc.items()} if fb_doc else None
-            ),
+            finalization_blocks=({str(k): int(v) for k, v in fb_doc.items()} if fb_doc else None),
         )
 
 
 def live_analysis_state(doc: SessionDoc, turn_index: int) -> AnalysisState | None:
     """The `AnalysisState` that GOVERNS *turn_index*, or `None`.
 
-        A state persists on the session doc after its turn ends, so it is HISTORY for every
-        later turn and must be invisible to anything that initializes, validates or
-        enforces. EVERY read of `analysis_state` goes through this predicate.
+    A state persists on the session doc after its turn ends, so it is HISTORY for every
+    later turn and must be invisible to anything that initializes, validates or
+    enforces. EVERY read of `analysis_state` goes through this predicate.
 
-        Without the `state.turn_index != turn_index` gate two failures are reachable:
-        initialization is refused from the session's second multi-intent turn onward (the
-        feature silently stops working), and an abandoned turn's `pending` intents block the
-        NEXT turn's finalization — burning its nudge and writing `ENFORCEMENT_EXHAUSTED`
-        onto the abandoned turn's intents.
+    Without the `state.turn_index != turn_index` gate two failures are reachable:
+    initialization is refused from the session's second multi-intent turn onward (the
+    feature silently stops working), and an abandoned turn's `pending` intents block the
+    NEXT turn's finalization — burning its nudge and writing `ENFORCEMENT_EXHAUSTED`
+    onto the abandoned turn's intents.
     """
     state = doc.analysis_state
     if state is None or state.turn_index != turn_index:

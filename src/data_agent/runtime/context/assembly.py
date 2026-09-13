@@ -137,7 +137,7 @@ class ContextAssembler:
         preview_row_count: int = 20,
         retrieval: RetrievalPipeline | None = None,
         retrieval_prefetch_tool_enabled: bool = False,
-        capability_prefetch_provider: Callable[[str], Any] | None = None,
+        capability_prefetch_provider: Callable[[str, str | None], Any] | None = None,
         base_system_prompt: str | None = None,
         tracer: Tracer | None = None,
     ) -> None:
@@ -180,6 +180,7 @@ class ContextAssembler:
         *,
         user_message: str | None = None,
         user_id: str | None = None,
+        user_jwt: str | None = None,
         retrieval_memo: dict[tuple[str, str], RetrievedContext] | None = None,
         capability_memo: dict[str, CapabilityPrefetch] | None = None,
         withheld_call_ids: set[str] | None = None,
@@ -187,26 +188,26 @@ class ContextAssembler:
     ) -> AssembledContext:
         """Assemble the canonical message list for one turn under *column_scope*.
 
-                *current_turn_index* is threaded straight through to
-                `scope_filter.filter_trail`; `None` preserves the all-strict D44 replay
-                behaviour.
+        *current_turn_index* is threaded straight through to
+        `scope_filter.filter_trail`; `None` preserves the all-strict D44 replay
+        behaviour.
 
-                *user_message*/*user_id*: with a `retrieval` pipeline injected AND a
-                *user_message* given, the retrieved thin-cards/knowledge/user-memory block is
-                associated with the LAST `user` message. The default representation is inserted
-                before it as one `user` message; the feature-flagged assistant/tool prefetch pair
-                is inserted after it. Neither adds a system message. Absent either input, no
-                retrieval runs.
+        *user_message*/*user_id*: with a `retrieval` pipeline injected AND a
+        *user_message* given, the retrieved thin-cards/knowledge/user-memory block is
+        associated with the LAST `user` message. The default representation is inserted
+        before it as one `user` message; the feature-flagged assistant/tool prefetch pair
+        is inserted after it. Neither adds a system message. Absent either input, no
+        retrieval runs.
 
-                *retrieval_memo* is a caller-owned dict memoizing the `RetrievedContext` by
-                `(user_message, scope_hash)`, so the D45 per-round-trip rebuild recalls at most
-                ONCE per turn window. It is per-turn state owned by `AgentLoop`, never by this
-                shared assembler.
+        *retrieval_memo* is a caller-owned dict memoizing the `RetrievedContext` by
+        `(user_message, scope_hash)`, so the D45 per-round-trip rebuild recalls at most
+        ONCE per turn window. It is per-turn state owned by `AgentLoop`, never by this
+        shared assembler.
 
-                *withheld_call_ids* is the same-lifecycle set of `tool_call_id`s whose
-                `loop_result_withheld_provenance` diagnostic has already fired this turn; `None`
-                disables the de-dup. Only the EVENT is de-duped — the sentinel injection itself
-                is unconditional on every round-trip.
+        *withheld_call_ids* is the same-lifecycle set of `tool_call_id`s whose
+        `loop_result_withheld_provenance` diagnostic has already fired this turn; `None`
+        disables the de-dup. Only the EVENT is de-duped — the sentinel injection itself
+        is unconditional on every round-trip.
         """
         scope_hash = scope_filter.compute_scope_hash(column_scope)
         span_cm = (
@@ -224,9 +225,7 @@ class ContextAssembler:
             raw_messages = doc.messages
 
             # 2. D44 filter EACH stream independently, order-preserving.
-            in_scope_trail = scope_filter.filter_trail(
-                raw_trail, column_scope, current_turn_index
-            )
+            in_scope_trail = scope_filter.filter_trail(raw_trail, column_scope, current_turn_index)
             in_scope_messages = scope_filter.filter_messages(raw_messages, column_scope)
 
             # 3/4/5. Phase 1: NO compaction (no summary). Interleave the two
@@ -276,7 +275,9 @@ class ContextAssembler:
                 )
                 if capability_prefetch is None:
                     try:
-                        capability_prefetch = await self._capability_prefetch_provider(user_message)
+                        capability_prefetch = await self._capability_prefetch_provider(
+                            user_message, user_jwt
+                        )
                     except Exception:
                         capability_prefetch = None
                     if capability_prefetch is not None and capability_memo is not None:
@@ -333,9 +334,7 @@ class ContextAssembler:
             if current_turn_index is not None:
                 state = live_analysis_state(doc, current_turn_index)
                 if state is not None and state.intents:
-                    messages.insert(
-                        _last_user_index(messages), render_analysis_state_block(state)
-                    )
+                    messages.insert(_last_user_index(messages), render_analysis_state_block(state))
 
             # 7. base system prompt at index 0 — the SOLE `role:"system"` message.
             # Inserted last so it precedes the interleaved history + retrieval block.
@@ -376,15 +375,15 @@ class ContextAssembler:
     ) -> list[dict[str, Any]]:
         """Merge the two in-scope streams into ONE chronological render list.
 
-                The merge key is `(turn_index, ts, stream_rank)` and the sort is STABLE, so the
-                rank is only a tie-break for an identical `(turn_index, ts)` and insertion order
-                survives an exact tie. Within a turn this yields question -> tool pairs ->
-                answer, and an askUser mid-turn answer lands between the tool pairs its `ts`
-                falls between.
+        The merge key is `(turn_index, ts, stream_rank)` and the sort is STABLE, so the
+        rank is only a tie-break for an identical `(turn_index, ts)` and insertion order
+        survives an exact tie. Within a turn this yields question -> tool pairs ->
+        answer, and an askUser mid-turn answer lands between the tool pairs its `ts`
+        falls between.
 
-                D94 fold: each current-turn `ok`+`None` entry that `filter_trail` dropped is
-                re-materialised as a non-data-bearing withheld sentinel at the DROPPED ENTRY'S
-                `ts`, and its de-duped diagnostic event fires here.
+        D94 fold: each current-turn `ok`+`None` entry that `filter_trail` dropped is
+        re-materialised as a non-data-bearing withheld sentinel at the DROPPED ENTRY'S
+        `ts`, and its de-duped diagnostic event fires here.
         """
         # (turn_index, ts, stream_rank, render_dict) — sorted by the first three.
         items: list[tuple[int, str, int, dict[str, Any]]] = []
@@ -393,7 +392,12 @@ class ContextAssembler:
         for message in in_scope_messages:
             rank = _STREAM_RANK_USER if message.role == "user" else _STREAM_RANK_ASSISTANT
             items.append(
-                (message.turn_index, message.ts, rank, {"role": message.role, "content": message.content})
+                (
+                    message.turn_index,
+                    message.ts,
+                    rank,
+                    {"role": message.role, "content": message.content},
+                )
             )
 
         # Trail stream + folded D94 sentinels, walked in raw_trail order so
@@ -410,13 +414,21 @@ class ContextAssembler:
                 continue
             if id(entry) in in_scope_ids:
                 items.append(
-                    (entry.turn_index, entry.ts, _STREAM_RANK_TRAIL,
-                     _render_entry(entry, self._preview_row_count))
+                    (
+                        entry.turn_index,
+                        entry.ts,
+                        _STREAM_RANK_TRAIL,
+                        _render_entry(entry, self._preview_row_count),
+                    )
                 )
             elif id(entry) in stranded_ids:
                 items.append(
-                    (entry.turn_index, entry.ts, _STREAM_RANK_TRAIL,
-                     _build_withheld_sentinel_message(entry))
+                    (
+                        entry.turn_index,
+                        entry.ts,
+                        _STREAM_RANK_TRAIL,
+                        _build_withheld_sentinel_message(entry),
+                    )
                 )
                 self._emit_withheld_provenance_event(
                     entry, current_turn_index, withheld_call_ids, observer
@@ -433,12 +445,12 @@ class ContextAssembler:
         current_turn_index: int | None,
     ) -> list[TrailEntry]:
         """The current-turn `ok`+`None`-provenance entries `filter_trail` dropped (covers
-                BOTH the raw `runQuery` and the `runBlueprint`/`_union_provenance` paths).
+        BOTH the raw `runQuery` and the `runBlueprint`/`_union_provenance` paths).
 
-                Cross-turn `ok`+`None` stays dropped as history, with no sentinel. The
-                `provenance is None` conjunct is belt-and-braces — such a current-turn entry can
-                never survive `filter_trail`, so the id check already holds; do not "simplify"
-                it away.
+        Cross-turn `ok`+`None` stays dropped as history, with no sentinel. The
+        `provenance is None` conjunct is belt-and-braces — such a current-turn entry can
+        never survive `filter_trail`, so the id check already holds; do not "simplify"
+        it away.
         """
         if current_turn_index is None:
             return []
@@ -464,11 +476,11 @@ class ContextAssembler:
         observer: Observer | None,
     ) -> tuple[int, int]:
         """Run retrieval (memoized), render the block, and insert it IMMEDIATELY BEFORE the
-                current-turn question (the last `user` message; appended at the end when there
-                is no question yet).
+        current-turn question (the last `user` message; appended at the end when there
+        is no question yet).
 
-                Returns the shape-only `(blueprints, knowledge)` counts. Retrieval never raises
-                (degrade-not-fail), so this never breaks assembly.
+        Returns the shape-only `(blueprints, knowledge)` counts. Retrieval never raises
+        (degrade-not-fail), so this never breaks assembly.
         """
         assert self._retrieval is not None  # guarded by the caller
         key = (user_message, scope_hash)
@@ -509,9 +521,9 @@ class ContextAssembler:
         observer: Observer | None,
     ) -> None:
         """Emit `loop_result_withheld_provenance` at most once per `tool_call_id` per budget
-                window. The payload is non-sensitive — no SQL, column, cell values or scope token
-                (D25/D61); `blueprint_id` is the model-supplied `id` on the `runBlueprint` path,
-                `None` for a raw `runQuery`.
+        window. The payload is non-sensitive — no SQL, column, cell values or scope token
+        (D25/D61); `blueprint_id` is the model-supplied `id` on the `runBlueprint` path,
+        `None` for a raw `runQuery`.
         """
         if observer is None:
             return
@@ -556,8 +568,8 @@ class ContextAssembler:
 
 def _last_user_index(messages: list[dict[str, Any]]) -> int:
     """Index of the last `role:"user"` render item (the current-turn question), or
-        `len(messages)` when there is none yet. The retrieval block is inserted at this index
-        so the question stays the last `user` message — the tail `fit_request_to_budget` pins.
+    `len(messages)` when there is none yet. The retrieval block is inserted at this index
+    so the question stays the last `user` message — the tail `fit_request_to_budget` pins.
     """
     for index in range(len(messages) - 1, -1, -1):
         if messages[index].get("role") == "user":
@@ -584,17 +596,17 @@ def turn_date_anchor_day(
     raw_messages: Sequence[TurnMessage], current_turn_index: int
 ) -> str | None:
     """The ISO day this turn is anchored to (`"2026-08-26"`), or `None` when there is no
-        usable one.
+    usable one.
 
-        THE SINGLE DERIVATION, shared by the model-facing anchor message below and by the
-        answer judge's brief (09 §D.2). A second derivation is not a duplication risk in the
-        abstract — it is a specific, silent failure: the judge would grade "this year"
-        against a different today than the model was given, and would then fault a correct
-        answer for a disagreement it created itself.
+    THE SINGLE DERIVATION, shared by the model-facing anchor message below and by the
+    answer judge's brief (09 §D.2). A second derivation is not a duplication risk in the
+    abstract — it is a specific, silent failure: the judge would grade "this year"
+    against a different today than the model was given, and would then fault a correct
+    answer for a disagreement it created itself.
 
-        See `_turn_date_anchor` for why the date comes from the turn's own first `user`
-        message `ts` rather than `date.today()`, and why a malformed stamp yields `None`
-        instead of a confidently-rendered non-date.
+    See `_turn_date_anchor` for why the date comes from the turn's own first `user`
+    message `ts` rather than `date.today()`, and why a malformed stamp yields `None`
+    instead of a confidently-rendered non-date.
     """
     for message in raw_messages:
         if message.turn_index == current_turn_index and message.role == "user":
@@ -611,27 +623,27 @@ def _turn_date_anchor(
     raw_messages: Sequence[TurnMessage], current_turn_index: int
 ) -> dict[str, Any] | None:
     """`Today's date is YYYY-MM-DD.` plus `DATE_ANCHOR_SQL_NOTE`, as ONE `user`-role
-        message, or `None`.
+    message, or `None`.
 
-        The model has no grounded present: without this, "last 6 months" or "this quarter"
-        resolves against training-frozen time and nothing downstream can detect the wrong
-        window — the SQL parses, the query runs, the grain verifies.
+    The model has no grounded present: without this, "last 6 months" or "this quarter"
+    resolves against training-frozen time and nothing downstream can detect the wrong
+    window — the SQL parses, the query runs, the grain verifies.
 
-        THE DATE COMES FROM THE TURN'S OWN FIRST `user` MESSAGE `ts`, NOT `date.today()`.
-        That stamp is written once when the turn opens and then persisted, so round-trip 1,
-        round-trip 9, a budget-window rebuild and a next-morning resume all re-derive
-        byte-identical bytes; `date.today()` would re-evaluate on every rebuild, so a turn
-        spanning midnight would silently change what "today" means. For the same reason the
-        anchor cannot live in the module-level `AGENT_SYSTEM_PROMPT`.
+    THE DATE COMES FROM THE TURN'S OWN FIRST `user` MESSAGE `ts`, NOT `date.today()`.
+    That stamp is written once when the turn opens and then persisted, so round-trip 1,
+    round-trip 9, a budget-window rebuild and a next-morning resume all re-derive
+    byte-identical bytes; `date.today()` would re-evaluate on every rebuild, so a turn
+    spanning midnight would silently change what "today" means. For the same reason the
+    anchor cannot live in the module-level `AGENT_SYSTEM_PROMPT`.
 
-        `role: "user"`, not `system`, so the base prompt stays the SOLE `role:"system"`
-        message. Reads the RAW messages, not the filtered ones: `user` messages always carry
-        `frozenset()` provenance and are never dropped, and the raw stream cannot become
-        empty for a reason unrelated to dates.
+    `role: "user"`, not `system`, so the base prompt stays the SOLE `role:"system"`
+    message. Reads the RAW messages, not the filtered ones: `user` messages always carry
+    `frozenset()` provenance and are never dropped, and the raw stream cannot become
+    empty for a reason unrelated to dates.
 
-        Returns `None` when the turn has no `user` message yet, and when the stored `ts` is
-        not a readable date. The slice is VALIDATED, not trusted — no anchor is better than
-        confidently rendering `Today's date is not-a-dat.` from a malformed stamp.
+    Returns `None` when the turn has no `user` message yet, and when the stored `ts` is
+    not a readable date. The slice is VALIDATED, not trusted — no anchor is better than
+    confidently rendering `Today's date is not-a-dat.` from a malformed stamp.
     """
     # `ts` is produced by `_now_iso()` (`datetime.now(UTC).isoformat()`), so the first
     # 10 characters ARE the ISO date — the slice is the cheap path, and
@@ -647,15 +659,15 @@ def _turn_date_anchor(
 def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:
     """Render the live `AnalysisState` as ONE `user`-role message.
 
-        `role: "user"`, not `system`, so the base prompt stays the SOLE `role:"system"`
-        message — the head-pin the total-request fit and the send-seam base-prompt invariant
-        both depend on.
+    `role: "user"`, not `system`, so the base prompt stays the SOLE `role:"system"`
+    message — the head-pin the total-request fit and the send-seam base-prompt invariant
+    both depend on.
 
-        Every `description` is structurally sanitised through the shared
-        `runtime/sanitize.py` before interpolation: this is model-authored text re-entering
-        model context, and a newline could otherwise fabricate a bullet, a header, or an
-        instruction line inside this block. Deterministic — the same state renders
-        byte-identically, so a D45 rebuild or resume produces the same request.
+    Every `description` is structurally sanitised through the shared
+    `runtime/sanitize.py` before interpolation: this is model-authored text re-entering
+    model context, and a newline could otherwise fabricate a bullet, a header, or an
+    instruction line inside this block. Deterministic — the same state renders
+    byte-identically, so a D45 rebuild or resume produces the same request.
     """
     lines = [
         "[Analysis state — the deliverables you are tracking for the current question]",
@@ -670,8 +682,7 @@ def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:
         if intent.evidence_tool_call_id:
             detail = f"{detail}, evidence {intent.evidence_tool_call_id}"
         lines.append(
-            f"- {intent.intent_id} [{detail}] "
-            f"{sanitize_text(intent.description, MAX_FIELD_CHARS)}"
+            f"- {intent.intent_id} [{detail}] {sanitize_text(intent.description, MAX_FIELD_CHARS)}"
         )
     return {"role": "user", "content": "\n".join(lines)}
 
@@ -728,29 +739,29 @@ _STALE_CROSS_TURN_ERROR_CODES = frozenset(
 
 def _is_stale_model_text_entry(entry: TrailEntry, current_turn_index: int | None) -> bool:
     """True for a `_STALE_CROSS_TURN_TOOLS` / `_STALE_CROSS_TURN_ERROR_CODES` entry from
-        any turn OTHER than the current one.
+    any turn OTHER than the current one.
 
-        Such an entry is dropped from the replayed context NOT because its provenance is
-        unknown (it is `frozenset()` — these tools read no warehouse data) but because its
-        `args` carry model-authored plain-English text that must not re-enter model context
-        on a later turn, whose `column_scope` may since have narrowed: an assumption may
-        name VALUES, and an intent description is derived from the user's own question. The
-        finalization refusal (matched by ERROR CODE, since it is persisted under
-        `answerWithTable`, whose successful entries must keep replaying) carries both.
+    Such an entry is dropped from the replayed context NOT because its provenance is
+    unknown (it is `frozenset()` — these tools read no warehouse data) but because its
+    `args` carry model-authored plain-English text that must not re-enter model context
+    on a later turn, whose `column_scope` may since have narrowed: an assumption may
+    name VALUES, and an intent description is derived from the user's own question. The
+    finalization refusal (matched by ERROR CODE, since it is persisted under
+    `answerWithTable`, whose successful entries must keep replaying) carries both.
 
-        This is a REPLAY rule, not a provenance one. Encoding it as `None` provenance
-        fail-closed drops the entry cross-turn but also replaces the model's own in-turn
-        confirmation with the D94 withheld sentinel on every successful call. It is also why
-        the refusal keeps `frozenset()` provenance: one `None` collapses
-        `_compute_turn_provenance_union`, tagging that turn's final assistant message
-        undetermined and dropping the user's answer from every later replay.
+    This is a REPLAY rule, not a provenance one. Encoding it as `None` provenance
+    fail-closed drops the entry cross-turn but also replaces the model's own in-turn
+    confirmation with the D94 withheld sentinel on every successful call. It is also why
+    the refusal keeps `frozenset()` provenance: one `None` collapses
+    `_compute_turn_provenance_union`, tagging that turn's final assistant message
+    undetermined and dropping the user's answer from every later replay.
 
-        Dropping the entry cannot orphan a tool message — both halves are synthesized from
-        this one entry by `_tool_trail_entry_to_canonical`, so they leave together.
-        `current_turn_index is None` drops every such entry, the same fail-safe direction.
+    Dropping the entry cannot orphan a tool message — both halves are synthesized from
+    this one entry by `_tool_trail_entry_to_canonical`, so they leave together.
+    `current_turn_index is None` drops every such entry, the same fail-safe direction.
 
-        The RAW trail is untouched, so resume seeding, the UI's per-turn `assumptions` and
-        the `analysisState` ledger all still read the persisted document.
+    The RAW trail is untouched, so resume seeding, the UI's per-turn `assumptions` and
+    the `analysisState` ledger all still read the persisted document.
     """
     if (
         entry.tool_name not in _STALE_CROSS_TURN_TOOLS
@@ -763,20 +774,20 @@ def _is_stale_model_text_entry(entry: TrailEntry, current_turn_index: int | None
 def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:
     """Build the render-shape tool message carrying the D94 sentinel (Part 1).
 
-        The explicit `withheld_sentinel` flag (never set by the ordinary
-        `budget._render_entry` shape) tells `_tool_trail_entry_to_canonical` to use this
-        verbatim, data-free text as the tool result instead of a rendered payload — an
-        explicit marker, so no future `_render_entry` field can silently reroute a normal
-        tool entry to verbatim rendering.
+    The explicit `withheld_sentinel` flag (never set by the ordinary
+    `budget._render_entry` shape) tells `_tool_trail_entry_to_canonical` to use this
+    verbatim, data-free text as the tool result instead of a rendered payload — an
+    explicit marker, so no future `_render_entry` field can silently reroute a normal
+    tool entry to verbatim rendering.
 
-        `args` carries the model's OWN current-turn arguments (the SQL it just sent) so the
-        synthesized ASSISTANT-side `tool_call` correlates the withheld marker with the exact
-        call that stranded; without it the model sees `runQuery({})`, cannot map "do not
-        retry the identical call" to its SQL, and re-strands. The sentinel CONTENT stays the
-        fixed, data-free string — no result preview, no column values.
+    `args` carries the model's OWN current-turn arguments (the SQL it just sent) so the
+    synthesized ASSISTANT-side `tool_call` correlates the withheld marker with the exact
+    call that stranded; without it the model sees `runQuery({})`, cannot map "do not
+    retry the identical call" to its SQL, and re-strands. The sentinel CONTENT stays the
+    fixed, data-free string — no result preview, no column values.
 
-        An `IDEMPOTENT_READ_ALREADY_SERVED_CODE` guard entry reuses this exact shape with
-        the "you already fetched this, proceed" nudge as its verbatim content.
+    An `IDEMPOTENT_READ_ALREADY_SERVED_CODE` guard entry reuses this exact shape with
+    the "you already fetched this, proceed" nudge as its verbatim content.
     """
     content = (
         _REPEATED_IDEMPOTENT_READ_NUDGE

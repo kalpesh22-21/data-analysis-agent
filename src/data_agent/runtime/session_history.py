@@ -40,8 +40,8 @@ def _project_provenance(
     provenance: frozenset[tuple[str, str]] | None,
 ) -> list[str] | None:
     """Project a provenance set to a sorted list of `"db.table.column"` strings, identical
-        to `_outcome_to_dict` (`runtime/app.py`). `None` (undetermined) -> `null`;
-        `frozenset()` (determined-empty) -> `[]`.
+    to `_outcome_to_dict` (`runtime/app.py`). `None` (undetermined) -> `null`;
+    `frozenset()` (determined-empty) -> `[]`.
     """
     if provenance is None:
         return None
@@ -51,8 +51,8 @@ def _project_provenance(
 def _project_tool_call(entry: TrailEntry) -> dict[str, Any]:
     """Project one surviving `TrailEntry` to a `tool_calls[]` element.
 
-        `sql` is `args["sql"]` for `runQuery`; `null` for `runBlueprint` (its node SQL is
-        behind a KV pointer, not inline) and for any tool that carries no `sql` argument.
+    `sql` is `args["sql"]` for `runQuery`; `null` for `runBlueprint` (its node SQL is
+    behind a KV pointer, not inline) and for any tool that carries no `sql` argument.
     """
     sql = None if entry.tool_name == "runBlueprint" else entry.args.get("sql")
     return {
@@ -73,11 +73,11 @@ def project_history(
     observer: Callable[[str, dict[str, Any]], None] = _noop_observer,
 ) -> dict[str, Any]:
     """Project the persisted `messages`/`tool_trail` into the transcript shape under
-        *column_scope*, applying the two D44 filters first.
+    *column_scope*, applying the two D44 filters first.
 
-        Returns `{"turns": [...], "pending_question": ...}` ordered by `turn_index`
-        ascending; the caller wraps it with `session_id`. Pure: no I/O, no store read, no
-        KV de-reference.
+    Returns `{"turns": [...], "pending_question": ...}` ordered by `turn_index`
+    ascending; the caller wraps it with `session_id`. Pure: no I/O, no store read, no
+    KV de-reference.
     """
     surviving_messages = filter_messages(messages, column_scope)
     # A read has NO in-progress turn — pass `current_turn_index=None` so every
@@ -151,9 +151,7 @@ def project_history(
     for entry in trail:
         if entry.status != "ok" or entry.tool_name != ANSWER_TABLE_TOOL_NAME:
             continue
-        finalized = finalize_designations(
-            resolve_designations(entry.args, terminal_by_id).items
-        )
+        finalized = finalize_designations(resolve_designations(entry.args, terminal_by_id).items)
         if not finalized.tables:
             continue
         persisted = entry.answer_table_provenance
@@ -189,10 +187,12 @@ def project_history(
         # a surfaced answer carries its assumptions; a withheld answer withholds
         # them too. `[]` (turn recorded none) collapses to `None` — the `sql` fork.
         assumptions = (
-            (raw_assumptions_by_turn.get(turn_index) or None)
-            if assistant is not None
-            else None
+            (raw_assumptions_by_turn.get(turn_index) or None) if assistant is not None else None
         )
+        if assistant is not None and assistant.ship_disposition is not None:
+            assumptions = (assumptions or [])[: assistant.retained_assumption_count or 0] or None
+            if assistant.ship_disposition != "ship_tables_with_hedge":
+                answer_tables_by_turn.pop(turn_index, None)
         turns.append(
             {
                 "turn_index": turn_index,

@@ -152,7 +152,7 @@ async def test_action_prefetch_searches_navigation_and_action_bearing_widgets() 
     class RecordingClient:
         kinds = None
 
-        async def search(self, query, kinds, limit=5):
+        async def search(self, query, kinds, limit=5, *, end_user_jwt=None):
             self.kinds = kinds
             return []
 
@@ -295,6 +295,8 @@ async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> N
     )
 
     assert hydrated.result_full == {
+        "data": [],
+        "presentation": "data widget — card (EmployeeCard)",
         "found": True,
         "tool_name": "show_employee_profile",
         "kind": "data_widget",
@@ -332,9 +334,9 @@ async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> N
         "resolved_entities": {"employee": ["Jane Doe"]},
         "additional_arguments": {},
         "answer": "Jane is active.",
-            "_agent_evidence": {
-                "kind": "data_widget",
-                "activation": "user_interaction_required",
+        "_agent_evidence": {
+            "kind": "data_widget",
+            "activation": "user_interaction_required",
             "description": "Display an employee profile.",
             "parameters": [
                 {

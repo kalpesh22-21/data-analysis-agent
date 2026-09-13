@@ -6,7 +6,7 @@ FAIL-OPEN IS THE CONTRACT, NOT A FALLBACK. A disabled judge, a dead provider, a 
 a response that never calls the tool, a rejection with an invented slug and a rejection
 with nothing to say must ALL be indistinguishable from an approval — one object,
 `APPROVED`, so no caller can build behaviour on the difference. Every guard below asserts
-the same return value for a different broken shape, which is the point: the shapes differ,
+the same unreviewed approval for a different broken shape, which is the point: the shapes differ,
 the outcome must not.
 
 TRIMMING MAY ONLY EVER TOUCH RESULTS. The question, the draft, the assumptions, the ledger
@@ -118,7 +118,10 @@ def test_tool_enum_is_derived_from_the_vocabulary_not_respelled() -> None:
             "a bare string member char-explodes on .name",
             ModelTurnResult(assistant_text=None, tool_calls=["x"]),  # type: ignore[list-item]
         ),
-        ("no tool call at all", ModelTurnResult(assistant_text="I think it is fine", tool_calls=[])),
+        (
+            "no tool call at all",
+            ModelTurnResult(assistant_text="I think it is fine", tool_calls=[]),
+        ),
         ("called a different tool", _raw_turn({"approved": False}, name="something_else")),
         ("arguments are not an object", _raw_turn("approved=false")),
         ("approved is a string", _raw_turn({"approved": "false", "violation": "", "feedback": ""})),
@@ -393,9 +396,7 @@ def test_figure_corroborated_is_three_valued() -> None:
     absent = json.loads(judge.messages_for(_brief())[1]["content"])
     assert "figures_found_in_results" not in absent
     for value in (True, False):
-        payload = json.loads(
-            judge.messages_for(_brief(figure_corroborated=value))[1]["content"]
-        )
+        payload = json.loads(judge.messages_for(_brief(figure_corroborated=value))[1]["content"])
         assert payload["figures_found_in_results"] is value
 
 
@@ -415,7 +416,11 @@ async def test_disabled_makes_no_model_call() -> None:
 @pytest.mark.asyncio
 async def test_review_returns_a_valid_rejection() -> None:
     client = ScriptedModelClient(
-        [_verdict_turn(False, "unrecorded_assumption", "Name the year.", usage={"total_tokens": 3120})]
+        [
+            _verdict_turn(
+                False, "unrecorded_assumption", "Name the year.", usage={"total_tokens": 3120}
+            )
+        ]
     )
     events: list[tuple[str, dict]] = []
     judge = AnswerJudge(
@@ -517,7 +522,8 @@ async def test_a_genuine_approval_emits_no_failure_event() -> None:
         token_budget=_ROOMY,
         observer=lambda e, p: events.append((e, p)),
     )
-    assert await judge.review(_brief()) is APPROVED
+    verdict = await judge.review(_brief())
+    assert verdict.approved and verdict.reviewed
     assert [e for e, _ in events] == ["loop_answer_judge_called"]
 
 
@@ -531,7 +537,8 @@ async def test_an_observer_that_raises_never_breaks_the_turn() -> None:
         token_budget=_ROOMY,
         observer=_hostile,
     )
-    assert await judge.review(_brief()) is APPROVED
+    verdict = await judge.review(_brief())
+    assert verdict.approved and verdict.reviewed
 
 
 @pytest.mark.asyncio
@@ -541,5 +548,6 @@ async def test_no_retry_on_a_malformed_response() -> None:
     doubles the latency added to a wall-clock-bounded turn."""
     client = ScriptedModelClient([_raw_turn({"approved": "maybe"}), _verdict_turn(True)])
     judge = AnswerJudge(model_client=client, token_budget=_ROOMY)
-    assert await judge.review(_brief()) is APPROVED
+    verdict = await judge.review(_brief())
+    assert verdict.approved and not verdict.reviewed
     assert client.calls_made == 1

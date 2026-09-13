@@ -9,3 +9,12 @@ types:
     table: dbpcm_warehouse.employee
     column: employee_code
     output_column: employee_name
+
+  # Confirmed in tests/fixtures/catalog_export.json and the integration warehouse schema.
+  position:
+    table: dbpcm_warehouse.employee
+    column: position_title_position_info
+
+  work_location:
+    table: dbpcm_warehouse.employee
+    column: work_location_description

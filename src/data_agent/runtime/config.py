@@ -395,8 +395,8 @@ class RuntimeSettings(BaseSettings):
     # DELIBERATELY relaxes the D25 "no cell/slot values in progress" rule for THIS
     # channel — the value-rich line may include concrete parameters drawn from the
     # tool arguments (docs/08-ui.md). Off by default → zero behavior change (no
-    # extra LLM call, no D25 relaxation). The summarization is fire-and-forget and
-    # never blocks tool dispatch or the turn result (fail-soft everywhere).
+    # extra LLM call, no D25 relaxation). Summarization completes before dispatch and adds at most its configured
+    # timeout per call; failures are contained.
     progress_summary_enabled: bool = Field(
         False,
         description=(
@@ -405,12 +405,18 @@ class RuntimeSettings(BaseSettings):
             "tool call and relaxes D25 for the progress channel. Off => byte-identical."
         ),
     )
+    openai_summary_base_url: str | None = Field(
+        None, description="Optional progress model endpoint."
+    )
+    openai_summary_api_key: str | None = Field(
+        None, repr=False, description="Optional progress model API key."
+    )
     openai_summary_model: str = Field(
         "gpt-4.1-mini",
         description=(
             "Cheap/small model id used ONLY for progress-line summarization "
             "(progress_summary_enabled). A second OpenAIModelClient is built on this "
-            "model, sharing the OpenAI api_key/base_url with the main client."
+            "model, with optional separate endpoint/key and main-client defaults."
         ),
     )
     progress_summary_timeout_seconds: float = Field(
@@ -419,15 +425,16 @@ class RuntimeSettings(BaseSettings):
         description=(
             "Per-call timeout for the progress-line summarization LLM call. On timeout "
             "the summary is dropped (fail-soft) and the instant template label stands. "
-            "Generous BY DESIGN: the call is fire-and-forget and is already bounded by "
-            "turn-end cancellation, so this only has to stop a hung request — it is not "
-            "a latency budget. It was 3.0s, which sat on top of the summarizer's own "
-            "measured latency (p50 ~1.9s, tail >4s when a parallel tool batch puts "
-            "several calls in flight at once) and silently dropped ~1 line in 5."
+            "This timeout bounds the extra latency before dispatch when summaries are enabled."
         ),
     )
 
     # --- The answer judge (09) ---
+    answer_judge_evidence_token_budget: int = Field(
+        32_000,
+        gt=0,
+        description="Result evidence budget for the answer judge; subject fields remain pinned.",
+    )
     answer_judge_enabled: bool = Field(
         False,
         description=(
@@ -641,7 +648,7 @@ class RuntimeSettings(BaseSettings):
     )
     jwt_issuer: str = Field("", description="Expected JWT 'iss' claim.")
     jwt_audience: str = Field("", description="Expected JWT 'aud' claim.")
-    verify_signature:bool = Field(False, description="Check signature")
+    verify_signature: bool = Field(False, description="Check signature")
 
     # --- Offline token mint for the S9 golden-replay probe (S9-activation §1.3/§4) ---
     # The S9 promotion scheduler mints a per-blueprint JWT scoped to the blueprint's
@@ -728,9 +735,7 @@ class RuntimeSettings(BaseSettings):
         False, description="Enable Help Center tools and prompt guidance."
     )
     help_center_search_url: str = Field("", description="Help Center search API endpoint.")
-    help_center_documents_url: str = Field(
-        "", description="Help Center documents API base URL."
-    )
+    help_center_documents_url: str = Field("", description="Help Center documents API base URL.")
     help_center_timeout_seconds: float = Field(10.0, gt=0)
     help_center_search_candidate_limit: int = Field(25, ge=5, le=100)
     help_center_search_top_k: int = Field(5, ge=1, le=5)
@@ -738,11 +743,8 @@ class RuntimeSettings(BaseSettings):
     capability_tools_enabled: bool = Field(False)
     capability_prefetch_enabled: bool = Field(False)
     capability_api_url: str = Field("")
-    capability_api_key: str = Field("")
     capability_timeout_seconds: float = Field(10.0, gt=0)
-    capability_resolution_path: str = Field(
-        "config/capability-value-resolution.yaml"
-    )
+    capability_resolution_path: str = Field("config/capability-value-resolution.yaml")
 
     # --- Agent loop / budget caps (D47/D55, OQ-H) ---
     #
@@ -1098,9 +1100,7 @@ class RuntimeSettings(BaseSettings):
     )
     neo4j_creds_path: str = Field(
         "application/datascience/iwant_reporting/neo4j",
-        description=(
-            "Vault KV path holding the Neo4j connection secret"
-        ),
+        description=("Vault KV path holding the Neo4j connection secret"),
     )
     mcp_service_key_vault_path: str = Field(
         "application/datascience/iwant_reporting/admin",
@@ -1112,16 +1112,11 @@ class RuntimeSettings(BaseSettings):
     )
     couchbase_vault_path: str = Field(
         "application/datascience/iwant_reporting/couchbase",
-        description=(
-            "Vault KV path holding the Couchbase connection"
-            "Empty → use env/default."
-        ),
+        description=("Vault KV path holding the Couchbase connectionEmpty → use env/default."),
     )
-    openai_api_key_path:str = Field(
+    openai_api_key_path: str = Field(
         "application/datascience/iwant_reporting/llm",
-        description=(
-            "Vault KV path holding the OpenAI API Key"
-        ),
+        description=("Vault KV path holding the OpenAI API Key"),
     )
 
     def effective_agent_system_prompt(self) -> str | None:
@@ -1144,18 +1139,18 @@ class RuntimeSettings(BaseSettings):
 
     def request_token_budget(self) -> int:
         """Absolute cap on the FULL assembled request (all messages) handed to `send_turn`: the
-                model context window minus the reserve held back for the model's own output, times a
-                0.8 headroom factor.
+        model context window minus the reserve held back for the model's own output, times a
+        0.8 headroom factor.
 
-                The 0.8 is headroom because the chars/4 estimator under-counts JSON- and SQL-dense
-                content (~3 chars/token in practice): a list "fitted" to the raw window could still
-                be 20-30% over the REAL window and let the endpoint front-truncate the leading base
-                prompt. The margin is applied ONLY at this request-fit seam, so the shared estimator
-                and the trail token math are untouched.
+        The 0.8 is headroom because the chars/4 estimator under-counts JSON- and SQL-dense
+        content (~3 chars/token in practice): a list "fitted" to the raw window could still
+        be 20-30% over the REAL window and let the endpoint front-truncate the leading base
+        prompt. The margin is applied ONLY at this request-fit seam, so the shared estimator
+        and the trail token math are untouched.
 
-                Clamped to at least 1, so a configuration where the reserve meets or exceeds the
-                window can never yield a non-positive budget the fit walk would treat as "drop
-                everything".
+        Clamped to at least 1, so a configuration where the reserve meets or exceeds the
+        window can never yield a non-positive budget the fit walk would treat as "drop
+        everything".
         """
         headroom = (
             self.model_context_window - self.response_token_reserve
@@ -1180,14 +1175,14 @@ class RuntimeSettings(BaseSettings):
     def catalog_api_base(self) -> str:
         """Resolve the MCP catalog-export base URL (…/catalog), no trailing slash.
 
-                Uses `catalog_api_url` when set; otherwise derives it from `mcp_url` by replacing the
-                MCP mount path with `/catalog` (the route lives on the same MCP host).
-                `HttpCatalogClient` appends `/export`.
+        Uses `catalog_api_url` when set; otherwise derives it from `mcp_url` by replacing the
+        MCP mount path with `/catalog` (the route lives on the same MCP host).
+        `HttpCatalogClient` appends `/export`.
 
-                WARNING: the derivation keeps ONLY `mcp_url`'s scheme and netloc and DISCARDS any
-                path prefix, so a path-routed ingress like `https://host/prefix/mcp` yields
-                `https://host/catalog` — which may point at the wrong host or 404. Set
-                `catalog_api_url` to the explicit base to override the derivation in that case.
+        WARNING: the derivation keeps ONLY `mcp_url`'s scheme and netloc and DISCARDS any
+        path prefix, so a path-routed ingress like `https://host/prefix/mcp` yields
+        `https://host/catalog` — which may point at the wrong host or 404. Set
+        `catalog_api_url` to the explicit base to override the derivation in that case.
         """
         if self.catalog_api_url:
             return self.catalog_api_url.rstrip("/")
@@ -1248,22 +1243,22 @@ class RuntimeSettings(BaseSettings):
 def effective_llm_hide(settings: RuntimeSettings) -> bool:
     """The EFFECTIVE OpenAI-LLM-content hide, resolving the two observability flags.
 
-        Content is hidden ONLY when `otlp_hide_llm_content` is True AND the master telemetry
-        debug switch `otlp_disable_redaction` is False. Disabling redaction forces the reveal, so
-        a debugging operator sees the LLM Q/A and exception events alongside the real tool calls:
+    Content is hidden ONLY when `otlp_hide_llm_content` is True AND the master telemetry
+    debug switch `otlp_disable_redaction` is False. Disabling redaction forces the reveal, so
+    a debugging operator sees the LLM Q/A and exception events alongside the real tool calls:
 
-            hide_llm_content  disable_redaction  -> hidden?
-            True              False              -> True   (the ONLY hiding combination)
-            True              True               -> False  (revealed; disable wins)
-            False             False              -> False
-            False             True               -> False  (the shipped default)
+        hide_llm_content  disable_redaction  -> hidden?
+        True              False              -> True   (the ONLY hiding combination)
+        True              True               -> False  (revealed; disable wins)
+        False             False              -> False
+        False             True               -> False  (the shipped default)
 
-        Note what that costs: hiding the LLM content takes TWO settings, not one.
-        `OTLP_HIDE_LLM_CONTENT=true` alone no longer hides anything, because
-        `otlp_disable_redaction` defaults True and overrides it.
+    Note what that costs: hiding the LLM content takes TWO settings, not one.
+    `OTLP_HIDE_LLM_CONTENT=true` alone no longer hides anything, because
+    `otlp_disable_redaction` defaults True and overrides it.
 
-        `app.py` passes this single value to BOTH `configure_tracing(hide_llm_content=)` and
-        `instrument_openai(hide_content=)`, so the two content channels can never disagree.
+    `app.py` passes this single value to BOTH `configure_tracing(hide_llm_content=)` and
+    `instrument_openai(hide_content=)`, so the two content channels can never disagree.
     """
     return settings.otlp_hide_llm_content and not settings.otlp_disable_redaction
 
@@ -1288,6 +1283,7 @@ def _read_vault_secret(vc, key: str, path: str, current):
             type(exc).__name__,
         )
         return current
+
 
 def load_settings_from_vault() -> RuntimeSettings:
     """Construct Settings, then override sensitive values from Vault when enabled.
@@ -1319,9 +1315,7 @@ def load_settings_from_vault() -> RuntimeSettings:
     # --- Neo4j main connection ---
     if settings.neo4j_creds_path:
         p = settings.neo4j_creds_path
-        settings.neo4j_url = _read_vault_secret(
-            vc, "NEO4J_URL", p, settings.neo4j_url
-        )
+        settings.neo4j_url = _read_vault_secret(vc, "NEO4J_URL", p, settings.neo4j_url)
         settings.neo4j_username = _read_vault_secret(
             vc, "NEO4J_USERNAME", p, settings.neo4j_username
         )
@@ -1366,6 +1360,7 @@ def load_settings_from_vault() -> RuntimeSettings:
             vc, "API_KEY", settings.mcp_service_key_vault_path, settings.mcp_service_key
         )
     return settings
+
 
 @lru_cache(maxsize=1)
 def get_runtime_settings() -> RuntimeSettings:

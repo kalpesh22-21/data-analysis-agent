@@ -64,6 +64,8 @@ _RUN_BLUEPRINT_CODES = {
 _TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR"}
 
 _EXPECTED_RETRYABLE = {
+    "UNKNOWN_TOOL": True,
+    "BLUEPRINT_NOT_SEARCHED": True,
     # RETRYABLE on purpose: the fix is one runBlueprint call away and the model can
     # make it inside the same turn.
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN": True,
@@ -159,7 +161,8 @@ _FINALIZATION_CODES = {"FINALIZATION_BLOCKED_PENDING_INTENTS"}
 _BLUEPRINT_DEFINITION_CODES = {"BLUEPRINT_DEFINITION_NOT_READ"}
 
 _ALL_KNOWN_CODES = (
-    _ALL_SEVEN_CODES
+    {"UNKNOWN_TOOL", "BLUEPRINT_NOT_SEARCHED"}
+    | _ALL_SEVEN_CODES
     | _GUARDRAIL_CODES
     | _COMPOSITE_CODES
     | _READ_TOOL_CODES
@@ -225,6 +228,8 @@ def test_none_code_is_handled() -> None:
 # calls, the shape of the envelope)". The WORK_JUDGED/INFRA_FAILED line is the H8 one:
 # did anything actually form a verdict on the work, or did the floor give way under it.
 _EXPECTED_KIND = {
+    "UNKNOWN_TOOL": DenialKind.GATE,
+    "BLUEPRINT_NOT_SEARCHED": DenialKind.GATE,
     # --- GATE: protocol refusals — nothing was computed, nothing computed was wrong ---
     # Call ORDER: getBlueprint must precede runBlueprint. The executor never ran, so
     # this is not evidence that the blueprint is wrong.

@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from data_agent.runtime import app as app_module
 from data_agent.runtime.app import create_app
 from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.context.discovery_emulation import _opaque_discovery_call_id
 from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -215,8 +216,8 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
 
     messages = model_client.calls[0].messages
     tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-    assert "emulated-listDatabases" in tool_ids
-    assert f"emulated-listTables-{db}" in tool_ids
+    assert _opaque_discovery_call_id(SESSION_ID, "databases") in tool_ids
+    assert _opaque_discovery_call_id(SESSION_ID, f"tables:{db}") in tool_ids
     # SEQUENTIAL TURN LAYOUT: every emulated pair FOLLOWS the real user question,
     # which immediately precedes the first of them.
     first_emulated = min(i for i, m in enumerate(messages) if m.get("role") == "tool") - 1
@@ -244,8 +245,8 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
 
     # The pairs still reach the second turn's payload — served from cache, not re-swept.
     tool_ids2 = [m["tool_call_id"] for m in model_client.calls[1].messages if m["role"] == "tool"]
-    assert "emulated-listDatabases" in tool_ids2
-    assert f"emulated-listTables-{db}" in tool_ids2
+    assert _opaque_discovery_call_id(SESSION_ID, "databases") in tool_ids2
+    assert _opaque_discovery_call_id(SESSION_ID, f"tables:{db}") in tool_ids2
 
 
 def test_turn_endpoint_missing_auth_header_returns_401(monkeypatch) -> None:
@@ -1142,21 +1143,27 @@ def test_history_survives_an_unreadable_blueprint_result(monkeypatch) -> None:
         await store.get_or_create_session(SESSION_ID)
         await store.append_message(
             SESSION_ID,
-            TurnMessage(turn_index=0, role="user", content="q?", ts="t0",
-                        provenance=frozenset()),
+            TurnMessage(turn_index=0, role="user", content="q?", ts="t0", provenance=frozenset()),
         )
         await store.append_message(
             SESSION_ID,
-            TurnMessage(turn_index=0, role="assistant", content="a", ts="t3",
-                        provenance=frozenset()),
+            TurnMessage(
+                turn_index=0, role="assistant", content="a", ts="t3", provenance=frozenset()
+            ),
         )
         await store.append_trail_entry(
             SESSION_ID,
             TrailEntry(
-                turn_index=0, tool_call_id="b1", tool_name="runBlueprint",
-                args={"id": "bp-x"}, status="ok", error_code=None,
-                provenance=frozenset(), result_preview=None,
-                result_full_ref="result::gone", ts="t1",
+                turn_index=0,
+                tool_call_id="b1",
+                tool_name="runBlueprint",
+                args={"id": "bp-x"},
+                status="ok",
+                error_code=None,
+                provenance=frozenset(),
+                result_preview=None,
+                result_full_ref="result::gone",
+                ts="t1",
             ),
         )
 
@@ -1167,8 +1174,8 @@ def test_history_survives_an_unreadable_blueprint_result(monkeypatch) -> None:
     assert resp.status_code == 200, "an unreadable blueprint result must not 500 history"
     turns = resp.json()["turns"]
     assert len(turns) == 1
-    assert turns[0]["answer"] == "a"          # the transcript still rebuilds
-    assert turns[0]["answer_sql"] is None     # only the table reference is lost
+    assert turns[0]["answer"] == "a"  # the transcript still rebuilds
+    assert turns[0]["answer_sql"] is None  # only the table reference is lost
 
 
 def test_update_analysis_state_is_wired_and_gets_the_loops_own_turn_index(
@@ -1219,17 +1226,17 @@ def test_update_analysis_state_is_wired_and_gets_the_loops_own_turn_index(
     client = TestClient(app)
 
     client.post("/turn", json={"message": "first question"}, headers=HEADERS)
-    response = client.post(
-        "/turn", json={"message": "two things please"}, headers=HEADERS
-    )
+    response = client.post("/turn", json={"message": "two things please"}, headers=HEADERS)
     assert response.status_code == 200
 
     import asyncio
 
     from data_agent.runtime.session.models import live_analysis_state
 
-    doc = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        store.get_or_create_session(SESSION_ID)
+    doc = (
+        asyncio.get_event_loop_policy()
+        .new_event_loop()
+        .run_until_complete(store.get_or_create_session(SESSION_ID))
     )
     assert doc.analysis_state is not None
     assert doc.analysis_state.turn_index == 1
@@ -1301,8 +1308,6 @@ def test_extra_observers_receive_loop_events_on_both_endpoints(monkeypatch) -> N
 
 
 def test_create_app_without_extra_observers_is_unchanged(monkeypatch) -> None:
-    client = _build_client(
-        monkeypatch, ScriptedModelClient([ModelTurnResult(assistant_text="hi")])
-    )
+    client = _build_client(monkeypatch, ScriptedModelClient([ModelTurnResult(assistant_text="hi")]))
     response = client.post("/turn", json={"message": "hello"}, headers=HEADERS)
     assert _parse_sse(response.text)[-1]["data"]["status"] == "done"

@@ -24,6 +24,7 @@ collection.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import replace as dc_replace
@@ -53,7 +54,7 @@ _CAS_RETRY_BACKOFF_SECONDS = 0.02
 # are the extra types only this store writes with. Same guard posture: the module
 # stays importable with no `couchbase` package installed (the constructor refuses).
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
-    from couchbase.exceptions import CasMismatchException
+    from couchbase.exceptions import CasMismatchException, ValueFormatException
     from couchbase.options import QueryOptions, ReplaceOptions, UpsertOptions
 except ImportError:  # pragma: no cover
     pass
@@ -115,11 +116,11 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         self, session_id: str, mutate: Callable[[SessionDoc], None]
     ) -> SessionDoc:
         """Read-with-CAS -> apply *mutate* in place -> CAS'd `replace`, with a bounded
-                retry-on-`CasMismatchException` loop.
+        retry-on-`CasMismatchException` loop.
 
-                *mutate* must be a pure in-place mutation of the freshly-read `doc`. It may be
-                called more than once — once per retry, against a freshly re-read document — so
-                it must not carry any state of its own across calls.
+        *mutate* must be a pure in-place mutation of the freshly-read `doc`. It may be
+        called more than once — once per retry, against a freshly re-read document — so
+        it must not carry any state of its own across calls.
         """
         last_exc: CasMismatchException | None = None
         for attempt in range(_MAX_CAS_RETRIES):
@@ -160,7 +161,7 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
 
     async def _create_session(self, session_id: str) -> SessionDoc:
         """Create (or return the already-present) session document — the shared
-                create-on-miss body the public paths reuse once their own `_get_doc` missed.
+        create-on-miss body the public paths reuse once their own `_get_doc` missed.
         """
         await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
@@ -196,7 +197,7 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         await self._mutate_with_cas_retry(session_id, lambda _doc: None)
 
     async def write_full_result(
-        self, session_id: str, result_id: str, result_full: dict[str, Any]
+        self, session_id: str, result_id: str, result_full: dict[str, Any] | list[Any]
     ) -> str:
         await self._ensure_connected()
         result_id = result_id or str(uuid.uuid4())
@@ -214,7 +215,21 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         # per-session scoping and the Protocol.
         await self._ensure_connected()
         result = await get_or_none(self._results, result_full_ref)
-        return None if result is None else result.content_as[dict]
+        if result is None:
+            return None
+        try:
+            content = result.value
+        except (ValueError, ValueFormatException):
+            logging.getLogger(__name__).warning(
+                "Full result %r failed JSON decode; using preview", result_full_ref
+            )
+            return None
+        if isinstance(content, dict):
+            return content
+        logging.getLogger(__name__).warning(
+            "Full result %r decoded as %s; using preview", result_full_ref, type(content).__name__
+        )
+        return None
 
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
         await self._ensure_connected()
@@ -230,10 +245,10 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
     ) -> AnalysisState:
         """Merge-callback read-modify-write of `analysis_state`.
 
-                *merge* is re-invoked on every CAS retry against the FRESHLY re-read doc, so a
-                concurrent state write cannot be clobbered by a value derived from a stale read.
-                `applied` is reset at the top of each invocation rather than appended across
-                them, so the returned state is the one the winning attempt actually wrote.
+        *merge* is re-invoked on every CAS retry against the FRESHLY re-read doc, so a
+        concurrent state write cannot be clobbered by a value derived from a stale read.
+        `applied` is reset at the top of each invocation rather than appended across
+        them, so the returned state is the one the winning attempt actually wrote.
         """
         await self._ensure_connected()
         applied: list[AnalysisState] = []
@@ -256,18 +271,18 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
     ) -> bool:
         """CAS-guarded claim of the (turn, window, kind)'s ONE forced re-round.
 
-                *kind* discriminates INDEPENDENT allowances on the one map, so two different
-                gates refusing in the same window contend for nothing.
+        *kind* discriminates INDEPENDENT allowances on the one map, so two different
+        gates refusing in the same window contend for nothing.
 
-                The check and the increment happen inside the SAME `_mutate_with_cas_retry`
-                callback, so a concurrent claimant cannot also see "unspent": whichever write
-                lands first bumps the count, and the loser's callback re-runs against the fresh
-                doc and returns `False`. `claimed` is reset at the top of each invocation, never
-                appended across retries.
+        The check and the increment happen inside the SAME `_mutate_with_cas_retry`
+        callback, so a concurrent claimant cannot also see "unspent": whichever write
+        lands first bumps the count, and the loser's callback re-runs against the fresh
+        doc and returns `False`. `claimed` is reset at the top of each invocation, never
+        appended across retries.
 
-                A refused claim still writes (the helper always replaces the doc, bumping
-                `last_activity`) — one benign write on the exhausted path buys a single atomic
-                code path, and that path ends the turn anyway.
+        A refused claim still writes (the helper always replaces the doc, bumping
+        `last_activity`) — one benign write on the exhausted path buys a single atomic
+        code path, and that path ends the turn anyway.
         """
         await self._ensure_connected()
         claimed: list[bool] = []
@@ -349,10 +364,10 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         limit: int,
     ) -> list[tuple[SessionDoc, Any]]:
         """N1QL scan for idle sessions. `META().cas` is selected so each returned CAS is
-                usable directly by `transition_learning_status`'s CAS-guarded `replace`.
+        usable directly by `transition_learning_status`'s CAS-guarded `replace`.
 
-                N1QL is NOT exempt from the connect gate: `AsyncClusterImpl.query` calls the
-                SDK's own `_ensure_connected()` exactly like a KV op does.
+        N1QL is NOT exempt from the connect gate: `AsyncClusterImpl.query` calls the
+        SDK's own `_ensure_connected()` exactly like a KV op does.
         """
         await self._ensure_connected()
         keyspace = (
@@ -397,11 +412,11 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
     ) -> Any:
         """Single-shot CAS transition (D96 single-writer-per-session).
 
-                Reads fresh, asserts the `from` state, then `replace`s under the CALLER's *cas*
-                (the scan snapshot). Deliberately NOT the retrying `_mutate_with_cas_retry`
-                path: a lost transition race must be a SKIP, not a retry that would force the
-                write. The lifecycle flag is the ONLY field written — bumping `last_activity`
-                would resurrect the idle session (D72 read-only).
+        Reads fresh, asserts the `from` state, then `replace`s under the CALLER's *cas*
+        (the scan snapshot). Deliberately NOT the retrying `_mutate_with_cas_retry`
+        path: a lost transition race must be a SKIP, not a retry that would force the
+        write. The lifecycle flag is the ONLY field written — bumping `last_activity`
+        would resurrect the idle session (D72 read-only).
         """
         await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)

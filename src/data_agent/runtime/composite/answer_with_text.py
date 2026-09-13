@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
+from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
 from data_agent.runtime.session.models import ResultPreview
 
 from .answer_with_table import clean_answer_text
@@ -24,10 +25,16 @@ def clean_evidence(raw: Any) -> tuple[str, ...]:
     )
 
 
-class AnswerWithTextTool:
+class AnswerWithTextTool(RuntimeToolBase):
+    _INTERNAL_ERROR_CODE = "RUNTIME_TOOL_INTERNAL_ERROR"
+    _INTERNAL_ERROR_MESSAGE = "The tool could not complete. Please try again."
+
+    def _span_args(self, model_args: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
     tool_name = TOOL_NAME
 
-    async def run(
+    async def _execute(
         self,
         arguments: dict[str, Any],
         credentials: RuntimeCredentials,
@@ -38,10 +45,12 @@ class AnswerWithTextTool:
             columns=["answered", "evidence_declared"],
             row_count=1,
             truncated=False,
-            preview_rows=[[
-                clean_answer_text(args.get("answer")) is not None,
-                bool(clean_evidence(args.get("evidence"))),
-            ]],
+            preview_rows=[
+                [
+                    clean_answer_text(args.get("answer")) is not None,
+                    bool(clean_evidence(args.get("evidence"))),
+                ]
+            ],
         )
         return ToolResult(
             status="ok",

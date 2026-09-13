@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from jsonschema import ValidationError, validate
+from opentelemetry import trace
 
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolObserver,
@@ -19,7 +20,10 @@ from .client import (
     CapabilityDefinition,
     CapabilityError,
     CapabilityServiceError,
+    safe_provider_code,
 )
+from .digest import definition_data_digest, presentation_label
+from .hydrate_trace import record_hydrate_event
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -73,7 +77,7 @@ class _CapabilityTool(RuntimeToolBase):
                 "PAYLOAD_TOO_LARGE",
             }
             return self._error(
-                f"CAPABILITY_{exc.code}",
+                f"CAPABILITY_{safe_provider_code(exc.code)}",
                 (
                     "The capability arguments need to be corrected."
                     if invalid
@@ -96,7 +100,7 @@ class SearchCapabilityToolsTool(_CapabilityTool):
         if not isinstance(query, str) or not query.strip():
             return self._error(INVALID_ARGS, "'query' must be non-empty text.", retryable=True)
         cards = await self._client.search(
-            query.strip(), ("navigation", "data_widget"), limit=5
+            query.strip(), ("navigation", "data_widget"), limit=5, end_user_jwt=credentials.jwt
         )
         return _ok(self.tool_name, {"cards": [card.to_dict() for card in cards]})
 
@@ -122,9 +126,16 @@ class GetCapabilityTool(_CapabilityTool):
         if not isinstance(name, str) or not name.strip():
             return self._error(INVALID_ARGS, "'tool_name' must be non-empty text.", retryable=True)
         name = name.strip()
-        definition = await self._client.get_definition(name)
+        definition = await self._client.get_definition(name, end_user_jwt=credentials.jwt)
         if definition is None:
-            return _ok(self.tool_name, {"found": False, "tool_name": name})
+            return _ok(
+                self.tool_name,
+                {
+                    "found": False,
+                    "tool_name": name,
+                    "note": "No UI option exists with this exact name. It was not loaded and must not be called. Use searchCapabilityTools to find an available option.",
+                },
+            )
         ready = self._hydrate(definition) is not False
         if ready:
             self._visible_names.add(name)
@@ -135,12 +146,18 @@ class GetCapabilityTool(_CapabilityTool):
                 "tool_name": name,
                 "kind": definition.kind,
                 "ready": ready,
+                "data": list(definition_data_digest(definition)),
+                "presentation": presentation_label(
+                    definition.kind,
+                    preamble_url=definition.metadata.get("preamble_url"),
+                    widget_name=definition.metadata.get("widgetName"),
+                ),
                 "presented": False,
                 "next_step": (
                     f"Call {name} to present this option; definition lookup alone does not "
                     "present it. Omit optional arguments the user did not supply."
                     if ready
-                    else "This definition cannot be presented by the runtime."
+                    else "This UI option was not loaded as a callable tool. Do not call its name; use searchCapabilityTools to choose another option, or answer from the data tools."
                 ),
             },
         )
@@ -174,12 +191,19 @@ class PresentCapabilityCardTool(_CapabilityTool):
             parameter.collection and parameter.name in arguments
             for parameter in self._definition.parameters
         )
-        result = await self._client.hydrate(
-            self.tool_name,
-            query=query,
-            raw_arguments=arguments,
-            end_user_jwt=credentials.jwt if needs_entity_resolution else None,
-        )
+        hydrate_span = trace.get_current_span() if self._tracer is not None else None
+        try:
+            result = await self._client.hydrate(
+                self.tool_name,
+                query=query,
+                raw_arguments=arguments,
+                end_user_jwt=credentials.jwt,
+                forward_end_user=needs_entity_resolution,
+            )
+        except Exception as exc:
+            record_hydrate_event(hydrate_span, error=exc)
+            raise
+        record_hydrate_event(hydrate_span, card=result)
         if result is None:
             return self._error(
                 "CAPABILITY_NOT_FOUND",

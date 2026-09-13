@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     MAX_INTENTS,
@@ -55,6 +57,8 @@ from data_agent.runtime.session.models import (
 from data_agent.runtime.session_history import project_history
 from tests._blueprint_gate import expand_blueprint
 
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+
 SESSION_ID = "sess-multi-table"
 _E = "dbpcm_warehouse.employee"
 _P = "dbpcm_warehouse.payroll"
@@ -78,7 +82,10 @@ def _creds(scope: frozenset[str] = frozenset()) -> RuntimeCredentials:
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in ("runQuery", "getTableSchema", "listDatabases", "listTables")
+    ]
 
 
 class _StubBlueprintTool:
@@ -104,7 +111,7 @@ class _StubBlueprintTool:
         self._empty = empty
 
     async def run(
-        self, arguments: dict, credentials: RuntimeCredentials, turn: Any = None
+        self, arguments: dict, credentials: RuntimeCredentials, turn: Any = None, tool_call_id=None
     ) -> ToolResult:
         blueprint_id = arguments.get("id")
         terminal_sql, verified = self._registry[blueprint_id]
@@ -159,9 +166,7 @@ def _build(
         STATE: UpdateAnalysisStateTool(session_store=store, observer=_observe),
     }
     if blueprints:
-        runtime_tools["runBlueprint"] = _StubBlueprintTool(
-            blueprints, empty=empty_blueprints
-        )
+        runtime_tools["runBlueprint"] = _StubBlueprintTool(blueprints, empty=empty_blueprints)
     loop = AgentLoop(
         model_client=ScriptedModelClient(turns),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=_observe),
@@ -358,9 +363,7 @@ def test_an_empty_tables_array_falls_back_to_the_legacy_pair() -> None:
     nothing to put there must still emit the key. Falling back (rather than
     unioning) is what stops a call that filled the array with nothing from silently
     losing its table."""
-    designation = resolve_designations(
-        {"answer": "x", "sql": SALARY_SQL, "tables": []}, {}
-    )
+    designation = resolve_designations({"answer": "x", "sql": SALARY_SQL, "tables": []}, {})
     assert [item.sql for item in designation.items] == [SALARY_SQL]
 
 
@@ -843,9 +846,7 @@ async def test_a_designated_query_outside_scope_is_dropped_live() -> None:
             )
         ]
     )
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_creds(scope), user_message="q?"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(scope), user_message="q?")
     assert [t["sql"] for t in outcome.answer_tables] == [HEADCOUNT_SQL]
     assert {"reason": "out_of_scope"} in _payloads(events, "loop_answer_table_item_dropped")
 
@@ -1011,9 +1012,7 @@ def test_a_multi_table_turn_round_trips_through_session_history(monkeypatch) -> 
     )
     headers = {"Authorization": "Bearer t", "X-Session-Id": SESSION_ID}
     live = client.post("/turn", json={"message": "q?"}, headers=headers)
-    live_frame = json.loads(
-        live.text.strip().split("\n\n")[-1].splitlines()[-1].split(":", 1)[1]
-    )
+    live_frame = json.loads(live.text.strip().split("\n\n")[-1].splitlines()[-1].split(":", 1)[1])
 
     reloaded = client.get("/session/history", headers=headers).json()
     turn = reloaded["turns"][0]
@@ -1050,9 +1049,7 @@ def test_history_reconstructs_per_table_badges_from_the_same_two_keys() -> None:
     reloaded badge is the badge the live turn showed."""
     messages = [
         TurnMessage(turn_index=0, role="user", content="q?", ts="t0", provenance=frozenset()),
-        TurnMessage(
-            turn_index=0, role="assistant", content="x", ts="t1", provenance=frozenset()
-        ),
+        TurnMessage(turn_index=0, role="assistant", content="x", ts="t1", provenance=frozenset()),
     ]
     trail = [
         TrailEntry(
@@ -1237,9 +1234,7 @@ async def test_an_empty_blueprint_table_is_counted_but_not_as_verified() -> None
         empty_blueprints=frozenset({"bp-headcount"}),
     )
     await expand_blueprint(store, SESSION_ID, "bp-headcount")
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_creds(), user_message="q?"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
 
     assert _payloads(events, "loop_answer_tables_designated") == [
         {"table_count": 1, "blueprint_table_count": 1, "verified_table_count": 0}
@@ -1282,9 +1277,7 @@ async def test_a_verified_table_beside_an_empty_one_counts_only_the_verified() -
     )
     await expand_blueprint(store, SESSION_ID, "bp-headcount")
     await expand_blueprint(store, SESSION_ID, "bp-salary")
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_creds(), user_message="q?"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
 
     assert _payloads(events, "loop_answer_tables_designated") == [
         {"table_count": 2, "blueprint_table_count": 2, "verified_table_count": 1}
@@ -1361,10 +1354,13 @@ async def test_a_completed_intent_whose_result_went_untabled_is_reported() -> No
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                {"columns": ["department_name"], "rows": [["Sales"]], "row_count": 1,
-                 "truncated": False},
-                {"columns": ["annual_salary"], "rows": [[1]], "row_count": 1,
-                 "truncated": False},
+                {
+                    "columns": ["department_name"],
+                    "rows": [["Sales"]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
+                {"columns": ["annual_salary"], "rows": [[1]], "row_count": 1, "truncated": False},
             ]
         }
     )
@@ -1382,9 +1378,7 @@ async def test_a_completed_intent_whose_result_went_untabled_is_reported() -> No
                         ToolCallRequest(
                             id="s1",
                             name=STATE,
-                            arguments={
-                                "intents": [{"description": "one"}, {"description": "two"}]
-                            },
+                            arguments={"intents": [{"description": "one"}, {"description": "two"}]},
                         )
                     ]
                 ),
@@ -1525,7 +1519,10 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
     await store.append_message(
         SESSION_ID,
         TurnMessage(
-            turn_index=0, role="assistant", content="By department.", ts="t3",
+            turn_index=0,
+            role="assistant",
+            content="By department.",
+            ts="t3",
             provenance=frozenset({(_E, "department_name")}),
         ),
     )
@@ -1535,9 +1532,16 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
     await store.append_trail_entry(
         SESSION_ID,
         TrailEntry(
-            turn_index=0, tool_call_id="a1", tool_name=ANSWER, args=legacy_args,
-            status="ok", error_code=None, provenance=tool_result.provenance,
-            result_preview=tool_result.result_preview, result_full_ref=None, ts="t2",
+            turn_index=0,
+            tool_call_id="a1",
+            tool_name=ANSWER,
+            args=legacy_args,
+            status="ok",
+            error_code=None,
+            provenance=tool_result.provenance,
+            result_preview=tool_result.result_preview,
+            result_full_ref=None,
+            ts="t2",
         ),
     )
     doc = await store.get_or_create_session(SESSION_ID)
@@ -1565,7 +1569,8 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
 
     # 3. Cross-turn replay — read on turn 1, the turn AFTER the one that wrote it.
     assembled = await ContextAssembler(
-        session_store=store, base_system_prompt="BASE",
+        session_store=store,
+        base_system_prompt="BASE",
         preview_row_count=20,
     ).assemble(SESSION_ID, frozenset(), current_turn_index=1)
     replayed = [m for m in assembled.messages if m.get("tool_name") == ANSWER]

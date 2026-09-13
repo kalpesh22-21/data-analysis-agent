@@ -32,9 +32,17 @@ from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import AlreadyConsumedError, InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
 
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
-    {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    {
+        _E: {
+            "EmployeeCode": "String",
+            "Department": "Nullable(String)",
+            "AnnualSalary": "Nullable(Float64)",
+        }
+    }
 )
 SESSION_ID = "sess-bp-approval"
 _BID = "bp-flag-departments"
@@ -80,7 +88,11 @@ def _detail() -> BlueprintDetail:
         hit_count=0,
         catalog_sha="",
         composes=[
-            {"order": 0, "output": {"n": "scalar"}, "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee"},
+            {
+                "order": 0,
+                "output": {"n": "scalar"},
+                "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee",
+            },
             {
                 "order": 1,
                 "node_kind": "approval",
@@ -95,17 +107,16 @@ def _detail() -> BlueprintDetail:
 
 
 async def _tools_provider(_c: RuntimeCredentials) -> list[dict]:
-    return [{"type": "function", "name": "runBlueprint", "description": "", "parameters": {}}]
+    return [
+        {"type": "function", "name": name, "description": "", "parameters": {}}
+        for name in ("runBlueprint", "runQuery")
+    ]
 
 
-def _make_loop(
-    store: InMemorySessionStore, model: ScriptedModelClient, mcp: FakeMCPClient
-):
+def _make_loop(store: InMemorySessionStore, model: ScriptedModelClient, mcp: FakeMCPClient):
     index = FakeVectorIndex()
     index.add_detail(_detail())
-    executor = BlueprintExecutor(
-        tool_dispatcher=ToolDispatcher(mcp, CATALOG), vector_index=index
-    )
+    executor = BlueprintExecutor(tool_dispatcher=ToolDispatcher(mcp, CATALOG), vector_index=index)
     tool = RunBlueprintTool(executor=executor)
     from data_agent.runtime.loop.agent_loop import AgentLoop
 
@@ -132,7 +143,9 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
         ]
@@ -162,8 +175,8 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
     resume_mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["department"], [["Sales"], ["Eng"]]),   # node 1 query (approved)
-                _rq(["__bp_n", "__bp_d"], [[2, 2]]),         # grain probe
+                _rq(["department"], [["Sales"], ["Eng"]]),  # node 1 query (approved)
+                _rq(["__bp_n", "__bp_d"], [[2, 2]]),  # grain probe
             ]
         }
     )
@@ -202,7 +215,9 @@ async def test_verified_resume_persists_authoritative_marker() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
         ]
@@ -250,7 +265,9 @@ async def test_approval_resume_final_outcome_carries_enrichment() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
         ]
@@ -312,7 +329,8 @@ async def test_a_blueprint_that_completed_before_the_pause_is_designatable_after
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="c1", name="runBlueprint",
+                        id="c1",
+                        name="runBlueprint",
                         arguments={"id": _BID, "slot_bindings": {}},
                     )
                 ]
@@ -330,7 +348,8 @@ async def test_a_blueprint_that_completed_before_the_pause_is_designatable_after
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="a1", name="answerWithTable",
+                        id="a1",
+                        name="answerWithTable",
                         arguments={
                             "answer": "Flagged 2 departments.",
                             "tables": [{"blueprint_id": _BID}],
@@ -359,9 +378,7 @@ async def test_a_blueprint_that_completed_before_the_pause_is_designatable_after
     assert len(resume_model.calls) == 1
     assert done.answer_sql
     assert done.answer_tables[0]["blueprint_use"] == {"blueprint_id": _BID, "slots": {}}
-    entry = [
-        e for e in await store.load_trail(SESSION_ID) if e.tool_name == "answerWithTable"
-    ][0]
+    entry = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == "answerWithTable"][0]
     assert entry.status == "ok"
 
 
@@ -412,7 +429,9 @@ async def test_in_loop_pause_carries_partial_enrichment_from_prior_query() -> No
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(id="q1", name="runQuery", arguments={"sql": query_sql}),
-                    ToolCallRequest(id="b1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}),
+                    ToolCallRequest(
+                        id="b1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    ),
                 ]
             ),
         ]
@@ -440,7 +459,9 @@ async def test_double_resume_is_rejected_exactly_once() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
         ]
@@ -478,7 +499,9 @@ async def test_approval_deny_stops_cleanly_and_model_answers_from_raw_loop() -> 
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
         ]
@@ -519,7 +542,9 @@ async def test_resume_executor_crash_is_contained_and_loop_continues() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             ),
         ]

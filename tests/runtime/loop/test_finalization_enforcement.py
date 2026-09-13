@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -46,6 +48,8 @@ from data_agent.runtime.session.models import (
 )
 from data_agent.runtime.session_history import project_history
 
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+
 SESSION_ID = "sess-finalization"
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
@@ -60,7 +64,10 @@ ATTRITION = "attrition by department"
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in ("runQuery", "getTableSchema", "listDatabases", "listTables")
+    ]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -502,9 +509,7 @@ async def test_the_state_block_precedes_the_question_and_the_nudge_is_last() -> 
         ]
     )
 
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="THE QUESTION"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="THE QUESTION")
 
     request = model.calls[2].messages
     contents = [str(m.get("content") or "") for m in request]
@@ -675,9 +680,7 @@ async def test_the_hard_ceiling_force_blocks_with_budget_exhausted() -> None:
     assert outcome.status == "stopped_hard_ceiling"
     doc = await store.get_or_create_session(SESSION_ID)
     state = live_analysis_state(doc, 0)
-    assert [(i.status, i.reason_code) for i in state.intents] == [
-        ("blocked", "BUDGET_EXHAUSTED")
-    ]
+    assert [(i.status, i.reason_code) for i in state.intents] == [("blocked", "BUDGET_EXHAUSTED")]
     assert _events(events, "loop_analysis_state_transition") == [
         {
             "intent_id": "i1",
@@ -750,7 +753,9 @@ async def test_a_stop_answer_does_not_rewrite_an_earlier_turns_state() -> None:
     # Turn 0 happened and left a pending state behind; the run below is turn 1.
     await store.append_message(
         SESSION_ID,
-        TurnMessage(turn_index=0, role="user", content="an older question", ts="2026-08-11T00:00:00+00:00"),
+        TurnMessage(
+            turn_index=0, role="user", content="an older question", ts="2026-08-11T00:00:00+00:00"
+        ),
     )
     await store.apply_analysis_state(
         SESSION_ID,
@@ -768,9 +773,7 @@ async def test_a_stop_answer_does_not_rewrite_an_earlier_turns_state() -> None:
     await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     doc = await store.get_or_create_session(SESSION_ID)
-    assert [(i.status, i.reason_code) for i in doc.analysis_state.intents] == [
-        ("pending", None)
-    ]
+    assert [(i.status, i.reason_code) for i in doc.analysis_state.intents] == [("pending", None)]
     assert not _events(events, "loop_intent_force_blocked")
 
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -49,6 +50,8 @@ from data_agent.runtime.observability import tracing
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TrailEntry
+
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
 SESSION_ID = "sess-span-qa"
 HEADERS = {"Authorization": "Bearer test-jwt", "X-Session-Id": SESSION_ID}
@@ -219,14 +222,12 @@ class TestSpanDumpIsPIIClean:
         # vacuous by construction — nothing to leak).
         dump = client.get("/_test/spans").json()
         assert dump["count"] > 0, "no spans captured — cannot prove the invariant"
-        assert any(
-            s["name"] == "tool.runQuery" for s in dump["spans"]
-        ), "the runQuery TOOL span is missing — nothing carried the SQL literal"
+        assert any(s["name"] == "tool.runQuery" for s in dump["spans"]), (
+            "the runQuery TOOL span is missing — nothing carried the SQL literal"
+        )
         return dump
 
-    def test_sql_literal_and_result_cell_never_reach_a_span_attribute(
-        self, monkeypatch
-    ) -> None:
+    def test_sql_literal_and_result_cell_never_reach_a_span_attribute(self, monkeypatch) -> None:
         # The turn ran a runQuery whose SQL embeds PII_SENTINEL as a string
         # literal AND whose result cell equals PII_SENTINEL. D25 requires: masked
         # SQL literals in the telemetry copy, and result values never on a span.
@@ -313,9 +314,7 @@ class TestConfigureTracingDefaultPath:
     def test_omitting_span_exporter_kwarg_matches_explicit_none(self) -> None:
         # The production call path passes span_exporter=None; the byte-identical
         # claim also covers callers that omit the kwarg entirely (its default).
-        provider = tracing.configure_tracing(
-            otlp_endpoint="", service_name="data-agent-runtime"
-        )
+        provider = tracing.configure_tracing(otlp_endpoint="", service_name="data-agent-runtime")
         assert _processor_count(provider) == 0
 
     def test_injected_exporter_attaches_exactly_one_processor(self) -> None:

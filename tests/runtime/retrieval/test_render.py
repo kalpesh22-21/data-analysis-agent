@@ -20,8 +20,12 @@ from data_agent.runtime.retrieval.render import (
 
 def _ctx() -> RetrievedContext:
     return RetrievedContext(
-        thin_cards=[ThinCard(id="bp-1", intent="sales overtime", slots_summary="dept, period", score=0.9)],
-        knowledge_hits=[KnowledgeHit(id="kn-1", text="OT is 1.5x pay", score=0.8, title="Overtime")],
+        thin_cards=[
+            ThinCard(id="bp-1", intent="sales overtime", slots_summary="dept, period", score=0.9)
+        ],
+        knowledge_hits=[
+            KnowledgeHit(id="kn-1", text="OT is 1.5x pay", score=0.8, title="Overtime")
+        ],
         user_memory=[UserMemoryItem(kind="entity_default", text="'my team' -> dept=0420")],
         reranked=True,
     )
@@ -101,11 +105,12 @@ def test_dag_less_card_renders_exactly_as_before_enrichment() -> None:
     # a blueprint with no stored DAG produces a byte-identical block.
     plain = ThinCard(id="bp-1", intent="sales overtime", slots_summary="dept, period", score=0.9)
     assert _content(plain) == (
-        _USER_CONTEXT_PREFIX
-        + "Relevant context retrieved for this request "
+        _USER_CONTEXT_PREFIX + "Relevant context retrieved for this request "
         "(pre-injected; you may ignore anything not helpful):\n\n"
         "Candidate blueprints (analysis templates you can run):\n"
-        "- bp-1: sales overtime [slots: dept, period]"
+        "- bp-1: sales overtime [slots: dept, period]\n"
+        "These are the closest recalled matches. If none clearly fits, call searchBlueprints "
+        "before writing raw SQL; the corpus may contain additional blueprints."
     )
 
 
@@ -129,9 +134,7 @@ def test_slot_overflow_marker_is_rendered() -> None:
     # upstream — the marker is what stops the model believing a 12-slot blueprint
     # has 6 and under-filling runBlueprint.
     card = _enriched_card(
-        slots=tuple(
-            SlotSummary(name=f"slot{i}", type="string", required=True) for i in range(6)
-        ),
+        slots=tuple(SlotSummary(name=f"slot{i}", type="string", required=True) for i in range(6)),
         slots_omitted=6,
     )
     content = _content(card)
@@ -154,7 +157,7 @@ def test_enrichment_fields_are_structurally_sanitised() -> None:
     assert "\n## System" not in body  # ...but never as its own line
     assert "\x00" not in content
     # Exactly the header line + the bullet + the three sub-lines: no forged rows.
-    assert len(body.splitlines()) == 4
+    assert len(body.splitlines()) == 5  # Includes the fixed retrieval advisory.
 
 
 def test_enrichment_fields_are_length_capped_like_existing_card_fields() -> None:

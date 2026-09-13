@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     ANALYSIS_STATE_INVALID_CODE,
@@ -45,6 +47,8 @@ from data_agent.runtime.session.models import (
 )
 from data_agent.runtime.session.store import CASMismatchError
 
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+
 SESSION_ID = "sess-finalization-adversarial"
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
@@ -56,7 +60,10 @@ ATTRITION = "attrition by department"
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in ("runQuery", "getTableSchema", "listDatabases", "listTables")
+    ]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -75,6 +82,7 @@ class _StubSearchBlueprints:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: Any = None,
+        tool_call_id=None,
     ) -> ToolResult:
         return ToolResult(
             status="ok",
@@ -402,9 +410,7 @@ async def test_a_pending_intent_at_the_hard_ceiling_is_force_blocked_exactly_onc
     assert outcome.status == "stopped_hard_ceiling"
     doc = await store.get_or_create_session(SESSION_ID)
     state = live_analysis_state(doc, 0)
-    assert [(i.status, i.reason_code) for i in state.intents] == [
-        ("blocked", "BUDGET_EXHAUSTED")
-    ]
+    assert [(i.status, i.reason_code) for i in state.intents] == [("blocked", "BUDGET_EXHAUSTED")]
     assert _events(events, "loop_intent_force_blocked") == [
         {"intent_id": "i1", "reason_code": "BUDGET_EXHAUSTED"}
     ]

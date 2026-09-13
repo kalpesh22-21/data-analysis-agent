@@ -34,7 +34,9 @@ from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview, TrailEntry
 
 _E = "dbpcm_warehouse.employee"
-CATALOG = CatalogHandle({_E: {"EarnCode": "Nullable(String)", "EarnDescription": "Nullable(String)"}})
+CATALOG = CatalogHandle(
+    {_E: {"EarnCode": "Nullable(String)", "EarnDescription": "Nullable(String)"}}
+)
 SESSION_ID = "sess-qa3"
 _A = "dbpcm_warehouse.payroll.Amount"
 _Q = "overtime rollup"
@@ -91,7 +93,10 @@ def _real_search_tool(*, reranked: bool = True) -> SearchBlueprintsTool:
 def _bp(id: str, intent: str, uses: set[str]) -> tuple[Candidate, list[float]]:
     return (
         Candidate(
-            id=id, kind="blueprint", text=intent, uses=frozenset(uses),
+            id=id,
+            kind="blueprint",
+            text=intent,
+            uses=frozenset(uses),
             payload={"intent": intent, "slots_summary": f"slots-of-{id}"},
         ),
         [1.0, 0.0],
@@ -109,7 +114,9 @@ def _sb_call(call_id: str, query: str = _Q) -> ToolCallRequest:
 
 
 class _RaisingPipeline:
-    async def search_blueprints(self, *, question: str, column_scope: frozenset[str], k: int) -> Any:
+    async def search_blueprints(
+        self, *, question: str, column_scope: frozenset[str], k: int
+    ) -> Any:
         raise RuntimeError("internal boom")
 
 
@@ -171,7 +178,8 @@ async def test_mixed_runtime_and_mcp_calls_order_and_counts() -> None:
                     tool_calls=[
                         _sb_call("c1"),
                         ToolCallRequest(
-                            id="c2", name="resolveValues",
+                            id="c2",
+                            name="resolveValues",
                             arguments={"table": _E, "column": "EarnCode", "concept": "overtime"},
                         ),
                         ToolCallRequest(id="c3", name="listDatabases", arguments={}),
@@ -190,7 +198,9 @@ async def test_mixed_runtime_and_mcp_calls_order_and_counts() -> None:
         runtime_tools={"searchBlueprints": _real_search_tool(), "resolveValues": composite},
     )
 
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi"
+    )
 
     assert outcome.tool_calls_made == 3
     trail = await store.load_trail(SESSION_ID)
@@ -213,10 +223,13 @@ async def test_per_iteration_cap_boundary_at_8() -> None:
         ]
     )
     loop, store = _build(
-        model=model, mcp=FakeMCPClient(),
+        model=model,
+        mcp=FakeMCPClient(),
         runtime_tools={"searchBlueprints": _real_search_tool()},
     )
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi"
+    )
     assert outcome.tool_calls_made == 8  # the 9th is not dispatched this round
     trail = await store.load_trail(SESSION_ID)
     assert len(trail) == 8
@@ -232,12 +245,22 @@ class _RecordingTool:
         self.ran = False
 
     async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn=None,
+        tool_call_id=None,
     ) -> ToolResult:
         self.ran = True
         return ToolResult(
-            status="ok", tool_name="searchBlueprints", error_code=None, retryable=None,
-            user_message=None, provenance=frozenset(), result_preview=None, result_full={"count": 0},
+            status="ok",
+            tool_name="searchBlueprints",
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full={"count": 0},
         )
 
 
@@ -275,10 +298,13 @@ async def test_duplicate_tool_call_ids_both_execute_and_trail() -> None:
         ]
     )
     loop, store = _build(
-        model=model, mcp=FakeMCPClient(),
+        model=model,
+        mcp=FakeMCPClient(),
         runtime_tools={"searchBlueprints": _real_search_tool()},
     )
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi"
+    )
     # PIN: the loop does not de-duplicate ids — both run, both are trailed under
     # the same tool_call_id. (Replay would synthesize two assistant/tool pairs
     # with a colliding id — see the report's ambiguity note for runBlueprint.)
@@ -297,12 +323,21 @@ class _ShadowRunQuery:
         self.ran = False
 
     async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn=None,
+        tool_call_id=None,
     ) -> ToolResult:
         self.ran = True
         return ToolResult(
-            status="ok", tool_name="runQuery", error_code=None, retryable=None,
-            user_message=None, provenance=frozenset(), result_preview=None,
+            status="ok",
+            tool_name="runQuery",
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=frozenset(),
+            result_preview=None,
             result_full={"shadowed": True},
         )
 
@@ -314,10 +349,18 @@ async def test_runtime_tool_named_runquery_shadows_the_mcp_tool() -> None:
     # read tools), but nothing guards against a future collision (e.g. a
     # mis-named runBlueprint). See the report.
     shadow = _ShadowRunQuery()
-    mcp = FakeMCPClient(scripted={"runQuery": [{"columns": ["x"], "rows": [[1]], "row_count": 1, "truncated": False}]})
+    mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [{"columns": ["x"], "rows": [[1]], "row_count": 1, "truncated": False}]
+        }
+    )
     model = ScriptedModelClient(
         [
-            ModelTurnResult(tool_calls=[ToolCallRequest(id="c1", name="runQuery", arguments={"sql": "SELECT 1"})]),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="c1", name="runQuery", arguments={"sql": "SELECT 1"})
+                ]
+            ),
             ModelTurnResult(assistant_text="done"),
         ]
     )
@@ -346,7 +389,9 @@ async def test_advertised_but_unwired_read_tool_returns_unavailable() -> None:
     assert outcome.tool_calls_made == 1
     trail = await store.load_trail(SESSION_ID)
     assert (trail[0].tool_name, trail[0].status, trail[0].error_code) == (
-        "searchBlueprints", "error", "RETRIEVAL_TOOL_UNAVAILABLE",
+        "searchBlueprints",
+        "error",
+        "RETRIEVAL_TOOL_UNAVAILABLE",
     )
     # Never dispatched to the MCP under its own name (no such MCP tool).
     assert mcp.calls == []
@@ -364,15 +409,30 @@ async def test_advertised_but_unwired_read_tool_returns_unavailable() -> None:
 
 def test_frozenset_provenance_read_entry_survives_narrowed_scope_d44() -> None:
     read_entry = TrailEntry(
-        turn_index=0, tool_call_id="r1", tool_name="searchBlueprints", args={"query": "x"},
-        status="ok", error_code=None, provenance=frozenset(),
-        result_preview=ResultPreview(columns=[], row_count=1, truncated=False, preview_rows=[[{"count": 0}]]),
-        result_full_ref="ref-1", ts="t",
+        turn_index=0,
+        tool_call_id="r1",
+        tool_name="searchBlueprints",
+        args={"query": "x"},
+        status="ok",
+        error_code=None,
+        provenance=frozenset(),
+        result_preview=ResultPreview(
+            columns=[], row_count=1, truncated=False, preview_rows=[[{"count": 0}]]
+        ),
+        result_full_ref="ref-1",
+        ts="t",
     )
     warehouse_entry = TrailEntry(
-        turn_index=0, tool_call_id="w1", tool_name="runQuery", args={"sql": "..."},
-        status="ok", error_code=None, provenance=frozenset({(_E, "EarnCode")}),
-        result_preview=None, result_full_ref="ref-2", ts="t",
+        turn_index=0,
+        tool_call_id="w1",
+        tool_name="runQuery",
+        args={"sql": "..."},
+        status="ok",
+        error_code=None,
+        provenance=frozenset({(_E, "EarnCode")}),
+        result_preview=None,
+        result_full_ref="ref-2",
+        ts="t",
     )
     narrowed = frozenset({"dbpcm_warehouse.other.Col"})  # excludes employee.EarnCode
 
@@ -394,7 +454,11 @@ def test_frozenset_provenance_read_entry_survives_narrowed_scope_d44() -> None:
 
 class _UnguardedRaisingTool:
     async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn=None,
+        tool_call_id=None,
     ) -> ToolResult:
         raise RuntimeError("a runtime tool that does not self-guard")
 
@@ -411,7 +475,9 @@ async def test_loop_wraps_a_raising_runtime_tool_turn_survives() -> None:
         ]
     )
     loop, store = _build(
-        model=model, mcp=FakeMCPClient(), runtime_tools={"searchBlueprints": _UnguardedRaisingTool()}
+        model=model,
+        mcp=FakeMCPClient(),
+        runtime_tools={"searchBlueprints": _UnguardedRaisingTool()},
     )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="hi")
     assert outcome.status == "done"
@@ -427,14 +493,23 @@ async def test_loop_wraps_a_raising_runtime_tool_turn_survives() -> None:
 
 class _MalformedProvenanceTool:
     async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn=None,
+        tool_call_id=None,
     ) -> ToolResult:
         # provenance declared frozenset[tuple[str,str]] | None, but a contract
         # violator returns a bare string.
         return ToolResult(
-            status="ok", tool_name="searchBlueprints", error_code=None, retryable=None,
-            user_message=None, provenance="not-a-frozenset",  # type: ignore[arg-type]
-            result_preview=None, result_full={"count": 0},
+            status="ok",
+            tool_name="searchBlueprints",
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance="not-a-frozenset",  # type: ignore[arg-type]
+            result_preview=None,
+            result_full={"count": 0},
         )
 
 
@@ -451,7 +526,8 @@ async def test_loop_validates_runtime_tool_provenance_type_coerces_to_none() -> 
         ]
     )
     loop, store = _build(
-        model=model, mcp=FakeMCPClient(),
+        model=model,
+        mcp=FakeMCPClient(),
         runtime_tools={"searchBlueprints": _MalformedProvenanceTool()},
     )
     outcome = await loop.run(

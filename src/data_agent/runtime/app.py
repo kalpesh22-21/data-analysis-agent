@@ -306,13 +306,13 @@ def create_app(
     extra_observers: Sequence[ToolObserver] = (),
 ) -> FastAPI:
     """Build the FastAPI app. All dependencies default to the real implementations, sourced
-        from *settings* — pass Layer-1 fakes for any of them to avoid touching real infra
-        entirely.
+    from *settings* — pass Layer-1 fakes for any of them to avoid touching real infra
+    entirely.
 
-        *retrieval*: the D7/D8 pipeline pre-injected into `ContextAssembler`. When left `None`
-        AND `neo4j_url` plus an embedder are configured, a `Neo4jVectorIndex`-backed pipeline is
-        constructed here and its driver is closed on app shutdown; absent either the store or the
-        embedder it stays `None`, which is byte-identical Phase-0 parity (D86).
+    *retrieval*: the D7/D8 pipeline pre-injected into `ContextAssembler`. When left `None`
+    AND `neo4j_url` plus an embedder are configured, a `Neo4jVectorIndex`-backed pipeline is
+    constructed here and its driver is closed on app shutdown; absent either the store or the
+    embedder it stays `None`, which is byte-identical Phase-0 parity (D86).
     """
     settings = settings or get_runtime_settings()
     mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
@@ -344,7 +344,6 @@ def create_app(
             raise ValueError("CAPABILITY_TOOLS_ENABLED requires CAPABILITY_API_URL.")
         capability_client = HttpCapabilityClient(
             base_url=settings.capability_api_url,
-            api_key=settings.capability_api_key,
             timeout_seconds=settings.capability_timeout_seconds,
         )
     capability_resolution_registry = (
@@ -361,11 +360,13 @@ def create_app(
     # today (no extra LLM call, no D25 relaxation). The extra call is auto-covered by
     # `instrument_openai` below, like every other OpenAI round-trip.
     progress_summarizer: ProgressSummarizer | None = None
-    if settings.progress_summary_enabled and settings.openai_api_key:
+    if settings.progress_summary_enabled and (
+        settings.openai_summary_api_key or settings.openai_api_key
+    ):
         summary_model_client = build_openai_model_client(
-            api_key=settings.openai_api_key,
+            api_key=settings.openai_summary_api_key or settings.openai_api_key,
             model=settings.openai_summary_model,
-            base_url=settings.openai_base_url,
+            base_url=settings.openai_summary_base_url or settings.openai_base_url,
         )
         progress_summarizer = ProgressSummarizer(
             summary_model_client,
@@ -599,8 +600,8 @@ def create_app(
     if settings.capability_tools_enabled and settings.capability_prefetch_enabled:
         assert capability_client is not None
 
-        async def capability_prefetch_provider(query: str):
-            return await prefetch_capabilities(capability_client, query)
+        async def capability_prefetch_provider(query: str, user_jwt: str | None = None):
+            return await prefetch_capabilities(capability_client, query, end_user_jwt=user_jwt)
 
     context_assembler = ContextAssembler(
         session_store,
@@ -724,26 +725,27 @@ def create_app(
                 active_tool_schemas.extend(await _base_tools_provider(credentials))
                 base_tools_loaded = True
             return active_tool_schemas
+
         # `recordAssumptions` (docs/decisions/ui-assumptions-contract.md): ALWAYS
         # wired — it has no backing stack (it only echoes the model's plain-English
         # assumptions into the turn result), so it is never subject to the
         # advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path.
-        runtime_tools["recordAssumptions"] = RecordAssumptionsTool()
+        runtime_tools["recordAssumptions"] = RecordAssumptionsTool(observer=observer)
         # `answerWithTable` (composite/answer_with_table.py): ALWAYS wired, same
         # reasoning — it only echoes the model's final prose + designated query into
         # the turn result and has no backing stack. It is TERMINAL: a successful call
         # ends the turn, so the model does not spend a further round-trip restating
         # an answer it already wrote. The UI pages the designated query itself via
         # `POST /query/page`.
-        runtime_tools["answerWithTable"] = AnswerWithTableTool()
-        runtime_tools["answerWithText"] = AnswerWithTextTool()
+        runtime_tools["answerWithTable"] = AnswerWithTableTool(observer=observer)
+        runtime_tools["answerWithText"] = AnswerWithTextTool(observer=observer)
         # `updateAnalysisState` (Release 1, composite/analysis_state.py): ALWAYS
         # wired — its only dependency is the session store, so it is never subject
         # to the advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path. Unlike the
         # two composite tools above it takes `observer` and `tracer` and self-emits
         # its dispatch events, exactly like the three retrieval read tools below:
         # `_run_runtime_tool` emits nothing on a composite tool's behalf, so
-        # copying the `RecordAssumptionsTool()` shape would leave the one feature
+        # copying the `RecordAssumptionsTool(observer=observer)` shape would leave the one feature
         # whose telemetry IS the deliverable completely mute.
         runtime_tools["updateAnalysisState"] = UpdateAnalysisStateTool(
             session_store=session_store, observer=observer, tracer=tracer
@@ -785,9 +787,7 @@ def create_app(
                     for parameter in definition.parameters
                 ):
                     return False
-                active_tool_schemas.append(
-                    definition.tool_schema(capability_resolution_registry)
-                )
+                active_tool_schemas.append(definition.tool_schema(capability_resolution_registry))
                 runtime_tools[definition.name] = PresentCapabilityCardTool(
                     client=capability_client,
                     definition=definition,
@@ -921,7 +921,7 @@ def create_app(
             answer_judge=(
                 AnswerJudge(
                     model_client=judge_model_client,
-                    token_budget=settings.request_token_budget(),
+                    token_budget=settings.answer_judge_evidence_token_budget,
                     timeout_seconds=settings.answer_judge_timeout_seconds,
                     observer=observer,
                     # The judge opens its OWN `answer_judge` CHAIN span, so the
@@ -951,8 +951,11 @@ def create_app(
         try:
             yield
         finally:
-            if vector_index is not None:
-                await vector_index.close()
+            try:
+                if vector_index is not None:
+                    await vector_index.close()
+            finally:
+                await asyncio.to_thread(tracing.shutdown_tracing, tracer_provider)
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
 
@@ -1018,7 +1021,10 @@ def create_app(
 
         async def _call() -> TurnOutcome:
             with tracing.agent_span(
-                tracer, scope_hash=hash_scope(credentials.column_scope), turn_index=turn_index_hint
+                tracer,
+                session_id=x_session_id,
+                scope_hash=hash_scope(credentials.column_scope),
+                turn_index=turn_index_hint,
             ):
                 return await agent_loop.run(
                     session_id=x_session_id, credentials=credentials, user_message=body.message
@@ -1052,7 +1058,10 @@ def create_app(
 
         async def _call() -> TurnOutcome:
             with tracing.agent_span(
-                tracer, scope_hash=hash_scope(credentials.column_scope), turn_index=turn_index_hint
+                tracer,
+                session_id=x_session_id,
+                scope_hash=hash_scope(credentials.column_scope),
+                turn_index=turn_index_hint,
             ):
                 return await agent_loop.resume(
                     session_id=x_session_id, credentials=credentials, answer=body.answer
@@ -1066,14 +1075,14 @@ def create_app(
         x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
     ) -> JSONResponse:
         """A scope-filtered, read-only projection of the persisted `SessionDoc` into a `turns[]`
-                transcript. Same `_extract_credentials` auth as `/turn`; one store read, no CAS, no
-                loop, no KV de-reference, and no writes beyond the store's doc auto-create for an
-                unknown but authenticated session.
+        transcript. Same `_extract_credentials` auth as `/turn`; one store read, no CAS, no
+        loop, no KV de-reference, and no writes beyond the store's doc auto-create for an
+        unknown but authenticated session.
 
-                The two D44 filters run over THIS request's `column_scope` inside `project_history`
-                BEFORE any serialization, so a past turn's answer or tool call is fail-closed dropped
-                once it is no longer in scope — the read sibling of the live replay gate. An unknown
-                session yields an empty doc and `turns: []`, never a 404.
+        The two D44 filters run over THIS request's `column_scope` inside `project_history`
+        BEFORE any serialization, so a past turn's answer or tool call is fail-closed dropped
+        once it is no longer in scope — the read sibling of the live replay gate. An unknown
+        session yields an empty doc and `turns: []`, never a 404.
         """
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings
@@ -1147,20 +1156,20 @@ def create_app(
     ) -> JSONResponse:
         """Execute the model-designated `answer_sql` and return ONE page of rows.
 
-                This replaced the fixed ~20-row `ResultPreview` the user could not page past: the
-                model designates the answer query and the UI pages through it here.
+        This replaced the fixed ~20-row `ResultPreview` the user could not page past: the
+        model designates the answer query and the UI pages through it here.
 
-                It adds NO authority. The query runs through the SAME
-                `ToolDispatcher.dispatch("runQuery", ...)` the model uses, with THIS caller's
-                credentials, so column scope (D57/D80), read-only enforcement, row caps, denial
-                mapping and provenance capture are the identical code path — a designated query can
-                never read a column the same caller could not already reach by asking the agent.
+        It adds NO authority. The query runs through the SAME
+        `ToolDispatcher.dispatch("runQuery", ...)` the model uses, with THIS caller's
+        credentials, so column scope (D57/D80), read-only enforcement, row caps, denial
+        mapping and provenance capture are the identical code path — a designated query can
+        never read a column the same caller could not already reach by asking the agent.
 
-                Paging is applied by WRAPPING the SQL via sqlglot, never by splicing a LIMIT onto
-                model text, which also rejects multi-statement and non-SELECT payloads before
-                dispatch. A rejection is a 400 with a STATIC message — never the offending SQL, never
-                a raw parser message. A denial from the MCP is returned as the dispatcher's own
-                canned `user_message`, exactly as the model would have seen it.
+        Paging is applied by WRAPPING the SQL via sqlglot, never by splicing a LIMIT onto
+        model text, which also rejects multi-statement and non-SELECT payloads before
+        dispatch. A rejection is a 400 with a STATIC message — never the offending SQL, never
+        a raw parser message. A denial from the MCP is returned as the dispatcher's own
+        canned `user_message`, exactly as the model would have seen it.
         """
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings
@@ -1178,8 +1187,10 @@ def create_app(
             # the same one the model would have received. Never the raw backend text.
             return JSONResponse(
                 status_code=403 if result.status == "denied" else 502,
-                content={"error": result.user_message or "The query could not be run.",
-                         "error_code": result.error_code},
+                content={
+                    "error": result.user_message or "The query could not be run.",
+                    "error_code": result.error_code,
+                },
             )
         preview = result.result_preview
         # Rows come from `result_full`, NOT `preview.preview_rows`: the preview is

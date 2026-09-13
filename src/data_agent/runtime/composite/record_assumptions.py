@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
+from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
 from data_agent.runtime.session.models import ResultPreview
 
 if TYPE_CHECKING:
@@ -38,16 +39,16 @@ _MAX_ASSUMPTION_LEN = 2000
 
 def clean_assumptions(raw: Any) -> list[str]:
     """Normalize a model-supplied `assumptions` value into a clean list of plain-English
-        strings — the SINGLE cleaning used by BOTH the agent loop and `session_history`, so the
-        two agree.
+    strings — the SINGLE cleaning used by BOTH the agent loop and `session_history`, so the
+    two agree.
 
-        Lenient by design: a non-list is `[]`; only non-blank `str` items survive (stored in
-        stripped form); duplicates drop preserving FIRST-occurrence order; items past
-        `_MAX_ASSUMPTIONS` are ignored and any single item longer than `_MAX_ASSUMPTION_LEN` is
-        truncated.
+    Lenient by design: a non-list is `[]`; only non-blank `str` items survive (stored in
+    stripped form); duplicates drop preserving FIRST-occurrence order; items past
+    `_MAX_ASSUMPTIONS` are ignored and any single item longer than `_MAX_ASSUMPTION_LEN` is
+    truncated.
 
-        Does NOT attempt to detect or strip SQL or codes — that contract is enforced by the tool
-        description and system prompt, never here.
+    Does NOT attempt to detect or strip SQL or codes — that contract is enforced by the tool
+    description and system prompt, never here.
     """
     if not isinstance(raw, list | tuple):
         return []
@@ -72,16 +73,22 @@ def clean_assumptions(raw: Any) -> list[str]:
 
 def fold_assumptions(target: list[str], raw: Any) -> None:
     """Clean *raw* and append each assumption to *target* IN PLACE, skipping any already
-        present (dedupe, first-occurrence order). The SINGLE fold used by the loop's
-        accumulation, the loop's blueprint-resume trail reconstruction and `session_history`, so
-        all three stay in lockstep.
+    present (dedupe, first-occurrence order). The SINGLE fold used by the loop's
+    accumulation, the loop's blueprint-resume trail reconstruction and `session_history`, so
+    all three stay in lockstep.
     """
     for assumption in clean_assumptions(raw):
         if assumption not in target:
             target.append(assumption)
 
 
-class RecordAssumptionsTool:
+class RecordAssumptionsTool(RuntimeToolBase):
+    _INTERNAL_ERROR_CODE = "RUNTIME_TOOL_INTERNAL_ERROR"
+    _INTERNAL_ERROR_MESSAGE = "The tool could not complete. Please try again."
+
+    def _span_args(self, model_args: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
     """The `recordAssumptions(assumptions)` runtime tool.
 
         Stateless: `run` never raises on malformed args (the loop's `_run_runtime_tool` also
@@ -92,7 +99,7 @@ class RecordAssumptionsTool:
 
     tool_name = TOOL_NAME
 
-    async def run(
+    async def _execute(
         self,
         arguments: dict[str, Any],
         credentials: RuntimeCredentials,

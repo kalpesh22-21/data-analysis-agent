@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -45,6 +47,8 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import FinalizationBlockKind
 from data_agent.runtime.session_history import project_history
+
+pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
 SESSION_ID = "sess-answer-shape"
 _E = "dbpcm_warehouse.employee"
@@ -64,7 +68,10 @@ _ESCAPE_MARK = "re-send your full answer"
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in ("runQuery", "getTableSchema", "listDatabases", "listTables")
+    ]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -161,9 +168,7 @@ def _is_a_user_message(messages: list[dict[str, Any]], content: str) -> bool:
     `system` message (05 §B.2), and a `tool` message cannot stand alone —
     `_assembled_to_canonical` only ever emits one by expanding a trail entry into
     an `assistant(tool_calls) + tool` pair."""
-    return any(
-        m.get("role") == "user" and str(m.get("content") or "") == content for m in messages
-    )
+    return any(m.get("role") == "user" and str(m.get("content") or "") == content for m in messages)
 
 
 def _requests_carrying_the_nudge(model: ScriptedModelClient) -> list[int]:
@@ -826,7 +831,9 @@ async def test_each_turn_gets_its_own_shape_allowance() -> None:
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="turn zero")
     events.clear()
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="turn one")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="turn one"
+    )
 
     assert outcome.status == "done"
     # Turn 1 was refused ON ITS OWN MERITS — one multi-row call, not turn 0's.
@@ -846,7 +853,9 @@ async def test_each_turn_gets_its_own_shape_allowance() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _empty_answer(call_id: str = "a1", answer: str = "Sales has 3, Eng 2, Ops 1.") -> ToolCallRequest:
+def _empty_answer(
+    call_id: str = "a1", answer: str = "Sales has 3, Eng 2, Ops 1."
+) -> ToolCallRequest:
     """`answerWithTable` that names NO table — the shape 08 §O made likelier, since
     `tables` is REQUIRED and a model that cannot omit a declared key sends `[]`."""
     return ToolCallRequest(id=call_id, name=ANSWER, arguments={"answer": answer, "tables": []})
@@ -953,7 +962,9 @@ async def test_an_empty_designation_does_not_disarm_the_gate_for_the_prose_finis
             ModelTurnResult(tool_calls=[_query("q1")]),
             # Blank `answer` — does not terminate, and designates nothing.
             ModelTurnResult(
-                tool_calls=[ToolCallRequest(id="a1", name=ANSWER, arguments={"answer": "", "tables": []})]
+                tool_calls=[
+                    ToolCallRequest(id="a1", name=ANSWER, arguments={"answer": "", "tables": []})
+                ]
             ),
             ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),
             ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),

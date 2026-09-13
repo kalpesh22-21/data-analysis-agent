@@ -127,15 +127,21 @@ async def test_successful_call_reaches_the_model_as_its_real_confirmation() -> N
     await store.append_trail_entry(
         SESSION_ID,
         TrailEntry(
-            turn_index=0, tool_call_id="pt1", tool_name="answerWithTable",
+            turn_index=0,
+            tool_call_id="pt1",
+            tool_name="answerWithTable",
             args={"answer": "By dept.", "tables": [{"sql": _ANSWER_SQL}]},
-            status=result.status, error_code=result.error_code,
-            provenance=result.provenance, result_preview=result.result_preview,
-            result_full_ref=None, ts="t1",
+            status=result.status,
+            error_code=result.error_code,
+            provenance=result.provenance,
+            result_preview=result.result_preview,
+            result_full_ref=None,
+            ts="t1",
         ),
     )
     assembled = await ContextAssembler(
-        session_store=store, base_system_prompt="BASE",
+        session_store=store,
+        base_system_prompt="BASE",
         preview_row_count=20,
     ).assemble(SESSION_ID, frozenset(), current_turn_index=0)
 
@@ -223,7 +229,9 @@ async def test_the_terminal_answer_is_persisted_like_an_ordinary_one() -> None:
     persisted assistant `TurnMessage`. If it were not written identically, history
     would silently disagree with the live answer for exactly the table turns."""
     loop, store = _build_loop(
-        ScriptedModelClient([_answer("a1", answer="Three departments.", tables=[{"sql": _ANSWER_SQL}])])
+        ScriptedModelClient(
+            [_answer("a1", answer="Three departments.", tables=[{"sql": _ANSWER_SQL}])]
+        )
     )
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="by dept?")
 
@@ -249,7 +257,10 @@ async def test_a_call_without_answer_text_does_not_end_the_turn() -> None:
     turn on a text-less call would deliver an EMPTY answer — a total, silent
     failure — so the loop keeps going and the ordinary exit supplies the prose."""
     model = ScriptedModelClient(
-        [_answer("a1", tables=[{"sql": _ANSWER_SQL}]), ModelTurnResult(assistant_text="Recovered prose.")]
+        [
+            _answer("a1", tables=[{"sql": _ANSWER_SQL}]),
+            ModelTurnResult(assistant_text="Recovered prose."),
+        ]
     )
     loop, _ = _build_loop(model)
 
@@ -268,11 +279,13 @@ async def test_batched_assumptions_and_answer_both_land() -> None:
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="r1", name="recordAssumptions",
+                        id="r1",
+                        name="recordAssumptions",
                         arguments={"assumptions": ["'Active' meant currently employed."]},
                     ),
                     ToolCallRequest(
-                        id="a1", name="answerWithTable",
+                        id="a1",
+                        name="answerWithTable",
                         arguments={
                             "answer": "See the table.",
                             "tables": [{"sql": _ANSWER_SQL}],
@@ -298,11 +311,13 @@ async def test_last_designation_wins() -> None:
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="a1", name="answerWithTable",
+                        id="a1",
+                        name="answerWithTable",
                         arguments={"answer": "one", "tables": [{"sql": _ANSWER_SQL}]},
                     ),
                     ToolCallRequest(
-                        id="a2", name="answerWithTable",
+                        id="a2",
+                        name="answerWithTable",
                         arguments={"answer": "two", "tables": [{"sql": second}]},
                     ),
                 ]
@@ -362,7 +377,8 @@ async def test_the_nudge_is_visible_to_the_model_on_the_next_round_trip() -> Non
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
 
     rendered = [
-        m for m in model.calls[1].messages
+        m
+        for m in model.calls[1].messages
         if m.get("role") == "tool" and "runBlueprint" in str(m.get("content", ""))
     ]
     assert rendered, "the nudge must reach the model's next round-trip"
@@ -382,7 +398,11 @@ async def test_a_raw_sql_designation_is_never_nudged() -> None:
 async def test_raw_sql_wins_when_both_are_given() -> None:
     loop, _ = _build_loop(
         ScriptedModelClient(
-            [_answer("a1", answer="x", tables=[{"sql": _ANSWER_SQL, "blueprint_id": "bp-never-ran"}])]
+            [
+                _answer(
+                    "a1", answer="x", tables=[{"sql": _ANSWER_SQL, "blueprint_id": "bp-never-ran"}]
+                )
+            ]
         )
     )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
@@ -406,7 +426,8 @@ async def test_an_unresolved_hook_can_supply_a_replacement() -> None:
     hooks = AnswerTableHooks()
     hooks.register_unresolved(_hook)
     loop, _ = _build_loop(
-        ScriptedModelClient([_answer("a1", answer="x", tables=[{"blueprint_id": "bp-never-ran"}])]), hooks=hooks
+        ScriptedModelClient([_answer("a1", answer="x", tables=[{"blueprint_id": "bp-never-ran"}])]),
+        hooks=hooks,
     )
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
@@ -456,7 +477,9 @@ async def test_a_raising_hook_never_breaks_the_turn() -> None:
     hooks = AnswerTableHooks()
     hooks.register_ephemeral(_boom)
     loop, _ = _build_loop(
-        ScriptedModelClient([_answer("a1", answer="x", tables=[{"sql": "SELECT * FROM scratch.t"}])]),
+        ScriptedModelClient(
+            [_answer("a1", answer="x", tables=[{"sql": "SELECT * FROM scratch.t"}])]
+        ),
         hooks=hooks,
     )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
@@ -494,14 +517,18 @@ class _StubBlueprintTool:
         }
 
     async def run(
-        self, arguments: dict, credentials: RuntimeCredentials, turn=None
+        self, arguments: dict, credentials: RuntimeCredentials, turn=None, tool_call_id=None
     ):
         from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
         from data_agent.runtime.session.models import ResultPreview
 
         return ToolResult(
-            status="ok", tool_name="runBlueprint", error_code=None, retryable=None,
-            user_message=None, provenance=frozenset({("db.t", "c")}),
+            status="ok",
+            tool_name="runBlueprint",
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=frozenset({("db.t", "c")}),
             result_preview=ResultPreview(
                 columns=["month"], row_count=6, truncated=False, preview_rows=[["2026-01"]]
             ),
@@ -521,12 +548,18 @@ async def test_a_blueprint_id_resolves_to_that_blueprints_terminal_sql() -> None
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="b1", name="runBlueprint",
-                        arguments={"id": "bp-hires-per-month", "slot_bindings": {"window_months": 6}},
+                        id="b1",
+                        name="runBlueprint",
+                        arguments={
+                            "id": "bp-hires-per-month",
+                            "slot_bindings": {"window_months": 6},
+                        },
                     )
                 ]
             ),
-            _answer("a1", answer="Six months of hires.", tables=[{"blueprint_id": "bp-hires-per-month"}]),
+            _answer(
+                "a1", answer="Six months of hires.", tables=[{"blueprint_id": "bp-hires-per-month"}]
+            ),
         ]
     )
     loop = AgentLoop(
@@ -580,24 +613,51 @@ async def test_a_blueprint_designation_survives_a_pause_and_resume() -> None:
 
     # The blueprint ran: its result_full lives behind a KV ref, as in production.
     ref = await store.write_full_result(
-        SESSION_ID, "r1",
-        {"blueprint_id": "bp-hires-per-month", "status": "verified",
-         "sql": ["SELECT 1 /* earlier node */", terminal], "terminal_sql": terminal},
+        SESSION_ID,
+        "r1",
+        {
+            "blueprint_id": "bp-hires-per-month",
+            "status": "verified",
+            "sql": ["SELECT 1 /* earlier node */", terminal],
+            "terminal_sql": terminal,
+        },
     )
-    await store.append_trail_entry(SESSION_ID, TrailEntry(
-        turn_index=0, tool_call_id="b1", tool_name="runBlueprint",
-        args={"id": "bp-hires-per-month", "slot_bindings": {}}, status="ok",
-        error_code=None, provenance=frozenset({("db.t", "c")}), result_preview=None,
-        result_full_ref=ref, ts="t1",
-    ))
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0,
+            tool_call_id="b1",
+            tool_name="runBlueprint",
+            args={"id": "bp-hires-per-month", "slot_bindings": {}},
+            status="ok",
+            error_code=None,
+            provenance=frozenset({("db.t", "c")}),
+            result_preview=None,
+            result_full_ref=ref,
+            ts="t1",
+        ),
+    )
     # …and the model designated it the ANSWER using the exact live shape: empty
     # `sql` beside `blueprint_id`.
-    await store.append_trail_entry(SESSION_ID, TrailEntry(
-        turn_index=0, tool_call_id="a1", tool_name="answerWithTable",
-        args={"answer": "Six months of hires.", "sql": "", "blueprint_id": "bp-hires-per-month"},
-        status="ok", error_code=None, provenance=frozenset(), result_preview=None,
-        result_full_ref=None, ts="t2",
-    ))
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0,
+            tool_call_id="a1",
+            tool_name="answerWithTable",
+            args={
+                "answer": "Six months of hires.",
+                "sql": "",
+                "blueprint_id": "bp-hires-per-month",
+            },
+            status="ok",
+            error_code=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full_ref=None,
+            ts="t2",
+        ),
+    )
 
     loop = _loop_over(store)
     tables, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
@@ -609,11 +669,21 @@ async def test_a_raw_sql_designation_still_reseeds() -> None:
     entry is read the same way today's `tables` entry is."""
     store = InMemorySessionStore()
     await store.get_or_create_session(SESSION_ID)
-    await store.append_trail_entry(SESSION_ID, TrailEntry(
-        turn_index=0, tool_call_id="a1", tool_name="answerWithTable",
-        args={"answer": "x", "sql": _ANSWER_SQL}, status="ok", error_code=None,
-        provenance=frozenset(), result_preview=None, result_full_ref=None, ts="t",
-    ))
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0,
+            tool_call_id="a1",
+            tool_name="answerWithTable",
+            args={"answer": "x", "sql": _ANSWER_SQL},
+            status="ok",
+            error_code=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full_ref=None,
+            ts="t",
+        ),
+    )
     loop = _loop_over(store)
     tables, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
     assert [t.sql for t in tables] == [_ANSWER_SQL]
@@ -623,12 +693,21 @@ async def test_a_tables_designation_reseeds_the_same_way() -> None:
     """The shape the model actually sends since 08 §O, through the same seed."""
     store = InMemorySessionStore()
     await store.get_or_create_session(SESSION_ID)
-    await store.append_trail_entry(SESSION_ID, TrailEntry(
-        turn_index=0, tool_call_id="a1", tool_name="answerWithTable",
-        args={"answer": "x", "tables": [{"sql": _ANSWER_SQL, "caption": "By dept"}]},
-        status="ok", error_code=None,
-        provenance=frozenset(), result_preview=None, result_full_ref=None, ts="t",
-    ))
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0,
+            tool_call_id="a1",
+            tool_name="answerWithTable",
+            args={"answer": "x", "tables": [{"sql": _ANSWER_SQL, "caption": "By dept"}]},
+            status="ok",
+            error_code=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full_ref=None,
+            ts="t",
+        ),
+    )
     loop = _loop_over(store)
     tables, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
     assert [t.sql for t in tables] == [_ANSWER_SQL]
