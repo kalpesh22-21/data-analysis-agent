@@ -25,9 +25,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
+import anyio
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.types import Send
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
@@ -244,23 +246,43 @@ async def _stream_turn(
             emitter.close()
 
     task = asyncio.create_task(_runner())
-    async for event in emitter.stream():
-        yield _format_sse("progress", {"step": event.step, "shape": event.shape})
-
     try:
-        outcome = await task
-    except (AlreadyConsumedError, CASMismatchError) as exc:
-        yield _format_sse("error", {"code": type(exc).__name__, "message": str(exc)})
-        return
-    except Exception:  # noqa: BLE001 - last-resort SSE error framing, never a bare 500
-        # Never forward the raw exception text to the client/model (D5/D25,
-        # same class as B4) — log it server-side only, yield a generic canned
-        # message to the SSE `error` event.
-        _logger.exception("Unhandled exception during AgentLoop.run/resume")
-        yield _format_sse("error", {"code": "INTERNAL_ERROR", "message": _INTERNAL_ERROR_MESSAGE})
-        return
+        async for event in emitter.stream():
+            yield _format_sse("progress", {"step": event.step, "shape": event.shape})
 
-    yield _format_sse("result", _outcome_to_dict(outcome))
+        try:
+            outcome = await task
+        except (AlreadyConsumedError, CASMismatchError) as exc:
+            yield _format_sse("error", {"code": type(exc).__name__, "message": str(exc)})
+            return
+        except Exception:  # noqa: BLE001 - last-resort SSE error framing, never a bare 500
+            # Never forward the raw exception text to the client/model (D5/D25,
+            # same class as B4) — log it server-side only, yield a generic canned
+            # message to the SSE `error` event.
+            _logger.exception("Unhandled exception during AgentLoop.run/resume")
+            yield _format_sse("error", {"code": "INTERNAL_ERROR", "message": _INTERNAL_ERROR_MESSAGE})
+            return
+
+        yield _format_sse("result", _outcome_to_dict(outcome))
+    finally:
+        # The request owns this worker. Retrieve its result even when the consumer
+        # closes between events, and shield cleanup from Starlette's disconnect
+        # cancel scope so async resource cleanup can finish before we return.
+        if not task.done():
+            task.cancel()
+        with anyio.CancelScope(shield=True):
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class _TurnStreamingResponse(StreamingResponse):
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            # A failed/canceled send leaves the generator suspended at a yield;
+            # async-for does not close it. Close explicitly, not via eventual GC.
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
 
 
 def create_app(
@@ -1030,7 +1052,7 @@ def create_app(
                     session_id=x_session_id, credentials=credentials, user_message=body.message
                 )
 
-        return StreamingResponse(_stream_turn(_call, emitter), media_type="text/event-stream")
+        return _TurnStreamingResponse(_stream_turn(_call, emitter), media_type="text/event-stream")
 
     @app.post("/turn/resume")
     async def resume(
@@ -1067,7 +1089,7 @@ def create_app(
                     session_id=x_session_id, credentials=credentials, answer=body.answer
                 )
 
-        return StreamingResponse(_stream_turn(_call, emitter), media_type="text/event-stream")
+        return _TurnStreamingResponse(_stream_turn(_call, emitter), media_type="text/event-stream")
 
     @app.get("/session/history")
     async def session_history(
