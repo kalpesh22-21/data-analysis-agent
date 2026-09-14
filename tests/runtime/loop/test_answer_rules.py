@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -42,6 +44,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import FinalizationBlockKind
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-answer-rules"
 _E = "dbpcm_warehouse.employee"
@@ -65,7 +70,7 @@ _FABRICATED = "The current active employee count is **9,184**."
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [{"type": "function", "name": name, "parameters": {}} for name in ["runQuery"]]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -175,9 +180,9 @@ async def test_a_figure_with_no_query_behind_it_is_refused_and_recovers() -> Non
     answer on the round that was handed back — accepted VERBATIM."""
     loop, store, events, model = _build(
         [
-            ModelTurnResult(assistant_text=_FABRICATED),
+            final_answer(assistant_text=_FABRICATED),
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text="There are 412 active employees."),
+            final_answer(assistant_text="There are 412 active employees."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -201,8 +206,8 @@ async def test_the_refused_draft_is_carried_back_and_never_persisted() -> None:
     said."""
     loop, _store, _events_, model = _build(
         [
-            ModelTurnResult(assistant_text=_FABRICATED),
-            ModelTurnResult(assistant_text="I could not run a query for that."),
+            final_answer(assistant_text=_FABRICATED),
+            final_answer(assistant_text="I could not run a query for that."),
         ]
     )
 
@@ -217,14 +222,12 @@ async def test_the_refused_draft_is_carried_back_and_never_persisted() -> None:
     assert outcome.assistant_text == "I could not run a query for that."
 
 
-async def test_a_second_ungrounded_finish_passes_and_says_so() -> None:
-    """The runtime never hard-locks a turn. These rules read SHAPE, not truth, so a
-    second refusal would be the runtime destroying an answer it cannot prove wrong —
-    the prose passes and the EXHAUSTED event is what makes the pass visible."""
+async def test_a_second_ungrounded_finish_declines_and_records_exhaustion() -> None:
+    """Exhausting a repair allowance must not publish an unsupported figure. The runtime substitutes a limitation and records the exhausted rule."""
     loop, store, events, _model = _build(
         [
-            ModelTurnResult(assistant_text=_FABRICATED),
-            ModelTurnResult(assistant_text=_FABRICATED),
+            final_answer(assistant_text=_FABRICATED),
+            final_answer(assistant_text=_FABRICATED),
         ]
     )
 
@@ -233,7 +236,10 @@ async def test_a_second_ungrounded_finish_passes_and_says_so() -> None:
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == _FABRICATED
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     assert _events(events, ANSWER_RULE_EXHAUSTED_EVENT) == [{"rule": "ungrounded_quantity"}]
     assert store.claims == ["ungrounded_answer", "ungrounded_answer"]
 
@@ -248,7 +254,7 @@ async def test_a_figure_with_a_query_behind_it_is_untouched() -> None:
     loop, store, events, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text="There are 9,184 active employees."),
+            final_answer(assistant_text="There are 9,184 active employees."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -268,7 +274,7 @@ async def test_tool_calls_with_no_prose_are_untouched() -> None:
     loop, store, events, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text="Done."),
+            final_answer(assistant_text="Done."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -286,7 +292,7 @@ async def test_empty_prose_belongs_to_the_empty_answer_gate() -> None:
     loop, store, events, _model = _build(
         [
             ModelTurnResult(assistant_text=None),
-            ModelTurnResult(assistant_text="I could not run a query for that."),
+            final_answer(assistant_text="I could not run a query for that."),
         ]
     )
 
@@ -317,8 +323,8 @@ async def test_a_markdown_table_is_refused_even_though_a_query_ran() -> None:
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text=_MARKDOWN_ANSWER),
-            ModelTurnResult(assistant_text="Sales leads on headcount."),
+            final_answer(assistant_text=_MARKDOWN_ANSWER),
+            final_answer(assistant_text="Sales leads on headcount."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -339,8 +345,8 @@ async def test_the_markdown_rule_charges_the_answer_shape_allowance() -> None:
     loop, store, _events_, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text=_MARKDOWN_ANSWER),
-            ModelTurnResult(assistant_text="Sales leads on headcount."),
+            final_answer(assistant_text=_MARKDOWN_ANSWER),
+            final_answer(assistant_text="Sales leads on headcount."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -356,8 +362,8 @@ async def test_grounding_beats_form_on_a_fabricated_table() -> None:
     the presentation of an invented answer."""
     loop, store, events, _model = _build(
         [
-            ModelTurnResult(assistant_text=_MARKDOWN_ANSWER),
-            ModelTurnResult(assistant_text="I could not run a query for that."),
+            final_answer(assistant_text=_MARKDOWN_ANSWER),
+            final_answer(assistant_text="I could not run a query for that."),
         ]
     )
 
@@ -387,8 +393,8 @@ async def test_sql_in_the_answer_is_refused_even_though_a_query_ran() -> None:
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text=_SQL_ANSWER),
-            ModelTurnResult(assistant_text="There are 412 active employees."),
+            final_answer(assistant_text=_SQL_ANSWER),
+            final_answer(assistant_text="There are 412 active employees."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -410,8 +416,8 @@ async def test_the_sql_rule_charges_the_answer_shape_allowance() -> None:
     loop, store, _events_, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text=_SQL_ANSWER),
-            ModelTurnResult(assistant_text="There are 412 active employees."),
+            final_answer(assistant_text=_SQL_ANSWER),
+            final_answer(assistant_text="There are 412 active employees."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -428,8 +434,8 @@ async def test_the_sql_draft_comes_back_and_a_second_leak_passes() -> None:
     loop, _store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("c1")]),
-            ModelTurnResult(assistant_text=_SQL_ANSWER),
-            ModelTurnResult(assistant_text=_SQL_ANSWER),
+            final_answer(assistant_text=_SQL_ANSWER),
+            final_answer(assistant_text=_SQL_ANSWER),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -448,8 +454,8 @@ async def test_grounding_beats_the_sql_rule() -> None:
     turn never executed it."""
     loop, store, events, _model = _build(
         [
-            ModelTurnResult(assistant_text=_SQL_ANSWER),
-            ModelTurnResult(assistant_text="I could not run a query for that."),
+            final_answer(assistant_text=_SQL_ANSWER),
+            final_answer(assistant_text="I could not run a query for that."),
         ]
     )
 

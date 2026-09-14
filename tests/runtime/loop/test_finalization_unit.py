@@ -591,9 +591,9 @@ def test_the_answer_shape_nudge_says_the_turn_is_not_over() -> None:
     text = answer_shape_nudge_text("Radiology leads on attrition.", 2)
     assert "You drafted: Radiology leads on attrition." in text
     assert "This turn produced 2 multi-row result(s)" in text
-    assert "The turn is NOT over and answerWithTable is still available to you" in text
+    assert "The turn is NOT over and finalizeAnswer is still available to you" in text
     # THE ESCAPE HATCH IS NOT DECORATION: the gate reads row counts, not meaning.
-    assert "re-send your full answer through answerWithText" in text
+    assert "re-send your full answer through finalizeAnswer" in text
 
 
 def test_the_answer_shape_nudge_marks_its_truncation() -> None:

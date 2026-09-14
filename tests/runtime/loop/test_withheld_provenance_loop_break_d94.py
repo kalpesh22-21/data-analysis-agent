@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -34,6 +36,9 @@ from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 # The catalog knows `employee` but NOT `ghost_table` — a sampleRows against the
 # latter succeeds at the MCP yet yields undetermined (None) provenance.
@@ -87,8 +92,8 @@ class _RetryUntilSentinelModel:
             for m in messages
         )
         if saw_sentinel:
-            return ModelTurnResult(
-                assistant_text="That result is withheld; I'll ask the user instead.",
+            return final_answer(
+                assistant_text="I cannot answer because that result is withheld.",
                 usage={"total_tokens": 1},
             )
         return ModelTurnResult(
@@ -155,7 +160,7 @@ async def test_sentinel_breaks_retry_loop_and_terminates_normally() -> None:
 
     # The stranded entry really is ok+None (the skew condition under test).
     trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 1
+    assert len(trail) == 2
     assert trail[0].status == "ok"
     assert trail[0].provenance is None
 

@@ -105,7 +105,9 @@ def test_the_judge_events_survive_the_real_observer_with_their_slugs() -> None:
     tracer, exporter = _tracer_with_memory_exporter()
     observe = tracing.guardrail_observer(tracer)
 
-    observe(ANSWER_JUDGE_REFUSED_EVENT, {"violation": "unrecorded_assumption", "site": "exit_prose"})
+    observe(
+        ANSWER_JUDGE_REFUSED_EVENT, {"violation": "unrecorded_assumption", "site": "exit_prose"}
+    )
     observe(ASK_USER_JUDGE_REFUSED_EVENT, {"violation": "non_contextual_question"})
     observe(ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "wall_clock"})
     observe(ANSWER_JUDGE_CALLED_EVENT, {"site": "exit_table", "tokens": 1234})
@@ -211,3 +213,51 @@ async def test_no_tracer_means_no_span_and_no_crash() -> None:
     )
     assert (await judge.review(_brief())).approved is True
     assert [s for s in exporter.get_finished_spans() if s.name == "answer_judge"] == []
+
+
+async def test_judge_is_nested_in_agent_turn_and_restores_context() -> None:
+    from opentelemetry import trace
+
+    tracer, exporter = _tracer_with_memory_exporter()
+
+    class Model:
+        async def send_turn(self, messages: Any, tools: Any) -> ModelTurnResult:
+            with tracer.start_as_current_span("Response"):
+                return _verdict_turn(True)
+
+    judge = AnswerJudge(model_client=Model(), token_budget=100_000, tracer=tracer)
+    with tracing.agent_span(
+        tracer, scope_hash="scope", turn_index=2, session_id="session"
+    ) as agent:
+        await judge.review(_brief())
+        assert trace.get_current_span() is agent
+        with tracer.start_as_current_span("next_agent_call"):
+            pass
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    review = spans["answer_judge"]
+    assert review.parent.span_id == agent.get_span_context().span_id
+    assert review.context.trace_id == agent.get_span_context().trace_id
+    assert spans["Response"].parent.span_id == review.context.span_id
+    assert spans["Response"].context.trace_id == review.context.trace_id
+    assert spans["next_agent_call"].parent.span_id == agent.get_span_context().span_id
+
+
+async def test_failed_judge_stays_nested_and_restores_agent_context() -> None:
+    from opentelemetry import trace
+
+    tracer, exporter = _tracer_with_memory_exporter()
+
+    class Model:
+        async def send_turn(self, messages: Any, tools: Any) -> ModelTurnResult:
+            raise RuntimeError(SECRET_FEEDBACK)
+
+    judge = AnswerJudge(model_client=Model(), token_budget=100_000, tracer=tracer)
+    with tracer.start_as_current_span("agent.turn") as agent:
+        assert (await judge.review(_brief())).approved is True
+        assert trace.get_current_span() is agent
+    review = next(s for s in exporter.get_finished_spans() if s.name == "answer_judge")
+    assert review.parent.span_id == agent.get_span_context().span_id
+    assert review.attributes["outcome"] == "provider_error"
+    assert review.context.trace_id == agent.get_span_context().trace_id
+    assert not review.events

@@ -110,12 +110,12 @@ async def test_analysis_state_round_trips_and_merges_against_real_couchbase(
         assert live is not None, "the second call must see the first call's state"
         by_id = {i.intent_id: i for i in live.intents}
         by_id["i1"] = TrackedIntent(
-            intent_id="i1", description="headcount", status="completed",
+            intent_id="i1",
+            description="headcount",
+            status="completed",
             evidence_tool_call_id="call_1",
         )
-        return AnalysisState(
-            turn_index=7, intents=tuple(by_id[i.intent_id] for i in live.intents)
-        )
+        return AnalysisState(turn_index=7, intents=tuple(by_id[i.intent_id] for i in live.intents))
 
     merged = await store.apply_analysis_state(session_id, 7, _complete_i1)
     assert [i.status for i in merged.intents] == ["completed", "pending"]
@@ -124,3 +124,41 @@ async def test_analysis_state_round_trips_and_merges_against_real_couchbase(
     assert live_analysis_state(doc, 7) == merged
     # A.1: history for every other turn.
     assert live_analysis_state(doc, 8) is None
+
+
+async def test_review_state_and_multi_intent_pause_survive_fresh_store(settings):
+    from uuid import uuid4
+
+    from data_agent.runtime.loop.proposal import ReviewState
+    from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
+    from data_agent.runtime.session.models import PauseCheckpoint
+
+    sid = "harness-review-" + uuid4().hex
+    state = ReviewState(
+        calls=1,
+        repaired=True,
+        site="exit_table",
+        scope_hash="scope",
+        violation="contradicts_result",
+        feedback="Use the existing correct result.",
+        result_ids=("result-one",),
+        answer_version="draft-one",
+        excluded_components=(
+            {"kind": "capability", "result_id": "card-result", "capability_ref": "identifier"},
+        ),
+    )
+    store = CouchbaseSessionStore(settings)
+    await store.write_review_state(sid, 0, state.to_doc())
+    await store.write_pause_checkpoint(
+        sid,
+        PauseCheckpoint(
+            reason="blueprint_slot",
+            pending_question={"question": "Which group?", "options": ["Sales", "Engineering"]},
+            awaiting="user_answer",
+            consumed=False,
+            serves_intents=("i1", "i2"),
+        ),
+    )
+    restored = await CouchbaseSessionStore(settings).get_or_create_session(sid)
+    assert ReviewState.restore(restored.review_states["0"], "scope") == state
+    assert restored.pause_checkpoint.serves_intents == ("i1", "i2")

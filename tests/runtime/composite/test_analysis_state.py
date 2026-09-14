@@ -11,7 +11,6 @@ from typing import Any
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     ANALYSIS_STATE_INVALID_CODE,
-    ANALYSIS_STATE_LATE_INIT_CODE,
     SUBSTANTIVE_TOOLS,
     UpdateAnalysisStateTool,
     find_locking_tool,
@@ -132,8 +131,15 @@ async def test_update_is_batched_across_several_intents_in_one_call() -> None:
     tool = _tool(store)
     await tool.run(_init_args("a", "b", "c"), _credentials(), turn=TurnContext(turn_index=TURN))
     await _entry(store, "call_q", "runQuery", serves_intent="i1")
-    await _entry(store, "call_denied", "runQuery", status="denied",
-                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None, serves_intent="i2")
+    await _entry(
+        store,
+        "call_denied",
+        "runQuery",
+        status="denied",
+        error_code="COLUMN_SCOPE_VIOLATION",
+        row_count=None,
+        serves_intent="i2",
+    )
 
     result = await tool.run(
         {
@@ -175,27 +181,15 @@ async def test_an_unmentioned_intent_is_never_dropped() -> None:
     assert result.result_full["intents"][1]["status"] == "pending"
 
 
-async def test_late_init_is_rejected_after_a_substantive_call() -> None:
+async def test_late_init_preserves_explicitly_unbound_pending_intents() -> None:
     store = InMemorySessionStore()
-    events: list[tuple[str, dict[str, Any]]] = []
     await _entry(store, "call_q", "runQuery")
-
-    result = await _tool(store, events).run(
+    result = await _tool(store).run(
         _init_args("headcount", "attrition"), _credentials(), turn=TurnContext(turn_index=TURN)
     )
-
-    assert result.status == "error"
-    assert result.error_code == ANALYSIS_STATE_LATE_INIT_CODE
-    assert result.retryable is False  # the boundary has passed; no retry helps
-    # 03 §C.3 / spec §5.1: the detail carries the PROPOSED descriptions, on the
-    # only channel that reaches the model.
-    assert "headcount" in result.denial_detail
-    assert "attrition" in result.denial_detail
-    assert ("loop_analysis_state_late_init_rejected",
-            {"proposed_count": 2, "blocking_tool_name": "runQuery"}) in events
-    # A rejected init leaves the turn running UNPROTECTED — it does not error it.
-    doc = await store.get_or_create_session(SESSION_ID)
-    assert live_analysis_state(doc, TURN) is None
+    assert result.status == "ok"
+    assert all(i["status"] == "pending" for i in result.result_full["intents"])
+    assert all(i["evidence_tool_call_id"] is None for i in result.result_full["intents"])
 
 
 async def test_late_init_is_permitted_after_a_metadata_call() -> None:
@@ -250,7 +244,7 @@ async def test_evidence_must_come_from_a_prior_round_trip() -> None:
     )
     assert result.error_code == ANALYSIS_STATE_INVALID_CODE
     assert result.retryable is True
-    assert "NEXT message" in result.denial_detail
+    assert "result_id" in result.denial_detail
 
 
 async def test_a_missing_turn_context_refuses_rather_than_guessing() -> None:
@@ -286,6 +280,6 @@ async def test_a_prior_turns_call_is_never_bound_as_this_turns_evidence() -> Non
         turn=TurnContext(turn_index=TURN),
     )
     assert result.error_code == ANALYSIS_STATE_INVALID_CODE
-    assert "nothing this turn answered it" in result.denial_detail
+    assert "result_id" in result.denial_detail
     doc = await store.get_or_create_session(SESSION_ID)
     assert live_analysis_state(doc, TURN).intents[0].status == "pending"

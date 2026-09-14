@@ -46,7 +46,9 @@ def _entry(
 
 async def test_assemble_filters_out_of_scope_before_compaction() -> None:
     store = InMemorySessionStore()
-    in_scope_entry = _entry("c1", frozenset({(_E, "Department")}), sql="SELECT Department FROM employee")
+    in_scope_entry = _entry(
+        "c1", frozenset({(_E, "Department")}), sql="SELECT Department FROM employee"
+    )
     out_of_scope_entry = _entry("c2", frozenset({(_P, "Amount")}), sql="SELECT Amount FROM payroll")
     undetermined_entry = _entry("c3", None, sql="SELECT * FROM generateRandom(...)")
 
@@ -84,7 +86,9 @@ async def test_assemble_never_folds_entries_into_a_summary() -> None:
 
     store = InMemorySessionStore()
     for i in range(5):
-        await store.append_trail_entry("sess-1", _entry(f"c{i}", frozenset(), sql=f"SELECT {i} FROM padding"))
+        await store.append_trail_entry(
+            "sess-1", _entry(f"c{i}", frozenset(), sql=f"SELECT {i} FROM padding")
+        )
 
     assembled = await ContextAssembler(store).assemble("sess-1", frozenset())
 
@@ -155,7 +159,9 @@ async def test_base_prompt_is_index_zero_and_sole_system_message_after_retrieval
 
             return RetrievedContext(
                 thin_cards=[
-                    ThinCard(id="bp.headcount", intent="Count employees", slots_summary="", score=1.0)
+                    ThinCard(
+                        id="bp.headcount", intent="Count employees", slots_summary="", score=1.0
+                    )
                 ],
                 reranked=True,
             )
@@ -272,7 +278,9 @@ async def test_the_state_block_is_re_read_every_round_trip() -> None:
             turn_index=0,
             intents=(
                 TrackedIntent(
-                    intent_id="i1", description="headcount", status="completed",
+                    intent_id="i1",
+                    description="headcount",
+                    status="completed",
                     evidence_tool_call_id="call_7",
                 ),
             ),
@@ -383,9 +391,7 @@ class _StubAnchorRetrieval:
 
         return RetrievedContext(
             thin_cards=[
-                ThinCard(
-                    id="bp.headcount", intent="Count employees", slots_summary="", score=1.0
-                )
+                ThinCard(id="bp.headcount", intent="Count employees", slots_summary="", score=1.0)
             ],
             reranked=True,
         )
@@ -490,9 +496,7 @@ async def test_a_resumed_turn_keeps_the_date_it_opened_with() -> None:
     await _anchor_session(store, "sess-1", "2026-08-12T23:50:00+00:00")
     await store.append_message(
         "sess-1",
-        TurnMessage(
-            turn_index=0, role="user", content="Sales", ts="2026-08-13T08:05:00+00:00"
-        ),
+        TurnMessage(turn_index=0, role="user", content="Sales", ts="2026-08-13T08:05:00+00:00"),
     )
 
     assembler = ContextAssembler(store)
@@ -577,7 +581,7 @@ async def test_one_rendered_turn_carries_both_halves_of_the_date_rule() -> None:
 
     system = [m for m in assembled.messages if m.get("role") == "system"]
     assert len(system) == 1  # the base prompt is the SOLE system message (head-pin)
-    assert "prefer dateDiff against `today()`/`now()`" in system[0]["content"]
+    assert "Prefer dateDiff with today()/now()" in system[0]["content"]
 
     assert _anchor(assembled) == f"Today's date is 2026-08-12.{DATE_ANCHOR_SQL_NOTE}"
     assert "never as this literal" in _anchor(assembled)

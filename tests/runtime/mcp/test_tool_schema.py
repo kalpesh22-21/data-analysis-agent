@@ -8,13 +8,13 @@ import pytest
 
 from data_agent.runtime.composite.analysis_state import (
     INTENT_TAGGABLE_TOOLS,
-    SUBSTANTIVE_TOOLS,
 )
 from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.tool_schema import (
     ANSWER_WITH_TABLE_TOOL_SCHEMA,
     ASK_USER_TOOL_SCHEMA,
+    FINALIZE_ANSWER_SCHEMA,
     GET_BLUEPRINT_TOOL_SCHEMA,
     RECORD_ASSUMPTIONS_TOOL_SCHEMA,
     RESOLVE_VALUES_TOOL_SCHEMA,
@@ -110,7 +110,9 @@ def test_translate_passes_input_schema_verbatim() -> None:
     """The MCP is the single source of truth for parameter shape — no re-derivation."""
     for tool in _FAKE_TOOLS:
         schema = translate_tool_spec(tool)
-        assert schema["parameters"] is tool.input_schema or schema["parameters"] == tool.input_schema
+        assert (
+            schema["parameters"] is tool.input_schema or schema["parameters"] == tool.input_schema
+        )
 
 
 async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> None:
@@ -131,19 +133,21 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
         "searchKnowledge",
         "runBlueprint",
         "recordAssumptions",
-        "answerWithTable",
+        "finalizeAnswer",
         "updateAnalysisState",
     }
     assert len(schemas) == 15
     ask_user = next(s for s in schemas if s["name"] == "askUser")
     assert ask_user == ASK_USER_TOOL_SCHEMA
     assert ask_user["parameters"]["properties"]["options"]["maxItems"] == 5
-    assert "never provide a bare code" in ask_user["parameters"]["properties"]["options"][
-        "description"
-    ]
-    assert "Do not enumerate choices" in ask_user["parameters"]["properties"]["question"][
-        "description"
-    ]
+    assert (
+        "never provide a bare code"
+        in ask_user["parameters"]["properties"]["options"]["description"]
+    )
+    assert (
+        "Do not enumerate choices"
+        in ask_user["parameters"]["properties"]["question"]["description"]
+    )
     resolve_values = next(s for s in schemas if s["name"] == "resolveValues")
     assert resolve_values == RESOLVE_VALUES_TOOL_SCHEMA
     assert set(resolve_values["parameters"]["required"]) == {"table", "column", "concept"}
@@ -155,7 +159,7 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
     assert next(s for s in schemas if s["name"] == "searchKnowledge") == (
         SEARCH_KNOWLEDGE_TOOL_SCHEMA
     )
-    assert set(SEARCH_BLUEPRINTS_TOOL_SCHEMA["parameters"]["required"]) == {"query"}
+    assert set(SEARCH_BLUEPRINTS_TOOL_SCHEMA["parameters"]["required"]) == set()
     assert set(GET_BLUEPRINT_TOOL_SCHEMA["parameters"]["required"]) == {"id"}
     assert set(SEARCH_KNOWLEDGE_TOOL_SCHEMA["parameters"]["required"]) == {"query"}
     # runBlueprint (Slice B), appended verbatim after the read tools.
@@ -189,17 +193,17 @@ async def test_serves_intent_is_advertised_on_exactly_the_taggable_tools() -> No
     advertised = {
         schema["name"]
         for schema in schemas
-        if "serves_intent" in (schema.get("parameters") or {}).get("properties", {})
+        if "serves_intents" in (schema.get("parameters") or {}).get("properties", {})
     }
     schema_names = {schema["name"] for schema in schemas}
     assert advertised == set(INTENT_TAGGABLE_TOOLS) & schema_names
     for schema in schemas:
         properties = (schema.get("parameters") or {}).get("properties", {})
-        if "serves_intent" in properties:
-            assert properties["serves_intent"] == SERVES_INTENT_PARAM
+        if "serves_intents" in properties:
+            assert properties["serves_intents"] == SERVES_INTENT_PARAM
             # OPTIONAL — a tag is a convenience, never a precondition for running
             # the tool.
-            assert "serves_intent" not in (schema["parameters"].get("required") or [])
+            assert "serves_intents" not in (schema["parameters"].get("required") or [])
 
 
 def test_the_augmentation_does_not_mutate_the_mcps_own_schema() -> None:
@@ -210,7 +214,7 @@ def test_the_augmentation_does_not_mutate_the_mcps_own_schema() -> None:
     spec = next(t for t in _FAKE_TOOLS if t.name == "runQuery")
     before = json.loads(json.dumps(spec.input_schema))
     augmented = augment_with_serves_intent(translate_tool_spec(spec))
-    assert "serves_intent" in augmented["parameters"]["properties"]
+    assert "serves_intents" in augmented["parameters"]["properties"]
     assert spec.input_schema == before, "the MCP's own schema object was mutated"
 
 
@@ -232,12 +236,12 @@ def test_update_analysis_state_description_teaches_the_one_binding_path() -> Non
     allowance is unreachable to a model that does not know it may close a second
     intent on the same call."""
     description = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
-    assert "serves_intent" in description
-    assert "You never name the call" in description
-    assert "IF ONE CALL ANSWERS TWO DELIVERABLES" in description
-    assert "simply mark the other completed too" in description
+    assert "serves_intents" in description
+    assert "result_id" in description
+    assert "several intents" in description
+    assert "never guesses" in description
     # The ordering caveat still applies to the tag.
-    assert "has not run yet" in description
+    assert "until the next response" in description
 
 
 def test_update_analysis_state_schema_declares_exactly_three_item_properties() -> None:
@@ -253,10 +257,14 @@ def test_update_analysis_state_schema_declares_exactly_three_item_properties() -
     citation path stayed alive for as long as it did.
     """
     items = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["parameters"]["properties"]["intents"]["items"]
-    assert set(items["properties"]) == {"description", "intent_id", "status"}
+    assert set(items["properties"]) == {"description", "intent_id", "status", "result_id"}
     description = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
-    for retired in ("evidence_tool_call_id", "reason_code", "NO_ACCESS",
-                    "REQUIRED_DATA_UNAVAILABLE"):
+    for retired in (
+        "evidence_tool_call_id",
+        "reason_code",
+        "NO_ACCESS",
+        "REQUIRED_DATA_UNAVAILABLE",
+    ):
         assert retired not in description, f"retired field still taught: {retired}"
 
 
@@ -296,30 +304,17 @@ def test_answer_with_table_declares_tables_as_the_only_designation_carrier() -> 
     assert "A single-table answer is ONE entry" in description
 
 
-def test_update_analysis_state_description_names_every_locking_tool() -> None:
-    """Derived from `SUBSTANTIVE_TOOLS`, not from a hand-written list, so adding a
-    tool to the locking set cannot silently drift out of the model-facing text.
-
-    The description enumerated only three of the four for a while, omitting
-    `runBlueprint` — the MOST likely first substantive call in a blueprint-first
-    release. A model following it would run a blueprint, then declare, and take
-    the NON-RETRYABLE `ANALYSIS_STATE_LATE_INIT`, after which the turn runs
-    untracked and nothing errors: exactly the asymmetric silent failure 03 §E
-    warns about, live on every turn because the schema is re-sent every
-    round-trip.
-    """
+def test_state_description_permits_late_declaration():
     description = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
-    missing = sorted(tool for tool in SUBSTANTIVE_TOOLS if tool not in description)
-    assert not missing, f"the late-init boundary text does not name {missing}"
+    assert "late initial declaration is allowed" in description
+    assert "result_id" in description
 
 
-def test_update_analysis_state_description_agrees_with_the_base_prompt() -> None:
-    """Both are re-sent every round-trip, so a disagreement between them is live
-    on every turn. They must name the same four tools for the same boundary."""
+def test_state_schema_and_prompt_teach_explicit_binding():
     from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
-    for tool in SUBSTANTIVE_TOOLS:
-        assert tool in AGENT_SYSTEM_PROMPT, tool
+    for text in (AGENT_SYSTEM_PROMPT, UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]):
+        assert "serves_intents" in text and "result_id" in text
 
 
 async def test_name_collision_guard_raises_when_mcp_shadows_a_local_tool() -> None:
@@ -345,7 +340,7 @@ async def test_no_credential_params_leak_in_any_schema() -> None:
     client = FakeMCPClient(tools=_FAKE_TOOLS)
     schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
     blob = json.dumps(schemas).lower()
-    for forbidden in ("session_id", "jwt", "column_scope", "\"scope\""):
+    for forbidden in ("session_id", "jwt", "column_scope", '"scope"'):
         assert forbidden not in blob, f"credential-shaped parameter leaked: {forbidden}"
 
 
@@ -369,6 +364,7 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
 
     reloaded = await cache.get_schemas(jwt="tok", session_id="s1", force_reload=True)
     assert reloaded == [
+        FINALIZE_ANSWER_SCHEMA,
         ASK_USER_TOOL_SCHEMA,
         RESOLVE_VALUES_TOOL_SCHEMA,
         SEARCH_BLUEPRINTS_TOOL_SCHEMA,
@@ -376,6 +372,5 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
         SEARCH_KNOWLEDGE_TOOL_SCHEMA,
         RUN_BLUEPRINT_TOOL_SCHEMA,
         RECORD_ASSUMPTIONS_TOOL_SCHEMA,
-        ANSWER_WITH_TABLE_TOOL_SCHEMA,
         UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
     ]

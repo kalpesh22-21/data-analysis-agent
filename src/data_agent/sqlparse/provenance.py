@@ -113,7 +113,7 @@ _BLOCKED_STATEMENT_KINDS: tuple[type[exp.Expression], ...] = (
     exp.Update,
     exp.Delete,
     exp.Alter,
-    exp.Block,   # stacked statements (multi-statement injection)
+    exp.Block,  # stacked statements (multi-statement injection)
 )
 
 # Default database name; used when qualify_tables fills in the database prefix.
@@ -381,7 +381,9 @@ def _has_select_star(ast: exp.Expression) -> bool:
 # month range) is how ClickHouse writes a gap-free time series, and rejecting it
 # sent the model into rewrite loops — one observed turn burned its whole budget
 # window and returned no answer at all.
-_PURE_GENERATOR_FUNCTIONS = frozenset({"numbers", "numbers_mt", "generate_series", "generateseries"})
+_PURE_GENERATOR_FUNCTIONS = frozenset(
+    {"numbers", "numbers_mt", "generate_series", "generateseries"}
+)
 # The synthetic column names those generators project. Kept explicit (not "any
 # column of a generator source") so a real unresolvable column in the same query
 # still fails closed.
@@ -487,9 +489,7 @@ def _is_output_alias_reference(col_node: exp.Column) -> bool:
         return False
 
     alias_names = {
-        proj.alias
-        for proj in sel.expressions
-        if isinstance(proj, exp.Alias) and proj.alias
+        proj.alias for proj in sel.expressions if isinstance(proj, exp.Alias) and proj.alias
     }
     return col_node.name in alias_names
 
@@ -516,9 +516,7 @@ def _references_only_scratch_sources(col_node: exp.Column) -> bool:
     sel = col_node.find_ancestor(exp.Select)
     if sel is None:
         return False
-    direct_tables = [
-        tbl for tbl in sel.find_all(exp.Table) if tbl.find_ancestor(exp.Select) is sel
-    ]
+    direct_tables = [tbl for tbl in sel.find_all(exp.Table) if tbl.find_ancestor(exp.Select) is sel]
     if not direct_tables:
         return False
     for tbl in direct_tables:
@@ -696,9 +694,7 @@ def extract_column_provenance(
     # Step 1: Guard — empty / whitespace-only input (D63)
     # ------------------------------------------------------------------
     if not sql or not sql.strip():
-        raise ProvenanceExtractionError(
-            "Empty or whitespace-only SQL input — fail-closed (D63)."
-        )
+        raise ProvenanceExtractionError("Empty or whitespace-only SQL input — fail-closed (D63).")
 
     # ------------------------------------------------------------------
     # Step 2: Parse with ClickHouse dialect (D62)
@@ -724,9 +720,7 @@ def extract_column_provenance(
         ) from exc
 
     if ast is None:
-        raise ProvenanceExtractionError(
-            "sqlglot returned None for SQL input — fail-closed (D63)."
-        )
+        raise ProvenanceExtractionError("sqlglot returned None for SQL input — fail-closed (D63).")
 
     # ------------------------------------------------------------------
     # Step 3: Reject blocked statement kinds (D21, D63, OQ-5)
@@ -927,7 +921,12 @@ def extract_column_provenance(
             # else fails closed.
             extracted_col_names_so_far = {cn for _, cn in uses}
             if col_name in all_catalog_column_names:
-                if col_name not in extracted_col_names_so_far:
+                if col_name not in extracted_col_names_so_far and not _is_output_alias_reference(
+                    col_node
+                ):
+                    # The defining expression may be visited later (outer ORDER BY
+                    # before a CTE body). A proven output-alias reference is safe;
+                    # every column in its definition is still checked independently.
                     # Exact catalog match but not yet captured — unresolved real column (case A)
                     raise ProvenanceExtractionError(
                         f"Column '{col_name}' could not be attributed to any table after "

@@ -128,6 +128,14 @@ class InMemorySessionStore:
         self._bump_version(session_id)
         return new_state
 
+    async def write_review_state(
+        self, session_id: str, turn_index: int, state: dict[str, Any]
+    ) -> None:
+        doc = await self.get_or_create_session(session_id)
+        doc.review_states[str(turn_index)] = copy.deepcopy(state)
+        doc.last_activity = _now()
+        self._bump_version(session_id)
+
     async def claim_finalization_block(
         self,
         session_id: str,

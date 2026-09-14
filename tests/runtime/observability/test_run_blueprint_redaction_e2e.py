@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -34,10 +35,19 @@ from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
-    {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    {
+        _E: {
+            "EmployeeCode": "String",
+            "Department": "Nullable(String)",
+            "AnnualSalary": "Nullable(Float64)",
+        }
+    }
 )
 SESSION_ID = "sess-bp-redact-e2e"
 JWT = "jwt-should-never-leak"
@@ -77,7 +87,14 @@ def _detail() -> BlueprintDetail:
         drift_status="clean",
         hit_count=0,
         catalog_sha="",
-        slots=[{"name": "department", "type": "string", "required": True, "binds_to": f"{_E}.Department"}],
+        slots=[
+            {
+                "name": "department",
+                "type": "string",
+                "required": True,
+                "binds_to": f"{_E}.Department",
+            }
+        ],
         sql_template=_AVG_SQL,
         result_grain=["Department"],
     )
@@ -93,9 +110,24 @@ async def test_slot_value_absent_from_every_span_and_progress_event() -> None:
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                {"columns": ["Department"], "rows": [[PII_VALUE]], "row_count": 1, "truncated": False},
-                {"columns": ["department", "avg_salary", "headcount"], "rows": [[PII_VALUE, 50000.0, 3]], "row_count": 1, "truncated": False},
-                {"columns": ["__bp_n", "__bp_d"], "rows": [[1, 1]], "row_count": 1, "truncated": False},
+                {
+                    "columns": ["Department"],
+                    "rows": [[PII_VALUE]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
+                {
+                    "columns": ["department", "avg_salary", "headcount"],
+                    "rows": [[PII_VALUE, 50000.0, 3]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
+                {
+                    "columns": ["__bp_n", "__bp_d"],
+                    "rows": [[1, 1]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
             ]
         }
     )
@@ -120,12 +152,14 @@ async def test_slot_value_absent_from_every_span_and_progress_event() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="The average salary is $50,000."),
+            final_answer(assistant_text="The average salary is $50,000."),
         ]
     )
     loop = AgentLoop(
         model_client=model,
-        tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=capturing_observer, tracer=tracer),
+        tool_dispatcher=ToolDispatcher(
+            FakeMCPClient(), CATALOG, observer=capturing_observer, tracer=tracer
+        ),
         context_assembler=ContextAssembler(store, tracer=tracer),
         session_store=store,
         tools_provider=_tools_provider,
@@ -138,7 +172,9 @@ async def test_slot_value_absent_from_every_span_and_progress_event() -> None:
     # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
     await expand_blueprint(store, SESSION_ID, _BID)
 
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="avg salary?")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="avg salary?"
+    )
     assert outcome.status == "done"
 
     spans = exporter.get_finished_spans()

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from data_agent.runtime.dispatch.denial_mapping import classify_denial
+from data_agent.runtime.dispatch.sql_diagnostics import decode_diagnostic
 from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
 from data_agent.runtime.session.models import TrailEntry
 
@@ -34,15 +35,15 @@ def _estimate_tokens(text: str) -> int:
 def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     """Render one verbatim `TrailEntry` into a plain, model-facing dict.
 
-        SQL and every other model-supplied arg is preserved verbatim — this function never
-        paraphrases. Only the already-persisted preview is exposed, defensively re-truncated
-        to *preview_row_count* rows in case the setting shrank since write-time (never grown
-        back).
+    SQL and every other model-supplied arg is preserved verbatim — this function never
+    paraphrases. Only the already-persisted preview is exposed, defensively re-truncated
+    to *preview_row_count* rows in case the setting shrank since write-time (never grown
+    back).
 
-        `user_message`: for a non-`"ok"` entry, re-derives the static, PII-safe denial
-        message from `entry.error_code` via `dispatch/denial_mapping.py::classify_denial` —
-        never the raw MCP error text, and never re-persisted on the `TrailEntry` itself — so
-        the model can see WHY a retryable call failed and self-correct.
+    `user_message`: for a non-`"ok"` entry, re-derives the static, PII-safe denial
+    message from `entry.error_code` via `dispatch/denial_mapping.py::classify_denial` —
+    never the raw MCP error text, and never re-persisted on the `TrailEntry` itself — so
+    the model can see WHY a retryable call failed and self-correct.
     """
     preview: dict[str, Any] | None = None
     if entry.result_preview is not None:
@@ -50,9 +51,8 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         preview = {
             "columns": entry.result_preview.columns,
             "row_count": entry.result_preview.row_count,
-            "truncated": entry.result_preview.truncated or len(rows) < len(
-                entry.result_preview.preview_rows
-            ),
+            "truncated": entry.result_preview.truncated
+            or len(rows) < len(entry.result_preview.preview_rows),
             "preview_rows": rows,
         }
     # The model-facing reason for a non-`ok` entry. `denial_detail` — set only where
@@ -65,14 +65,22 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     # This function is the SINGLE producer of every model-facing tool message, which
     # is why a specific reason that is not persisted on the entry cannot reach the
     # model at all — `ToolResult.user_message` has no field here and is dropped.
+    diagnostic = decode_diagnostic(entry.denial_detail)
     user_message = (
-        (entry.denial_detail or classify_denial(entry.error_code).user_message)
+        (
+            (None if diagnostic else entry.denial_detail)
+            or classify_denial(entry.error_code).user_message
+        )
         if entry.status != "ok"
         else None
     )
     rendered: dict[str, Any] = {
         "role": "tool",
         "tool_call_id": entry.tool_call_id,
+        "model_response": entry.model_response,
+        "measurement_review": entry.measurement_review,
+        "turn_index": entry.turn_index,
+        "serves_intents": list(entry.serves_intents),
         "tool_name": entry.tool_name,
         "args": dict(entry.args),
         "status": entry.status,
@@ -80,6 +88,8 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         "user_message": user_message,
         "result_preview": preview,
     }
+    if diagnostic:
+        rendered["sql_diagnostic"] = diagnostic
     # Carry the verified-blueprint "authoritative" marker through so the canonical
     # tool message (loop/agent_loop.py::_tool_trail_entry_to_canonical) can flag it
     # to the model. Emitted only when set (a plain runQuery/denial entry is
@@ -100,16 +110,16 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
 def render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     """`_render_entry` under a PUBLIC name, for callers outside the model-request path.
 
-        There is exactly one such caller — `loop/answer_judge.py` (09 §D.3) — and the export
-        exists to make its contract enforceable rather than merely stated. The judge must see
-        a result EXACTLY as the model saw it: `preview_row_count` rows, never the
-        `result_full_ref` behind it. A judge holding more than the model held faults the model
-        for the preview cap and manufactures false rejections, which 05 §L.6 establishes as
-        the expensive direction.
+    There is exactly one such caller — `loop/answer_judge.py` (09 §D.3) — and the export
+    exists to make its contract enforceable rather than merely stated. The judge must see
+    a result EXACTLY as the model saw it: `preview_row_count` rows, never the
+    `result_full_ref` behind it. A judge holding more than the model held faults the model
+    for the preview cap and manufactures false rejections, which 05 §L.6 establishes as
+    the expensive direction.
 
-        Sharing the producer makes that parity structural: there is no second renderer to
-        drift, and a change to what the model sees changes what the judge sees in the same
-        commit. Nothing here is judge-specific — do not add anything judge-specific to it.
+    Sharing the producer makes that parity structural: there is no second renderer to
+    drift, and a change to what the model sees changes what the judge sees in the same
+    commit. Nothing here is judge-specific — do not add anything judge-specific to it.
     """
     return _render_entry(entry, preview_row_count)
 
@@ -147,7 +157,7 @@ _SUMMARY_CONTEXT_PREFIX = "[Earlier steps in this session were summarized to sav
 
 def estimate_message_tokens(message: Mapping[str, Any]) -> int:
     """Token estimate for one canonical `send_turn` message — the chars/4 heuristic, and
-        the single estimator to swap for a real tokenizer later.
+    the single estimator to swap for a real tokenizer later.
     """
     return _estimate_tokens(json.dumps(message, default=str))
 
@@ -202,12 +212,12 @@ def _fit_units(
     messages: list[dict[str, Any]], head_end: int, tail_start: int
 ) -> list[tuple[int, int]]:
     """Group the droppable middle `messages[head_end:tail_start)` into pairing-preserving
-        UNITS (half-open `(start, end)` index ranges).
+    UNITS (half-open `(start, end)` index ranges).
 
-        An assistant message carrying `tool_calls` plus its immediately following `tool`
-        result message(s) form ONE atomic unit, dropped or kept together so a `tool` message
-        is never orphaned from its announcing assistant (invariant 4). Every other message
-        is its own single-message unit.
+    An assistant message carrying `tool_calls` plus its immediately following `tool`
+    result message(s) form ONE atomic unit, dropped or kept together so a `tool` message
+    is never orphaned from its announcing assistant (invariant 4). Every other message
+    is its own single-message unit.
     """
     units: list[tuple[int, int]] = []
     i = head_end
@@ -227,10 +237,10 @@ def _fit_units(
 def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
     """Classify a droppable unit for drop-priority + telemetry:
 
-          * `trail`        — an assistant `tool_calls` + `tool` result pair;
-          * `retrieval`    — the current question's retrieved-context `user` block;
-          * `summary`      — the compaction summary `user` block (by its prefix);
-          * `conversation` — anything else (a prior-turn user/assistant exchange).
+    * `trail`        — an assistant `tool_calls` + `tool` result pair;
+    * `retrieval`    — the current question's retrieved-context `user` block;
+    * `summary`      — the compaction summary `user` block (by its prefix);
+    * `conversation` — anything else (a prior-turn user/assistant exchange).
     """
     first = messages[start]
     if (
@@ -253,20 +263,20 @@ def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
 
 def _current_turn_start(messages: list[dict[str, Any]], head_end: int, n: int) -> int:
     """Index where the CURRENT (in-progress) turn's messages begin — the first `user`
-        message after the last COMPLETED prior turn.
+    message after the last COMPLETED prior turn.
 
-        A completed prior turn always ends in a plain `assistant` ANSWER (role `assistant`
-        with NO `tool_calls`); the in-progress turn has none yet, and its synthetic
-        assistant messages all carry `tool_calls`. So the current turn is the run after the
-        LAST plain-assistant answer, starting at that run's first `user` message — the
-        ORIGINATING question, even after an askUser resume appended a clarification answer.
-        Identifying it positionally is what removes any need to thread `turn_index`.
+    A completed prior turn always ends in a plain `assistant` ANSWER (role `assistant`
+    with NO `tool_calls`); the in-progress turn has none yet, and its synthetic
+    assistant messages all carry `tool_calls`. So the current turn is the run after the
+    LAST plain-assistant answer, starting at that run's first `user` message — the
+    ORIGINATING question, even after an askUser resume appended a clarification answer.
+    Identifying it positionally is what removes any need to thread `turn_index`.
 
-        Returns `n` when there is no current-turn `user` message, so nothing is pinned as
-        the current turn — which is what stops a lone trailing `tool` from being pinned
-        while its announcing assistant unit stays droppable (invariant 4). If EVERY prior
-        turn's assistant answer was scope-dropped, the boundary walks back to the first user
-        message, harmlessly over-pinning.
+    Returns `n` when there is no current-turn `user` message, so nothing is pinned as
+    the current turn — which is what stops a lone trailing `tool` from being pinned
+    while its announcing assistant unit stays droppable (invariant 4). If EVERY prior
+    turn's assistant answer was scope-dropped, the boundary walks back to the first user
+    message, harmlessly over-pinning.
     """
     last_answer = head_end - 1
     for i in range(n - 1, head_end - 1, -1):
@@ -288,34 +298,34 @@ def fit_request_to_budget(
     pinned_tool_call_ids: frozenset[str] | None = None,
 ) -> RequestFitResult:
     """Fit the FULL canonical request to `token_budget` while honoring the send-seam
-        invariants:
+    invariants:
 
-          1. the base prompt (the leading run of `role:"system"` messages) is NEVER dropped
-             or truncated — it is pinned as the head;
-          2. the returned list never exceeds `token_budget` tokens WHEN that is achievable
-             without violating (1), (3) or (6);
-          3. the CURRENT turn is pinned from its FIRST `user` message through the end, so
-             its originating question, its retrieval-cards block and an askUser
-             clarification answer are all undroppable;
-          4. assistant `tool_calls` <-> `tool` result pairing is preserved — units are
-             dropped or kept atomically (see `_fit_units`);
-          5. under pressure droppable units go in DROP-PRIORITY tier order, not pure
-             position: prior-turn conversation and trail first (tier 0), then a prior
-             retrieval/summary block (tier 1), and only as a last resort the current turn's
-             OLDER tool pairs (tier 2). Within a tier the oldest goes first;
-          6. the current turn's most-recent `pinned_recent_tool_pairs` (K) tool pairs are
-             PINNED — K protects the D94 withheld/idempotent-read self-correct loop, and
-             making the pairs older than K droppable is what keeps a single non-terminating
-             turn bounded by the budget;
-          7. any unit whose `tool_call_id` is in *pinned_tool_call_ids* is PINNED regardless
-             of tier or age. This carries the emulated-discovery pairs, which are anchored
-             at the SESSION'S FIRST question and so classify as prior-turn trail, tier 0.
-             Dropping them is uniquely harmful: the loop seeds its repeated-idempotent-read
-             guard from the same sweep, so the model would be unable to see the tables AND
-             unable to re-fetch them. `None`/empty behaves as if the parameter did not exist.
+      1. the base prompt (the leading run of `role:"system"` messages) is NEVER dropped
+         or truncated — it is pinned as the head;
+      2. the returned list never exceeds `token_budget` tokens WHEN that is achievable
+         without violating (1), (3) or (6);
+      3. the CURRENT turn is pinned from its FIRST `user` message through the end, so
+         its originating question, its retrieval-cards block and an askUser
+         clarification answer are all undroppable;
+      4. assistant `tool_calls` <-> `tool` result pairing is preserved — units are
+         dropped or kept atomically (see `_fit_units`);
+      5. under pressure droppable units go in DROP-PRIORITY tier order, not pure
+         position: prior-turn conversation and trail first (tier 0), then a prior
+         retrieval/summary block (tier 1), and only as a last resort the current turn's
+         OLDER tool pairs (tier 2). Within a tier the oldest goes first;
+      6. the current turn's most-recent `pinned_recent_tool_pairs` (K) tool pairs are
+         PINNED — K protects the D94 withheld/idempotent-read self-correct loop, and
+         making the pairs older than K droppable is what keeps a single non-terminating
+         turn bounded by the budget;
+      7. any unit whose `tool_call_id` is in *pinned_tool_call_ids* is PINNED regardless
+         of tier or age. This carries the emulated-discovery pairs, which are anchored
+         at the SESSION'S FIRST question and so classify as prior-turn trail, tier 0.
+         Dropping them is uniquely harmful: the loop seeds its repeated-idempotent-read
+         guard from the same sweep, so the model would be unable to see the tables AND
+         unable to re-fetch them. `None`/empty behaves as if the parameter did not exist.
 
-        Invariants 1/3/6/7 take precedence over 2, so in the pathological corner where the
-        pinned material ALONE exceeds `token_budget` the result may still exceed it.
+    Invariants 1/3/6/7 take precedence over 2, so in the pathological corner where the
+    pinned material ALONE exceeds `token_budget` the result may still exceed it.
     """
     pinned_ids = pinned_tool_call_ids or frozenset()
     sizes = [estimate_message_tokens(m) for m in messages]
@@ -359,12 +369,8 @@ def fit_request_to_budget(
     droppable: list[int] = []
     for u, (s, e) in enumerate(units):
         is_current = s >= turn_start
-        is_tool_pair = (
-            messages[s].get("role") == "assistant" and messages[s].get("tool_calls")
-        )
-        if pinned_ids and any(
-            messages[k].get("tool_call_id") in pinned_ids for k in range(s, e)
-        ):
+        is_tool_pair = messages[s].get("role") == "assistant" and messages[s].get("tool_calls")
+        if pinned_ids and any(messages[k].get("tool_call_id") in pinned_ids for k in range(s, e)):
             pinned[u] = True  # invariant 7 — emulated discovery, never dropped.
         elif kinds[u] == _UNIT_KIND_RETRIEVAL:
             # The current question's prefetch pair replaces the formerly pinned

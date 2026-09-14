@@ -30,8 +30,10 @@ in the loop registry, so these tools always hold live dependencies.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping
+from itertools import zip_longest
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.blueprint.models import slot_type_gloss, window_anchor_declaration
@@ -99,9 +101,7 @@ class _ReadTool(RuntimeToolBase):
         # (`query` redacted, §5); True puts the REAL `query` on the span. The envelope
         # always hands `_execute` the raw model_args, so the search/scope-filter path is
         # unaffected either way.
-        super().__init__(
-            observer=observer, tracer=tracer, disable_redaction=disable_redaction
-        )
+        super().__init__(observer=observer, tracer=tracer, disable_redaction=disable_redaction)
         # Per-result preview SIZE cap (tokens), the SAME operator lever
         # `ToolDispatcher` takes (`RuntimeSettings.max_tool_result_tokens`). It is
         # threaded here because `_build_preview` defaults it: without this the read
@@ -112,9 +112,7 @@ class _ReadTool(RuntimeToolBase):
         self._max_result_tokens = max_result_tokens
 
     def _span_args(self, model_args: dict[str, Any]) -> dict[str, Any]:
-        return tool_span_args(
-            self.tool_name, model_args, disable_redaction=self._disable_redaction
-        )
+        return tool_span_args(self.tool_name, model_args, disable_redaction=self._disable_redaction)
 
     # -- ToolResult builders --------------------------------------------------
 
@@ -126,11 +124,11 @@ class _ReadTool(RuntimeToolBase):
         preview_row_count: int = 20,
     ) -> ToolResult:
         """*provenance* defaults to the safe-empty `frozenset()` — correct for `searchKnowledge`
-                and the `getBlueprint` not-found path, both of which name no column. The two results
-                that DO name columns override it so the entry drops under a later scope narrowing:
-                `getBlueprint`'s FOUND path with the blueprint's scoped `uses`, and
-                `searchBlueprints` with the union of its enriched cards' `uses` — or `None` when
-                that union does not cover what the cards print.
+        and the `getBlueprint` not-found path, both of which name no column. The two results
+        that DO name columns override it so the entry drops under a later scope narrowing:
+        `getBlueprint`'s FOUND path with the blueprint's scoped `uses`, and
+        `searchBlueprints` with the union of its enriched cards' `uses` — or `None` when
+        that union does not cover what the cards print.
         """
         return ToolResult(
             status="ok",
@@ -150,9 +148,7 @@ class _ReadTool(RuntimeToolBase):
         )
 
 
-def _clamp_k(
-    raw: Any, *, default_k: int, max_k: int
-) -> tuple[int | None, str | None]:
+def _clamp_k(raw: Any, *, default_k: int, max_k: int) -> tuple[int | None, str | None]:
     """Resolve the model-supplied `k`: absent → *default_k*; a non-integer or a
     value < 1 is malformed (§6, fail-closed); a valid `k` over *max_k* is CLAMPED
     (a lenient over-ask, not a rejection, §9). Returns `(k, None)` or
@@ -170,13 +166,13 @@ def _clamp_k(
 
 def _uses_to_provenance(uses: frozenset[str]) -> frozenset[tuple[str, str]] | None:
     """Split a blueprint's scoped `uses` ("database.table.column" keys) into the
-        `(db_table, column)` provenance tuples the D44 replay filter consumes. This is what
-        makes a `getBlueprint` trail entry DROP under a later scope narrowing: its footprint is
-        no longer a subset of the narrowed scope.
+    `(db_table, column)` provenance tuples the D44 replay filter consumes. This is what
+    makes a `getBlueprint` trail entry DROP under a later scope narrowing: its footprint is
+    no longer a subset of the narrowed scope.
 
-        Fail-closed: any malformed key (no dot, empty part) yields `None` for the WHOLE set
-        (undetermined, dropped from replay), never a partial set that could fail open. An empty
-        `uses` yields `frozenset()`.
+    Fail-closed: any malformed key (no dot, empty part) yields `None` for the WHOLE set
+    (undetermined, dropped from replay), never a partial set that could fail open. An empty
+    `uses` yields `frozenset()`.
     """
     tuples: set[tuple[str, str]] = set()
     for use in uses:
@@ -203,15 +199,15 @@ _OPTIONAL_PLAIN_NOTE = "May be omitted."
 
 def _enrich_slot(raw: Any) -> dict[str, Any]:
     """Shape one raw slot dict into the ENRICHED model-facing view: keep name/type, ADD a
-        plain-English `type_meaning` gloss, a `requirement`, and a `note` explaining the
-        contract. `binds_to`/`enum_values`/bounds are preserved when present. A raw slot missing
-        `type` gets the generic gloss and a missing or invalid `required` defaults to True — the
-        slot is never dropped.
+    plain-English `type_meaning` gloss, a `requirement`, and a `note` explaining the
+    contract. `binds_to`/`enum_values`/bounds are preserved when present. A raw slot missing
+    `type` gets the generic gloss and a missing or invalid `required` defaults to True — the
+    slot is never dropped.
 
-        The optional note only promises "no filter (all values)" when the slot carries an
-        `optional_pattern`, which the executor substitutes on omission. Without one, omission
-        fails closed to the raw loop, so the note softens to a neutral "May be omitted." rather
-        than overclaim.
+    The optional note only promises "no filter (all values)" when the slot carries an
+    `optional_pattern`, which the executor substitutes on omission. Without one, omission
+    fails closed to the raw loop, so the note softens to a neutral "May be omitted." rather
+    than overclaim.
     """
     slot = raw if isinstance(raw, dict) else {}
     type_ = slot.get("type")
@@ -240,9 +236,9 @@ def _enrich_slot(raw: Any) -> dict[str, Any]:
 def _composition_annotation(composes: list[Any]) -> dict[str, Any]:
     """Compact, model-facing stand-in for a composed blueprint's raw `composes` DAG.
 
-        The raw DAG is the confusion vector — it invites the model to hand-run steps or reason
-        about their order — so it is replaced with a step count and a "one atomic call" note.
-        The runtime executes the DAG from the store, never from this serialization.
+    The raw DAG is the confusion vector — it invites the model to hand-run steps or reason
+    about their order — so it is replaced with a step count and a "one atomic call" note.
+    The runtime executes the DAG from the store, never from this serialization.
     """
     steps = len(composes)
     return {
@@ -274,25 +270,25 @@ def _require_text(raw: Any, name: str) -> tuple[str | None, str | None]:
 def _search_card(card: ThinCard) -> dict[str, Any]:
     """Serialize one `ThinCard` into a `searchBlueprints` result entry.
 
-        ENRICHED so the model can pick between candidates without a `getBlueprint` round-trip
-        each. The enrichment keys are OMITTED when the blueprint stored no DAG, so a DAG-less
-        blueprint serialises byte-identically to before.
+    ENRICHED so the model can pick between candidates without a `getBlueprint` round-trip
+    each. The enrichment keys are OMITTED when the blueprint stored no DAG, so a DAG-less
+    blueprint serialises byte-identically to before.
 
-        `status` is DELIBERATELY absent. Recall filters
-        `coalesce(node.status,'validated') = 'validated'`, so every card here is validated by
-        construction — the field would be a constant carrying no information, and printing it
-        would imply a distinction that cannot occur in a search result. It stays on
-        `getBlueprint`, where a keyed fetch by id genuinely can return a non-validated blueprint.
+    `status` is DELIBERATELY absent. Recall filters
+    `coalesce(node.status,'validated') = 'validated'`, so every card here is validated by
+    construction — the field would be a constant carrying no information, and printing it
+    would imply a distinction that cannot occur in a search result. It stays on
+    `getBlueprint`, where a keyed fetch by id genuinely can return a non-validated blueprint.
 
-        `slots` are the `{name, type, required}` SUMMARY only (the projection is enforced
-        upstream); `binds_to`, `enum_values`, `optional_pattern` and the numeric bounds are
-        `getBlueprint`'s job.
+    `slots` are the `{name, type, required}` SUMMARY only (the projection is enforced
+    upstream); `binds_to`, `enum_values`, `optional_pattern` and the numeric bounds are
+    `getBlueprint`'s job.
 
-        ⚠ Every key emitted here is read back by the printed-column guard
-        (`_card_printed_columns`), which decides whether the trail entry's D44 provenance can be
-        claimed as determined. A NEW key is guarded by default — its strings must be covered by
-        the cards' `uses` union or the whole entry fails closed out of replay — so classify it
-        there when you add one.
+    ⚠ Every key emitted here is read back by the printed-column guard
+    (`_card_printed_columns`), which decides whether the trail entry's D44 provenance can be
+    claimed as determined. A NEW key is guarded by default — its strings must be covered by
+    the cards' `uses` union or the whole entry fails closed out of replay — so classify it
+    there when you add one.
     """
     entry: dict[str, Any] = {
         "id": card.id,
@@ -303,8 +299,7 @@ def _search_card(card: ThinCard) -> dict[str, Any]:
     _put_if_present(entry, "resolves", card.resolves)
     if card.slots is not None:
         entry["slots"] = [
-            {"name": slot.name, "type": slot.type, "required": slot.required}
-            for slot in card.slots
+            {"name": slot.name, "type": slot.type, "required": slot.required} for slot in card.slots
         ]
         # Only when the per-card cap actually dropped slots — a `0` on every
         # enriched card would break the "omit what is absent" shape, and its
@@ -393,22 +388,22 @@ def _slot_printed_columns(value: Any) -> set[str]:
 def _grain_printed_columns(value: Any) -> set[str]:
     """Column identifiers printed by a card's `result_grain`.
 
-        A grain entry is an OUTPUT-COLUMN DISPLAY LABEL for a `SELECT … AS x`, not a warehouse
-        column identifier. That is this repo's own recorded reading —
-        `blueprint/structural_key.py::normalize_structural_grain` says so and pins a case fold
-        on the strength of it — and the seed corpus bears it out.
+    A grain entry is an OUTPUT-COLUMN DISPLAY LABEL for a `SELECT … AS x`, not a warehouse
+    column identifier. That is this repo's own recorded reading —
+    `blueprint/structural_key.py::normalize_structural_grain` says so and pins a case fold
+    on the strength of it — and the seed corpus bears it out.
 
-        So requiring a BARE grain entry to be covered would make most real blueprints
-        undetermined, and undetermined is dropped from replay ALWAYS — even under allow-all, and
-        even inside its own turn once the entry is `ok`. The model would stop seeing its own
-        search results one round-trip after asking for them, which is strictly worse than the
-        label it would be withholding, and the card's prose names it anyway.
+    So requiring a BARE grain entry to be covered would make most real blueprints
+    undetermined, and undetermined is dropped from replay ALWAYS — even under allow-all, and
+    even inside its own turn once the entry is `ok`. The model would stop seeing its own
+    search results one round-trip after asking for them, which is strictly worse than the
+    label it would be withholding, and the card's prose names it anyway.
 
-        A bare entry is therefore read as the display label it is. A QUALIFIED entry
-        ("db.table.column") is no display label under any reading and must be covered. Residual,
-        recorded deliberately: a bare grain entry that IS a real column name of some other table
-        cannot be told apart from a label at this layer, since retrieval holds no catalog. A
-        `resolves` value naming that column IS caught.
+    A bare entry is therefore read as the display label it is. A QUALIFIED entry
+    ("db.table.column") is no display label under any reading and must be covered. Residual,
+    recorded deliberately: a bare grain entry that IS a real column name of some other table
+    cannot be told apart from a label at this layer, since retrieval holds no catalog. A
+    `resolves` value naming that column IS caught.
     """
     return {entry for entry in _printed_strings(value) if "." in entry}
 
@@ -437,22 +432,22 @@ def _card_printed_columns(entry: Mapping[str, Any]) -> set[str]:
 def _is_covered(printed: str, *, qualified: set[str], bare: set[str]) -> bool:
     """Is one printed identifier covered by the footprint being claimed?
 
-        THE qualification mismatch: `uses` keys are fully qualified while a card prints BARE
-        column names — a card never prints a qualification, which is exactly why `binds_to` is
-        kept off it. Comparing the two as whole strings would match nothing and make EVERY
-        enriched card undetermined, silently disabling replay for the entire release. So:
+    THE qualification mismatch: `uses` keys are fully qualified while a card prints BARE
+    column names — a card never prints a qualification, which is exactly why `binds_to` is
+    kept off it. Comparing the two as whole strings would match nothing and make EVERY
+    enriched card undetermined, silently disabling replay for the entire release. So:
 
-          - a BARE printed name is compared against the LAST SEGMENT of each `uses` key — the
-            only comparison that can succeed at all;
-          - a DOTTED printed name is compared against the whole key, suffix-matched on a dot
-            boundary so a `table.column` spelling still matches its `db.table.column` key.
+      - a BARE printed name is compared against the LAST SEGMENT of each `uses` key — the
+        only comparison that can succeed at all;
+      - a DOTTED printed name is compared against the whole key, suffix-matched on a dot
+        boundary so a `table.column` spelling still matches its `db.table.column` key.
 
-        Both sides are case-folded, matching `normalize_structural_grain`'s pinned `str.lower()`:
-        the real corpus hazard is authoring case skew, not two columns of one table differing
-        only by case.
+    Both sides are case-folded, matching `normalize_structural_grain`'s pinned `str.lower()`:
+    the real corpus hazard is authoring case skew, not two columns of one table differing
+    only by case.
 
-        A bare name matching no footprint column cannot be resolved to a qualified column; that
-        is itself undetermined, and the caller fails closed on it.
+    A bare name matching no footprint column cannot be resolved to a qualified column; that
+    is itself undetermined, and the caller fails closed on it.
     """
     token = printed.strip().lower()
     if "." not in token:
@@ -464,31 +459,31 @@ def _cards_to_provenance(
     cards: Sequence[ThinCard], serialised: Sequence[Mapping[str, Any]]
 ) -> frozenset[tuple[str, str]] | None:
     """The `searchBlueprints` entry's D44 provenance: the UNION of the returned cards' `uses`
-        footprints — but only when that union covers every column identifier the cards PRINT.
+    footprints — but only when that union covers every column identifier the cards PRINT.
 
-        `_ok` defaults to the safe-empty `frozenset()`, and that WAS correct here for a precise
-        reason: a thin card carried no column identifier, so there was nothing a later scope
-        narrowing could forbid. Enrichment breaks that premise — `resolves` maps a term to a
-        COLUMN NAME and `result_grain` is a column/alias list — so a `frozenset()` entry would
-        be kept in replay FOREVER, including after the caller's scope narrows past the columns
-        it names.
+    `_ok` defaults to the safe-empty `frozenset()`, and that WAS correct here for a precise
+    reason: a thin card carried no column identifier, so there was nothing a later scope
+    narrowing could forbid. Enrichment breaks that premise — `resolves` maps a term to a
+    COLUMN NAME and `result_grain` is a column/alias list — so a `frozenset()` entry would
+    be kept in replay FOREVER, including after the caller's scope narrows past the columns
+    it names.
 
-        Every returned card is already in scope (recall pre-filters `uses ⊆ scope`), so the union
-        is in scope at write time; when scope later narrows past ANY of it, the WHOLE entry
-        drops. Whole-entry granularity is coarse but fail-closed, and it is what every other
-        multi-column entry already has.
+    Every returned card is already in scope (recall pre-filters `uses ⊆ scope`), so the union
+    is in scope at write time; when scope later narrows past ANY of it, the WHOLE entry
+    drops. Whole-entry granularity is coarse but fail-closed, and it is what every other
+    multi-column entry already has.
 
-        Fail-closed three times over — an UNDETERMINED card footprint, a malformed `uses` key,
-        and a PRINTED COLUMN the union does not cover — each yielding `None` for the whole set,
-        never a partial or empty set that would fail open. NO cards yields `frozenset()`.
+    Fail-closed three times over — an UNDETERMINED card footprint, a malformed `uses` key,
+    and a PRINTED COLUMN the union does not cover — each yielding `None` for the whole set,
+    never a partial or empty set that would fail open. NO cards yields `frozenset()`.
 
-        The coverage check runs against the UNION, not per card, because the entry's provenance
-        IS the union: a column card A prints that lives in card B's `uses` is still in the
-        claimed footprint, so the entry drops the moment that column leaves scope. Per-card
-        checking would fail closed on that case for no gain.
+    The coverage check runs against the UNION, not per card, because the entry's provenance
+    IS the union: a column card A prints that lives in card B's `uses` is still in the
+    claimed footprint, so the entry drops the moment that column leaves scope. Per-card
+    checking would fail closed on that case for no gain.
 
-        *serialised* must be the very dicts placed in `result_full` — the guard is derived from
-        what is printed, so handing it anything else would measure the wrong thing.
+    *serialised* must be the very dicts placed in `result_full` — the guard is derived from
+    what is printed, so handing it anything else would measure the wrong thing.
     """
     union: set[str] = set()
     for card in cards:
@@ -542,24 +537,78 @@ class SearchBlueprintsTool(_ReadTool):
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
     ) -> ToolResult:
-        query, err = _require_text(model_args.get("query"), "query")
-        if err is not None:
-            return self._error(INVALID_ARGS_CODE, err, retryable=True)
+        raw_deliverables = model_args.get("deliverables")
+        if raw_deliverables is not None:
+            query_arg = model_args.get("query")
+            # Optional fields may arrive as empty placeholders. Only an actual
+            # second query is ambiguous; null/blank carries no competing intent.
+            if query_arg is not None and (not isinstance(query_arg, str) or query_arg.strip()):
+                return self._error(
+                    INVALID_ARGS_CODE, "Supply query OR deliverables, not both.", retryable=True
+                )
+            if (
+                not isinstance(raw_deliverables, list)
+                or not 1 <= len(raw_deliverables) <= min(4, self._max_k)
+                or any(
+                    not isinstance(q, str) or not q.strip() or len(q) > 2000
+                    for q in raw_deliverables
+                )
+            ):
+                return self._error(
+                    INVALID_ARGS_CODE,
+                    "deliverables must contain 1 to 4 non-empty focused search queries, each at most 2000 characters, within the card limit.",
+                    retryable=True,
+                )
+            queries = [q.strip() for q in raw_deliverables]
+            if len(set(queries)) != len(queries):
+                return self._error(
+                    INVALID_ARGS_CODE,
+                    "Use one distinct focused query per deliverable.",
+                    retryable=True,
+                )
+        else:
+            query, err = _require_text(model_args.get("query"), "query")
+            if err is not None:
+                return self._error(INVALID_ARGS_CODE, err, retryable=True)
+            queries = [query]
         k, k_err = _clamp_k(model_args.get("k"), default_k=self._default_k, max_k=self._max_k)
         if k_err is not None:
             return self._error(INVALID_ARGS_CODE, k_err, retryable=True)
-
-        cards, reranked = await self._pipeline.search_blueprints(
-            question=query,  # type: ignore[arg-type]
-            column_scope=credentials.column_scope,
-            k=k,  # type: ignore[arg-type]
+        # Divide the display budget fairly; each deliverable receives its own
+        # retrieval/reranking pass and at least one candidate slot. Never combine
+        # the query strings into one embedding or let one intent dominate the cut.
+        budget = max(k, len(queries))
+        results = await asyncio.gather(
+            *(
+                self._pipeline.search_blueprints(
+                    question=query,
+                    column_scope=credentials.column_scope,
+                    k=budget // len(queries) + (index < budget % len(queries)),
+                )
+                for index, query in enumerate(queries)
+            )
         )
+        unique = {}
+        for row in zip_longest(*(found for found, _ in results)):
+            for card in row:
+                if card is not None:
+                    unique.setdefault(card.id, card)
+        cards = list(unique.values())
         entries = [_search_card(card) for card in cards]
         result_full: dict[str, Any] = {
             "count": len(cards),
-            "degraded": not reranked,
+            "degraded": not all(flag for _, flag in results),
             "blueprints": entries,
         }
+        if raw_deliverables is not None:
+            result_full["searches"] = [
+                {
+                    "deliverable": index + 1,
+                    "blueprint_ids": [card.id for card in found],
+                    "degraded": not flag,
+                }
+                for index, (found, flag) in enumerate(results)
+            ]
         # NOT the inherited safe-empty frozenset(): an enriched card names
         # columns, so the entry carries the union of the cards' `uses` footprints
         # — and only when that union covers every column the SERIALISED cards

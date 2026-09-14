@@ -107,6 +107,12 @@ class SessionStore(Protocol):
         """
         ...
 
+    async def write_review_state(
+        self, session_id: str, turn_index: int, state: dict[str, Any]
+    ) -> None:
+        """Persist turn-scoped review state independently of model-writable intents."""
+        ...
+
     async def claim_finalization_block(
         self,
         session_id: str,

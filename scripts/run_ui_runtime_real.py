@@ -144,9 +144,12 @@ def build_real_app():
         "yes",
         "on",
     )
-    capability_prefetch_on = os.environ.get(
-        "CAPABILITY_PREFETCH_ENABLED", ""
-    ).strip().lower() in ("1", "true", "yes", "on")
+    capability_prefetch_on = os.environ.get("CAPABILITY_PREFETCH_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     answer_judge_on = os.environ.get("ANSWER_JUDGE_ENABLED", "").strip().lower() in (
         "1",
         "true",
@@ -160,6 +163,8 @@ def build_real_app():
         openai_api_key=api_key,
         openai_model=model,
         openai_base_url="",
+        use_reasoning_metadata=os.environ.get("USE_REASONING_METADATA", "").lower()
+        in {"1", "true", "yes"},
         # Real JWT verification against the live l2-token JWKS (NOT bypassed).
         jwks_url=_JWKS_URL,
         jwt_issuer=_TOKEN_ISSUER,
@@ -259,6 +264,7 @@ def build_real_app():
             api_key=settings.openai_api_key,
             model=settings.openai_model,
             base_url=settings.openai_base_url,
+            use_reasoning_metadata=settings.use_reasoning_metadata,
         ),
         catalog=catalog_handle(),
     )

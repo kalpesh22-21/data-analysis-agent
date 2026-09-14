@@ -350,6 +350,12 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
             "or USING clause, or wrap a constant side in a subquery."
         ),
     ),
+    "SQL_REPAIR_EXHAUSTED": DenialInfo(
+        code="SQL_REPAIR_EXHAUSTED",
+        retryable=False,
+        kind=DenialKind.GATE,
+        user_message="The same SQL failed twice with the same error. This attempt was not executed. Use a materially corrected query, or bind this result_id to a blocked intent and disclose that execution could not be completed. This does not prove missing data or denied permissions.",
+    ),
     "CLICKHOUSE_QUERY_ERROR": DenialInfo(
         code="CLICKHOUSE_QUERY_ERROR",
         retryable=True,

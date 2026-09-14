@@ -149,20 +149,20 @@ class ExecCompleted:
 class ExecPaused:
     """A pause the executor yields; the loop honors it.
 
-        A slot-resolution `askUser` (`reason="blueprint_slot"`, `awaiting_node=None`) happens
-        BEFORE any node runs, so there is no mid-DAG state to rehydrate and the resume re-runs
-        via the model loop.
+    A slot-resolution `askUser` (`reason="blueprint_slot"`, `awaiting_node=None`) happens
+    BEFORE any node runs, so there is no mid-DAG state to rehydrate and the resume re-runs
+    via the model loop.
 
-        An approval gate (`blueprint_approval`) or a `when…on_violation:ask`
-        (`blueprint_when_ask`) carries `completed_nodes_json` — the SCALAR outputs, provenance,
-        SQL and (for a table producer) the materialized `scratch.…` table name + row count of
-        the nodes already run — plus `awaiting_node`, so `AgentLoop.resume` re-enters
-        `resume()` with completed nodes rehydrated and never re-runs them (exactly-once,
-        surviving a process restart). It comes back as persisted, therefore untrusted, JSON:
-        the carried table is re-validated for session ownership (D64) AND re-counted live
-        before anything binds it, because the intermediate's TTL expires ROWS while leaving
-        the table standing. A `resolve_via` degrade does NOT pause; it falls back to the raw
-        loop.
+    An approval gate (`blueprint_approval`) or a `when…on_violation:ask`
+    (`blueprint_when_ask`) carries `completed_nodes_json` — the SCALAR outputs, provenance,
+    SQL and (for a table producer) the materialized `scratch.…` table name + row count of
+    the nodes already run — plus `awaiting_node`, so `AgentLoop.resume` re-enters
+    `resume()` with completed nodes rehydrated and never re-runs them (exactly-once,
+    surviving a process restart). It comes back as persisted, therefore untrusted, JSON:
+    the carried table is re-validated for session ownership (D64) AND re-counted live
+    before anything binds it, because the intermediate's TTL expires ROWS while leaving
+    the table standing. A `resolve_via` degrade does NOT pause; it falls back to the raw
+    loop.
     """
 
     reason: str  # "blueprint_slot" | "blueprint_approval" | "blueprint_when_ask"
@@ -190,7 +190,7 @@ ExecOutcome = ExecCompleted | ExecPaused | ExecFailed
 
 class BlueprintExecutor:
     """The DAG walker. Stateless per call; every dependency is injected so Layer-1 fakes and
-        the live stack use the identical path.
+    the live stack use the identical path.
     """
 
     def __init__(
@@ -307,10 +307,10 @@ class BlueprintExecutor:
     ) -> ExecOutcome:
         """Re-enter a paused mid-DAG blueprint at *awaiting_node* (D45).
 
-                Stateless by construction: everything needed to continue lives in the checkpoint the
-                loop passes back (the raw `slot_bindings`, the completed SCALAR outputs, the node to
-                resume at), so a FRESH process resumes identically. The loop has already CAS-consumed
-                the checkpoint (exactly-once); completed nodes are rehydrated here and NEVER re-run.
+        Stateless by construction: everything needed to continue lives in the checkpoint the
+        loop passes back (the raw `slot_bindings`, the completed SCALAR outputs, the node to
+        resume at), so a FRESH process resumes identically. The loop has already CAS-consumed
+        the checkpoint (exactly-once); completed nodes are rehydrated here and NEVER re-run.
         """
         detail = await self._vector_index.get_blueprint(blueprint_id)
         if detail is None or not is_blueprint_in_scope(
@@ -402,7 +402,9 @@ class BlueprintExecutor:
         # shape the loader forbids, but a poisoned/legacy record could carry) still
         # cannot be scalar-passed → UNSUPPORTED (defense-in-depth, fail-closed).
         if _has_table_intermediate(blueprint.composes) and not table_consumed_orders:
-            _logger.info("blueprint %s has a table intermediate with no table consume; UNSUPPORTED", bid)
+            _logger.info(
+                "blueprint %s has a table intermediate with no table consume; UNSUPPORTED", bid
+            )
             return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
         # node order → full "scratch.s_<sid>_bp_<uuid>". Populated live by
         # `_materialize_node` AND — since the mid-DAG-pause fix — re-seeded on resume
@@ -542,9 +544,7 @@ class BlueprintExecutor:
             # 4b. Approval gate (D59b) — pause showing UPSTREAM outputs only.
             if is_approval_node:
                 resumed_here = node.order == awaiting_node and approval_answer is not None
-                decision = (
-                    _approval_decision(approval_answer) if resumed_here else "repause"
-                )
+                decision = _approval_decision(approval_answer) if resumed_here else "repause"
                 if decision != "approve":
                     if decision == "deny":
                         # on_deny: skip_remaining — stop. Result ROWS are not carried
@@ -591,8 +591,7 @@ class BlueprintExecutor:
             )
             if bind_fail is not None:
                 _logger.warning(
-                    "blueprint %s node %s has referenced token(s) with no binding; "
-                    "SLOT_INVALID",
+                    "blueprint %s node %s has referenced token(s) with no binding; SLOT_INVALID",
                     bid,
                     node.order,
                 )
@@ -618,6 +617,13 @@ class BlueprintExecutor:
                 "blueprint_step",
                 {"blueprint_id": bid, "step": "executing_node", "node": node.order},
             )
+            from data_agent.runtime.loop.measurement import validate_join_cardinality
+
+            aggregation_error = await validate_join_cardinality(
+                node_sql, self._tool_dispatcher, credentials
+            )
+            if aggregation_error:
+                return ExecFailed("AGGREGATION_RISK", aggregation_error, retryable=True)
             result = await self._tool_dispatcher.dispatch(
                 "runQuery",
                 {"sql": node_sql, "limit": self._query_limit},
@@ -685,7 +691,9 @@ class BlueprintExecutor:
             return ExecFailed(ABORTED_CODE, _ABORTED_MESSAGE, retryable=True)
 
         # 5. Verify the FINAL node result (D56) + build the verified answer.
-        return await self._finalize(blueprint, terminal, node_sqls, provenances, credentials)
+        return await self._finalize(
+            blueprint, terminal, node_sqls, provenances, credentials, bound_slots=bound_slots
+        )
 
     async def _resolve_all_slots(
         self,
@@ -713,11 +721,15 @@ class BlueprintExecutor:
                 domain = None
             outcome = resolve_slot(raw, spec, domain=domain)
             if isinstance(outcome, AskUser):
-                return bound, omitted_patterns, ExecPaused(
-                    reason="blueprint_slot",
-                    pending_question={"question": outcome.question, "options": outcome.options},
-                    blueprint_id=blueprint.id,
-                    slot_bindings_json=_dumps(slot_bindings),
+                return (
+                    bound,
+                    omitted_patterns,
+                    ExecPaused(
+                        reason="blueprint_slot",
+                        pending_question={"question": outcome.question, "options": outcome.options},
+                        blueprint_id=blueprint.id,
+                        slot_bindings_json=_dumps(slot_bindings),
+                    ),
                 )
             if isinstance(outcome, OmitSlot):
                 # Slice C: carry an omitted optional slot's `optional_pattern` for
@@ -746,8 +758,10 @@ class BlueprintExecutor:
                         spec.name,
                         sorted(tokens - all_referenced),
                     )
-                    return bound, omitted_patterns, ExecFailed(
-                        SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True
+                    return (
+                        bound,
+                        omitted_patterns,
+                        ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True),
                     )
                 bound.update(expand_binding(spec, outcome.value))
         return bound, omitted_patterns, None
@@ -772,7 +786,9 @@ class BlueprintExecutor:
             if self._resolve_values is None:
                 # A dynamic rule with no resolve hook wired → cannot expand; never
                 # run the query unfiltered → raw loop.
-                _logger.info("blueprint %s has a resolve_via rule but no hook; UNSUPPORTED", blueprint.id)
+                _logger.info(
+                    "blueprint %s has a resolve_via rule but no hook; UNSUPPORTED", blueprint.id
+                )
                 return {}, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
             self._observer(
                 "blueprint_step", {"blueprint_id": blueprint.id, "step": "resolving_rule"}
@@ -824,6 +840,8 @@ class BlueprintExecutor:
         node_sqls: list[str],
         provenances: list[frozenset[tuple[str, str]] | None],
         credentials: RuntimeCredentials,
+        *,
+        bound_slots: dict[str, Any] | None = None,
     ) -> ExecOutcome:
         """Run the D56 gate over the FINAL node result and build the verified
         answer (§2.2 step 5 / §5.2). Identical teeth to the single-node path."""
@@ -863,6 +881,7 @@ class BlueprintExecutor:
             # a concrete pageable query WITHOUT re-running the blueprint (see
             # `composite/answer_with_table.py`).
             "terminal_sql": terminal_sql,
+            "bound_slots": dict(bound_slots or {}),
             "verify": _verify_block(verify_out, row_count),
         }
         _stamp_window_anchor(
@@ -916,17 +935,17 @@ class BlueprintExecutor:
         self, binds_to: str, credentials: RuntimeCredentials
     ) -> tuple[list[str] | None, list[frozenset[tuple[str, str]] | None]]:
         """Return the scope-enforced DISTINCT domain of `binds_to` ("database.table.column") and
-                the provenance entries to fold into the union:
+        the provenance entries to fold into the union:
 
-                  - a malformed `binds_to`, or a denied or errored probe -> `(None, [])`: no domain
-                    (the resolver binds directly, and the NODE query's own D57 enforcement still
-                    gates it — never a fabricated match), and NOTHING is added to the union, since a
-                    denied probe read nothing.
-                  - a SUCCESSFUL probe -> `(values, [probe.provenance])`, appended UNCONDITIONALLY
-                    even when `None`, so a successful probe with undetermined provenance POISONS the
-                    union — the same fail-closed rule as the node and grain queries.
+          - a malformed `binds_to`, or a denied or errored probe -> `(None, [])`: no domain
+            (the resolver binds directly, and the NODE query's own D57 enforcement still
+            gates it — never a fabricated match), and NOTHING is added to the union, since a
+            denied probe read nothing.
+          - a SUCCESSFUL probe -> `(values, [probe.provenance])`, appended UNCONDITIONALLY
+            even when `None`, so a successful probe with undetermined provenance POISONS the
+            union — the same fail-closed rule as the node and grain queries.
 
-                An ordinary dispatched runQuery; it does not count against the model budget.
+        An ordinary dispatched runQuery; it does not count against the model budget.
         """
         db_table, sep, column = binds_to.rpartition(".")
         if not sep or not db_table or not column:
@@ -958,69 +977,69 @@ class BlueprintExecutor:
         credentials: RuntimeCredentials,
     ) -> dict[int, str]:
         """Re-seed `materialized` on resume from the checkpoint's completed-node records
-                — the ONLY way a table intermediate can survive a mid-DAG pause, since its
-                producer is rehydrated-skipped and never re-materializes (exactly-once, D45).
+        — the ONLY way a table intermediate can survive a mid-DAG pause, since its
+        producer is rehydrated-skipped and never re-materializes (exactly-once, D45).
 
-                Nothing here is trusted. Three gates, cheapest first, and a failure of any one
-                simply does NOT seed that order: the consumer then finds no binding for its
-                `$N`, `_node_table_bindings` returns the pre-existing SLOT_INVALID, and the raw
-                loop answers. No new error code, no partial bind.
+        Nothing here is trusted. Three gates, cheapest first, and a failure of any one
+        simply does NOT seed that order: the consumer then finds no binding for its
+        `$N`, `_node_table_bindings` returns the pre-existing SLOT_INVALID, and the raw
+        loop answers. No new error code, no partial bind.
 
-                1. OWNERSHIP (D64) — the trust boundary. Every OTHER value that ever reached
-                   `materialized` came straight back from the scratch endpoint, which derives
-                   the `s_<sid>_` prefix server-side from X-Session-Id. THIS one comes from
-                   persisted checkpoint JSON, which a tampered session document could author,
-                   and it flows on into `_node_table_bindings` -> `bind_template` -> an
-                   identifier in dispatched SQL. It is AST-quoted, so not an injection surface
-                   — but a name reading `scratch.s_<OTHERSID>_bp_…` would be rewritten into the
-                   JOIN as a cross-session scratch read. So the SAME ownership rule the
-                   provenance extractor enforces on a read is re-applied at the point the
-                   untrusted name re-enters the runtime. Defense in depth: the MCP's own D64
-                   read gate would also deny it at dispatch; we do not make that the only check.
+        1. OWNERSHIP (D64) — the trust boundary. Every OTHER value that ever reached
+           `materialized` came straight back from the scratch endpoint, which derives
+           the `s_<sid>_` prefix server-side from X-Session-Id. THIS one comes from
+           persisted checkpoint JSON, which a tampered session document could author,
+           and it flows on into `_node_table_bindings` -> `bind_template` -> an
+           identifier in dispatched SQL. It is AST-quoted, so not an injection surface
+           — but a name reading `scratch.s_<OTHERSID>_bp_…` would be rewritten into the
+           JOIN as a cross-session scratch read. So the SAME ownership rule the
+           provenance extractor enforces on a read is re-applied at the point the
+           untrusted name re-enters the runtime. Defense in depth: the MCP's own D64
+           read gate would also deny it at dispatch; we do not make that the only check.
 
-                   WHAT THIS GATE DOES NOT COVER: it proves the named table belongs to THIS
-                   session, not that it is the table this run produced. WITHIN-session
-                   integrity belongs to the session document — a tamperer with write access to
-                   it can swap in a different own-session scratch table, exactly as they can
-                   rewrite the `output` scalars or the carried `sql`. That is the pre-existing
-                   trust model for the checkpoint, not something the table carry widens.
+           WHAT THIS GATE DOES NOT COVER: it proves the named table belongs to THIS
+           session, not that it is the table this run produced. WITHIN-session
+           integrity belongs to the session document — a tamperer with write access to
+           it can swap in a different own-session scratch table, exactly as they can
+           rewrite the `output` scalars or the carried `sql`. That is the pre-existing
+           trust model for the checkpoint, not something the table carry widens.
 
-                2. A CARRIED ROW COUNT must be present and well-typed. A checkpoint written by
-                   code older than this gate has a table but no count; the count cannot be
-                   verified, so the name is refused (fail-closed on the deploy boundary).
+        2. A CARRIED ROW COUNT must be present and well-typed. A checkpoint written by
+           code older than this gate has a table but no count; the count cannot be
+           verified, so the name is refused (fail-closed on the deploy boundary).
 
-                3. A LIVE COUNT of the named table must match it EXACTLY. This is the TTL
-                   gate. The intermediate carries a ROW-level TTL on a MergeTree (ch-api
-                   `build_scratch_create_sql`), so after `scratch_ttl_seconds` (3600 by
-                   default, against a 7-day session doc) the table still resolves while its
-                   rows are gone — no dispatch error, a smaller JOIN, and a D56 shape check
-                   that validates the smaller result happily. Exact equality in BOTH
-                   directions distinguishes the two cases an emptiness check would conflate: a
-                   producer that legitimately materialized ZERO rows stores 0, probes 0 and
-                   passes; one that materialized 812 and expired to 0 — or to 300 mid-merge —
-                   is refused.
+        3. A LIVE COUNT of the named table must match it EXACTLY. This is the TTL
+           gate. The intermediate carries a ROW-level TTL on a MergeTree (ch-api
+           `build_scratch_create_sql`), so after `scratch_ttl_seconds` (3600 by
+           default, against a 7-day session doc) the table still resolves while its
+           rows are gone — no dispatch error, a smaller JOIN, and a D56 shape check
+           that validates the smaller result happily. Exact equality in BOTH
+           directions distinguishes the two cases an emptiness check would conflate: a
+           producer that legitimately materialized ZERO rows stores 0, probes 0 and
+           passes; one that materialized 812 and expired to 0 — or to 300 mid-merge —
+           is refused.
 
-                   POINT-IN-TIME, NOT HELD (TOCTOU residual). The count and the consumer's
-                   JOIN are two separate dispatches with no lock, no snapshot and no shared
-                   session, so a TTL merge committing between them still shrinks the table
-                   after a passing count, silently and with the same failure mode. Be precise
-                   about the size of what is left: that window is IN-PROCESS and sub-second
-                   (one round trip), against the unbounded one this gate closes — a 3600s row
-                   TTL under a checkpoint that can sit in a 7-day session doc. A real
-                   narrowing, not a full close. Closing it fully needs the count and the JOIN
-                   to share ONE statement's parts snapshot — e.g. folding a scalar
-                   `(SELECT count() FROM scratch.t) = <expected>` predicate into the consumer
-                   — which is named here as the option and deliberately NOT built.
+           POINT-IN-TIME, NOT HELD (TOCTOU residual). The count and the consumer's
+           JOIN are two separate dispatches with no lock, no snapshot and no shared
+           session, so a TTL merge committing between them still shrinks the table
+           after a passing count, silently and with the same failure mode. Be precise
+           about the size of what is left: that window is IN-PROCESS and sub-second
+           (one round trip), against the unbounded one this gate closes — a 3600s row
+           TTL under a checkpoint that can sit in a 7-day session doc. A real
+           narrowing, not a full close. Closing it fully needs the count and the JOIN
+           to share ONE statement's parts snapshot — e.g. folding a scalar
+           `(SELECT count() FROM scratch.t) = <expected>` predicate into the consumer
+           — which is named here as the option and deliberately NOT built.
 
-                   The count/JOIN equivalence also rests on the D93 DDL being a plain
-                   MergeTree with a row TTL: `COUNT(*)` is answered from part metadata, and
-                   the JOIN reads the same committed parts, so at one instant the two cannot
-                   disagree. That would break if scratch tables ever gained lightweight
-                   DELETEs (a part-metadata count ignores `_row_exists`) or a `FINAL` read.
-                   Neither applies today; both would need this gate revisited.
+           The count/JOIN equivalence also rests on the D93 DDL being a plain
+           MergeTree with a row TTL: `COUNT(*)` is answered from part metadata, and
+           the JOIN reads the same committed parts, so at one instant the two cannot
+           disagree. That would break if scratch tables ever gained lightweight
+           DELETEs (a part-metadata count ignores `_row_exists`) or a `FINAL` read.
+           Neither applies today; both would need this gate revisited.
 
-                Only orders that are actually table-consumed are considered, so a refused or
-                irrelevant record costs no dispatch at all.
+        Only orders that are actually table-consumed are considered, so a refused or
+        irrelevant record costs no dispatch at all.
         """
         restored: dict[int, str] = {}
         for order in sorted(table_consumed_orders):
@@ -1090,34 +1109,34 @@ class BlueprintExecutor:
         self, full_table: str, credentials: RuntimeCredentials
     ) -> int | None:
         """`SELECT COUNT(*)` the named scratch table through the runQuery choke point →
-                its live row count, or `None` on ANY surprise (a denial, an error, a vanished
-                table, an unreadable result). The caller treats `None` as "do not restore".
+        its live row count, or `None` on ANY surprise (a denial, an error, a vanished
+        table, an unreadable result). The caller treats `None` as "do not restore".
 
-                Dispatched exactly as `_probe_domain` dispatches its DISTINCT probe: through
-                `ToolDispatcher.dispatch` so D64 scratch isolation, D57 column scope and D5
-                credential injection come free, and with `emit_progress=False` so it stays an
-                internal query that costs no model budget. The table is built as an AST
-                identifier, never string-interpolated — the ownership rule constrains the
-                name's SHAPE (`s_<sid>_<suffix>`) but not its character set, so the suffix is
-                still endpoint-returned-or-persisted text and gets the same structural
-                treatment the JOIN rewrite gives it.
+        Dispatched exactly as `_probe_domain` dispatches its DISTINCT probe: through
+        `ToolDispatcher.dispatch` so D64 scratch isolation, D57 column scope and D5
+        credential injection come free, and with `emit_progress=False` so it stays an
+        internal query that costs no model budget. The table is built as an AST
+        identifier, never string-interpolated — the ownership rule constrains the
+        name's SHAPE (`s_<sid>_<suffix>`) but not its character set, so the suffix is
+        still endpoint-returned-or-persisted text and gets the same structural
+        treatment the JOIN rewrite gives it.
 
-                PROVENANCE: unlike `_probe_domain` (which appends its probe's provenance
-                UNCONDITIONALLY on success, so an undetermined footprint POISONS the union),
-                this probe contributes NOTHING to `provenances`. Deliberate, and the asymmetry
-                is real rather than an oversight: a domain probe READS A WAREHOUSE COLUMN, so
-                an undetermined provenance there means "we read warehouse data and cannot say
-                what" and must poison. This probe reads exactly one table, in the `scratch`
-                database, pinned by the gate above — no warehouse column is touched, scratch
-                pairs are excluded from the USES set by construction (D69/OQ-4), and the
-                warehouse lineage of the rows it counts is the PRODUCER's provenance, which is
-                carried on the same checkpoint record and already folded into the union. So
-                folding this probe could only ever add an empty set, or spuriously poison an
-                otherwise-honest footprint because an internal integrity check hiccuped. The
-                answer's footprint claim is unchanged and still complete either way.
+        PROVENANCE: unlike `_probe_domain` (which appends its probe's provenance
+        UNCONDITIONALLY on success, so an undetermined footprint POISONS the union),
+        this probe contributes NOTHING to `provenances`. Deliberate, and the asymmetry
+        is real rather than an oversight: a domain probe READS A WAREHOUSE COLUMN, so
+        an undetermined provenance there means "we read warehouse data and cannot say
+        what" and must poison. This probe reads exactly one table, in the `scratch`
+        database, pinned by the gate above — no warehouse column is touched, scratch
+        pairs are excluded from the USES set by construction (D69/OQ-4), and the
+        warehouse lineage of the rows it counts is the PRODUCER's provenance, which is
+        carried on the same checkpoint record and already folded into the union. So
+        folding this probe could only ever add an empty set, or spuriously poison an
+        otherwise-honest footprint because an internal integrity check hiccuped. The
+        answer's footprint claim is unchanged and still complete either way.
 
-                The number returned is COUNT(*), not a row of data: it is compared against a
-                stored integer and never reaches the model, the answer or a binding.
+        The number returned is COUNT(*), not a row of data: it is compared against a
+        stored integer and never reaches the model, the answer or a binding.
         """
         db, _sep, name = full_table.partition(".")
         probe_sql = (
@@ -1173,20 +1192,20 @@ class BlueprintExecutor:
         credentials: RuntimeCredentials,
     ) -> tuple[str | None, int | None, ExecFailed | None]:
         """Materialize a table-output node's result into a session-scoped scratch table via the
-                D93 side-channel.
+        D93 side-channel.
 
-                Returns `(full_scratch_table_name, row_count, None)` on success — the RETURNED
-                `scratch.s_<sid>_bp_<uuid>` name, used VERBATIM and never reconstructed, and the
-                number of rows ACTUALLY sent to the endpoint — or `(None, None,
-                ExecFailed(UNSUPPORTED))` on a structural over-cap or a rejected materialize.
-                Both fail closed to the raw loop: never a runaway materialization, never a wrong
-                answer.
+        Returns `(full_scratch_table_name, row_count, None)` on success — the RETURNED
+        `scratch.s_<sid>_bp_<uuid>` name, used VERBATIM and never reconstructed, and the
+        number of rows ACTUALLY sent to the endpoint — or `(None, None,
+        ExecFailed(UNSUPPORTED))` on a structural over-cap or a rejected materialize.
+        Both fail closed to the raw loop: never a runaway materialization, never a wrong
+        answer.
 
-                The row count is returned (rather than re-derived at the call site from
-                `result_full`) so it can only ever be the length of the list this function
-                handed the endpoint. It is stored on the checkpoint record and is what a resume
-                re-counts the table against — see `_restore_materialized`; a count computed from
-                a different vantage point could drift from what was actually written.
+        The row count is returned (rather than re-derived at the call site from
+        `result_full`) so it can only ever be the length of the list this function
+        handed the endpoint. It is stored on the checkpoint record and is what a resume
+        re-counts the table against — see `_restore_materialized`; a count computed from
+        a different vantage point could drift from what was actually written.
         """
         columns, rows, _rc, truncated = _unpack_result(result_full)
         if not columns:
@@ -1444,29 +1463,33 @@ def _unpack_result(raw: Any) -> tuple[list[str], list[list[Any]], int, bool]:
     columns = list(columns) if isinstance(columns, list) else []
     rows = [list(r) for r in rows if isinstance(r, list | tuple)] if isinstance(rows, list) else []
     row_count = raw.get("row_count")
-    row_count = int(row_count) if isinstance(row_count, int) and not isinstance(row_count, bool) else len(rows)
+    row_count = (
+        int(row_count)
+        if isinstance(row_count, int) and not isinstance(row_count, bool)
+        else len(rows)
+    )
     truncated = bool(raw.get("truncated", False))
     return columns, rows, row_count, truncated
 
 
 def _verify_block(verify_out: VerifyOutcome, row_count: int) -> dict[str, Any]:
     """The `result_full["verify"]` block — ONE builder for BOTH the single-node and the DAG
-        finalize path, so the two can never describe the same gate differently.
+    finalize path, so the two can never describe the same gate differently.
 
-        AN EMPTY RESULT IS UNVERIFIABLE, NOT VERIFIED. The D56 grain teeth are
-        `row_count == distinct_grain_count`; at zero rows that reads `0 == 0`, which passes for
-        every blueprint ever written, correct or not. The check did not catch anything because
-        there was nothing to catch, so it is reported as NOT having run (`grain_checked: False`)
-        plus an explicit `empty_result: True` marker — which is what lets the badge say
-        *empty — unverifiable* instead of *verified*.
+    AN EMPTY RESULT IS UNVERIFIABLE, NOT VERIFIED. The D56 grain teeth are
+    `row_count == distinct_grain_count`; at zero rows that reads `0 == 0`, which passes for
+    every blueprint ever written, correct or not. The check did not catch anything because
+    there was nothing to catch, so it is reported as NOT having run (`grain_checked: False`)
+    plus an explicit `empty_result: True` marker — which is what lets the badge say
+    *empty — unverifiable* instead of *verified*.
 
-        DELIBERATELY UNTOUCHED: `grain_ok` stays as the gate computed it (vacuously True). It,
-        with `signature_ok`, is what `tool._is_verified_blueprint_result` reads to set the
-        `authoritative` marker, and an empty blueprint result IS still the authoritative answer
-        for its intent. Only the VERIFICATION CLAIM is withdrawn, never the no-re-derivation rule.
+    DELIBERATELY UNTOUCHED: `grain_ok` stays as the gate computed it (vacuously True). It,
+    with `signature_ok`, is what `tool._is_verified_blueprint_result` reads to set the
+    `authoritative` marker, and an empty blueprint result IS still the authoritative answer
+    for its intent. Only the VERIFICATION CLAIM is withdrawn, never the no-re-derivation rule.
 
-        On a NON-empty result the returned dict is byte-identical to what it has always been:
-        `empty_result` is emitted only when it is true.
+    On a NON-empty result the returned dict is byte-identical to what it has always been:
+    `empty_result` is emitted only when it is true.
     """
     block: dict[str, Any] = {
         "grain_ok": verify_out.grain_ok,
@@ -1488,13 +1511,13 @@ def _union_provenance(
     provenances: list[frozenset[tuple[str, str]] | None],
 ) -> frozenset[tuple[str, str]] | None:
     """Union every inner runQuery's captured provenance. Fail-closed: if ANY inner call had
-        undetermined (`None`) provenance the union is `None` — the assistant message then drops
-        from D44 replay, matching `_compute_turn_provenance_union`'s posture.
+    undetermined (`None`) provenance the union is `None` — the assistant message then drops
+    from D44 replay, matching `_compute_turn_provenance_union`'s posture.
 
-        SCRATCH columns are EXCLUDED (D69): a `scratch.*` pair is session-gated, not scope-gated,
-        and the materialized scratch table is an ephemeral projection of already-scope-checked
-        warehouse data. Dropping those pairs keeps the persisted footprint HONEST — exactly the
-        real warehouse columns the answer depends on. The `None`-poison rule is unchanged.
+    SCRATCH columns are EXCLUDED (D69): a `scratch.*` pair is session-gated, not scope-gated,
+    and the materialized scratch table is an ephemeral projection of already-scope-checked
+    warehouse data. Dropping those pairs keeps the persisted footprint HONEST — exactly the
+    real warehouse columns the answer depends on. The `None`-poison rule is unchanged.
     """
     acc: set[tuple[str, str]] = set()
     for prov in provenances:
@@ -1554,8 +1577,7 @@ def _has_table_intermediate(nodes: tuple[Node, ...]) -> bool:
     for n in nodes:
         upstream.update(n.feeds_from)
     return any(
-        n.order in upstream and any(kind == "table" for kind in n.output.values())
-        for n in nodes
+        n.order in upstream and any(kind == "table" for kind in n.output.values()) for n in nodes
     )
 
 
@@ -1602,11 +1624,11 @@ def _node_table_bindings(
 def _infer_ch_type(values: list[Any]) -> str:
     """Infer the non-Nullable ClickHouse type for a column's NON-NULL cells.
 
-        Maps NATIVE result types: Bool -> Int64 -> Float64 -> String. A STRING cell maps to
-        `String` and is never re-parsed as a number, so an explicit `toString(...)` CAST on a
-        join key is HONORED — the scratch column stays String and matches the String warehouse
-        key, sidestepping the all-numeric-string mistyping hazard. Any mixed column falls back to
-        `String` (fail-safe: the endpoint stores it as data).
+    Maps NATIVE result types: Bool -> Int64 -> Float64 -> String. A STRING cell maps to
+    `String` and is never re-parsed as a number, so an explicit `toString(...)` CAST on a
+    join key is HONORED — the scratch column stays String and matches the String warehouse
+    key, sidestepping the all-numeric-string mistyping hazard. Any mixed column falls back to
+    `String` (fail-safe: the endpoint stores it as data).
     """
     if not values:
         return "String"  # all-NULL → the caller Nullable-wraps this
@@ -1619,9 +1641,7 @@ def _infer_ch_type(values: list[Any]) -> str:
     return "String"
 
 
-def _infer_scratch_columns(
-    columns: list[str], rows: list[list[Any]]
-) -> list[dict[str, str]]:
+def _infer_scratch_columns(columns: list[str], rows: list[list[Any]]) -> list[dict[str, str]]:
     """Infer `[{name, type}]` for a table intermediate (OQ-A default — runtime
     inference reusing admin_ingest's Int64→Float64→String ladder, Nullable-wrapped
     on any NULL). The endpoint RE-VALIDATES every type against its whitelist and
@@ -1639,11 +1659,11 @@ def _infer_scratch_columns(
 def _all_referenced_slots(blueprint: Blueprint) -> set[str]:
     """Every `{slot}` token referenced by the templates the DAG path ACTUALLY runs.
 
-        When `composes` is non-empty the DAG path runs and the top-level `sql_template` is DEAD.
-        Counting its `{slot}` tokens here would let a required slot that lives ONLY in the dead
-        template pass the referenced-slot backstop while being silently dropped at execution — a
-        company-wide "verified" wrong answer. So only node templates count when composes is
-        present; the loader also rejects the both-present hybrid outright.
+    When `composes` is non-empty the DAG path runs and the top-level `sql_template` is DEAD.
+    Counting its `{slot}` tokens here would let a required slot that lives ONLY in the dead
+    template pass the referenced-slot backstop while being silently dropped at execution — a
+    company-wide "verified" wrong answer. So only node templates count when composes is
+    present; the loader also rejects the both-present hybrid outright.
     """
     referenced: set[str] = set()
     if blueprint.composes:
@@ -1658,13 +1678,13 @@ def _all_referenced_slots(blueprint: Blueprint) -> set[str]:
 def _extract_scalar_output(node: Node, result_full: Any) -> dict[str, Any] | None:
     """Read a query node's SCALAR output(s) from its single-cell result.
 
-        A scalar intermediate is a single cell per declared scalar. Fail-closed: returns `None` —
-        a hard contract violation the caller maps to SLOT_INVALID — when the node does NOT return
-        exactly one row, when the column count does not equal the declared-scalar count, or when
-        a mapped cell is NULL. This closes the "silently take `rows[0][0]`" hazard: the D56 grain
-        gate only guards the TERMINAL node, so a fanned-out or wide intermediate would otherwise
-        bind an ARBITRARY cell downstream and still return a "verified" answer. A node with NO
-        declared scalar output yields `{}`.
+    A scalar intermediate is a single cell per declared scalar. Fail-closed: returns `None` —
+    a hard contract violation the caller maps to SLOT_INVALID — when the node does NOT return
+    exactly one row, when the column count does not equal the declared-scalar count, or when
+    a mapped cell is NULL. This closes the "silently take `rows[0][0]`" hazard: the D56 grain
+    gate only guards the TERMINAL node, so a fanned-out or wide intermediate would otherwise
+    bind an ARBITRARY cell downstream and still return a "verified" answer. A node with NO
+    declared scalar output yields `{}`.
     """
     scalars = [name for name, kind in node.output.items() if kind == "scalar"]
     if not scalars:
@@ -1725,13 +1745,13 @@ def _node_bindings(
     omitted_patterns: dict[str, str],
 ) -> tuple[dict[str, Any], ExecFailed | None]:
     """Assemble the exact `{placeholder: value}` set a node template needs from (a) upstream
-        scalar `consumes`, (b) resolved slots, and (c) `resolve_via` rule IN-lists. An unbound
-        placeholder or an unresolvable consume is fail-closed to SLOT_INVALID (never a half-bound
-        query).
+    scalar `consumes`, (b) resolved slots, and (c) `resolve_via` rule IN-lists. An unbound
+    placeholder or an unresolvable consume is fail-closed to SLOT_INVALID (never a half-bound
+    query).
 
-        *omitted_patterns* carries tokens satisfied by an omitted optional slot's
-        `optional_pattern` — NOT value-bound here, since the pattern replaces their predicate in
-        `bind_template`, so they are excluded from the unbound-token check.
+    *omitted_patterns* carries tokens satisfied by an omitted optional slot's
+    `optional_pattern` — NOT value-bound here, since the pattern replaces their predicate in
+    `bind_template`, so they are excluded from the unbound-token check.
     """
     refs = referenced_slots(node.sql_template or "")
     bindings: dict[str, Any] = {}
@@ -1793,22 +1813,47 @@ def _approval_question(node: Node) -> str:
 # ("do not proceed", "I'd rather not") wins over an affirmative substring it
 # contains ("proceed"); an unrecognized reply is neither → re-pause (never run).
 _APPROVAL_NEGATIVES: tuple[str, ...] = (
-    "no", "not", "n't", "deny", "denied", "decline", "never", "reject",
-    "cancel", "stop", "abort", "rather not", "won't", "wont",
+    "no",
+    "not",
+    "n't",
+    "deny",
+    "denied",
+    "decline",
+    "never",
+    "reject",
+    "cancel",
+    "stop",
+    "abort",
+    "rather not",
+    "won't",
+    "wont",
 )
 _APPROVAL_AFFIRMATIVES: tuple[str, ...] = (
-    "approve", "approved", "yes", "yep", "yeah", "ok", "okay", "proceed",
-    "continue", "confirm", "confirmed", "go ahead", "sure", "affirm", "do it",
+    "approve",
+    "approved",
+    "yes",
+    "yep",
+    "yeah",
+    "ok",
+    "okay",
+    "proceed",
+    "continue",
+    "confirm",
+    "confirmed",
+    "go ahead",
+    "sure",
+    "affirm",
+    "do it",
 )
 
 
 def _approval_decision(answer: str | None) -> str:
     """Classify a resume answer as `"approve"` | `"deny"` | `"repause"`.
 
-        Consent is opt-IN: proceed ONLY on an explicit affirmative. An explicit negation denies
-        (raw-loop fallback); anything unrecognized — garbage, silence — re-asks the same gate,
-        never proceeding on ambiguity. Negations are matched before affirmatives, so "do not
-        proceed" denies rather than the embedded "proceed" approving.
+    Consent is opt-IN: proceed ONLY on an explicit affirmative. An explicit negation denies
+    (raw-loop fallback); anything unrecognized — garbage, silence — re-asks the same gate,
+    never proceeding on ambiguity. Negations are matched before affirmatives, so "do not
+    proceed" denies rather than the embedded "proceed" approving.
     """
     if answer is None:
         return "repause"
@@ -1964,7 +2009,9 @@ def _rehydrate_completed(completed_nodes_json: str | None) -> dict[int, dict[str
                     _prov_from_jsonable(entry.get("provenance")),
                     sql if isinstance(sql, str) else None,
                     table if isinstance(table, str) else None,
-                    rows if isinstance(rows, int) and not isinstance(rows, bool) and rows >= 0 else None,
+                    rows
+                    if isinstance(rows, int) and not isinstance(rows, bool) and rows >= 0
+                    else None,
                 )
     return completed
 

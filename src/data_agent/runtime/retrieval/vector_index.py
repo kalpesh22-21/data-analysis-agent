@@ -22,6 +22,7 @@ from opentelemetry import trace
 from data_agent.runtime.blueprint.models import WINDOW_ANCHORS
 from data_agent.runtime.composite.ranking import cosine
 
+from .hybrid import BLUEPRINT_TEXT_INDEX, keyword_query
 from .models import BlueprintDetail, Candidate
 
 if TYPE_CHECKING:
@@ -39,19 +40,19 @@ class VectorIndex(Protocol):
     async def recall(self, *, query_vector: list[float], kind: str, k: int) -> list[Candidate]:
         """Return up to *k* nearest `Candidate`s of *kind*, most-similar first.
 
-                The real (neo4j) impl reads the `embedding_model` stamped on stored vectors and
-                returns `[]` on a model-id mismatch rather than garbage neighbours. An unavailable
-                or empty index also returns `[]` — a per-corpus degrade that never fails the turn.
+        The real (neo4j) impl reads the `embedding_model` stamped on stored vectors and
+        returns `[]` on a model-id mismatch rather than garbage neighbours. An unavailable
+        or empty index also returns `[]` — a per-corpus degrade that never fails the turn.
         """
         ...
 
     async def get_blueprint(self, blueprint_id: str) -> BlueprintDetail | None:
         """Keyed fetch of one blueprint's stored projection by id. NOT a vector op — a single
-                keyed read over the same store — but colocated here so `getBlueprint` needs no
-                parallel store abstraction.
+        keyed read over the same store — but colocated here so `getBlueprint` needs no
+        parallel store abstraction.
 
-                `None` on a genuine miss AND on any store failure (the real impl never raises), which
-                the tool renders identically as `{found: false}` — the non-oracle.
+        `None` on a genuine miss AND on any store failure (the real impl never raises), which
+        the tool renders identically as `{found: false}` — the non-oracle.
         """
         ...
 
@@ -59,10 +60,10 @@ class VectorIndex(Protocol):
 class FakeVectorIndex:
     """Layer-1 `VectorIndex` double — an in-memory corpus ranked by cosine.
 
-        Seeded per test with `(Candidate, vector)` pairs; `recall` filters by `kind`, ranks by
-        cosine descending and returns the top-*k* with `Candidate.score` set to the similarity.
-        Deterministic, no network. A `fail=True` flag makes `recall` return `[]` for every
-        corpus, to exercise the pipeline's index-unavailable degrade.
+    Seeded per test with `(Candidate, vector)` pairs; `recall` filters by `kind`, ranks by
+    cosine descending and returns the top-*k* with `Candidate.score` set to the similarity.
+    Deterministic, no network. A `fail=True` flag makes `recall` return `[]` for every
+    corpus, to exercise the pipeline's index-unavailable degrade.
     """
 
     def __init__(
@@ -182,6 +183,16 @@ RETURN node.id AS id, node.intent AS text, node.slots_summary AS slots_summary,
        score
 ORDER BY score DESC
 """
+_BLUEPRINT_KEYWORD_QUERY = (
+    "CALL db.index.fulltext.queryNodes($index_name, $query) YIELD node, score\n"
+    "WHERE coalesce(node.status, 'validated') = 'validated'\n"
+    "  AND coalesce(node.drift_status, 'clean') <> 'suspect'\n"
+    "  AND node.source = 'mcp'\n"
+    + "RETURN"
+    + _BLUEPRINT_RECALL_QUERY.split("RETURN", 1)[1]
+    + "LIMIT $k"
+)
+
 # THE TRUST GATE (governed-corpus Phase 2). Recall serves ONLY MCP-canon nodes
 # (`source='mcp'`). This is BARE equality, NOT `coalesce(node.source,'mcp')`, and
 # that is deliberate + safety-critical: a node with NO `source` property, or one
@@ -231,13 +242,13 @@ _CORPUS_QUERY: dict[str, str] = {
 
 def _coerce_uses(raw: Any) -> frozenset[str] | None:
     """Coerce a stored `uses` value into a `frozenset[str]`, or `None` when it is
-        UNDETERMINED — the fail-closed contract.
+    UNDETERMINED — the fail-closed contract.
 
-        `Candidate.uses is None` makes the scope pre-filter DROP the blueprint. Returning a
-        `frozenset()` instead would pass EVERY scope (`frozenset() <= anything`), a silent
-        fail-OPEN. So anything that is not a clean, non-empty list of `str` — null, empty, a bare
-        string that would explode into a char-set, non-`str` or unhashable elements, a non-list —
-        maps to `None`.
+    `Candidate.uses is None` makes the scope pre-filter DROP the blueprint. Returning a
+    `frozenset()` instead would pass EVERY scope (`frozenset() <= anything`), a silent
+    fail-OPEN. So anything that is not a clean, non-empty list of `str` — null, empty, a bare
+    string that would explode into a char-set, non-`str` or unhashable elements, a non-list —
+    maps to `None`.
     """
     if not raw:
         return None  # null or empty → undetermined → DROP fail-closed
@@ -251,16 +262,16 @@ def _coerce_uses(raw: Any) -> frozenset[str] | None:
 def map_blueprint_record(record: Mapping[str, Any]) -> Candidate:
     """Map one blueprint recall row -> `Candidate`.
 
-        THE load-bearing conversion: `Candidate.uses` carries the byte-exact
-        `"database.table.column"` strings stored on the node (NOT re-derived) as a
-        `frozenset[str]`, or `None` when the stored value is undetermined or corrupt, so the
-        scope pre-filter drops it rather than failing open.
+    THE load-bearing conversion: `Candidate.uses` carries the byte-exact
+    `"database.table.column"` strings stored on the node (NOT re-derived) as a
+    `frozenset[str]`, or `None` when the stored value is undetermined or corrupt, so the
+    scope pre-filter drops it rather than failing open.
 
-        The DAG props recall selects are JSON-decoded into `payload` with the SAME fail-soft
-        discipline `map_blueprint_detail_record` uses — a corrupt or absent prop yields `None`,
-        never a raise, so an enriched blueprint degrades to a pre-enrichment card rather than
-        losing the whole recall row. The payload carries the RAW decoded slots; the projection
-        and the per-card cap are enforced once, downstream, in the pipeline.
+    The DAG props recall selects are JSON-decoded into `payload` with the SAME fail-soft
+    discipline `map_blueprint_detail_record` uses — a corrupt or absent prop yields `None`,
+    never a raise, so an enriched blueprint degrades to a pre-enrichment card rather than
+    losing the whole recall row. The payload carries the RAW decoded slots; the projection
+    and the per-card cap are enforced once, downstream, in the pipeline.
     """
     text = record["text"]
     resolves = _decode_json(record.get("resolves_json"))
@@ -367,9 +378,9 @@ def _decode_json(raw: Any) -> Any:
 def _coerce_window_anchor(raw: Any) -> str | None:
     """Coerce a stored `window_anchor` property to a DECLARED anchor, else `None`.
 
-        Fail-soft in the same direction as `_decode_json`: absent, null, non-string or outside
-        `WINDOW_ANCHORS` all mean "this blueprint declares no anchor", the pre-J7 behaviour for
-        every blueprint. Never raises — a corrupt property must not fail the keyed fetch.
+    Fail-soft in the same direction as `_decode_json`: absent, null, non-string or outside
+    `WINDOW_ANCHORS` all mean "this blueprint declares no anchor", the pre-J7 behaviour for
+    every blueprint. Never raises — a corrupt property must not fail the keyed fetch.
     """
     return raw if isinstance(raw, str) and raw in WINDOW_ANCHORS else None
 
@@ -377,10 +388,10 @@ def _coerce_window_anchor(raw: Any) -> str | None:
 def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
     """Map one `getBlueprint` row -> `BlueprintDetail`.
 
-        `uses` is coerced with the SAME fail-closed `_coerce_uses` as recall, so an undetermined
-        or corrupt stored value becomes `None` and the scope check drops it rather than failing
-        open. `hit_count` defaults to 0 on a null or non-int value, and the additive DAG fields
-        default to `None` when absent or corrupt.
+    `uses` is coerced with the SAME fail-closed `_coerce_uses` as recall, so an undetermined
+    or corrupt stored value becomes `None` and the scope check drops it rather than failing
+    open. `hit_count` defaults to 0 on a null or non-int value, and the additive DAG fields
+    default to `None` when absent or corrupt.
     """
     raw_hits = record.get("hit_count")
     hit_count = raw_hits if isinstance(raw_hits, int) and not isinstance(raw_hits, bool) else 0
@@ -418,12 +429,12 @@ def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
 class Neo4jVectorIndex:
     """Real `VectorIndex` — recall from a neo4j native vector index.
 
-        A pure drop-in behind the frozen `VectorIndex` protocol: the pipeline, scope filter and
-        render are UNCHANGED. It holds a long-lived async driver (one per process; creation is
-        lazy and makes no connection until the first query), runs ONE
-        `db.index.vector.queryNodes` per corpus keyed by `kind`, maps each row to a `Candidate`,
-        and NEVER raises — every driver, query or timeout failure is caught and returned as `[]`
-        (D86 degrade). `close()` shuts the pool down.
+    A pure drop-in behind the frozen `VectorIndex` protocol: the pipeline, scope filter and
+    render are UNCHANGED. It holds a long-lived async driver (one per process; creation is
+    lazy and makes no connection until the first query), runs ONE
+    `db.index.vector.queryNodes` per corpus keyed by `kind`, maps each row to a `Candidate`,
+    and NEVER raises — every driver, query or timeout failure is caught and returned as `[]`
+    (D86 degrade). `close()` shuts the pool down.
     """
 
     def __init__(
@@ -471,12 +482,38 @@ class Neo4jVectorIndex:
         hardcoded 'neo4j' that could diverge from a configured DB, L1)."""
         return self._database
 
+    async def recall_keywords(self, *, query: str, k: int) -> list[Candidate]:
+        """Lexical retrieval uses the same lifecycle/trust gates, independently of embeddings."""
+        text = keyword_query(query)
+        if not text:
+            return []
+        try:
+            records = await self._run(
+                _BLUEPRINT_KEYWORD_QUERY,
+                {
+                    "index_name": BLUEPRINT_TEXT_INDEX,
+                    "query": text,
+                    "k": k,
+                },
+            )
+        except Exception:
+            trace.get_current_span().set_attribute("retrieval.keyword_unavailable", True)
+            _logger.warning("blueprint keyword recall unavailable; using semantic recall")
+            return []
+        candidates = []
+        for record in records:
+            try:
+                candidates.append(map_blueprint_record(record))
+            except Exception:
+                _logger.warning("malformed keyword candidate skipped")
+        return candidates
+
     async def recall(self, *, query_vector: list[float], kind: str, k: int) -> list[Candidate]:
         """Recall up to *k* nearest `Candidate`s of *kind*, most-similar first.
 
-                Never raises: an unknown kind, unreachable neo4j, auth failure, query error or
-                timeout ALL return `[]`. A non-empty corpus that the parity guard drops entirely
-                sets a shape-only `retrieval.model_mismatch` attribute on the current span.
+        Never raises: an unknown kind, unreachable neo4j, auth failure, query error or
+        timeout ALL return `[]`. A non-empty corpus that the parity guard drops entirely
+        sets a shape-only `retrieval.model_mismatch` attribute on the current span.
         """
         query = _CORPUS_QUERY.get(kind)
         if query is None:
@@ -517,9 +554,9 @@ class Neo4jVectorIndex:
     async def get_blueprint(self, blueprint_id: str) -> BlueprintDetail | None:
         """Keyed fetch of one blueprint's stored projection.
 
-                Never raises: a missing id, unreachable neo4j, auth failure, query error or timeout
-                ALL return `None`. A single MATCH through the same `_run` seam recall uses, so
-                Layer 1 drives it without a live store.
+        Never raises: a missing id, unreachable neo4j, auth failure, query error or timeout
+        ALL return `None`. A single MATCH through the same `_run` seam recall uses, so
+        Layer 1 drives it without a live store.
         """
         try:
             records = await self._run(_GET_BLUEPRINT_QUERY, {"id": blueprint_id})
@@ -545,9 +582,9 @@ class Neo4jVectorIndex:
 
     async def graph_ready(self) -> bool:
         """Readiness signal for the `/ready` probe: True once the `:CorpusMeta.corpus_sha`
-                singleton is present, i.e. the hydrator daemon has completed at least one seed.
-                Never raises — an unreachable or uninitialized graph degrades to `False`, so a cold
-                or down neo4j keeps the pod OUT of the Service rather than 500ing the probe.
+        singleton is present, i.e. the hydrator daemon has completed at least one seed.
+        Never raises — an unreachable or uninitialized graph degrades to `False`, so a cold
+        or down neo4j keeps the pod OUT of the Service rather than 500ing the probe.
         """
         try:
             rows = await self._run(_GRAPH_READY_QUERY, {})
@@ -560,8 +597,8 @@ class Neo4jVectorIndex:
     async def _run(self, query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         """Run one read query and return its rows as plain dicts.
 
-                The single driver-touching seam, so Layer-1 tests can drive `recall` — mapping,
-                degrade and parity — without a live neo4j by monkeypatching this method.
+        The single driver-touching seam, so Layer-1 tests can drive `recall` — mapping,
+        degrade and parity — without a live neo4j by monkeypatching this method.
         """
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, parameters)  # type: ignore[arg-type]
@@ -569,14 +606,14 @@ class Neo4jVectorIndex:
 
     async def _flag_model_mismatch(self, kind: str) -> None:
         """When a corpus recall came back empty, probe whether the corpus has any RECALLABLE
-                (`source='mcp'`) nodes at all. If it does, the parity `WHERE` dropped everything —
-                a total model mismatch — so a shape-only `retrieval.model_mismatch` attribute is set
-                on the current span.
+        (`source='mcp'`) nodes at all. If it does, the parity `WHERE` dropped everything —
+        a total model mismatch — so a shape-only `retrieval.model_mismatch` attribute is set
+        on the current span.
 
-                The probe is `source='mcp'`-scoped to match recall's own trust gate: a corpus that is
-                empty-to-recall purely because its nodes are `source='learning'` or sourceless is NOT
-                a model mismatch, and counting those would set a FALSE flag and misdirect the
-                operator. Best-effort — any probe failure is swallowed.
+        The probe is `source='mcp'`-scoped to match recall's own trust gate: a corpus that is
+        empty-to-recall purely because its nodes are `source='learning'` or sourceless is NOT
+        a model mismatch, and counting those would set a FALSE flag and misdirect the
+        operator. Best-effort — any probe failure is swallowed.
         """
         label = _CORPUS_LABEL.get(kind)
         if label is None:

@@ -217,11 +217,7 @@ class DetectionRate:
 
     @property
     def false_positive_rate(self) -> float | None:
-        return (
-            (self.false_positives / self.single_intent_seen)
-            if self.single_intent_seen
-            else None
-        )
+        return (self.false_positives / self.single_intent_seen) if self.single_intent_seen else None
 
 
 def multi_intent_detection(observations: Iterable[DetectionObservation]) -> DetectionRate:
@@ -262,9 +258,7 @@ def multi_intent_detection(observations: Iterable[DetectionObservation]) -> Dete
 # ---------------------------------------------------------------------------
 
 
-def serves_intent_from_trail(
-    trail: Sequence[TrailEntry], turn_index: int
-) -> dict[str, set[str]]:
+def serves_intent_from_trail(trail: Sequence[TrailEntry], turn_index: int) -> dict[str, set[str]]:
     """`tool_call_id -> {intent_id}`, reconstructed from the persisted trail.
 
     TWO SOURCES, UNIONED, because the runtime has two ways to bind evidence:
@@ -299,6 +293,8 @@ def serves_intent_from_trail(
             continue
         if entry.serves_intent:
             mapping.setdefault(entry.tool_call_id, set()).add(entry.serves_intent)
+        if entry.serves_intents:
+            mapping.setdefault(entry.tool_call_id, set()).update(entry.serves_intents)
         if entry.tool_name != "updateAnalysisState":
             continue
         if entry.status != "ok":
@@ -309,7 +305,7 @@ def serves_intent_from_trail(
         for item in intents:
             if not isinstance(item, dict):
                 continue
-            call_id = item.get("evidence_tool_call_id")
+            call_id = item.get("result_id") or item.get("evidence_tool_call_id")
             intent_id = item.get("intent_id")
             if isinstance(call_id, str) and call_id and isinstance(intent_id, str):
                 mapping.setdefault(call_id, set()).add(intent_id)
@@ -379,9 +375,7 @@ def re_derivation_judgement(
             "so re-derivation was not judged",
         )
     queries = [
-        (position, entry)
-        for position, entry in enumerate(scoped)
-        if entry.tool_name == "runQuery"
+        (position, entry) for position, entry in enumerate(scoped) if entry.tool_name == "runQuery"
     ]
     bound = 0
     for b_position, b_entry in blueprints:

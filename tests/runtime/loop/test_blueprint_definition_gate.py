@@ -43,6 +43,9 @@ from data_agent.runtime.session.models import (
     TrailEntry,
     TurnMessage,
 )
+from tests.runtime.final_answer import final_answer, work_trail
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 CATALOG = CatalogHandle({"dbpcm_warehouse.employee": {"EmployeeCode": "String"}})
 SESSION_ID = "sess-bp-gate"
@@ -204,7 +207,7 @@ async def test_run_blueprint_without_get_blueprint_is_refused_before_the_executo
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="ok, expanding it first next time."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -215,7 +218,7 @@ async def test_run_blueprint_without_get_blueprint_is_refused_before_the_executo
     assert outcome.status == "done"
     # The executor was never reached.
     assert run_tool.calls == []
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.status, e.error_code) for e in trail] == [
         ("runBlueprint", "error", BLUEPRINT_DEFINITION_NOT_READ_CODE)
     ]
@@ -238,7 +241,7 @@ async def test_refusal_emits_a_loop_prefixed_observer_event() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     recorder = _Recorder()
@@ -280,7 +283,7 @@ async def test_a_prior_get_blueprint_for_the_same_id_lets_it_run() -> None:
         [
             ModelTurnResult(tool_calls=[_get_call("g1", BP_A)]),
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="7 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -290,7 +293,7 @@ async def test_a_prior_get_blueprint_for_the_same_id_lets_it_run() -> None:
 
     assert outcome.status == "done"
     assert run_tool.calls == [BP_A]
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.status) for e in trail] == [
         ("getBlueprint", "ok"),
         ("runBlueprint", "ok"),
@@ -303,7 +306,7 @@ async def test_get_blueprint_for_a_different_id_does_not_satisfy_the_gate() -> N
         [
             ModelTurnResult(tool_calls=[_get_call("g1", BP_B)]),
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -312,7 +315,7 @@ async def test_get_blueprint_for_a_different_id_does_not_satisfy_the_gate() -> N
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="headcount?")
 
     assert run_tool.calls == []
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert trail[-1].error_code == BLUEPRINT_DEFINITION_NOT_READ_CODE
     assert BP_A in (trail[-1].denial_detail or "")
 
@@ -348,7 +351,7 @@ async def test_a_get_blueprint_from_a_prior_turn_does_not_satisfy_the_gate() -> 
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -360,7 +363,7 @@ async def test_a_get_blueprint_from_a_prior_turn_does_not_satisfy_the_gate() -> 
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="and now Engineering?")
 
     assert run_tool.calls == []
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert trail[-1].error_code == BLUEPRINT_DEFINITION_NOT_READ_CODE
 
 
@@ -388,7 +391,7 @@ async def test_a_get_blueprint_from_an_earlier_window_of_the_same_turn_satisfies
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="7 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -428,7 +431,7 @@ async def test_a_failed_get_blueprint_does_not_satisfy_the_gate() -> None:
         [
             ModelTurnResult(tool_calls=[_get_call("g1", BP_A)]),
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -437,7 +440,7 @@ async def test_a_failed_get_blueprint_does_not_satisfy_the_gate() -> None:
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="headcount?")
 
     assert run_tool.calls == []
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert trail[-1].error_code == BLUEPRINT_DEFINITION_NOT_READ_CODE
 
 
@@ -451,7 +454,7 @@ async def test_same_response_get_then_run_is_still_refused() -> None:
         [
             ModelTurnResult(tool_calls=[_get_call("g1", BP_A), _run_call("b1", BP_A)]),
             ModelTurnResult(tool_calls=[_run_call("b2", BP_A)]),
-            ModelTurnResult(assistant_text="7 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -461,7 +464,7 @@ async def test_same_response_get_then_run_is_still_refused() -> None:
 
     # Refused in round 1, allowed in round 2.
     assert run_tool.calls == [BP_A]
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.error_code) for e in trail] == [
         ("getBlueprint", None),
         ("runBlueprint", BLUEPRINT_DEFINITION_NOT_READ_CODE),
@@ -486,7 +489,7 @@ async def test_batched_expand_then_run_costs_two_round_trips_for_n_deliverables(
         [
             ModelTurnResult(tool_calls=[_get_call(f"g{n}", bp) for n, bp in enumerate(ids)]),
             ModelTurnResult(tool_calls=[_run_call(f"b{n}", bp) for n, bp in enumerate(ids)]),
-            ModelTurnResult(assistant_text="here are all of them."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     get_tool = _RecordingGetBlueprint()
@@ -500,7 +503,7 @@ async def test_batched_expand_then_run_costs_two_round_trips_for_n_deliverables(
     assert run_tool.calls == ids
     # Two tool-bearing round-trips, plus the final prose one. NOT 2N.
     assert len(model.calls) == 3
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [e.error_code for e in trail] == [None] * (2 * deliverables)
 
 
@@ -556,7 +559,9 @@ async def test_a_mid_dag_resume_is_not_gated() -> None:
         ),
     )
     executor = _ResumingExecutor()
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="7 people.")])
+    model = ScriptedModelClient(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
     run_tool = _RecordingRunBlueprint()
     loop, store = _build(
         model=model,
@@ -570,7 +575,7 @@ async def test_a_mid_dag_resume_is_not_gated() -> None:
 
     assert outcome.status == "done"
     assert executor.resumed == [BP_A]
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.status, e.error_code) for e in trail] == [("runBlueprint", "ok", None)]
 
 
@@ -606,7 +611,7 @@ async def test_a_slot_pause_resume_re_running_the_blueprint_is_not_refused() -> 
     resumed_model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_run_call("b2", BP_A)]),
-            ModelTurnResult(assistant_text="7 people in Sales."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     resumed_loop, store = _build(
@@ -619,9 +624,10 @@ async def test_a_slot_pause_resume_re_running_the_blueprint_is_not_refused() -> 
 
     assert outcome.status == "done"
     assert settled_run.calls == [BP_A]
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.error_code) for e in trail] == [
         ("getBlueprint", None),
+        ("runBlueprint", "TOOL_PAUSED"),
         ("runBlueprint", None),
     ]
 
@@ -643,7 +649,7 @@ async def test_a_blank_blueprint_id_is_not_gated_it_is_the_executor_s_error() ->
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -652,7 +658,7 @@ async def test_a_blank_blueprint_id_is_not_gated_it_is_the_executor_s_error() ->
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="?")
 
     assert run_tool.calls == ["  "]
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert trail[0].error_code != BLUEPRINT_DEFINITION_NOT_READ_CODE
 
 
@@ -691,7 +697,7 @@ async def test_a_duplicate_get_blueprint_is_guarded_not_re_dispatched() -> None:
         [
             ModelTurnResult(tool_calls=[_get_call("g1", BP_A)]),
             ModelTurnResult(tool_calls=[_get_call("g2", BP_A)]),
-            ModelTurnResult(assistant_text="done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     get_tool = _RecordingGetBlueprint()
@@ -704,7 +710,7 @@ async def test_a_duplicate_get_blueprint_is_guarded_not_re_dispatched() -> None:
 
     # Fetched ONCE; the repeat never reached the tool.
     assert get_tool.calls == [BP_A]
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.error_code) for e in trail] == [
         ("getBlueprint", None),
         ("getBlueprint", IDEMPOTENT_READ_ALREADY_SERVED_CODE),
@@ -724,7 +730,7 @@ async def test_a_dedup_guarded_get_blueprint_satisfies_the_run_gate() -> None:
             ModelTurnResult(tool_calls=[_get_call("g1", BP_A)]),
             ModelTurnResult(tool_calls=[_get_call("g2", BP_A)]),
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="7 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -733,7 +739,7 @@ async def test_a_dedup_guarded_get_blueprint_satisfies_the_run_gate() -> None:
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="headcount?")
 
     assert run_tool.calls == [BP_A]
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert trail[-1].error_code is None
 
 
@@ -762,7 +768,7 @@ async def test_the_guarded_marker_alone_satisfies_the_gate() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="7 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _RecordingRunBlueprint()
@@ -809,7 +815,7 @@ async def test_expand_refused_run_defensive_re_expand_then_run_succeeds() -> Non
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
             ModelTurnResult(tool_calls=[_get_call("g2", BP_A)]),
             ModelTurnResult(tool_calls=[_run_call("b2", BP_A)]),
-            ModelTurnResult(assistant_text="7 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     run_tool = _SlotComplainingRunBlueprint()
@@ -818,7 +824,7 @@ async def test_expand_refused_run_defensive_re_expand_then_run_succeeds() -> Non
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="headcount?")
 
     assert outcome.status == "done"
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.error_code) for e in trail] == [
         ("getBlueprint", None),
         ("runBlueprint", "RUN_BLUEPRINT_SLOT_INVALID"),
@@ -847,7 +853,7 @@ async def test_a_get_blueprint_whose_result_was_trimmed_away_is_re_fetched_for_r
             ModelTurnResult(tool_calls=[_get_call("g1", BP_A)]),
             ModelTurnResult(tool_calls=[_get_call("g2", BP_A)]),
             ModelTurnResult(tool_calls=[_run_call("b1", BP_A)]),
-            ModelTurnResult(assistant_text="7 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     get_tool = _RecordingGetBlueprint()
@@ -886,7 +892,7 @@ async def test_a_visible_get_blueprint_repeat_is_still_guarded() -> None:
         [
             ModelTurnResult(tool_calls=[_get_call("g1", BP_A)]),
             ModelTurnResult(tool_calls=[_get_call("g2", BP_A)]),
-            ModelTurnResult(assistant_text="done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     get_tool = _RecordingGetBlueprint()

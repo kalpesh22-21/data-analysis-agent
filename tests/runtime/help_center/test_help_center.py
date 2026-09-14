@@ -81,7 +81,7 @@ async def test_schema_is_absent_unless_explicitly_enabled() -> None:
     assert "searchHelpCenter" not in {schema["name"] for schema in disabled}
     assert "searchHelpCenter" in {schema["name"] for schema in enabled}
     get_schema = next(schema for schema in enabled if schema["name"] == "getHelpCenterDocument")
-    assert "serves_intent" in get_schema["parameters"]["properties"]
+    assert "serves_intents" in get_schema["parameters"]["properties"]
 
 
 def test_prompt_is_byte_unchanged_when_disabled() -> None:
@@ -104,7 +104,7 @@ def test_product_guidance_navigation_instruction_requires_both_features() -> Non
     combined = both.effective_agent_system_prompt()
     assert marker in combined
     assert "use the Help Center to answer the question in text" in combined
-    assert "If no relevant navigation capability is available" in combined
+    assert "If no relevant navigation or action option is available" in combined
 
 
 @pytest.mark.asyncio

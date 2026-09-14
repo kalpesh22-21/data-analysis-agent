@@ -24,6 +24,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
+from uuid import uuid4
 
 import anyio
 from fastapi import FastAPI, Header, HTTPException
@@ -76,6 +77,7 @@ from data_agent.runtime.help_center.tools import (
 )
 from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
 from data_agent.runtime.loop.answer_judge import AnswerJudge
+from data_agent.runtime.loop.measurement import MeasurementReviewer
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
@@ -260,7 +262,9 @@ async def _stream_turn(
             # same class as B4) — log it server-side only, yield a generic canned
             # message to the SSE `error` event.
             _logger.exception("Unhandled exception during AgentLoop.run/resume")
-            yield _format_sse("error", {"code": "INTERNAL_ERROR", "message": _INTERNAL_ERROR_MESSAGE})
+            yield _format_sse(
+                "error", {"code": "INTERNAL_ERROR", "message": _INTERNAL_ERROR_MESSAGE}
+            )
             return
 
         yield _format_sse("result", _outcome_to_dict(outcome))
@@ -346,6 +350,7 @@ def create_app(
     model_client = model_client or build_openai_model_client(
         api_key=settings.openai_api_key,
         model=settings.openai_model,
+        use_reasoning_metadata=settings.use_reasoning_metadata,
         base_url=settings.openai_base_url,
     )
 
@@ -556,6 +561,7 @@ def create_app(
             vector_index=vector_index,
             user_memory=NullUserMemoryProvider(),
             recall_k=settings.retrieval_recall_k,
+            blueprint_recall_k=settings.retrieval_blueprint_recall_k,
             top_k_blueprints=settings.retrieval_top_k_blueprints,
             top_k_knowledge=settings.retrieval_top_k_knowledge,
             knowledge_min_score=settings.retrieval_knowledge_min_score,
@@ -746,6 +752,42 @@ def create_app(
             if not base_tools_loaded:
                 active_tool_schemas.extend(await _base_tools_provider(credentials))
                 base_tools_loaded = True
+                if settings.capability_tools_enabled and "getCapabilityTool" in runtime_tools:
+                    doc = await session_store.get_or_create_session(credentials.session_id)
+                    turn_index = doc.messages[-1].turn_index if doc.messages else -1
+                    names = {
+                        e.args.get("tool_name")
+                        for e in doc.tool_trail
+                        if e.turn_index == turn_index
+                        and e.tool_name == "getCapabilityTool"
+                        and e.status == "ok"
+                    }
+                    for name in names:
+                        if not isinstance(name, str) or name in runtime_tools:
+                            continue
+                        outcome = await runtime_tools["getCapabilityTool"].run(
+                            {"tool_name": name}, credentials
+                        )
+                        # Historical ready:true is superseded by this explicit result.
+                        from data_agent.runtime.session.models import TrailEntry
+                        from data_agent.timeutil import now_iso
+
+                        await session_store.append_trail_entry(
+                            credentials.session_id,
+                            TrailEntry(
+                                turn_index=turn_index,
+                                tool_call_id="restore-" + uuid4().hex,
+                                tool_name="getCapabilityTool",
+                                args={"tool_name": name},
+                                status=outcome.status,
+                                error_code=outcome.error_code,
+                                provenance=frozenset(),
+                                result_preview=outcome.result_preview,
+                                result_full_ref=None,
+                                ts=now_iso(),
+                                denial_detail=outcome.denial_detail,
+                            ),
+                        )
             return active_tool_schemas
 
         # `recordAssumptions` (docs/decisions/ui-assumptions-contract.md): ALWAYS
@@ -956,6 +998,11 @@ def create_app(
                 if judge_model_client is not None
                 else None
             ),
+            measurement_reviewer=(
+                MeasurementReviewer(model_client)
+                if settings.measurement_review_enabled and settings.openai_api_key
+                else None
+            ),
             answer_judge_min_headroom_seconds=settings.answer_judge_min_headroom_seconds,
             # 09 §D.3: the SAME number the assembler renders the model's context with,
             # so the judge's view of a result is byte-identical to the model's.
@@ -1155,6 +1202,7 @@ def create_app(
             )
             if captured is not None:
                 blueprint_runs[captured[0]] = captured[1]
+                blueprint_runs[entry.tool_call_id] = captured[1]
         body = project_history(
             doc.messages,
             doc.tool_trail,

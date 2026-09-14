@@ -205,7 +205,9 @@ def test_case_02_two_blueprint_intents_complete_on_authoritative_evidence(
     assert harness.observer.count("loop_enforcement_exhausted") == 0
     assert harness.outcomes[-1]["status"] == "done"
 
-    completed = [p["evidence_tool_name"] for p in harness.observer.payloads("loop_intent_completed")]
+    completed = [
+        p["evidence_tool_name"] for p in harness.observer.payloads("loop_intent_completed")
+    ]
     assert completed == ["runBlueprint", "runBlueprint"]
 
 
@@ -239,9 +241,7 @@ def test_case_03_post_blueprint_query_for_a_distinct_intent_is_not_re_derivation
     assert query.tool_name == "runQuery" and query.status == "ok"
 
     assert metrics.re_derivation_turn_scoped(trail, turn_index=0) is True
-    assert (
-        metrics.re_derivation(trail, harness.case.serves_intent, turn_index=0) is False
-    )
+    assert metrics.re_derivation(trail, harness.case.serves_intent, turn_index=0) is False
     # The same answer with the mapping RECONSTRUCTED from the trail rather than
     # declared by the fixture — this is the derivation A2 uses, so it is exercised
     # here where the expected value is known.
@@ -332,9 +332,7 @@ def test_case_05_metadata_intent_completes_on_a_schema_fetch(harness_factory) ->
     # it is persisted as a data-free entry carrying this marker, which passes
     # conditions 1-4 having fetched nothing and is rejected by condition 5.
     assert schema_entry.error_code is None
-    assert not [
-        e for e in harness.trail() if e.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
-    ]
+    assert not [e for e in harness.trail() if e.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE]
     assert harness.observer.count("loop_repeated_idempotent_read_guarded") == 0
 
     metadata_events = harness.observer.payloads("loop_metadata_evidence_completion")
@@ -364,14 +362,12 @@ def test_case_06_pending_intent_refuses_finalization_then_exhausts(
     harness = harness_factory("case-06-pending-blocks-finalization")
     _assert_state_writes_accepted(harness)
 
-    refusal = harness.entry("a1")
-    assert refusal.status == "error"
-    assert refusal.error_code == "FINALIZATION_BLOCKED_PENDING_INTENTS"
-    assert refusal.denial_detail is not None
-    # `denial_detail` is the ONLY channel that reaches the model (`_render_entry`
-    # never reads `ToolResult.user_message`), so a message that does not name the
-    # pending intent tells the model nothing actionable.
-    assert "i2" in refusal.denial_detail
+    proposal = harness.entry("a1")
+    assert proposal.status == "ok"
+    assert proposal.error_code is None
+    # Coverage is evaluated once the whole batch has been received.
+    nudge = harness.model.calls[-1].messages[-1]["content"]
+    assert "i2" in nudge
 
     refusals = harness.observer.payloads("loop_finalization_refused")
     assert [p["exit"] for p in refusals] == ["answer_with_table"]
@@ -381,9 +377,7 @@ def test_case_06_pending_intent_refuses_finalization_then_exhausts(
 
     assert harness.observer.count("loop_enforcement_exhausted") == 1
     forced = harness.observer.payloads("loop_intent_force_blocked")
-    assert [(p["intent_id"], p["reason_code"]) for p in forced] == [
-        ("i2", "ENFORCEMENT_EXHAUSTED")
-    ]
+    assert [(p["intent_id"], p["reason_code"]) for p in forced] == [("i2", "ENFORCEMENT_EXHAUSTED")]
 
     intents = _assert_all_terminal(harness)
     assert intents["i1"].status == "completed"
@@ -807,9 +801,7 @@ def test_case_13_a_narrowed_reload_drops_one_table_and_keeps_the_rest(
     narrowed_away = harness.case.expect["narrowed_away_column"]
 
     # (a) Drop ONLY the never-executed table's column.
-    monkeypatch.setattr(
-        app_module, "verify_jwt", lambda *a, **k: full - {narrowed_away}
-    )
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: full - {narrowed_away})
     turn = harness.client.get("/session/history", headers=headers).json()["turns"][0]
     assert turn["answer"] is not None, "the answer's own union is still covered"
     assert len(turn["answer_tables"]) == 1

@@ -72,14 +72,14 @@ model_script:
         id: s2
         args:
           intents:
-            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+            - {intent_id: i1, status: completed, result_id: b1}
             # The second intent is BLOCKED, not completed: its table is a
             # presentation query composed at answer time, never executed, so there
             # is no evidence call to cite. `REQUIRED_DATA_UNAVAILABLE` is not the
             # honest code here, so it stays pending and enforcement records the
             # disposition — which is itself the §D.3 point: the table exists on the
             # answer without any trail entry carrying its columns.
-            - {intent_id: i2, status: completed, evidence_tool_call_id: b1}
+            - {intent_id: i2, status: completed, result_id: b1}
       - name: answerWithTable
         id: a1
         args:

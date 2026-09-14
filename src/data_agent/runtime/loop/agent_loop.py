@@ -46,8 +46,6 @@ from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_a
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     MAX_STATE_CALLS,
-    SUBSTANTIVE_TOOLS,
-    find_locking_tool,
     split_serves_intent,
     surplus_state_call_rejected,
 )
@@ -57,6 +55,7 @@ from data_agent.runtime.composite.answer_with_table import (
     AnswerTable,
     BlueprintRun,
     DesignationItem,
+    blueprint_run_from_result,
     clean_answer_text,
     enrich_table,
     finalize_designations,
@@ -66,7 +65,6 @@ from data_agent.runtime.composite.answer_with_table import (
     terminal_sql_by_id,
 )
 from data_agent.runtime.composite.answer_with_text import TOOL_NAME as ANSWER_TEXT_TOOL_NAME
-from data_agent.runtime.composite.answer_with_text import clean_evidence
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
@@ -90,6 +88,7 @@ from data_agent.runtime.hooks.answer_table import (
     references_scratch,
 )
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
+from data_agent.runtime.model.conversation import restore_response_batches
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.sanitize import sanitize_text
@@ -106,7 +105,6 @@ from data_agent.runtime.session.store import SessionStore
 from data_agent.timeutil import now_iso
 
 from .answer_judge import (
-    ANSWER_JUDGE_EXHAUSTED_EVENT,
     ANSWER_JUDGE_FAILED_EVENT,
     ANSWER_JUDGE_REFUSED_EVENT,
     ANSWER_JUDGE_SKIPPED_EVENT,
@@ -121,39 +119,37 @@ from .answer_judge import (
     ask_user_judge_nudge_text,
 )
 from .answer_rules import (
+    ANSWER_RULE_EXHAUSTED_EVENT,
     ANSWER_RULE_REFUSED_EVENT,
     first_match,
-    is_scope_decline,
     reported_figures,
 )
 from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
+from .clarification import normalize_clarification
 from .dispatch_gates import BlueprintSearchGate, advertised_names, refusal
 from .finalization import (
-    ANSWER_SHAPE_EXHAUSTED_EVENT,
-    ANSWER_SHAPE_REFUSED_EVENT,
     DATA_ANSWER_TOOLS,
+    EMPTY_ANSWER_EXHAUSTED_EVENT,
     EMPTY_ANSWER_FALLBACK_TEXT,
+    EMPTY_ANSWER_REFUSED_EVENT,
+    MAX_NUDGE_DRAFT_CHARS,
     AnswerShapeCounter,
     FinalizationGate,
-    answer_judge_rejected,
-    answer_shape_nudge_text,
-    answer_table_no_table_designated,
-    finalization_blocked,
+    empty_answer_nudge_text,
     finalization_nudge_text,
     pending_intents,
     refreshed_analysis_state,
 )
 from .help_grounding import HELP_TOOLS, HELP_UNAVAILABLE_TEXT, HelpGrounding
 from .judge_ship_guard import (
-    NAVIGATION_CLAIM_VIOLATION,
     JudgeShipGuard,
     capability_hedge_text,
     coherent_capability_ship_text,
-    is_card_fatal,
     ship_decline_text,
     table_hedge_text,
 )
+from .proposal import ReviewState, deliverable_evidence, fingerprint
 from .read_guard import ReadGuard, idempotent_read_signature, repeated_read_guard_event
 from .turn_accumulators import (
     AnswerEnvelope,
@@ -183,7 +179,9 @@ def _has_navigation_option(cards: Sequence[Mapping[str, Any]]) -> bool:
 
 
 def _claims_navigation_was_performed(text: str, cards: Sequence[Mapping[str, Any]]) -> bool:
-    return _has_navigation_option(cards) and bool(_NAVIGATION_EXECUTION_CLAIM.search(text.replace("’", "'")))
+    return _has_navigation_option(cards) and bool(
+        _NAVIGATION_EXECUTION_CLAIM.search(text.replace("’", "'"))
+    )
 
 
 def _answer_judge_refusal_kind(verdict: JudgeVerdict) -> FinalizationBlockKind:
@@ -527,6 +525,7 @@ class _CanonicalRequest:
 
     messages: list[dict[str, Any]]
     readable_tool_call_ids: frozenset[str]
+    prefetched_blueprints: bool = False
 
 
 ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE = "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
@@ -558,7 +557,7 @@ def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
         user_message=(
             f"You referenced blueprint '{blueprint_id}', but you have not run it in "
             "this turn, so there is no table to show. Call runBlueprint with that "
-            "blueprint first, then call answerWithTable again."
+            "blueprint first, then call finalizeAnswer again."
         ),
         provenance=frozenset(),
         result_preview=None,
@@ -569,7 +568,7 @@ def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
         denial_detail=(
             f"You referenced blueprint '{blueprint_id}', but you have not run it in "
             "this turn, so there is no table to show. Call runBlueprint with "
-            f"'{blueprint_id}' first, then call answerWithTable again."
+            f"'{blueprint_id}' first, then call finalizeAnswer again."
         ),
     )
 
@@ -657,9 +656,9 @@ class _NoLiveStateToForceError(Exception):
 # behaviour (silent drop + `loop_intent_tag_dropped`) stands. Telemetry is
 # unaffected either way: every drop is still reported.
 _INTENT_TAG_DROPPED_NOTE = (
-    "Note: your serves_intent tag was ignored — no intents are declared yet. Call "
-    "updateAnalysisState to declare your intents before your next substantive call "
-    "(runQuery/runBlueprint), or the turn will finish untracked."
+    "No intents are declared yet, so this execution could not be tagged. "
+    "Declare them with updateAnalysisState and bind this existing result_id explicitly. "
+    "Use serves_intents for subsequent work."
 )
 
 
@@ -719,6 +718,8 @@ def _tool_trail_entry_to_canonical(
         }
     else:
         content: dict[str, Any] = {
+            "tool_name": entry["tool_name"],
+            "turn_index": entry.get("turn_index"),
             "status": entry["status"],
             "error_code": entry.get("error_code"),
             # S4: the static, PII-safe denial message (never raw MCP error
@@ -726,7 +727,15 @@ def _tool_trail_entry_to_canonical(
             # self-correct — see context/budget.py::_render_entry.
             "user_message": entry.get("user_message"),
             "result_preview": entry.get("result_preview"),
+            "result_id": tool_call_id,
+            "measurement_review": entry.get("measurement_review"),
         }
+        if entry.get("sql_diagnostic"):
+            content["sql_diagnostic"] = entry["sql_diagnostic"]
+        if entry.get("status") != "ok":
+            content["evidence_usage"] = (
+                "Failure reference only; never supports completion or data claims. Permissions denials can support NO_ACCESS; SQL_REPAIR_EXHAUSTED can support EXECUTION_FAILED. Other SQL failures require a corrected approach and do not prove data is absent."
+            )
         # A SUCCESSFUL, D56-verified runBlueprint result is the trusted answer for
         # this intent. Surface an explicit, in-band marker + a terse human-readable
         # note so the model treats it as authoritative and goes straight to the final
@@ -792,6 +801,8 @@ def _tool_trail_entry_to_canonical(
             "tool_call_id": tool_call_id,
             "content": json.dumps(content, default=str),
         }
+    if entry.get("model_response"):
+        assistant_message["_model_response"] = entry["model_response"]
     return [assistant_message, tool_message]
 
 
@@ -884,6 +895,7 @@ class AgentLoop:
         # would also approve everything, but it would still be an object on the
         # terminal path; `None` is the stronger statement and the cheaper one.
         answer_judge: AnswerJudge | None = None,
+        measurement_reviewer: Any = None,
         # Seconds of wall clock a judge rejection needs to be worth making (09 §H).
         # Below this the judge is SKIPPED and the answer ships: a rejection issued at
         # 168s of a 180s window buys a regeneration the guard cuts off mid-round, and
@@ -898,6 +910,7 @@ class AgentLoop:
         # `app.py` passes `settings.preview_row_count` to this AND to the assembler.
         preview_row_count: int = 20,
     ) -> None:
+        self._use_reasoning_metadata = bool(getattr(model_client, "_use_reasoning_metadata", False))
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
         self._context_assembler = context_assembler
@@ -947,6 +960,7 @@ class AgentLoop:
         # while K protects the D94 re-fetch/self-correct loop. Default 3.
         self._request_budget_pinned_recent_tool_pairs = request_budget_pinned_recent_tool_pairs
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
+        self._measurement_reviewer = measurement_reviewer
         self._answer_judge = answer_judge
         self._answer_judge_min_headroom_seconds = answer_judge_min_headroom_seconds
         self._preview_row_count = preview_row_count
@@ -1163,7 +1177,9 @@ class AgentLoop:
         seed_answer_tables, seed_blueprint_runs = await self._compute_turn_answer_tables(
             session_id, turn_index
         )
-        seed_capability_cards = await self._compute_turn_capability_cards(session_id, turn_index)
+        seed_capability_cards = await self._compute_turn_capability_cards(
+            session_id, turn_index, credentials.column_scope
+        )
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
         return await self._run_loop_body(
@@ -1361,6 +1377,11 @@ class AgentLoop:
         # preserving assistant<->tool pairing. Never silent: a drop is logged
         # (structured) and emitted as a guardrail span event. `None` budget (loop
         # tests that do not wire it) skips the fit entirely (byte-identical).
+        canonical = restore_response_batches(
+            canonical,
+            scope_hash=scope_filter.compute_scope_hash(column_scope),
+            use_reasoning_metadata=self._use_reasoning_metadata,
+        )
         if self._request_token_budget is not None:
             fit = fit_request_to_budget(
                 canonical,
@@ -1414,7 +1435,11 @@ class AgentLoop:
             and isinstance(message.get("tool_call_id"), str)
             and message["tool_call_id"] not in sentinel_tool_call_ids
         )
-        return _CanonicalRequest(messages=canonical, readable_tool_call_ids=readable_tool_call_ids)
+        return _CanonicalRequest(
+            messages=canonical,
+            readable_tool_call_ids=readable_tool_call_ids,
+            prefetched_blueprints=assembled.retrieved_counts[0] > 0,
+        )
 
     async def _compute_turn_provenance_union(
         self, session_id: str, turn_index: int
@@ -1422,7 +1447,8 @@ class AgentLoop:
         """Union of every `TrailEntry.provenance` produced at *turn_index*, across every budget
         window of this external turn — the tag applied to that turn's final assistant
         `TurnMessage` (D44). Fail-closed: any undetermined (`None`) tool-result provenance
-        makes the whole turn's assistant message undetermined too. A turn with no tool
+        from a data-bearing result makes the assistant message undetermined too. Data-free failures
+        contribute no data provenance. A turn with no tool
         calls at all is determined-empty (`frozenset()`), always kept on replay.
         """
         trail = await self._session_store.load_trail(session_id)
@@ -1431,6 +1457,15 @@ class AgentLoop:
             return frozenset()
         union: set[tuple[str, str]] = set()
         for entry in turn_entries:
+            # A failure with no returned data cannot taint successful evidence.
+            # Its diagnostic remains current-turn-only in replay. Partial/error
+            # payloads still participate and fail closed if provenance is unknown.
+            if (
+                entry.status != "ok"
+                and entry.result_preview is None
+                and entry.result_full_ref is None
+            ):
+                continue
             # A repeated-idempotent-read guard entry is a data-free nudge (its
             # `ok`+`None` provenance exists only to route it through the D94
             # stranded-sentinel path). It fetched NO data — the real served read
@@ -1507,6 +1542,8 @@ class AgentLoop:
         # blueprint_id -> BlueprintRun, rebuilt from this turn's successful runs.
         blueprint_runs: dict[str, BlueprintRun] = {}
         for entry in turn_entries:
+            if entry.tool_name == "runQuery" and isinstance(entry.args.get("sql"), str):
+                blueprint_runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
             if entry.tool_name != "runBlueprint" or entry.result_full_ref is None:
                 continue
             result_full = await self._session_store.read_full_result(
@@ -1528,10 +1565,17 @@ class AgentLoop:
                     into=blueprint_runs,
                     arguments=entry.args,
                 )
+                captured = blueprint_run_from_result(
+                    result_full, slots=entry.args.get("slot_bindings")
+                )
+                if captured:
+                    blueprint_runs[entry.tool_call_id] = captured[1]
 
         terminal_by_id = terminal_sql_by_id(blueprint_runs)
         designated: list[AnswerTable] = []
         for entry in turn_entries:
+            if entry.tool_name == ANSWER_TEXT_TOOL_NAME and entry.args.get("tables") == []:
+                designated = []
             if entry.tool_name != ANSWER_TABLE_TOOL_NAME:
                 continue
             designation = resolve_designations(entry.args, terminal_by_id)
@@ -1554,14 +1598,26 @@ class AgentLoop:
                 )
                 for index, table in enumerate(finalized.tables)
             ]
-        return designated, blueprint_runs
+        doc = await self._session_store.get_or_create_session(session_id)
+        excluded = doc.review_states.get(str(turn_index), {}).get("excluded_components", ())
+        excluded_sql = {c.get("sql") for c in excluded if c.get("sql")}
+        return [t for t in designated if t.sql not in excluded_sql], blueprint_runs
 
     async def _compute_turn_capability_cards(
-        self, session_id: str, turn_index: int
+        self, session_id: str, turn_index: int, column_scope: frozenset[str] | None = None
     ) -> list[dict[str, Any]]:
         trail = await self._session_store.load_trail(session_id)
         cards: list[dict[str, Any]] = []
+        doc = await self._session_store.get_or_create_session(session_id)
+        excluded = doc.review_states.get(str(turn_index), {}).get("excluded_components", ())
+        excluded_names = {c["capability_ref"] for c in excluded if c["kind"] == "capability"}
         for entry in trail:
+            if entry.tool_name in excluded_names:
+                continue
+            if column_scope is not None and (entry.model_response or {}).get(
+                "scope_hash"
+            ) != scope_filter.compute_scope_hash(column_scope):
+                continue
             if (
                 entry.turn_index != turn_index
                 or entry.status != "ok"
@@ -1581,7 +1637,15 @@ class AgentLoop:
     ) -> None:
         """Emit the optional summary before dispatch so a late start cannot reopen a spinner."""
         if self._progress_summarizer is not None:
-            await self._summarize_and_emit(tool_name, tool_call_id, dict(arguments))
+            try:
+                await asyncio.wait_for(
+                    asyncio.create_task(
+                        self._summarize_and_emit(tool_name, tool_call_id, dict(arguments))
+                    ),
+                    timeout=1.0,
+                )
+            except TimeoutError:
+                pass
 
     async def _summarize_and_emit(
         self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
@@ -1856,6 +1920,7 @@ class AgentLoop:
         column_scope: frozenset[str],
         *,
         include_all_successful: bool = False,
+        exclude_result_ids: frozenset[str] = frozenset(),
     ) -> tuple[tuple[Mapping[str, Any], ...], str | None, tuple[TrailEntry, ...]]:
         """This turn's data-bearing results as the MODEL saw them, plus the date anchor —
         the two brief fields that cannot be read off a window-local (09 §D).
@@ -1882,9 +1947,17 @@ class AgentLoop:
         is off by default.
         """
         doc = await self._session_store.get_or_create_session(session_id)
-        in_scope = scope_filter.filter_trail(doc.tool_trail, column_scope)
+        in_scope = [
+            e
+            for e in scope_filter.filter_trail(doc.tool_trail, column_scope)
+            if e.tool_call_id not in exclude_result_ids
+        ]
         rendered = tuple(
-            render_entry(entry, self._preview_row_count)
+            {
+                k: v
+                for k, v in render_entry(entry, self._preview_row_count).items()
+                if k != "model_response"
+            }
             for entry in in_scope
             if entry.turn_index == turn_index
             and entry.status == "ok"
@@ -2034,6 +2107,9 @@ class AgentLoop:
                 and item not in ship_guard.assumptions_before_refusal
             ),
             capability_presented=accum.capability_judge_context,
+            measurement_contracts=tuple(
+                r["measurement_review"] for r in results if r.get("measurement_review")
+            ),
         )
 
     async def _finish(
@@ -2153,8 +2229,15 @@ class AgentLoop:
                 accum.apply_ship_disposition(ship_disposition, tuple(accum.assumptions or ()))
                 retained_assumption_count = len(accum.assumptions or ())
                 assistant_text = coherent_text
+        if assistant_text in {
+            "I could not verify every requested part from the available evidence.",
+            EMPTY_ANSWER_FALLBACK_TEXT,
+        }:
+            # Runtime limitation text contains no warehouse facts. Unknown provenance
+            # from failed work must not hide this message in scope-filtered history.
+            provenance = frozenset()
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance)
-        if persist_text is not None:
+        if persist_text is not None or (status == "done" and assistant_text):
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
             # that persist pass the same string they pass as *assistant_text*, so
             # this assignment is an identity for them and fail-closed for anything
@@ -2225,6 +2308,7 @@ class AgentLoop:
         envelope: AnswerEnvelope | None = None,
         assumptions: list[str] | None = None,
         serves_intent: str | None = None,
+        serves_intents: tuple[str, ...] = (),
     ) -> TurnOutcome:
         """Honor a runtime tool's `ToolPause` — write the checkpoint (with the additive
         `blueprint_*` mid-DAG state) and return `paused_ask_user`, the same terminal
@@ -2234,8 +2318,37 @@ class AgentLoop:
         succeeded, then runBlueprint paused on a slot question" turn surfaces the partial
         SQL and table on this pause flavor too, matching a direct `askUser` pause.
         """
-        pending_question = dict(pause.pending_question)
-        pending_question["options"] = _ask_user_options(pending_question.get("options"))
+        pending_question = normalize_clarification(
+            pause.pending_question.get("question"), pause.pending_question.get("options")
+        )
+        if self._answer_judge is not None and getattr(self._answer_judge, "enabled", True):
+            doc = await self._session_store.get_or_create_session(session_id)
+            active_turn = doc.messages[-1].turn_index if doc.messages else -1
+            user_answers = [
+                m.content for m in doc.messages if m.role == "user" and m.turn_index == active_turn
+            ]
+            original = user_answers[0] if user_answers else ""
+            try:
+                verdict = await asyncio.wait_for(
+                    self._answer_judge.review(
+                        JudgeBrief(
+                            site="ask_user",
+                            question=original,
+                            clarification_answers=tuple(user_answers[1:]),
+                            pending_question=pending_question["question"],
+                            pending_options=tuple(pending_question["options"] or ()),
+                        )
+                    ),
+                    timeout=getattr(self._answer_judge, "timeout_seconds", 20.0),
+                )
+            except Exception:
+                verdict = APPROVED
+            if not verdict.approved:
+                pending_question = {
+                    "question": "Please clarify the person, group, or period you mean using its full name or description.",
+                    "options": None,
+                }
+
         checkpoint = PauseCheckpoint(
             reason=pause.reason,
             pending_question=pending_question,
@@ -2252,6 +2365,7 @@ class AgentLoop:
             # `tool_call_id` — would be untagged, leaving the intent it was run for
             # closable only by citing an id the model never chose.
             serves_intent=serves_intent,
+            serves_intents=serves_intents,
         )
         await self._session_store.write_pause_checkpoint(session_id, checkpoint)
         # ISSUES I1, the same scrub `_finish` applies — this exit does not route
@@ -2398,6 +2512,7 @@ class AgentLoop:
                 # carry the tag forward from the checkpoint being consumed, or the
                 # chain loses it at the second link.
                 serves_intent=checkpoint.serves_intent,
+                serves_intents=checkpoint.serves_intents,
             )
 
         # UI Slice 1 Fix 1: fold this COMPLETED blueprint result into seed
@@ -2454,6 +2569,7 @@ class AgentLoop:
             # The tag survives the pause on the checkpoint, so the intent this
             # blueprint was run for closes by tag exactly as an unpaused one does.
             serves_intent=checkpoint.serves_intent,
+            serves_intents=checkpoint.serves_intents,
         )
         await self._session_store.append_trail_entry(session_id, entry)
 
@@ -2473,7 +2589,9 @@ class AgentLoop:
         seed_answer_tables, trail_runs = await self._compute_turn_answer_tables(
             session_id, turn_index
         )
-        seed_capability_cards = await self._compute_turn_capability_cards(session_id, turn_index)
+        seed_capability_cards = await self._compute_turn_capability_cards(
+            session_id, turn_index, credentials.column_scope
+        )
         seed_blueprint_runs = {**trail_runs, **seed_blueprint_runs}
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
@@ -2561,6 +2679,22 @@ class AgentLoop:
             "session_id_hash": hash_scope(frozenset({session_id})),
             "turn_index": turn_index,
         }
+        blueprint_runs = dict(blueprint_runs)
+        trail = await self._session_store.load_trail(session_id)
+        for entry in scope_filter.filter_trail(
+            trail, credentials.column_scope, current_turn_index=None
+        ):
+            if entry.turn_index != turn_index or entry.status != "ok":
+                continue
+            if entry.tool_name == "runQuery" and isinstance(entry.args.get("sql"), str):
+                blueprint_runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
+            elif (
+                entry.tool_name == "runBlueprint" and entry.authoritative and entry.result_full_ref
+            ):
+                full = await self._session_store.read_full_result(session_id, entry.result_full_ref)
+                captured = blueprint_run_from_result(full, slots=entry.args.get("slot_bindings"))
+                if captured:
+                    blueprint_runs[entry.tool_call_id] = captured[1]
         designation = resolve_designations(arguments, terminal_sql_by_id(blueprint_runs))
         # Read BEFORE anything is dropped. `designation.items` holds every entry that
         # carried a designation at all, resolved or not — so this is "did the model
@@ -2572,7 +2706,7 @@ class AgentLoop:
         for item in designation.items:
             if item.sql is None and item.named_blueprint is not None:
                 _logger.warning(
-                    "answerWithTable designated blueprint %r, which did not run "
+                    "finalizeAnswer designated blueprint %r, which did not run "
                     "successfully this turn — no answer table (session=%s)",
                     item.named_blueprint,
                     session_id,
@@ -2870,9 +3004,11 @@ class AgentLoop:
                 continue
             if prior_entry.tool_name in HELP_TOOLS:
                 preview = prior_entry.result_preview
-                payload = (preview.preview_rows[0][0]
-                           if preview and preview.preview_rows and preview.preview_rows[0]
-                           else None)
+                payload = (
+                    preview.preview_rows[0][0]
+                    if preview and preview.preview_rows and preview.preview_rows[0]
+                    else None
+                )
                 help_grounding.observe(prior_entry.tool_name, prior_entry.status, payload)
             if prior_entry.status != "ok":
                 continue
@@ -2931,20 +3067,39 @@ class AgentLoop:
             if declined_question
             else None
         )
+        if (
+            finalization_nudge is None
+            and len(
+                [m for m in session_doc.messages if m.role == "user" and m.turn_index == turn_index]
+            )
+            > 1
+        ):
+            finalization_nudge = (
+                "This turn is resuming. The later user messages answer or refine the original "
+                "request. Apply the supplied clarification now; an instruction in the original "
+                "request to ask first has already been satisfied. Continue the remaining work."
+            )
         declined_repeat_refused = False
         blueprint_search_gate = BlueprintSearchGate(question, session_doc.tool_trail, turn_index)
         empty_finishes = 0
         ship_guard = JudgeShipGuard()
-        capability_advisory_used = False
-        navigation_refused = False
-        if self._answer_judge is not None and getattr(self._answer_judge, "enabled", True):
-            if any(
-                (session_doc.finalization_blocks or {}).get(
-                    f"{turn_index}:{window_count}:{kind}", 0
-                )
-                for kind in ("answer_judge", "help_center_grounding")
-            ):
-                ship_guard.arm_persisted_refusal()
+        review_state = ReviewState.restore(
+            session_doc.review_states.get(str(turn_index)),
+            scope_filter.compute_scope_hash(credentials.column_scope),
+        )
+        accum.exclude_components(review_state.excluded_components)
+        if review_state.violation:
+            ship_guard.note_refusal(
+                review_state.site,
+                review_state.violation,
+                assumptions=review_state.assumptions_before_refusal,
+            )
+            if review_state.feedback:
+                finalization_nudge = answer_judge_nudge_text("", review_state.feedback)
+                if review_state.excluded_components:
+                    from .proposal import omission_nudge
+
+                    finalization_nudge = omission_nudge(review_state.excluded_components).lstrip()
         # K2: the `tool_call_id`s whose next-round tool result must carry
         # `_INTENT_TAG_DROPPED_NOTE`. Same ephemeral, never-persisted,
         # EXACTLY-ONE-ROUND-TRIP lifetime as `finalization_nudge`: filled during
@@ -2970,8 +3125,8 @@ class AgentLoop:
         # extra store read. Note it does NOT filter on `status`: the walk below skips
         # non-`ok` entries, but a FAILED runQuery locks late init just the same, which
         # is why this is a separate call and not folded into that walk.
-        substantive_ran = find_locking_tool(session_doc.tool_trail, turn_index) is not None
 
+        discovery_rounds = 0
         while True:
             request = await self._build_canonical_messages(
                 session_id,
@@ -2988,6 +3143,9 @@ class AgentLoop:
                 user_jwt=credentials.jwt,
             )
             canonical_messages = request.messages
+            blueprint_search_gate.observe_context(canonical_messages)
+            if request.prefetched_blueprints:
+                blueprint_search_gate.observe_prefetch()
             # ONE ROUND-TRIP ONLY (05 §D). `discovery_canonical` is computed once
             # per window and re-spliced into every rebuild; copying THAT lifetime
             # would repeat the nudge forever — including after the intents are
@@ -3011,11 +3169,7 @@ class AgentLoop:
             # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
             # terminal exit #2 below. Reset per iteration — a designation only ends
             # the turn it was made in.
-            designated_answer_text: str | None = None
-            designated_text_answer: str | None = None
-            designated_text_has_evidence = False
-            capability_terminal_text: str | None = None
-            capability_finalization_refused = False
+            proposal_args = None
             # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
             # BATCH. Reset per iteration beside `designated_answer_text`, and for the
             # same reason: it describes one response, not one turn.
@@ -3026,7 +3180,6 @@ class AgentLoop:
             # (`has_spent`) runs before `may_refuse` and turns the second call into a
             # SKIP, which approves — so without this local the second call terminated
             # the turn in the round the judge had just refused it.
-            judge_refusal_this_round: str | None = None
             # Start the blueprint gate's response batch: it stages the ids expanded
             # by a `getBlueprint` in THIS response and holds them apart from the
             # committed set until the batch drains (`commit_round`, below the
@@ -3042,6 +3195,27 @@ class AgentLoop:
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)
             last_assistant_text = result.assistant_text
+            model_response = {
+                "id": str(uuid.uuid4()),
+                "scope_hash": scope_filter.compute_scope_hash(credentials.column_scope),
+                "content": result.assistant_text,
+                "reasoning_metadata": result.reasoning_metadata
+                if self._use_reasoning_metadata
+                else {},
+                "tool_calls": [
+                    {
+                        "id": c.id,
+                        "type": "function",
+                        "function": {
+                            "name": c.name,
+                            "arguments": c.raw_arguments
+                            if c.raw_arguments is not None
+                            else json.dumps(c.arguments),
+                        },
+                    }
+                    for c in result.tool_calls
+                ],
+            }
 
             # --- FINALIZATION ENFORCEMENT, terminal exit #1 (05 §B.2) ---------
             #
@@ -3065,7 +3239,26 @@ class AgentLoop:
                 if not result.tool_calls and not (result.assistant_text or "").strip()
                 else 0
             )
-            if empty_finishes >= 2:
+            empty_refused = False
+            if empty_finishes:
+                empty_refused = await finalization_gate.may_refuse("empty_answer")
+                self._observer(
+                    EMPTY_ANSWER_REFUSED_EVENT if empty_refused else EMPTY_ANSWER_EXHAUSTED_EVENT,
+                    {"incomplete_reason": result.incomplete_reason or ""},
+                )
+            if empty_finishes and not empty_refused:
+                if pending_intents(analysis_state):
+                    self._observer(
+                        "loop_enforcement_exhausted",
+                        {"intent_count": len(pending_intents(analysis_state))},
+                    )
+                    analysis_state = await self._force_block_pending_intents(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        state=analysis_state,
+                        reason_code="ENFORCEMENT_EXHAUSTED",
+                    )
+                accum.apply_ship_disposition("decline_only", ())
                 return await self._finish(
                     session_id=session_id,
                     turn_index=turn_index,
@@ -3081,10 +3274,14 @@ class AgentLoop:
                 )
             if not result.tool_calls:
                 finalization_nudge = (
-                    "A normal assistant message cannot finish this turn. Put the complete "
-                    "answer in answerWithText, or use answerWithTable when rows must be "
-                    "shown. If the answer is grounded, list the exact successful supporting "
-                    "tool names in answerWithText.evidence."
+                    (
+                        empty_answer_nudge_text(result.incomplete_reason) + "\n"
+                        if empty_refused
+                        else ""
+                    )
+                    + "Finish by calling finalizeAnswer with answer, tables, capability_refs and "
+                    "evidence. Use empty lists when none apply, including for an honest decline. "
+                    "For supported claims, evidence contains successful result IDs, not tool names."
                 )
                 last_assistant_text = None
             # No dispatch occurs for an invalid plain response. It still reaches the
@@ -3145,7 +3342,10 @@ class AgentLoop:
             # state is committed first and the pause is honoured after the loop
             # (03 §E.1) — an `askUser` past the cap now pauses exactly as one before
             # the cap always did.
-            ask_user_call = next((tc for tc in result.tool_calls if tc.name == "askUser"), None)
+            ask_user_call = next(
+                (tc for tc in result.tool_calls if tc.name == "askUser" and not tc.argument_error),
+                None,
+            )
 
             # S3: never dispatch an unbounded number of tool calls from one
             # model response — cap per iteration (RuntimeSettings-configurable,
@@ -3170,7 +3370,40 @@ class AgentLoop:
             )
             state_calls_dispatched = 0
             blueprint_search_gate.observe_batch(capped_tool_calls)
+            dispatched_ids = set()
             for tool_call in capped_tool_calls:
+                dispatched_ids.add(tool_call.id)
+                is_unified_finalizer = tool_call.name == "finalizeAnswer"
+                if is_unified_finalizer:
+                    from .proposal import validate_proposal_args
+
+                    error = validate_proposal_args(tool_call.arguments)
+                    if error:
+                        tool_call = replace(tool_call, argument_error=error)
+                    tool_call = replace(
+                        tool_call,
+                        name=ANSWER_TABLE_TOOL_NAME
+                        if tool_call.arguments.get("tables")
+                        else ANSWER_TEXT_TOOL_NAME,
+                    )
+                raw_tags = tool_call.arguments.get("serves_intents", [])
+                valid_tags = (
+                    {i.intent_id for i in analysis_state.intents} if analysis_state else set()
+                )
+                serves_intents = (
+                    tuple(
+                        dict.fromkeys(t for t in raw_tags if isinstance(t, str) and t in valid_tags)
+                    )
+                    if isinstance(raw_tags, list)
+                    else ()
+                )
+                if "serves_intents" in tool_call.arguments:
+                    tool_call = replace(
+                        tool_call,
+                        arguments={
+                            k: v for k, v in tool_call.arguments.items() if k != "serves_intents"
+                        },
+                    )
                 # K2 gate: this call, if it is one of the four, closes the late-init
                 # door for the rest of the turn. Recorded on the NAME and BEFORE
                 # dispatch, deliberately: `find_locking_tool` keys on the persisted
@@ -3178,8 +3411,6 @@ class AgentLoop:
                 # a guard-served repeat all lock it just as a success does. Erring
                 # toward suppression costs at most one note; erring the other way
                 # costs the model a non-retryable refusal it was told to walk into.
-                if tool_call.name in SUBSTANTIVE_TOOLS:
-                    substantive_ran = True
                 # --- CALL-TIME INTENT TAGGING: split the tag off FIRST ---------
                 #
                 # `serves_intent` is a runtime concept the model puts on a
@@ -3216,6 +3447,16 @@ class AgentLoop:
                         and getattr(intent_handler, "intent_taggable", False)
                     ),
                 )
+                if tool_call.name in {ANSWER_TABLE_TOOL_NAME, ANSWER_TEXT_TOOL_NAME}:
+                    from .proposal import filter_excluded_components
+
+                    call_args = filter_excluded_components(
+                        call_args, review_state.excluded_components
+                    )
+                    if tool_call.name == ANSWER_TABLE_TOOL_NAME and call_args.get("tables") == []:
+                        if not is_unified_finalizer:
+                            self._observer("loop_answer_table_empty_designation", {})
+                        tool_call = replace(tool_call, name=ANSWER_TEXT_TOOL_NAME)
                 if tag_drop_reason is not None:
                     self._observer(
                         "loop_intent_tag_dropped",
@@ -3285,6 +3526,8 @@ class AgentLoop:
                         tool_call_id=tool_call.id,
                         tool_name=tool_call.name,
                         args=dict(call_args),
+                        model_response=model_response,
+                        serves_intents=serves_intents,
                         status="ok",
                         error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
                         # `None` (undetermined) is deliberate: it routes this
@@ -3351,6 +3594,18 @@ class AgentLoop:
                 # `RUN_BLUEPRINT_UNAVAILABLE` → raw-loop fallback (§6) with a loop.
                 handler = self._runtime_tools.get(tool_call.name)
                 gate_refusal: ToolResult | None = None
+                if tool_call.argument_error:
+                    gate_refusal = ToolResult(
+                        status="error",
+                        tool_name=tool_call.name,
+                        error_code="INVALID_TOOL_ARGUMENTS",
+                        retryable=True,
+                        user_message=tool_call.argument_error,
+                        denial_detail=tool_call.argument_error,
+                        provenance=frozenset(),
+                        result_preview=None,
+                        result_full=None,
+                    )
                 if tool_call.name not in advertised_names(
                     tools,
                     self._runtime_tools,
@@ -3365,7 +3620,7 @@ class AgentLoop:
                             "reason": "name_not_in_advertised_catalog",
                         },
                     )
-                else:
+                elif gate_refusal is None:
                     gate_refusal = blueprint_search_gate.check(tool_call.name)
                     if gate_refusal is not None:
                         self._observer("loop_blueprint_search_suggested", {"tool_name": "runQuery"})
@@ -3376,8 +3631,80 @@ class AgentLoop:
                 ):
                     gate_refusal = blueprint_gate.check_run_blueprint(call_args)
 
+                if gate_refusal is None and tool_call.name == "runQuery":
+                    from data_agent.runtime.dispatch.sql_diagnostics import repeated_sql_failure
+
+                    current_doc = await self._session_store.get_or_create_session(session_id)
+                    if repeated_sql_failure(
+                        str(call_args.get("sql", "")),
+                        current_doc.tool_trail,
+                        turn_index,
+                        scope_hash=scope_filter.compute_scope_hash(credentials.column_scope),
+                    ):
+                        gate_refusal = replace(
+                            refusal(tool_call.name, "SQL_REPAIR_EXHAUSTED"),
+                            retryable=False,
+                            provenance=None,
+                        )
+                        self._observer("loop_sql_repair_exhausted", {"tool_call_id": tool_call.id})
+
+                measurement_review = None
+                if gate_refusal is None and tool_call.name in {"runQuery", "runBlueprint"}:
+                    definition = dict(call_args)
+                    if self._measurement_reviewer is not None:
+                        from .measurement import catalog_evidence, execution_review_scope
+
+                        schema_evidence = catalog_evidence(canonical_messages)
+                        measurement_review = await self._measurement_reviewer.review(
+                            question,
+                            definition,
+                            schema_evidence,
+                            review_scope=execution_review_scope(
+                                canonical_messages,
+                                analysis_state,
+                                (*serves_intents, serves_intent),
+                                turn_index,
+                            ),
+                        )
+                        if not measurement_review.get("approved"):
+                            detail = (
+                                measurement_review.get("feedback")
+                                or "The proposed measurement does not match the requested outcome."
+                            )
+                            gate_refusal = ToolResult(
+                                status="error",
+                                tool_name=tool_call.name,
+                                error_code="MEASUREMENT_MISMATCH",
+                                retryable=True,
+                                user_message=detail,
+                                denial_detail=detail,
+                                provenance=frozenset(),
+                                result_preview=None,
+                                result_full=None,
+                            )
+                    if gate_refusal is None and tool_call.name == "runQuery":
+                        from .measurement import validate_join_cardinality
+
+                        detail = await validate_join_cardinality(
+                            call_args.get("sql", ""), self._tool_dispatcher, credentials
+                        )
+                        if detail:
+                            gate_refusal = ToolResult(
+                                status="error",
+                                tool_name=tool_call.name,
+                                error_code="AGGREGATION_RISK",
+                                retryable=True,
+                                user_message=detail,
+                                denial_detail=detail,
+                                provenance=frozenset(),
+                                result_preview=None,
+                                result_full=None,
+                            )
                 # A gated call does not run. Otherwise summarize before its start event.
-                if gate_refusal is None:
+                if gate_refusal is None and tool_call.name not in {
+                    ANSWER_TABLE_TOOL_NAME,
+                    ANSWER_TEXT_TOOL_NAME,
+                }:
                     await self._maybe_start_summary(tool_call.name, tool_call.id, call_args)
 
                 # Runtime-tool registry (read-tools-design §2): a runtime tool
@@ -3472,326 +3799,26 @@ class AgentLoop:
                         },
                     )
 
-                if tool_result.status == "ok" and (
-                    tool_call.name in {ANSWER_TABLE_TOOL_NAME, ANSWER_TEXT_TOOL_NAME}
-                    or tool_result.terminal
-                ):
-                    draft = clean_answer_text(call_args.get("answer"))
-                    rule = first_match(
-                        draft,
-                        accum.sql_executed,
-                        question,
-                        has_alternative_evidence=bool(
-                            successful_text_evidence_tools
-                            or accum.capability_cards
-                            or tool_result.terminal
-                            or (
-                                tool_call.name == ANSWER_TABLE_TOOL_NAME and call_args.get("tables")
-                            )
-                        ),
-                        declined_clarification=declined_question,
-                    )
-                    if rule is not None:
-                        if await finalization_gate.may_refuse(rule.charges_to):
-                            self._observer(ANSWER_RULE_REFUSED_EVENT, {"rule": rule.name})
-                            finalization_nudge = rule.nudge(draft)
-                            tool_result = answer_judge_rejected(finalization_nudge)
-                        elif rule.refusal is not None:
-                            call_args = {**call_args, "answer": rule.refusal}
-
-                # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote
-                # the state and returned it in full, so the local is updated from
-                # the result rather than re-read from the store. A rejected call
-                # (or an unreadable result) leaves the loaded value standing.
                 if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
                     refreshed = refreshed_analysis_state(tool_result, turn_index)
                     if refreshed is not None:
                         analysis_state = refreshed
-
-                # --- FINALIZATION ENFORCEMENT, terminal exit #2 (05 §B.1) -----
-                #
-                # A successful `answerWithTable` carrying non-blank prose ENDS the
-                # turn once the batch drains. Refuse it here — BEFORE the trail
-                # entry is written, so the persisted entry IS the refusal — and
-                # crucially BEFORE `_resolve_answer_sql` below, which fires the two
-                # dormant `hooks/answer_table.py` seams: a designation that is
-                # about to be refused must not fire the answer-table lifecycle,
-                # and checking afterwards would also clobber the more actionable
-                # blueprint-not-run message with this one.
-                #
-                # The full terminal condition is mirrored exactly (`ok` + a `dict`
-                # of arguments + non-blank `answer`), because a call that would NOT
-                # have terminated the turn is not a finalization and must not be
-                # refused as one.
-                if (
-                    tool_call.name == ANSWER_TABLE_TOOL_NAME
-                    and tool_result.status == "ok"
-                    and isinstance(call_args, dict)
-                    and clean_answer_text(call_args.get("answer")) is not None
-                ):
-                    pending_at_answer = pending_intents(analysis_state)
-                    if pending_at_answer:
-                        if await finalization_gate.may_refuse("intents"):
-                            self._observer(
-                                "loop_finalization_refused",
-                                {
-                                    "exit": "answer_with_table",
-                                    "pending_count": len(pending_at_answer),
-                                },
-                            )
-                            # A RETRYABLE error, so the turn continues and the
-                            # batch drains normally: `tool_result` is no longer
-                            # `ok`, so neither `_resolve_answer_tables` below nor
-                            # the terminal-exit check fires for this call.
-                            tool_result = finalization_blocked(pending_at_answer)
-                        else:
-                            analysis_state = await self._force_block_pending_intents(
-                                session_id=session_id,
-                                turn_index=turn_index,
-                                state=analysis_state,
-                                reason_code="ENFORCEMENT_EXHAUSTED",
-                            )
-                            self._observer(
-                                "loop_enforcement_exhausted",
-                                {"intent_count": len(pending_at_answer)},
-                            )
-
-                # answerWithTable naming a blueprint it never ran: turn the call
-                # into a retryable NUDGE rather than letting it terminate the turn
-                # with no table. Done HERE, before the trail entry is written, so the
-                # persisted entry IS the nudge and the model sees it on the next
-                # round-trip. Only when there is no raw `sql` to fall back on, and
-                # only after `_resolve_answer_tables` has had its go — which includes
-                # giving the dormant ON_ANSWER_TABLE_UNRESOLVED hook first refusal, so
-                # a registered hook that supplies a replacement wins over the nudge.
-                #
-                # AN ITEM OF `tables` IS TREATED EXACTLY LIKE THE TOP-LEVEL PAIR: it
-                # names a blueprint that did not run, the whole call is refused, and
-                # the model is told which one. Dropping the item instead would
-                # silently lose a deliverable's table, which is the failure
-                # multi-table exists to fix.
-                resolved_answer_tables: list[AnswerTable] = []
-                if (
-                    tool_call.name == ANSWER_TABLE_TOOL_NAME
-                    and tool_result.status == "ok"
-                    and isinstance(call_args, dict)
-                ):
-                    # Resolved ONCE — the hooks fire here and nowhere else.
-                    (
-                        resolved_answer_tables,
-                        unresolved_blueprint,
-                        carried_designation,
-                    ) = await self._resolve_answer_tables(
+                resolved_answer_tables = []
+                if tool_call.name == ANSWER_TABLE_TOOL_NAME and tool_result.status == "ok":
+                    resolved_answer_tables, unresolved, _ = await self._resolve_answer_tables(
                         call_args,
                         blueprint_runs=accum.blueprint_runs,
                         credentials=credentials,
                         session_id=session_id,
                         turn_index=turn_index,
                     )
-                    if unresolved_blueprint is not None:
-                        _logger.info(
-                            "answerWithTable named blueprint %r that did not run this "
-                            "turn — nudging the model to run it first (session=%s)",
-                            unresolved_blueprint,
-                            session_id,
-                        )
-                        tool_result = _answer_table_blueprint_not_run(unresolved_blueprint)
-                    elif (
-                        not carried_designation
-                        and answer_shape.multi_row_calls
-                        and clean_answer_text(call_args.get("answer")) is not None
-                    ):
-                        # THE EMPTY DESIGNATION (08 §O). The model called the table
-                        # tool, named no table, and — because the call carries prose
-                        # — would TERMINATE the turn right here, through the exit the
-                        # 05 §J shape gate does not watch. Measured live as
-                        # `status=done`, no table, no event, no log: the user asked
-                        # for a breakdown, the turn held six rows of it, and the
-                        # answer was prose. See `answer_table_no_table_designated`.
-                        #
-                        # `answer_shape.multi_row_calls` SCOPES IT, and the scope is the
-                        # whole of the false-positive protection: with nothing
-                        # multi-row in hand there is no table being withheld, and a
-                        # zero-row "none found" answered in prose is CORRECT (live
-                        # q6). Nudging that would charge a right answer a round-trip.
-                        #
-                        # THE NON-BLANK `answer` CHECK MIRRORS THE TERMINAL
-                        # CONDITION, for the reason the pending-intents refusal just
-                        # above states: a call that would NOT have ended the turn is
-                        # not a finalization and must not be refused as one. A
-                        # blank-`answer` empty call is a habit call, not an answer —
-                        # it does not terminate anything, so nothing is being
-                        # silently lost, and refusing it would burn this window's
-                        # allowance on it and leave the REAL prose finish that
-                        # follows unrefusable. The flag fix below is what covers that
-                        # case: it stops the empty call disarming the exit-#1 gate.
-                        #
-                        # SAME ALLOWANCE AS THE SHAPE GATE (`kind="answer_shape"`),
-                        # because it is the same complaint arriving through the other
-                        # exit — otherwise one mistake could be refused twice in a
-                        # window, once per exit. When the grant is spent the prose
-                        # PASSES and the turn ends: never a hard lock, the posture
-                        # `ENFORCEMENT_EXHAUSTED` takes for intents. The event is
-                        # emitted in `_resolve_answer_tables` either way, so the
-                        # behaviour stays visible after the allowance is gone.
-                        if await finalization_gate.may_refuse("answer_shape"):
-                            _logger.info(
-                                "answerWithTable designated no table while %d "
-                                "multi-row result(s) went untabled — nudging "
-                                "(session=%s)",
-                                answer_shape.multi_row_calls,
-                                session_id,
-                            )
-                            self._observer(
-                                ANSWER_SHAPE_REFUSED_EVENT,
-                                {"multi_row_calls": answer_shape.multi_row_calls},
-                            )
-                            tool_result = answer_table_no_table_designated()
-                        else:
-                            self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
-                    else:
-                        self._observe_uncovered_intents(
-                            analysis_state,
-                            tables=resolved_answer_tables,
-                            result_sql_by_call_id=accum.result_sql_by_call_id,
-                        )
-                # --- THE ANSWER JUDGE, exit #2 (09 §C.2) --------------------
-                #
-                # THE SITE THAT MATTERS MOST, and the one 05 §L.9 leaves
-                # entirely unchecked today: no answer rule runs here, so a
-                # multi-part answer that closes both intents, designates one
-                # table and discusses one subject ends `done` with no event and
-                # no log line. That is the population where "was every part
-                # answered" has teeth — and §L.5 records the route into it, the
-                # `markdown_table` nudge telling the model to call
-                # answerWithTable instead.
-                #
-                # THE TERMINAL CONDITION IS MIRRORED EXACTLY (`ok` + a `dict` of
-                # arguments + non-blank `answer`), as the pending-intents
-                # refusal above mirrors it: a call that would NOT have ended the
-                # turn is not a finalization and must not be judged as one. The
-                # `ok` half also means every refusal above — pending intents,
-                # blueprint-not-run, empty designation, the unrun query — has
-                # already rewritten `tool_result` and the judge is not paid for.
-                #
-                # THE ALLOWANCE IS SHARED WITH EXIT #1 (`kind="answer_judge"`):
-                # the two exits are two doors out of ONE finish, so a model
-                # pushed here by an exit-#1 nudge must not be judged twice for
-                # the same answer.
+                    if unresolved:
+                        tool_result = _answer_table_blueprint_not_run(unresolved)
                 if (
-                    tool_call.name == ANSWER_TABLE_TOOL_NAME
+                    tool_call.name in {ANSWER_TABLE_TOOL_NAME, ANSWER_TEXT_TOOL_NAME}
                     and tool_result.status == "ok"
-                    and isinstance(call_args, dict)
-                    and clean_answer_text(call_args.get("answer")) is not None
                 ):
-                    table_draft = clean_answer_text(call_args.get("answer")) or ""
-                    if judge_refusal_this_round is not None:
-                        # A SECOND `answerWithTable` IN THE SAME BATCH, after the
-                        # judge already refused one. It gets the SAME refusal for
-                        # free — no second model call, no second claim.
-                        #
-                        # THIS BRANCH IS THE WHOLE FIX for a defect that shipped
-                        # past review once. Without it the sequence was: call A
-                        # judged and refused (which records the grant), call B
-                        # reaches `_judge`, `has_spent` reports the allowance gone,
-                        # the judge is SKIPPED, and skipping returns APPROVED — so
-                        # B stayed `ok` and TERMINATED THE TURN in the very round
-                        # the judge had refused it. The user received a near-copy of
-                        # the refused answer and the feedback reached the model
-                        # never. `may_refuse`'s own free-refusal path exists for
-                        # exactly this shape (05 §C.2) and the judge could not reach
-                        # it, because its cost-avoidance peek runs first.
-                        tool_result = answer_judge_rejected(judge_refusal_this_round)
-                    elif finalization_gate.refused_this_round:
-                        # ANOTHER gate refused earlier in this same round-trip (the
-                        # empty-designation nudge, say). One refusal per round-trip
-                        # is the rule the whole chain expresses, so the judge does
-                        # not run — and, unlike the shape above, has nothing to
-                        # re-issue. Skipping here also keeps the judge off the
-                        # free-grant path, where a refusal would be issued without a
-                        # claim and the window's bound would quietly become two.
-                        self._observer(ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "round_refused"})
-                    else:
-
-                        async def _table_brief(
-                            _q: str = question,
-                            _state: AnalysisState | None = analysis_state,
-                            _draft: str = table_draft,
-                            _tables: tuple[AnswerTable, ...] = tuple(resolved_answer_tables),
-                        ) -> JudgeBrief:
-                            results, anchor, in_scope = await self._judge_results(
-                                session_id, turn_index, credentials.column_scope
-                            )
-                            return self._judge_brief(
-                                "exit_table",
-                                question=_q,
-                                accum=accum,
-                                ship_guard=ship_guard,
-                                analysis_state=_state,
-                                date_anchor=anchor,
-                                draft=_draft,
-                                results=results,
-                                designated_tables=tuple(
-                                    (table.caption, table.sql) for table in _tables
-                                ),
-                                figure_corroborated=await self._corroborated_figures(
-                                    session_id, turn_index, _draft, in_scope
-                                ),
-                            )
-
-                        table_verdict = await self._judge(
-                            _table_brief,
-                            guard=guard,
-                            gate=finalization_gate,
-                            kind="answer_judge",
-                        )
-                        if table_verdict.approved and table_verdict.reviewed:
-                            ship_guard.note_approval()
-                        if not table_verdict.approved:
-                            ship_guard.note_refusal(
-                                "exit_table", table_verdict.violation, assumptions=accum.assumptions
-                            )
-                            refusal_kind = _answer_judge_refusal_kind(table_verdict)
-                            if await finalization_gate.may_refuse(refusal_kind):
-                                self._observer(
-                                    ANSWER_JUDGE_REFUSED_EVENT,
-                                    {
-                                        "violation": table_verdict.violation,
-                                        "site": "exit_table",
-                                    },
-                                )
-                                # A RETRYABLE error, so the turn continues and the
-                                # batch drains normally — `tool_result` is no longer
-                                # `ok`, so the terminal-exit check below does not
-                                # fire for this call and the persisted entry IS the
-                                # refusal. NO DRAFT CLEAR is needed: exit #2 keeps
-                                # the model's prose in `TrailEntry.args`.
-                                tool_result = answer_judge_rejected(table_verdict.feedback)
-                                # Remembered for the REST OF THIS BATCH, so a second
-                                # answerWithTable is refused with the same words
-                                # rather than sailing through the skip above.
-                                judge_refusal_this_round = table_verdict.feedback
-                            else:
-                                # THE ANSWER PASSES. §J.5/§L.8's posture — the runtime
-                                # never hard-locks a turn, and this check reads MEANING
-                                # rather than truth.
-                                #
-                                # ⚠ THIS `else` BINDS TO `may_refuse`, NOT TO
-                                # `approved`. It sat one level out for a while and the
-                                # consequence was invisible offline: an APPROVED answer
-                                # took this branch and published
-                                # `loop_answer_judge_exhausted` with an empty
-                                # `violation`, so the metric that says "the judge was
-                                # overruled" fired on every clean tabled answer. Caught
-                                # by reading a live Phoenix trace, not by a test.
-                                self._observer(
-                                    ANSWER_JUDGE_EXHAUSTED_EVENT,
-                                    {
-                                        "violation": table_verdict.violation,
-                                        "site": "exit_table",
-                                    },
-                                )
-
+                    proposal_args = dict(call_args)
                 # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
                 # pause (today only `runBlueprint`, on a slot-resolution
                 # `askUser`). This GENERALIZES the terminal `askUser` branch
@@ -3812,6 +3839,30 @@ class AgentLoop:
                     # pins that it is still read LATE — after the folds of the
                     # calls that drained before this one.
                     envelope = accum.envelope()
+                    for pending in result.tool_calls:
+                        if pending.id in dispatched_ids and pending.id != tool_call.id:
+                            continue
+                        await self._session_store.append_trail_entry(
+                            session_id,
+                            TrailEntry(
+                                turn_index=turn_index,
+                                tool_call_id=pending.id,
+                                tool_name=pending.name,
+                                args=pending.arguments,
+                                status="error",
+                                error_code="TOOL_PAUSED"
+                                if pending.id == tool_call.id
+                                else "TOOL_NOT_EXECUTED",
+                                denial_detail="Awaiting clarification."
+                                if pending.id == tool_call.id
+                                else "Not executed because an earlier call paused. Reissue if needed.",
+                                provenance=frozenset(),
+                                result_preview=None,
+                                result_full_ref=None,
+                                ts=_now_iso(),
+                                model_response=model_response,
+                            ),
+                        )
                     return await self._pause_from_runtime_tool(
                         session_id=session_id,
                         pause=tool_result.pause,
@@ -3826,10 +3877,29 @@ class AgentLoop:
                         # `_pause_from_runtime_tool`): the trail entry for this work
                         # is written after the resume, under a new id.
                         serves_intent=serves_intent,
+                        serves_intents=serves_intents,
                     )
                 tool_calls_made += 1
+                if measurement_review and isinstance(tool_result.result_full, dict):
+                    tool_result = replace(
+                        tool_result,
+                        result_full={
+                            **tool_result.result_full,
+                            "measurement_review": measurement_review,
+                        },
+                    )
 
                 result_full_ref: str | None = None
+                # Final-answer arguments contain derived prose. Give their trail
+                # entries the same evidence scope as the persisted answer, rather
+                # than the handler's empty (data-free confirmation) provenance.
+                if tool_call.name in {ANSWER_TABLE_TOOL_NAME, ANSWER_TEXT_TOOL_NAME}:
+                    tool_result = replace(
+                        tool_result,
+                        provenance=await self._compute_turn_provenance_union(
+                            session_id, turn_index
+                        ),
+                    )
                 if tool_result.result_full is not None:
                     result_full_ref = await self._session_store.write_full_result(
                         session_id, str(uuid.uuid4()), tool_result.result_full
@@ -3840,6 +3910,9 @@ class AgentLoop:
                     tool_call_id=tool_call.id,
                     tool_name=tool_call.name,
                     args=dict(call_args),
+                    model_response=model_response,
+                    measurement_review=measurement_review,
+                    serves_intents=serves_intents,
                     status=tool_result.status,
                     error_code=tool_result.error_code,
                     provenance=tool_result.provenance,
@@ -3852,7 +3925,11 @@ class AgentLoop:
                     # data-anchored window; `None` for every other call, so every other
                     # entry serialises byte-identically.
                     window_note=tool_result.window_note,
-                    capability_terminal=tool_result.terminal,
+                    capability_terminal=tool_result.terminal
+                    or bool(
+                        isinstance(tool_result.result_full, dict)
+                        and tool_result.result_full.get("prepared")
+                    ),
                     # The validated tag (or `None`). Persisted on the entry rather
                     # than left in `args`, so it survives replay/resume and is
                     # readable by `updateAnalysisState` without re-parsing
@@ -3911,27 +3988,25 @@ class AgentLoop:
                 # the call ARGUMENTS on success — except LAST designation wins,
                 # over the whole SET, since a turn has one answer.
                 accum.note_answer_tables(tool_call.name, tool_result, resolved_answer_tables)
+                if is_unified_finalizer and tool_result.status == "ok":
+                    accum.select_answer_tables(resolved_answer_tables or ())
                 help_grounding.observe(tool_call.name, tool_result.status, tool_result.result_full)
-                if tool_result.status == "ok" and tool_call.name in _TEXT_ANSWER_EVIDENCE_TOOLS and (
-                    tool_call.name != "getHelpCenterDocument" or help_grounding.document_fetched
+                if (
+                    tool_result.status == "ok"
+                    and tool_call.name in _TEXT_ANSWER_EVIDENCE_TOOLS
+                    and (
+                        tool_call.name != "getHelpCenterDocument" or help_grounding.document_fetched
+                    )
                 ):
                     successful_text_evidence_tools.add(tool_call.name)
-                if tool_call.name == ANSWER_TEXT_TOOL_NAME and tool_result.status == "ok":
-                    designated_text_answer = (
-                        clean_answer_text(call_args.get("answer"))
-                        if isinstance(call_args, dict)
-                        else None
+                if tool_result.status == "ok" and (
+                    tool_result.terminal
+                    or (
+                        isinstance(tool_result.result_full, dict)
+                        and tool_result.result_full.get("prepared")
                     )
-                    declared_evidence = clean_evidence(
-                        call_args.get("evidence") if isinstance(call_args, dict) else None
-                    )
-                    designated_text_has_evidence = bool(declared_evidence) and set(
-                        declared_evidence
-                    ).issubset(successful_text_evidence_tools)
-                if tool_result.status == "ok" and tool_result.terminal:
-                    card_answer = accum.note_capability_card(tool_result)
-                    if card_answer is not None:
-                        capability_terminal_text = card_answer
+                ):
+                    accum.note_capability_card(tool_result)
                 # TERMINAL: a successful `answerWithTable` carries the final prose,
                 # so the turn ends on it. Recorded here and acted on AFTER the whole
                 # tool batch drains, so a model that batches recordAssumptions +
@@ -3961,7 +4036,7 @@ class AgentLoop:
                     # through the envelope, which is what the gate protects.
                     if resolved_answer_tables or accum.has_answer_tables:
                         answer_shape.note_answer_succeeded()
-                    designated_answer_text = (
+                    (
                         clean_answer_text(call_args.get("answer"))
                         if isinstance(call_args, dict)
                         else None
@@ -4021,8 +4096,6 @@ class AgentLoop:
             # corrective advice to give, and the pre-slice behaviour (silent drop, plus
             # `loop_intent_tag_dropped`, which fired above and is untouched) is the
             # correct fallback.
-            if substantive_ran:
-                intent_note_call_ids.clear()
 
             # BLUEPRINT-DEFINITION GATE, the fold. HERE, once the batch has drained,
             # and deliberately not mid-batch: ids expanded in THIS response become
@@ -4031,6 +4104,32 @@ class AgentLoop:
             # round-trip. See `BlueprintGate.commit_round` for the full rationale —
             # the position of this call is the half of it that lives here.
             blueprint_gate.commit_round()
+            for skipped in result.tool_calls:
+                if skipped.id in dispatched_ids:
+                    continue
+                await self._session_store.append_trail_entry(
+                    session_id,
+                    TrailEntry(
+                        turn_index=turn_index,
+                        tool_call_id=skipped.id,
+                        tool_name=skipped.name,
+                        args=skipped.arguments,
+                        status="error",
+                        error_code="CLARIFICATION_REQUESTED"
+                        if ask_user_call is not None and skipped.id == ask_user_call.id
+                        else "TOOL_NOT_EXECUTED",
+                        denial_detail=(
+                            "Clarification requested. Apply the next user answer or decline and continue without repeating it. If runtime feedback rejects this question, follow that feedback."
+                            if ask_user_call is not None and skipped.id == ask_user_call.id
+                            else "This call was not executed because the batch paused or reached its call limit. Reissue it if still needed."
+                        ),
+                        provenance=frozenset(),
+                        result_preview=None,
+                        result_full_ref=None,
+                        ts=_now_iso(),
+                        model_response=model_response,
+                    ),
+                )
 
             # TERMINATION: pause. Honoured AFTER the state calls above have been
             # committed (03 §E.1) and BEFORE anything else in the batch is
@@ -4038,23 +4137,6 @@ class AgentLoop:
             # path, so every other call still waits for the resume exactly as it
             # always did.
             if ask_user_call is not None:
-                if (
-                    accum.unpresented_capability_names
-                    and not capability_advisory_used
-                    and not ship_guard.unsafe_ship()
-                ):
-                    capability_names = ", ".join(accum.unpresented_capability_names)
-                    capability_advisory_used = True
-                    self._observer(
-                        "loop_capability_present_suggested",
-                        {"count": len(accum.unpresented_capability_names)},
-                    )
-                    finalization_nudge = (
-                        f"You loaded the UI option {capability_names} but did not present it. "
-                        "Call it if you want to show it; a definition lookup is not visible. "
-                        "If you intentionally chose not to present it, finish normally with an answer tool."
-                    )
-                    continue
                 raw_question = str(ask_user_call.arguments.get("question", ""))
                 declined_key = _question_key(declined_question) if declined_question else ""
                 if declined_key and _question_key(raw_question) == declined_key:
@@ -4117,7 +4199,13 @@ class AgentLoop:
                     _state: AnalysisState | None = analysis_state,
                     _asked: str = raw_question,
                     _options: tuple[str, ...] = tuple(
-                        _ask_user_options(ask_user_call.arguments.get("options")) or ()
+                        [
+                            o
+                            for o in ask_user_call.arguments.get("options", [])
+                            if isinstance(o, str)
+                        ]
+                        if isinstance(ask_user_call.arguments.get("options"), list)
+                        else ()
                     ),
                 ) -> JudgeBrief:
                     results, anchor, _ = await self._judge_results(
@@ -4126,7 +4214,7 @@ class AgentLoop:
                         credentials.column_scope,
                         include_all_successful=True,
                     )
-                    return self._judge_brief(
+                    brief = self._judge_brief(
                         "ask_user",
                         question=_q,
                         accum=accum,
@@ -4136,6 +4224,15 @@ class AgentLoop:
                         results=results,
                         pending_question=_asked,
                         pending_options=_options,
+                    )
+
+                    return replace(
+                        brief,
+                        clarification_answers=tuple(
+                            m.content
+                            for m in session_doc.messages
+                            if m.role == "user" and m.turn_index == turn_index
+                        )[1:],
                     )
 
                 ask_verdict = await self._judge(
@@ -4216,7 +4313,10 @@ class AgentLoop:
                             "exit": "ask_user_question",
                         },
                     )
-                options = _ask_user_options(ask_user_call.arguments.get("options"))
+                normalized = normalize_clarification(
+                    question, ask_user_call.arguments.get("options")
+                )
+                question, options = normalized["question"], normalized["options"]
                 checkpoint = PauseCheckpoint(
                     reason="askUser",
                     pending_question={"question": question, "options": options},
@@ -4238,325 +4338,389 @@ class AgentLoop:
                     event=("loop_paused_ask_user", {"question": question}),
                 )
 
-            if (
-                designated_text_answer is not None
-                and answer_shape.armed
-                and not accum.has_answer_tables
-            ):
-                if await finalization_gate.may_refuse("answer_shape"):
-                    finalization_nudge = answer_shape_nudge_text(
-                        designated_text_answer,
-                        answer_shape.multi_row_calls,
-                        refusal_actioned=bool(ship_guard.unsafe_ship()),
-                        cards_present=bool(accum.capability_cards),
-                        capability_repick_used=ship_guard.repick_used,
-                        capability_engaged=bool(
-                            accum.unpresented_capability_names or accum.capability_cards
-                        ),
-                    )
-                    designated_text_answer = None
-                    capability_finalization_refused = True
-
-            if designated_text_answer is not None and help_grounding.needs_decline(
-                successful_text_evidence_tools, bool(accum.capability_cards or accum.has_answer_tables)
-            ):
-                designated_text_answer = HELP_UNAVAILABLE_TEXT
-                self._observer("loop_help_center_grounding_declined", {})
-
-            if designated_text_answer is not None:
-                designated_text_has_evidence = designated_text_has_evidence or bool(
-                    accum.capability_cards
+            if proposal_args is not None:
+                final_text = clean_answer_text(proposal_args.get("answer")) or ""
+                final_text, proposal_redactions = scrub_answer_prose(
+                    final_text,
+                    provenance=await self._compute_turn_provenance_union(session_id, turn_index),
                 )
-                pending_at_text = pending_intents(analysis_state)
-                if (
-                    accum.unpresented_capability_names
-                    and not capability_advisory_used
-                    and not ship_guard.unsafe_ship()
+                if proposal_redactions:
+                    self._observer(
+                        ANSWER_PROSE_REDACTED_EVENT,
+                        {
+                            "redaction_count": proposal_redactions,
+                            "exit": "answer_with_table"
+                            if proposal_args.get("tables")
+                            else "answer_with_text",
+                        },
+                    )
+                self._observe_uncovered_intents(
+                    analysis_state,
+                    tables=accum.answer_tables,
+                    result_sql_by_call_id=accum.result_sql_by_call_id,
+                )
+                current_trail = await self._session_store.load_trail(session_id)
+                evidence_trail = [
+                    e
+                    for e in scope_filter.filter_trail(
+                        current_trail, credentials.column_scope, current_turn_index=turn_index
+                    )
+                    if e.turn_index == turn_index
+                ]
+                from .proposal import (
+                    context_catalog_entries,
+                    omission_nudge,
+                    omit_components,
+                    selected_components,
+                )
+
+                emulated_evidence = context_catalog_entries(
+                    canonical_messages, set(emulated_served_call_ids.values()), turn_index
+                )
+                evidence_trail.extend(emulated_evidence)
+                deliverables, evidence_error = deliverable_evidence(
+                    analysis_state, proposal_args, evidence_trail
+                )
+                refs = proposal_args.get("capability_refs", [])
+                if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
+                    evidence_error = "capability_refs must contain prepared option IDs."
+                    refs = []
+                if refs:
+                    missing = set(refs) - (
+                        accum.prepared_capability_names & self._runtime_tools.keys()
+                    )
+                    if missing:
+                        evidence_error = "A requested UI option is not prepared. Load and prepare it before finalizing."
+                # Explicit selection; preparation alone is never user-visible finalization.
+                if "capability_refs" in proposal_args:
+                    accum.select_capabilities(refs)
+                final_text = (
+                    coherent_capability_ship_text(
+                        final_text, accum.capability_cards, ship_guard.unsafe_ship()
+                    )
+                    if accum.capability_cards
+                    else final_text
+                )
+                if help_grounding.needs_decline(
+                    successful_text_evidence_tools, bool(accum.capability_cards)
                 ):
-                    capability_names = ", ".join(accum.unpresented_capability_names)
-                    capability_advisory_used = True
-                    self._observer(
-                        "loop_capability_present_suggested",
-                        {"count": len(accum.unpresented_capability_names)},
+                    final_text = HELP_UNAVAILABLE_TEXT
+                component_catalog = selected_components(
+                    proposal_args,
+                    evidence_trail,
+                    {
+                        **{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
+                        **accum.result_sql_by_call_id,
+                    },
+                )
+                complete = {
+                    "answer": final_text,
+                    "tables": [t.to_doc() for t in accum.answer_tables],
+                    "assumptions": accum.assumptions,
+                    "capabilities": accum.capability_cards,
+                    "deliverables": deliverables,
+                }
+                version = fingerprint(complete)
+                site = (
+                    "exit_capability"
+                    if accum.capability_cards
+                    else "exit_table"
+                    if accum.has_answer_tables
+                    else "exit_prose"
+                )
+                combined_prose = final_text + "\n" + "\n".join(accum.assumptions or ())
+                rule = first_match(
+                    combined_prose,
+                    accum.sql_executed,
+                    question,
+                    has_alternative_evidence=bool(
+                        any(d["evidence"] for d in deliverables)
+                        or accum.capability_cards
+                        or accum.has_answer_tables
+                    ),
+                    declined_clarification=declined_question,
+                )
+                feedback = evidence_error
+                kind = "ungrounded_answer"
+                if not final_text:
+                    feedback, kind = (
+                        "Provide the complete answer in finalizeAnswer.answer.",
+                        "empty_answer",
                     )
-                    finalization_nudge = (
-                        f"You loaded the UI option {capability_names} but did not present it. "
-                        "Call it if you want to show it; a definition lookup is not visible. "
-                        "If you intentionally chose not to present it, finish normally with an answer tool."
+                elif pending_intents(analysis_state):
+                    feedback, kind = (
+                        finalization_nudge_text(final_text, pending_intents(analysis_state)),
+                        "intents",
                     )
-                    designated_text_answer = None
-                    capability_finalization_refused = True
-                elif pending_at_text and await finalization_gate.may_refuse("intents"):
-                    self._observer(
-                        "loop_finalization_refused",
-                        {"exit": "answer_with_text", "pending_count": len(pending_at_text)},
-                    )
-                    finalization_nudge = finalization_nudge_text(
-                        designated_text_answer, pending_at_text
-                    )
-                    designated_text_answer = None
-                    capability_finalization_refused = True
+                elif rule:
+                    feedback, kind = rule.nudge(final_text), rule.charges_to
                 elif (
-                    not designated_text_has_evidence
-                    and not declined_question
-                    and not is_scope_decline(designated_text_answer)
-                    and await finalization_gate.may_refuse("ungrounded_answer")
+                    any(
+                        e.tool_name in DATA_ANSWER_TOOLS
+                        and e.status == "ok"
+                        and e.result_preview is not None
+                        and e.result_preview.row_count > 1
+                        and e.tool_call_id
+                        not in {c["result_id"] for c in review_state.excluded_components}
+                        for e in evidence_trail
+                    )
+                    and not accum.has_answer_tables
+                    and not accum.capability_cards
                 ):
-                    self._observer(ANSWER_RULE_REFUSED_EVENT, {"rule": "ungrounded_text_answer"})
-                    finalization_nudge = (
-                        "You tried to finish with answerWithText without valid current-turn "
-                        "evidence. Are you sure this answer can be given without runQuery, "
-                        "runBlueprint, getTableSchema, or a complete Help Center document? "
-                        "If evidence is available, use it and list its exact tool name in "
-                        "answerWithText.evidence. Otherwise call answerWithText again with "
-                        "an empty evidence list and give a concise, honest answer that makes "
-                        "no unsupported claim."
+                    echo = final_text[:MAX_NUDGE_DRAFT_CHARS]
+                    if len(echo) < len(final_text):
+                        echo += " …[truncated]"
+                    feedback, kind = (
+                        f"You drafted: {echo}\n\nThe turn is NOT over. Use finalizeAnswer.tables with the result IDs for the requested breakdown. Disclose any missing part and include the complete answer in finalizeAnswer.answer.",
+                        "answer_shape",
                     )
-                    designated_text_answer = None
-                    capability_finalization_refused = True
-
-            if designated_text_answer is not None and not finalization_gate.refused_this_round:
-
-                async def _text_tool_brief(
-                    _q: str = question,
-                    _state: AnalysisState | None = analysis_state,
-                    _draft: str = designated_text_answer,
-                ) -> JudgeBrief:
-                    results, anchor, in_scope = await self._judge_results(
-                        session_id, turn_index, credentials.column_scope
+                if feedback:
+                    if await finalization_gate.may_refuse(kind):
+                        if kind == "empty_answer":
+                            self._observer(
+                                EMPTY_ANSWER_REFUSED_EVENT,
+                                {"incomplete_reason": result.incomplete_reason or ""},
+                            )
+                        if rule and feedback == rule.nudge(final_text):
+                            self._observer(ANSWER_RULE_REFUSED_EVENT, {"rule": rule.name})
+                        if kind == "answer_shape":
+                            self._observer(
+                                "loop_answer_shape_refused",
+                                {"multi_row_calls": answer_shape.multi_row_calls},
+                            )
+                        elif kind == "intents":
+                            self._observer(
+                                "loop_finalization_refused",
+                                {
+                                    "exit": "answer_with_table"
+                                    if accum.has_answer_tables
+                                    else "answer_with_text",
+                                    "pending_count": len(pending_intents(analysis_state)),
+                                },
+                            )
+                        finalization_nudge = feedback
+                    else:
+                        if kind == "empty_answer":
+                            self._observer(
+                                EMPTY_ANSWER_EXHAUSTED_EVENT,
+                                {"incomplete_reason": result.incomplete_reason or ""},
+                            )
+                        if rule and feedback == rule.nudge(final_text):
+                            self._observer(ANSWER_RULE_EXHAUSTED_EVENT, {"rule": rule.name})
+                        if kind == "answer_shape":
+                            self._observer("loop_answer_shape_exhausted", {})
+                        final_text = (
+                            EMPTY_ANSWER_FALLBACK_TEXT
+                            if kind == "empty_answer"
+                            else (
+                                rule.refusal
+                                if rule and rule.refusal
+                                else "I could not verify every requested part from the available evidence."
+                            )
+                        )
+                        accum.apply_ship_disposition(
+                            "ship_tables_with_hedge" if accum.has_answer_tables else "decline_only",
+                            (),
+                        )
+                else:
+                    enabled = self._answer_judge is not None and getattr(
+                        self._answer_judge, "enabled", True
                     )
-                    return self._judge_brief(
-                        "exit_prose",
-                        question=_q,
-                        accum=accum,
-                        ship_guard=ship_guard,
-                        analysis_state=_state,
-                        date_anchor=anchor,
-                        draft=_draft,
-                        results=results,
-                        figure_corroborated=await self._corroborated_figures(
-                            session_id, turn_index, _draft, in_scope
-                        ),
-                    )
-
-                text_verdict = await self._judge(
-                    _text_tool_brief,
-                    guard=guard,
-                    gate=finalization_gate,
-                    kind="answer_judge",
-                )
-                if text_verdict.approved and text_verdict.reviewed:
-                    ship_guard.note_approval()
-                if not text_verdict.approved:
-                    ship_guard.note_refusal(
-                        "exit_prose", text_verdict.violation, assumptions=accum.assumptions
-                    )
-                    refusal_kind = _answer_judge_refusal_kind(text_verdict)
-                    if await finalization_gate.may_refuse(refusal_kind):
+                    verdict = APPROVED
+                    remaining = guard.usage().max_wall_clock_seconds - guard.usage().elapsed_seconds
+                    if enabled and review_state.calls < 2 and remaining > 0:
+                        # Persist consumption BEFORE the external call, so a pause/retry
+                        # cannot reset it. The second validation never grants another repair.
+                        review_state.calls += 1
+                        review_state.answer_version = version
+                        await self._session_store.write_review_state(
+                            session_id, turn_index, review_state.to_doc()
+                        )
+                        brief_ready = False
+                        try:
+                            results, anchor, in_scope = await self._judge_results(
+                                session_id,
+                                turn_index,
+                                credentials.column_scope,
+                                exclude_result_ids=frozenset(
+                                    c["result_id"] for c in review_state.excluded_components
+                                ),
+                            )
+                            results = (
+                                *results,
+                                *(
+                                    render_entry(e, self._preview_row_count)
+                                    for e in emulated_evidence
+                                ),
+                            )
+                            brief = self._judge_brief(
+                                site,
+                                question=question,
+                                accum=accum,
+                                analysis_state=analysis_state,
+                                date_anchor=anchor,
+                                draft=final_text,
+                                figure_corroborated=await self._corroborated_figures(
+                                    session_id, turn_index, final_text, in_scope
+                                ),
+                                results=results,
+                                ship_guard=ship_guard,
+                                designated_tables=tuple(
+                                    (t.caption, t.sql) for t in accum.answer_tables
+                                ),
+                            )
+                            brief = replace(
+                                brief,
+                                deliverables=tuple(deliverables),
+                                selected_components=tuple(component_catalog),
+                                capability_presented=tuple(
+                                    {
+                                        **card,
+                                        "result_ids": [
+                                            c["result_id"]
+                                            for c in component_catalog
+                                            if c.get("capability_ref") == card.get("name")
+                                        ],
+                                    }
+                                    for card in brief.capability_presented
+                                ),
+                                excluded_components=review_state.excluded_components,
+                                clarification_answers=tuple(
+                                    m.content
+                                    for m in session_doc.messages
+                                    if m.role == "user" and m.turn_index == turn_index
+                                )[1:],
+                                designated_tool_call_ids=tuple(
+                                    t["result_id"]
+                                    for t in proposal_args.get("tables", [])
+                                    if isinstance(t, dict) and isinstance(t.get("result_id"), str)
+                                ),
+                            )
+                            brief_ready = True
+                            verdict = await asyncio.wait_for(
+                                self._answer_judge.review(brief),
+                                timeout=min(
+                                    remaining, getattr(self._answer_judge, "timeout_seconds", 20.0)
+                                ),
+                            )
+                        except Exception as exc:
+                            self._observer(
+                                ANSWER_JUDGE_FAILED_EVENT,
+                                {
+                                    "reason": "timeout"
+                                    if isinstance(exc, TimeoutError)
+                                    else "review_failed"
+                                    if brief_ready
+                                    else "brief_failed"
+                                },
+                            )
+                            verdict = APPROVED
+                    if verdict.approved and verdict.reviewed:
+                        review_state.approved_version = version
+                        review_state.violation = ""
+                        ship_guard.note_approval()
+                    elif not verdict.approved:
                         self._observer(
                             ANSWER_JUDGE_REFUSED_EVENT,
-                            {"violation": text_verdict.violation, "site": "exit_prose"},
+                            {"violation": verdict.violation, "site": site},
                         )
-                        finalization_nudge = answer_judge_nudge_text(
-                            designated_text_answer, text_verdict.feedback
-                        )
-                        designated_text_answer = None
-                        capability_finalization_refused = True
-                    else:
-                        self._observer(
-                            ANSWER_JUDGE_EXHAUSTED_EVENT,
-                            {"violation": text_verdict.violation, "site": "exit_prose"},
-                        )
-
-            if accum.capability_cards and answer_shape.armed and not accum.has_answer_tables:
-                if await finalization_gate.may_refuse("answer_shape"):
-                    capability_finalization_refused = True
-                    self._observer(
-                        ANSWER_SHAPE_REFUSED_EVENT,
-                        {"multi_row_calls": answer_shape.multi_row_calls},
-                    )
-                    finalization_nudge = answer_shape_nudge_text(
-                        result.assistant_text,
-                        answer_shape.multi_row_calls,
-                        refusal_actioned=ship_guard.unsafe_ship() is not None,
-                        cards_present=True,
-                        capability_repick_used=ship_guard.repick_used,
-                        capability_engaged=True,
-                    )
-                    last_assistant_text = None
-                else:
-                    self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
-
-            if accum.capability_cards and not capability_finalization_refused:
-                capability_approved = False
-                final_text = (
-                    designated_answer_text
-                    or designated_text_answer
-                    or capability_terminal_text
-                    or "Here are the requested options."
-                )
-                if _claims_navigation_was_performed(final_text, accum.capability_cards):
-                    ship_guard.note_refusal(
-                        "exit_capability",
-                        NAVIGATION_CLAIM_VIOLATION,
-                        assumptions=accum.assumptions,
-                        card_fatal=False,
-                    )
-                    if not navigation_refused:
-                        navigation_refused = True
-                        capability_finalization_refused = True
-                        self._observer(
-                            "loop_navigation_claim_refused",
-                            {"violation": NAVIGATION_CLAIM_VIOLATION, "site": "exit_capability"},
-                        )
-                        finalization_nudge = "Navigation requires a user click. Rewrite using answerWithText without claiming you navigated or will navigate. The option is prepared; do not call it again."
-                        last_assistant_text = designated_answer_text = designated_text_answer = None
-                    else:
-                        final_text = capability_hedge_text(NAVIGATION_CLAIM_VIOLATION)
-                if not finalization_gate.refused_this_round and not capability_finalization_refused:
-
-                    async def _capability_brief(
-                        _q: str = question,
-                        _state: AnalysisState | None = analysis_state,
-                        _draft: str = final_text,
-                    ) -> JudgeBrief:
-                        results, anchor, in_scope = await self._judge_results(
-                            session_id, turn_index, credentials.column_scope
-                        )
-                        return self._judge_brief(
-                            "exit_capability",
-                            question=_q,
-                            accum=accum,
-                            ship_guard=ship_guard,
-                            analysis_state=_state,
-                            date_anchor=anchor,
-                            draft=_draft,
-                            results=results,
-                            figure_corroborated=await self._corroborated_figures(
-                                session_id, turn_index, _draft, in_scope
-                            ),
-                        )
-
-                    capability_verdict = await self._judge(
-                        _capability_brief,
-                        guard=guard,
-                        gate=finalization_gate,
-                        kind="answer_judge",
-                    )
-                    if capability_verdict.approved and capability_verdict.reviewed:
-                        capability_approved = True
-                        ship_guard.note_approval()
-                    if not capability_verdict.approved:
+                        review_state.site = site
+                        review_state.reject(verdict, version, accum.assumptions or ())
                         ship_guard.note_refusal(
-                            "exit_capability",
-                            capability_verdict.violation,
-                            assumptions=accum.assumptions,
+                            site,
+                            verdict.violation,
+                            assumptions=review_state.assumptions_before_refusal,
                         )
-                        refusal_kind = _answer_judge_refusal_kind(capability_verdict)
-                        if await finalization_gate.may_refuse(refusal_kind):
-                            capability_finalization_refused = True
-                            self._observer(
-                                ANSWER_JUDGE_REFUSED_EVENT,
+                        if not review_state.repaired and review_state.calls < 2 and remaining > 0:
+                            review_state.repaired = True
+                            feedback = verdict.feedback
+                            finalization_nudge = answer_judge_nudge_text(final_text, feedback)
+                            finalization_nudge += "\nRepair target: " + json.dumps(
                                 {
-                                    "violation": capability_verdict.violation,
-                                    "site": "exit_capability",
-                                },
+                                    "intent_id": verdict.intent_id,
+                                    "result_ids": verdict.result_ids,
+                                    "repair_type": verdict.repair_type,
+                                }
                             )
-                            finalization_nudge = answer_judge_nudge_text(
-                                final_text, capability_verdict.feedback
-                            )
-                            if is_card_fatal("exit_capability", capability_verdict.violation):
-                                accum.clear_capabilities()
-                                if not ship_guard.repick_used and not finalization_gate.has_spent(
-                                    "answer_judge"
-                                ):
-                                    ship_guard.repick_used = True
-                                    finalization_nudge += " You may select one different UI option only if its declared coverage fits: searchCapabilityTools, getCapabilityTool, then present it. Otherwise decline through answerWithText."
-                                else:
-                                    finalization_nudge += " Do not re-pick an unreviewed option; give an honest decline through answerWithText."
-                            designated_text_answer = None
-                            last_assistant_text = None
-                            designated_answer_text = None
-                        else:
-                            self._observer(
-                                ANSWER_JUDGE_EXHAUSTED_EVENT,
-                                {
-                                    "violation": capability_verdict.violation,
-                                    "site": "exit_capability",
-                                },
-                            )
-                if not capability_finalization_refused:
-                    if (self._answer_judge is not None and getattr(self._answer_judge, "enabled", True)
-                            and not capability_approved
-                            and any(card["kind"] != "navigation" for card in accum.capability_judge_context)):
+                            if omit_components(review_state, verdict, component_catalog):
+                                accum.exclude_components(review_state.excluded_components)
+                                finalization_nudge = omission_nudge(
+                                    review_state.excluded_components
+                                ).lstrip()
+                            elif verdict.repair_type == "omit_component":
+                                finalization_nudge += " The omission target was invalid or ambiguous; no component was automatically removed. Correct the answer using accessible evidence."
+                            if verdict.repair_type in {"prose", "presentation"}:
+                                finalization_nudge += " Preserve the existing results. No additional warehouse query is needed."
+                    await self._session_store.write_review_state(
+                        session_id, turn_index, review_state.to_doc()
+                    )
+                if not feedback or finalization_nudge is None:
+                    if (
+                        self._answer_judge is not None
+                        and getattr(self._answer_judge, "enabled", True)
+                        and review_state.approved_version != version
+                        and any(
+                            card["kind"] != "navigation" for card in accum.capability_judge_context
+                        )
+                    ):
                         ship_guard.refuse_unreviewed_data_card(assumptions=accum.assumptions)
+                    if pending_intents(analysis_state):
+                        self._observer(
+                            "loop_enforcement_exhausted",
+                            {"intent_count": len(pending_intents(analysis_state))},
+                        )
+                        await self._force_block_pending_intents(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            state=analysis_state,
+                            reason_code="ENFORCEMENT_EXHAUSTED",
+                        )
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
                         status="done",
-                        exit_label=(
-                            "answer_with_text"
-                            if designated_text_answer is not None
-                            else "capability"
-                        ),
+                        exit_label="answer_with_table"
+                        if accum.has_answer_tables
+                        else "answer_with_text",
                         assistant_text=final_text,
-                        tool_calls_made=tool_calls_made,
+                        persist_text=final_text,
                         accum=accum,
+                        tool_calls_made=tool_calls_made,
+                        ship_guard=ship_guard,
+                        judge_site=site,
                         provenance=await self._compute_turn_provenance_union(
                             session_id, turn_index
                         ),
-                        persist_text=final_text,
                         event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
-                        capability_cards=accum.capability_cards,
-                        ship_guard=ship_guard,
-                        judge_site="exit_capability",
                     )
 
-            # Explicit answer tools are checked after the whole batch drains, so
-            # batched bookkeeping and finalization calls are folded together.
-            # answerWithTable carries its final prose in the call. It is checked
-            # AFTER the whole batch drains so a batched recordAssumptions +
-            # answerWithTable still folds both before the turn closes.
-            #
-            # Everything below mirrors the no-tool-calls exit exactly — the same
-            # `_compute_turn_provenance_union` (the single fail-closed source of
-            # truth) and the same persisted assistant `TurnMessage` — because
-            # replay, `session_history`, and the D44 scope gate all read that
-            # message. A divergence here would make history disagree with the live
-            # answer for exactly the turns that produced a table.
-            if designated_answer_text is not None:
-                turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
-                return await self._finish(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    status="done",
-                    exit_label="answer_with_table",
-                    ship_guard=ship_guard,
-                    judge_site="exit_table",
-                    assistant_text=designated_answer_text,
-                    tool_calls_made=tool_calls_made,
-                    accum=accum,
-                    provenance=turn_provenance,
-                    persist_text=designated_answer_text,
-                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+            discovery_names = {
+                "listDatabases",
+                "listTables",
+                "getTableSchema",
+                "searchKnowledge",
+                "searchBlueprints",
+                "getBlueprint",
+                "searchHelpCenter",
+                "getHelpCenterDocument",
+                "searchCapabilityTools",
+                "getCapabilityTool",
+            }
+            if result.tool_calls and all(c.name in discovery_names for c in result.tool_calls):
+                discovery_rounds += 1
+            else:
+                discovery_rounds = 0
+            if discovery_rounds >= 6 and finalization_nudge is None:
+                finalization_nudge = (
+                    "You have spent six consecutive rounds on discovery. Assess the evidence "
+                    "already received against the original request now. For an overview, finalize "
+                    "a concise supported overview rather than inventorying the catalog. If no "
+                    "relevant article or option was found, finalize with that limitation. Continue "
+                    "discovery only for a specific fact necessary to answer an unresolved part. "
+                    "Use finalizeAnswer; empty tables, capability_refs and evidence lists are valid "
+                    "when declining unsupported claims."
                 )
-
-            if designated_text_answer is not None:
-                turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
-                return await self._finish(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    status="done",
-                    exit_label="answer_with_text",
-                    ship_guard=ship_guard,
-                    judge_site="exit_prose",
-                    assistant_text=designated_text_answer,
-                    tool_calls_made=tool_calls_made,
-                    accum=accum,
-                    provenance=turn_provenance,
-                    persist_text=designated_text_answer,
-                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
-                )
+                discovery_rounds = 0
 
             # SPEND, not occupancy: `total_tokens` is this round-trip's prompt +
             # completion, and every round replays the conversation, so the sum is

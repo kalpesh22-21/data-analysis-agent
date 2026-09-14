@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+import pytest
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -44,6 +45,9 @@ from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -153,7 +157,7 @@ def _prose_resume_script(text: str) -> list[ModelTurnResult]:
     """Two identical prose finishes: the resumed blueprint returns TWO rows, so the
     first bare-prose finish trips the answer-shape gate (05 §J) and costs a round. Same
     helper (and same reason) as `tests/runtime/blueprint/test_loop_resume_dag.py`."""
-    return [ModelTurnResult(assistant_text=text), ModelTurnResult(assistant_text=text)]
+    return [final_answer(assistant_text=text), final_answer(assistant_text=text)]
 
 
 async def _run_to_approval_pause(store: InMemorySessionStore) -> None:
@@ -323,9 +327,7 @@ async def test_a_raising_resume_stamps_error_and_keeps_the_crash_text_off_the_sp
     assert span.attributes["tool.error_code"]
     assert span.attributes["tool.args.slot_count"] == 1
     assert [event.name for event in span.events] == []
-    rendered = str(
-        [dict(span.attributes or {}), [dict(e.attributes or {}) for e in span.events]]
-    )
+    rendered = str([dict(span.attributes or {}), [dict(e.attributes or {}) for e in span.events]])
     assert CRASH_TEXT not in rendered
     assert PII_SLOT_VALUE not in rendered
 

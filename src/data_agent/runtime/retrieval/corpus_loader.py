@@ -47,6 +47,7 @@ from data_agent.runtime.blueprint.compiler import (
     validate_blueprint_dag,
     validate_blueprint_uses,
 )
+from data_agent.runtime.retrieval.hybrid import BLUEPRINT_TEXT_INDEX_DDL
 from data_agent.runtime.retrieval.vector_index import READ_CORPUS_META_QUERY
 
 if TYPE_CHECKING:
@@ -67,9 +68,9 @@ _logger = logging.getLogger(__name__)
 class LoadReport:
     """Outcome of a `load_corpus` run — counts plus the model the corpus was stamped with.
 
-        `columns_referenced`/`tables_referenced` count the DISTINCT keys the seeded blueprints
-        REFERENCE, not nodes this loader writes: `:Column`/`:Table` nodes are owned by
-        `load_catalog_graph`, and `load_corpus` only links `:USES` to pre-existing ones.
+    `columns_referenced`/`tables_referenced` count the DISTINCT keys the seeded blueprints
+    REFERENCE, not nodes this loader writes: `:Column`/`:Table` nodes are owned by
+    `load_catalog_graph`, and `load_corpus` only links `:USES` to pre-existing ones.
     """
 
     model_id: str
@@ -87,11 +88,11 @@ class LoadReport:
 @dataclass(frozen=True)
 class CatalogGraphReport:
     """Outcome of a `load_catalog_graph` run — the `:Table`/`:Column` hydration counts and the
-        run's `catalog_sha`.
+    run's `catalog_sha`.
 
-        `skipped=True` is the no-op fast path (the graph already carries this export's sha, so
-        nothing was written). `drift_referenced_columns` lists any `:Column` the GC removed that
-        STILL had an inbound `:USES` — GC wins, and the drift is logged.
+    `skipped=True` is the no-op fast path (the graph already carries this export's sha, so
+    nothing was written). `drift_referenced_columns` lists any `:Column` the GC removed that
+    STILL had an inbound `:USES` — GC wins, and the drift is logged.
     """
 
     catalog_sha: str
@@ -116,8 +117,8 @@ def load_seed_fixtures(
 ) -> tuple[list[BlueprintSeed], list[KnowledgeSeed]]:
     """Read `blueprints.yaml` + `knowledge.yaml` under *corpus_dir* into seeds.
 
-        Raises `CorpusLoadError` on a duplicate id, within OR across the two files: MERGE-by-id
-        would otherwise let a copy-pasted id overwrite in place, masking an authoring mistake.
+    Raises `CorpusLoadError` on a duplicate id, within OR across the two files: MERGE-by-id
+    would otherwise let a copy-pasted id overwrite in place, masking an authoring mistake.
     """
     root = Path(corpus_dir)
     blueprints = [BlueprintSeed(**item) for item in _read_yaml_list(root / "blueprints.yaml")]
@@ -128,16 +129,19 @@ def load_seed_fixtures(
 
 def effective_corpus_sha(export: dict[str, Any]) -> str:
     """The stamp/guard key for an online corpus hydration — the export's `blueprints_sha` +
-        `knowledge_sha` combined, or a deterministic content hash when either is missing.
+    `knowledge_sha` combined, or a deterministic content hash when either is missing.
 
-        A change to EITHER corpus flips the combined stamp, so the skip-guard and the GC re-run.
-        An empty combined stamp would silently break both guards, hence the derived fallback.
+    A change to EITHER corpus flips the combined stamp, so the skip-guard and the GC re-run.
+    An empty combined stamp would silently break both guards, hence the derived fallback.
     """
     bp_sha = export.get("blueprints_sha")
     kn_sha = export.get("knowledge_sha")
     if isinstance(bp_sha, str) and bp_sha and isinstance(kn_sha, str) and kn_sha:
         return f"{bp_sha}:{kn_sha}"
-    payload = {"blueprints": export.get("blueprints") or {}, "knowledge": export.get("knowledge") or {}}
+    payload = {
+        "blueprints": export.get("blueprints") or {},
+        "knowledge": export.get("knowledge") or {},
+    }
     digest = hashlib.sha1(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
@@ -149,12 +153,10 @@ def effective_corpus_sha(export: dict[str, Any]) -> str:
     return digest
 
 
-def corpus_content_sha(
-    blueprints: list[BlueprintSeed], knowledge: list[KnowledgeSeed]
-) -> str:
+def corpus_content_sha(blueprints: list[BlueprintSeed], knowledge: list[KnowledgeSeed]) -> str:
     """A stable content-hash `corpus_sha` for a SEED-LIST reconcile. Deterministic over the
-        seeds' full field content, so a re-seed of unchanged fixtures keeps the same stamp (an
-        idempotent GC no-op) and any edit flips it.
+    seeds' full field content, so a re-seed of unchanged fixtures keeps the same stamp (an
+    idempotent GC no-op) and any edit flips it.
     """
     from dataclasses import asdict
 
@@ -226,16 +228,17 @@ _CORPUS_CONSTRAINTS: tuple[str, ...] = (
 
 def schema_statements(dimension: int) -> tuple[str, ...]:
     """The full idempotent schema DDL (constraints + the two native vector indexes), with the
-        vector-index dimension parameterized.
+    vector-index dimension parameterized.
 
-        The dimension is resolved from settings or INFERRED from the live embedder, so a
-        different embedding model is honored without a code edit. Every statement is
-        `IF NOT EXISTS`, so the whole write path is re-runnable — BUT a
-        `CREATE VECTOR INDEX ... IF NOT EXISTS` silently keeps the OLD dimension of a
-        pre-existing index, which is why `apply_schema` introspects and raises before creating.
+    The dimension is resolved from settings or INFERRED from the live embedder, so a
+    different embedding model is honored without a code edit. Every statement is
+    `IF NOT EXISTS`, so the whole write path is re-runnable — BUT a
+    `CREATE VECTOR INDEX ... IF NOT EXISTS` silently keeps the OLD dimension of a
+    pre-existing index, which is why `apply_schema` introspects and raises before creating.
     """
     return (
         *_CORPUS_CONSTRAINTS,
+        BLUEPRINT_TEXT_INDEX_DDL,
         # PriorArt Slice 2 — the LOOSE cross-tier key's lookup index. The learning
         # loop's `PriorArtIndex.get_by_structural_key` matches a new candidate against
         # every tier by this key; without a RANGE index that MATCH is a
@@ -469,10 +472,10 @@ RETURN count(*) AS deleted
 def check_model_parity(existing_models: set[str], model_id: str) -> None:
     """Refuse a write that would mix embedding models into one index.
 
-        Pure (the strict write-time guard, Layer-1-testable without infra): any already-stored
-        model id other than *model_id* raises `CorpusLoadError`. An empty-string stored stamp is
-        treated as a CONFLICTING model, not a non-model — a node with no model stamp is a broken
-        row, not a free pass.
+    Pure (the strict write-time guard, Layer-1-testable without infra): any already-stored
+    model id other than *model_id* raises `CorpusLoadError`. An empty-string stored stamp is
+    treated as a CONFLICTING model, not a non-model — a node with no model stamp is a broken
+    row, not a free pass.
     """
     conflicting = {m for m in existing_models if m != model_id}
     if conflicting:
@@ -485,13 +488,13 @@ def check_model_parity(existing_models: set[str], model_id: str) -> None:
 
 def check_dimension_parity(existing_dims: set[int], target_dim: int) -> None:
     """Refuse to (re)deploy the schema when a pre-existing vector index carries a DIFFERENT
-        embedding dimension than *target_dim*.
+    embedding dimension than *target_dim*.
 
-        Pure. *existing_dims* is the set of `vector.dimensions` read from `SHOW VECTOR INDEXES`;
-        an empty set (no index yet) passes trivially and the create runs at *target_dim*. Any
-        other dimension raises `DimensionMismatchError` naming BOTH dims, because a
-        `CREATE ... IF NOT EXISTS` would silently keep the old one and recall would break
-        undetectably.
+    Pure. *existing_dims* is the set of `vector.dimensions` read from `SHOW VECTOR INDEXES`;
+    an empty set (no index yet) passes trivially and the create runs at *target_dim*. Any
+    other dimension raises `DimensionMismatchError` naming BOTH dims, because a
+    `CREATE ... IF NOT EXISTS` would silently keep the old one and recall would break
+    undetectably.
     """
     conflicting = {d for d in existing_dims if d != target_dim}
     if conflicting:
@@ -508,9 +511,9 @@ def check_dimension_parity(existing_dims: set[int], target_dim: int) -> None:
 async def fetch_existing_vector_dims(runner: Any) -> set[int]:
     """The set of `vector.dimensions` configured on the two corpus vector indexes.
 
-        *runner* is anything with `.run` (a live session OR a recording stub). Absent indexes
-        yield an empty set — a fresh graph, so the create runs at the target dim. A `None` or
-        non-int dimension row is skipped defensively.
+    *runner* is anything with `.run` (a live session OR a recording stub). Absent indexes
+    yield an empty set — a fresh graph, so the create runs at the target dim. A `None` or
+    non-int dimension row is skipped defensively.
     """
     result = await runner.run(_EXISTING_VECTOR_DIMS)
     rows = await result.data()
@@ -529,15 +532,15 @@ async def resolve_embedding_dimension(
     sample_vectors: list[list[float]] | None = None,
 ) -> int:
     """Resolve the vector-index dimension: the CONFIGURED value when set, else INFERRED from
-        already-embedded *sample_vectors* (no extra network call), else a one-shot PROBE embed.
+    already-embedded *sample_vectors* (no extra network call), else a one-shot PROBE embed.
 
-        An empty or degenerate probe result raises `CorpusLoadError` — the schema cannot be
-        shaped without a dimension.
+    An empty or degenerate probe result raises `CorpusLoadError` — the schema cannot be
+    shaped without a dimension.
 
-        When BOTH a configured value AND a non-empty sample vector are present, the sample's
-        length MUST equal the configured one: otherwise the operator set `EMBEDDING_DIMENSION` to
-        a value the live model does NOT emit, which would build the index at one dimension, write
-        vectors of another, and silently EXCLUDE every row from the index.
+    When BOTH a configured value AND a non-empty sample vector are present, the sample's
+    length MUST equal the configured one: otherwise the operator set `EMBEDDING_DIMENSION` to
+    a value the live model does NOT emit, which would build the index at one dimension, write
+    vectors of another, and silently EXCLUDE every row from the index.
     """
     first_sample = next((vec for vec in sample_vectors or [] if vec), None)
     if configured is not None:
@@ -563,8 +566,8 @@ async def resolve_embedding_dimension(
 def _use_edges(uses: list[str]) -> list[dict[str, str]]:
     """Derive `{column_key, table_key}` edge rows from `"db.table.column"` keys.
 
-        `table_key` is everything before the final dot, matching the scope-key construction
-        `f"{db_table}.{column}"`.
+    `table_key` is everything before the final dot, matching the scope-key construction
+    `f"{db_table}.{column}"`.
     """
     edges: list[dict[str, str]] = []
     for key in uses:
@@ -593,13 +596,13 @@ def _json_or_none(value: Any) -> str | None:
 
 def _str_list(value: Any) -> list[str]:
     """Coerce a value into a list of strings (dropping a non-list to `[]`), for the
-        array-of-primitive node props (`grain`, `synonyms`). Casing is preserved (D70).
+    array-of-primitive node props (`grain`, `synonyms`). Casing is preserved (D70).
 
-        TODO (cleanup wave B): replace with `data_agent.untrusted.as_str_list`. This is the WEAK
-        copy — `str(item)` writes the literal `"None"` for a JSON null and a dict member lands as
-        its repr, both of which then read as real grain/synonym content, whereas the shared
-        coercer SKIPS non-`str` members. The change is behavioural, so it belongs in a slice that
-        owns this file.
+    TODO (cleanup wave B): replace with `data_agent.untrusted.as_str_list`. This is the WEAK
+    copy — `str(item)` writes the literal `"None"` for a JSON null and a dict member lands as
+    its repr, both of which then read as real grain/synonym content, whereas the shared
+    coercer SKIPS non-`str` members. The change is behavioural, so it belongs in a slice that
+    owns this file.
     """
     if not isinstance(value, list):
         return []
@@ -609,10 +612,10 @@ def _str_list(value: Any) -> list[str]:
 def _table_node_props(db_table: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Project one catalog entry into the enriched `:Table` node props.
 
-        `key` is `db_table`, byte-identical to `_use_edges`' `table_key`. Scalars and arrays are
-        stored natively; the nested fields are JSON-encoded to `*_json`. `grain_verifiable`
-        defaults True when absent (parity with `SemanticCatalogHandle`). `catalog_sha` is NOT
-        included here — the upsert Cypher stamps it.
+    `key` is `db_table`, byte-identical to `_use_edges`' `table_key`. Scalars and arrays are
+    stored natively; the nested fields are JSON-encoded to `*_json`. `grain_verifiable`
+    defaults True when absent (parity with `SemanticCatalogHandle`). `catalog_sha` is NOT
+    included here — the upsert Cypher stamps it.
     """
     default_db, _, default_table = db_table.partition(".")
     grain_verifiable = entry.get("grain_verifiable", True)
@@ -638,10 +641,10 @@ def _table_node_props(db_table: str, entry: dict[str, Any]) -> dict[str, Any]:
 def _column_node_props(db_table: str, name: str, col: dict[str, Any]) -> dict[str, Any]:
     """Project one catalog column into the enriched `:Column` node props.
 
-        `key` is `f"{db_table}.{name}"` — byte-identical to `_use_edges`' `column_key`, asserted
-        by a unit test. `name` mirrors the FULL key so graph browsers caption the column by it,
-        consistently with the other node types; the bare short name is retained as `short_name`.
-        Nested `values` is JSON-encoded; unknown or adversarial extra keys are simply not read.
+    `key` is `f"{db_table}.{name}"` — byte-identical to `_use_edges`' `column_key`, asserted
+    by a unit test. `name` mirrors the FULL key so graph browsers caption the column by it,
+    consistently with the other node types; the bare short name is retained as `short_name`.
+    Nested `values` is JSON-encoded; unknown or adversarial extra keys are simply not read.
     """
     key = f"{db_table}.{name}"
     return {
@@ -662,11 +665,11 @@ def _catalog_graph_rows(
     catalog: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], set[str]]:
     """Build the batched UNWIND rows for the `:Table`/`:Column` upserts from a parsed catalog
-        dict (`{db.table: <entry>}`).
+    dict (`{db.table: <entry>}`).
 
-        Returns `(table_rows, column_rows, table_keys, column_keys)`. A non-dict entry, or a
-        non-dict column def, is tolerated — skipped, or falling back to `{}` — so a mangled
-        fixture never crashes the build and just yields sparse props via the whitelist.
+    Returns `(table_rows, column_rows, table_keys, column_keys)`. A non-dict entry, or a
+    non-dict column def, is tolerated — skipped, or falling back to `{}` — so a mangled
+    fixture never crashes the build and just yields sparse props via the whitelist.
     """
     table_rows: list[dict[str, Any]] = []
     column_rows: list[dict[str, Any]] = []
@@ -711,13 +714,13 @@ def _format_edge_drift(missing_by_blueprint: dict[str, list[str]]) -> str:
 
 def _warn_on_catalog_skew(blueprints: list[BlueprintSeed], catalog: CatalogHandle) -> None:
     """Log a SOFT WARNING per blueprint whose `uses` references a `db.table` absent from
-        *catalog*. Never raises: a blueprint may legitimately reference tables absent from a
-        partial or dev catalog snapshot, so this is a dev-time early warning for catalog and
-        extractor skew, not a load precondition.
+    *catalog*. Never raises: a blueprint may legitimately reference tables absent from a
+    partial or dev catalog snapshot, so this is a dev-time early warning for catalog and
+    extractor skew, not a load precondition.
 
-        The `db.table` grouping is everything-before-the-final-dot — the SAME convention as
-        `_use_edges`' `table_key` and the scope-key construction — so the two parsers agree even
-        for a key with a dotted table segment.
+    The `db.table` grouping is everything-before-the-final-dot — the SAME convention as
+    `_use_edges`' `table_key` and the scope-key construction — so the two parsers agree even
+    for a key with a dotted table segment.
     """
     for bp in blueprints:
         missing: list[str] = []
@@ -740,17 +743,15 @@ def _warn_on_catalog_skew(blueprints: list[BlueprintSeed], catalog: CatalogHandl
             )
 
 
-async def apply_schema(
-    driver: AsyncDriver, *, dimension: int, database: str = "neo4j"
-) -> None:
+async def apply_schema(driver: AsyncDriver, *, dimension: int, database: str = "neo4j") -> None:
     """Create the constraints + native vector indexes (idempotent, at *dimension*), then wait
-        for every index to come ONLINE so a subsequent recall sees them.
+    for every index to come ONLINE so a subsequent recall sees them.
 
-        BEFORE the `CREATE VECTOR INDEX ... IF NOT EXISTS` — which silently keeps a pre-existing
-        index's OLD dimension — the existing dimensions are introspected and checked, raising
-        `DimensionMismatchError` when one already exists at a DIFFERENT dimension (the signal
-        that the embedding model changed and the graph must be rebuilt). A fresh graph passes and
-        the indexes are created at *dimension*.
+    BEFORE the `CREATE VECTOR INDEX ... IF NOT EXISTS` — which silently keeps a pre-existing
+    index's OLD dimension — the existing dimensions are introspected and checked, raising
+    `DimensionMismatchError` when one already exists at a DIFFERENT dimension (the signal
+    that the embedding model changed and the graph must be rebuilt). A fresh graph passes and
+    the indexes are created at *dimension*.
     """
     async with driver.session(database=database) as session:
         existing_dims = await fetch_existing_vector_dims(session)
@@ -772,6 +773,7 @@ async def apply_schema(
 # fresh `apply_schema`/`apply_catalog_graph_schema` re-creates them cleanly). Every
 # statement is `IF EXISTS`, so the nuke is safe on a partially-provisioned graph.
 _NUKE_STATEMENTS: tuple[str, ...] = (
+    "DROP INDEX blueprint_intent_text IF EXISTS",
     "DROP INDEX blueprint_intent_vec IF EXISTS",
     "DROP INDEX knowledge_text_vec IF EXISTS",
     "DROP CONSTRAINT blueprint_id IF EXISTS",
@@ -800,8 +802,7 @@ _NUKE_DELETE_NODES = "MATCH (n) WHERE NOT n:RebuildLock DETACH DELETE n"
 # deliberately NOT dropped by `_NUKE_STATEMENTS` (the lock + its keying must survive
 # the nuke that spares the lock node).
 _REBUILD_LOCK_CONSTRAINT = (
-    "CREATE CONSTRAINT rebuild_lock_id IF NOT EXISTS "
-    "FOR (l:RebuildLock) REQUIRE l.id IS UNIQUE"
+    "CREATE CONSTRAINT rebuild_lock_id IF NOT EXISTS FOR (l:RebuildLock) REQUIRE l.id IS UNIQUE"
 )
 
 # DEAD for the hydrator (retained for the seed script + back-compat): the hydrator is a
@@ -842,34 +843,32 @@ async def claim_rebuild_lock(
 ) -> bool:
     """Best-effort single-flight claim on the `RebuildLock` singleton.
 
-        Returns True iff THIS *holder* now owns the lock and may nuke + rebuild; False iff
-        another live holder holds a fresh claim. The claim protects the FULL rebuild plus the
-        stale window, and the `rebuild_lock_id` uniqueness constraint created here closes the
-        simultaneous double-MERGE. A stale claim (holder crashed) is reclaimed after
-        *stale_seconds*.
+    Returns True iff THIS *holder* now owns the lock and may nuke + rebuild; False iff
+    another live holder holds a fresh claim. The claim protects the FULL rebuild plus the
+    stale window, and the `rebuild_lock_id` uniqueness constraint created here closes the
+    simultaneous double-MERGE. A stale claim (holder crashed) is reclaimed after
+    *stale_seconds*.
     """
     async with driver.session(database=database) as session:
         await session.run(_REBUILD_LOCK_CONSTRAINT)  # type: ignore[arg-type]
-        result = await session.run(
-            _CLAIM_REBUILD_LOCK, holder=holder, stale_seconds=stale_seconds
-        )
+        result = await session.run(_CLAIM_REBUILD_LOCK, holder=holder, stale_seconds=stale_seconds)
         row = await result.single()
     return bool(row["claimed"]) if row is not None else False
 
 
 async def nuke_graph(driver: AsyncDriver, *, database: str = "neo4j") -> None:
     """DESTRUCTIVE: drop the corpus vector indexes + all schema constraints, then
-        `DETACH DELETE` every node, leaving an empty graph ready for a fresh `apply_schema` and
-        reseed at a possibly new embedding dimension.
+    `DETACH DELETE` every node, leaving an empty graph ready for a fresh `apply_schema` and
+    reseed at a possibly new embedding dimension.
 
-        Dropping the vector indexes is REQUIRED (a `CREATE ... IF NOT EXISTS` keeps the old
-        dimension otherwise); deleting the nodes is REQUIRED so the freshness singletons do not
-        short-circuit the re-seed. The `:RebuildLock` singleton is SPARED so the single-flight
-        guard survives its own nuke.
+    Dropping the vector indexes is REQUIRED (a `CREATE ... IF NOT EXISTS` keeps the old
+    dimension otherwise); deleting the nodes is REQUIRED so the freshness singletons do not
+    short-circuit the re-seed. The `:RebuildLock` singleton is SPARED so the single-flight
+    guard survives its own nuke.
 
-        Strictly the seed-script maintenance op. The SINGLETON hydrator does NOT call this — it
-        would DESTROY the `source='learning'` staging tier, which is not in the MCP export and
-        would not be re-seeded; the hydrator uses `rebuild_mcp_corpus_partition` instead.
+    Strictly the seed-script maintenance op. The SINGLETON hydrator does NOT call this — it
+    would DESTROY the `source='learning'` staging tier, which is not in the MCP export and
+    would not be re-seeded; the hydrator uses `rebuild_mcp_corpus_partition` instead.
     """
     async with driver.session(database=database) as session:
         for statement in _NUKE_STATEMENTS:
@@ -906,31 +905,31 @@ async def rebuild_mcp_corpus_partition(
 ) -> None:
     """Scoped destructive reseed-prep for the SINGLETON hydrator (data-loss-safe).
 
-        Clears ONLY the trusted `source='mcp'` nodes plus the `:CorpusMeta`/`:CatalogMeta`
-        freshness singletons, then leaves the caller to reseed. PRESERVES the `source='learning'`
-        staging tier (human-promoted content not in the MCP export, which a full `nuke_graph`
-        would destroy) AND the `:Table`/`:Column` catalog graph.
+    Clears ONLY the trusted `source='mcp'` nodes plus the `:CorpusMeta`/`:CatalogMeta`
+    freshness singletons, then leaves the caller to reseed. PRESERVES the `source='learning'`
+    staging tier (human-promoted content not in the MCP export, which a full `nuke_graph`
+    would destroy) AND the `:Table`/`:Column` catalog graph.
 
-        Two modes:
-          * *dimension* given (a DIMENSION change) — additionally DROP and recreate the two
-            corpus vector indexes at the new dimension, since a `CREATE ... IF NOT EXISTS`
-            silently keeps the old one. The preserved learning-tier nodes keep their old-dim
-            embeddings and are excluded from both the new-dim index and the recall source gate,
-            so no bad neighbours surface.
-          * *dimension* `None` (a same-dim MODEL swap) — leave the indexes; just clear the mcp
-            nodes so the reseed re-embeds them at the new model without tripping the mcp-scoped
-            write-time model-parity guard, which reads the pre-write state.
+    Two modes:
+      * *dimension* given (a DIMENSION change) — additionally DROP and recreate the two
+        corpus vector indexes at the new dimension, since a `CREATE ... IF NOT EXISTS`
+        silently keeps the old one. The preserved learning-tier nodes keep their old-dim
+        embeddings and are excluded from both the new-dim index and the recall source gate,
+        so no bad neighbours surface.
+      * *dimension* `None` (a same-dim MODEL swap) — leave the indexes; just clear the mcp
+        nodes so the reseed re-embeds them at the new model without tripping the mcp-scoped
+        write-time model-parity guard, which reads the pre-write state.
 
-        Deleting the mcp nodes rather than overwriting them is REQUIRED even for a same-dim swap:
-        the parity check reads the existing mcp models as the FIRST statement of the write txn, so
-        a stale old-model node would raise `CorpusLoadError` before the MERGE-by-id overwrite ran.
+    Deleting the mcp nodes rather than overwriting them is REQUIRED even for a same-dim swap:
+    the parity check reads the existing mcp models as the FIRST statement of the write txn, so
+    a stale old-model node would raise `CorpusLoadError` before the MERGE-by-id overwrite ran.
 
-        ATOMICITY: the mcp-node delete AND the freshness-singleton delete run in ONE
-        `execute_write` so they commit together. As two auto-commit statements, a crash between
-        them could leave the mcp partition DELETED while `:CorpusMeta` SURVIVED at its old sha —
-        the next cycle would see no model change, sha-SKIP, and recall would be permanently empty
-        while /ready still read 200. The vector-index DDL stays OUTSIDE the txn (neo4j forbids
-        schema ops inside a data txn).
+    ATOMICITY: the mcp-node delete AND the freshness-singleton delete run in ONE
+    `execute_write` so they commit together. As two auto-commit statements, a crash between
+    them could leave the mcp partition DELETED while `:CorpusMeta` SURVIVED at its old sha —
+    the next cycle would see no model change, sha-SKIP, and recall would be permanently empty
+    while /ready still read 200. The vector-index DDL stays OUTSIDE the txn (neo4j forbids
+    schema ops inside a data txn).
     """
     async with driver.session(database=database) as session:
         if dimension is not None:
@@ -954,11 +953,11 @@ async def rebuild_mcp_corpus_partition(
 
 async def apply_catalog_graph_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
     """Ensure ONLY the catalog-graph constraints (`Table.key`, `Column.key`, `CatalogMeta.id`)
-        — the lightweight schema-ensure `load_catalog_graph` uses.
+    — the lightweight schema-ensure `load_catalog_graph` uses.
 
-        Deliberately does NOT create the vector indexes nor await indexes: both are irrelevant to
-        the `:Table`/`:Column` upsert and would add index-await latency to the cold-fetch turn.
-        The full `apply_schema` stays owned by `load_corpus`. Idempotent.
+    Deliberately does NOT create the vector indexes nor await indexes: both are irrelevant to
+    the `:Table`/`:Column` upsert and would add index-await latency to the cold-fetch turn.
+    The full `apply_schema` stays owned by `load_corpus`. Idempotent.
     """
     async with driver.session(database=database) as session:
         for statement in _CATALOG_GRAPH_CONSTRAINTS:
@@ -989,12 +988,12 @@ async def _read_corpus_meta(session: Any) -> str | None:
 
 def _effective_catalog_sha(catalog_export: dict[str, Any]) -> str:
     """The stamp/guard key for a hydration run — the export's own `catalog_sha`, or a
-        deterministic content-hash FALLBACK when it is empty or missing.
+    deterministic content-hash FALLBACK when it is empty or missing.
 
-        An empty sha would silently break BOTH the skip-guard (`current == ""` never triggers a
-        no-op) AND the GC predicate (`coalesce(sha,'') <> ''` matches every node, including
-        freshly-stamped ones), so one is never propagated. The same content always yields the same
-        stamp, so both guards stay idempotent.
+    An empty sha would silently break BOTH the skip-guard (`current == ""` never triggers a
+    no-op) AND the GC predicate (`coalesce(sha,'') <> ''` matches every node, including
+    freshly-stamped ones), so one is never propagated. The same content always yields the same
+    stamp, so both guards stay idempotent.
     """
     sha = catalog_export.get("catalog_sha")
     if isinstance(sha, str) and sha:
@@ -1020,25 +1019,25 @@ async def load_catalog_graph(
     gc: bool = True,
 ) -> CatalogGraphReport:
     """Independent, enriched, self-healing hydration of the `:Table`/`:Column` catalog graph
-        from the MCP catalog EXPORT dict (`{"catalog_sha", "catalog"}`).
+    from the MCP catalog EXPORT dict (`{"catalog_sha", "catalog"}`).
 
-        Catalog-OWNED and separate from `load_corpus`: no embeddings, no model parity. Every node
-        upsert stamps the run's `catalog_sha`.
+    Catalog-OWNED and separate from `load_corpus`: no embeddings, no model parity. Every node
+    upsert stamps the run's `catalog_sha`.
 
-        Two write modes:
-          * `gc=True` (the EXPLICIT seed/reconcile path) — after upserting, GC deletes any
-            `:Table`/`:Column` whose stamp is stale, logging any GC'd column that still had an
-            inbound `:USES`.
-          * `gc=False` (the ONLINE self-heal wired in `app.py`) — upsert + meta-stamp ONLY, NEVER
-            delete, so two replicas booting on DIFFERENT shas during a rolling deploy converge to
-            a current-or-SUPERSET graph instead of GC-deleting each other's freshly-stamped nodes.
-            Dropped-column GC is deferred to the explicit maintenance op.
+    Two write modes:
+      * `gc=True` (the EXPLICIT seed/reconcile path) — after upserting, GC deletes any
+        `:Table`/`:Column` whose stamp is stale, logging any GC'd column that still had an
+        inbound `:USES`.
+      * `gc=False` (the ONLINE self-heal wired in `app.py`) — upsert + meta-stamp ONLY, NEVER
+        delete, so two replicas booting on DIFFERENT shas during a rolling deploy converge to
+        a current-or-SUPERSET graph instead of GC-deleting each other's freshly-stamped nodes.
+        Dropped-column GC is deferred to the explicit maintenance op.
 
-        No-op fast path (BOTH modes): if the stored `:CatalogMeta.catalog_sha` already EQUALS this
-        run's sha, returns `skipped=True` without writing.
+    No-op fast path (BOTH modes): if the stored `:CatalogMeta.catalog_sha` already EQUALS this
+    run's sha, returns `skipped=True` without writing.
 
-        Atomicity: the upserts, optional GCs and the meta upsert run in ONE `execute_write`, so no
-        concurrent reader ever sees a torn graph.
+    Atomicity: the upserts, optional GCs and the meta upsert run in ONE `execute_write`, so no
+    concurrent reader ever sees a torn graph.
     """
     export_sha = _effective_catalog_sha(catalog_export)
     catalog = catalog_export["catalog"]
@@ -1125,28 +1124,28 @@ async def load_corpus(
 ) -> LoadReport:
     """Embed + upsert the seed corpus into neo4j (idempotent). See module docs.
 
-        *dimension* is the vector-index embedding dimension. `None` INFERS it — from the
-        just-embedded corpus vectors when present, else a one-shot probe — so the schema is shaped
-        to the live embedding model without a code edit; pass an int to pin it.
+    *dimension* is the vector-index embedding dimension. `None` INFERS it — from the
+    just-embedded corpus vectors when present, else a one-shot probe — so the schema is shaped
+    to the live embedding model without a code edit; pass an int to pin it.
 
-        Raises `CorpusLoadError` on a malformed `uses` key or a write-time model-parity violation.
+    Raises `CorpusLoadError` on a malformed `uses` key or a write-time model-parity violation.
 
-        Each seed carries a `source`/`verified` trust stamp (defaulting `mcp`/`True`, so the
-        fixture path writes TRUSTED canon; the learning landing writer overrides to
-        `learning`/`False`). These flow onto the node so recall's `source='mcp'` trust gate and
-        the corpus GC can partition the trusted canon from the learning staging tier.
+    Each seed carries a `source`/`verified` trust stamp (defaulting `mcp`/`True`, so the
+    fixture path writes TRUSTED canon; the learning landing writer overrides to
+    `learning`/`False`). These flow onto the node so recall's `source='mcp'` trust gate and
+    the corpus GC can partition the trusted canon from the learning staging tier.
 
-        *corpus_sha* + *gc* mirror `load_catalog_graph`'s self-healing reconcile, SCOPED to
-        `source='mcp'`: every seeded node is stamped; a truthy sha enables the no-op fast path
-        (returning `skipped=True` without re-embedding); and `gc=True` (the explicit seed op)
-        additionally DELETES any `source='mcp'` node whose stamp is stale. The GC WHERE clause is
-        `source='mcp'`-scoped, so it can NEVER touch a learning node. An empty *corpus_sha* never
-        skips and never stamps the singleton.
+    *corpus_sha* + *gc* mirror `load_catalog_graph`'s self-healing reconcile, SCOPED to
+    `source='mcp'`: every seeded node is stamped; a truthy sha enables the no-op fast path
+    (returning `skipped=True` without re-embedding); and `gc=True` (the explicit seed op)
+    additionally DELETES any `source='mcp'` node whose stamp is stale. The GC WHERE clause is
+    `source='mcp'`-scoped, so it can NEVER touch a learning node. An empty *corpus_sha* never
+    skips and never stamps the singleton.
 
-        *catalog*, when supplied, cross-checks every blueprint's `uses` tables and logs a SOFT
-        WARNING per blueprint referencing an uncatalogued table. The load ALWAYS proceeds — this
-        is a dev-time early warning, never a `CorpusLoadError`, and the real production safety is
-        MCP-fails-closed plus both catalogs agreeing.
+    *catalog*, when supplied, cross-checks every blueprint's `uses` tables and logs a SOFT
+    WARNING per blueprint referencing an uncatalogued table. The load ALWAYS proceeds — this
+    is a dev-time early warning, never a `CorpusLoadError`, and the real production safety is
+    MCP-fails-closed plus both catalogs agreeing.
     """
     # Governed-corpus B1 no-op fast path (Phase 2): when a truthy corpus_sha is
     # supplied AND the `:CorpusMeta` singleton already carries it, the seeded canon is
@@ -1159,9 +1158,7 @@ async def load_corpus(
         async with driver.session(database=database) as session:
             current_sha = await _read_corpus_meta(session)
         if current_sha and current_sha == corpus_sha:
-            _logger.info(
-                "corpus already at corpus_sha=%s; skipping load (B1 no-op)", corpus_sha
-            )
+            _logger.info("corpus already at corpus_sha=%s; skipping load (B1 no-op)", corpus_sha)
             return LoadReport(
                 model_id=model_id,
                 blueprints_written=0,
@@ -1353,12 +1350,12 @@ async def load_corpus(
 
 async def fetch_existing_models(runner: Any) -> set[str]:
     """Distinct non-null `embedding_model` stamps on the TRUSTED `source='mcp'` partition;
-        learning-tier nodes are excluded. Powers BOTH `load_corpus`'s write-txn parity check and
-        the hydrator's model-change detection.
+    learning-tier nodes are excluded. Powers BOTH `load_corpus`'s write-txn parity check and
+    the hydrator's model-change detection.
 
-        *runner* is anything with `.run` — a session OR a managed transaction. Empty-string stamps
-        are RETAINED, not filtered, so a broken or unstamped mcp row surfaces as a parity conflict
-        rather than a silent free pass; the Cypher already excludes true NULLs.
+    *runner* is anything with `.run` — a session OR a managed transaction. Empty-string stamps
+    are RETAINED, not filtered, so a broken or unstamped mcp row surfaces as a parity conflict
+    rather than a silent free pass; the Cypher already excludes true NULLs.
     """
     result = await runner.run(_EXISTING_MODELS)
     row = await result.single()

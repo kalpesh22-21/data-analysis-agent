@@ -43,9 +43,7 @@ def _entry(
     preview = (
         None
         if row_count is None
-        else ResultPreview(
-            columns=["x"], row_count=row_count, truncated=False, preview_rows=[]
-        )
+        else ResultPreview(columns=["x"], row_count=row_count, truncated=False, preview_rows=[])
     )
     return TrailEntry(
         turn_index=TURN,
@@ -132,9 +130,7 @@ def test_required_data_unavailable_rejects_table_not_found() -> None:
             row_count=None,
         )
     ]
-    assert (
-        validate_block_evidence("call_1", "REQUIRED_DATA_UNAVAILABLE", trail, TURN) is not None
-    )
+    assert validate_block_evidence("call_1", "REQUIRED_DATA_UNAVAILABLE", trail, TURN) is not None
 
 
 def test_required_data_unavailable_citing_a_denied_entry_does_not_raise() -> None:
@@ -220,10 +216,12 @@ def test_cut_reasons_and_empty_codes_are_rejected() -> None:
         assert validate_block_evidence("call_1", code, trail, TURN) is not None  # type: ignore[arg-type]
 
 
-def test_only_two_codes_are_model_declarable() -> None:
+def test_only_evidence_backed_codes_are_model_declarable() -> None:
     """Structural, not a comment: the split is what stops a FUTURE runtime code
     becoming model-declarable the day it lands."""
-    assert MODEL_REASON_CODES == frozenset({"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE"})
+    assert MODEL_REASON_CODES == frozenset(
+        {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED"}
+    )
     assert len(RUNTIME_REASON_CODES) == 3
     assert not (MODEL_REASON_CODES & RUNTIME_REASON_CODES)
 
@@ -267,7 +265,6 @@ def test_manufactured_required_data_unavailable_via_where_1_equals_0_is_permitte
     assert validate_block_evidence("call_empty", "REQUIRED_DATA_UNAVAILABLE", trail, TURN) is None
 
 
-
 # ---------------------------------------------------------------------------
 # The derivation (04 §B.7) — asserted against the SAME entries as the validator
 # ---------------------------------------------------------------------------
@@ -285,16 +282,40 @@ def test_the_derived_reason_code_is_the_one_whose_validator_accepts() -> None:
     falling back to a plausible-looking label.
     """
     cases = [
-        (_entry("d1", "runQuery", status="denied",
-                error_code="COLUMN_SCOPE_VIOLATION", row_count=None), "NO_ACCESS"),
-        (_entry("d2", "runBlueprint", status="error",
-                error_code="SCRATCH_SESSION_VIOLATION", row_count=None), "NO_ACCESS"),
+        (
+            _entry(
+                "d1",
+                "runQuery",
+                status="denied",
+                error_code="COLUMN_SCOPE_VIOLATION",
+                row_count=None,
+            ),
+            "NO_ACCESS",
+        ),
+        (
+            _entry(
+                "d2",
+                "runBlueprint",
+                status="error",
+                error_code="SCRATCH_SESSION_VIOLATION",
+                row_count=None,
+            ),
+            "NO_ACCESS",
+        ),
         (_entry("e1", "runQuery", row_count=0), "REQUIRED_DATA_UNAVAILABLE"),
         (_entry("r1", "runQuery", row_count=7), None),
-        (_entry("f1", "runQuery", status="error",
-                error_code="PARSE_FAILED_CLOSED", row_count=None), None),
-        (_entry("t1", "sampleRows", status="denied",
-                error_code="TABLE_NOT_FOUND", row_count=None), None),
+        (
+            _entry(
+                "f1", "runQuery", status="error", error_code="PARSE_FAILED_CLOSED", row_count=None
+            ),
+            None,
+        ),
+        (
+            _entry(
+                "t1", "sampleRows", status="denied", error_code="TABLE_NOT_FOUND", row_count=None
+            ),
+            None,
+        ),
     ]
     trail = [entry for entry, _ in cases]
     for entry, expected in cases:
@@ -327,7 +348,12 @@ def test_a_deduped_guard_marker_is_not_classified_as_absent_data() -> None:
     args = {"database": "dbpcm_warehouse", "table": "employee"}
     trail = [
         _entry("s1", "getTableSchema", args=args),
-        _entry("s2", "getTableSchema", args=args, row_count=None,
-               error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE),
+        _entry(
+            "s2",
+            "getTableSchema",
+            args=args,
+            row_count=None,
+            error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+        ),
     ]
     assert classify_block_evidence("s2", trail, TURN) is None

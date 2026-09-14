@@ -177,7 +177,8 @@ class TrailEntry:
     # a non-`ok` entry — the out-of-scope column name, the blueprint that was never
     # run. `None` (the default, and every ordinary denial) means the canned
     # `denial_mapping.py` string derived from `error_code` is the whole story, so
-    # legacy documents load byte-identically.
+    # legacy documents load byte-identically. The sql_diagnostic: prefix stores
+    # sanitized structured repair context; rendering separates it from user_message.
     #
     # It is the ONLY channel by which a specific denial reason reaches the model.
     # `ToolResult.user_message` does not: there is deliberately no field for it here,
@@ -238,6 +239,9 @@ class TrailEntry:
     # about a window anchor, carrying no column identifier and no warehouse value.
     window_note: str | None = None
     capability_terminal: bool = False
+    serves_intents: tuple[str, ...] = ()
+    model_response: dict[str, Any] | None = None
+    measurement_review: dict[str, Any] | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -261,6 +265,9 @@ class TrailEntry:
             ),
             "window_note": self.window_note,
             "capability_terminal": self.capability_terminal,
+            "serves_intents": list(self.serves_intents),
+            "model_response": self.model_response,
+            "measurement_review": self.measurement_review,
         }
 
     @classmethod
@@ -292,6 +299,13 @@ class TrailEntry:
                 doc.get("window_note") if isinstance(doc.get("window_note"), str) else None
             ),
             capability_terminal=doc.get("capability_terminal") is True,
+            serves_intents=tuple(v for v in doc.get("serves_intents", []) if isinstance(v, str)),
+            model_response=doc.get("model_response")
+            if isinstance(doc.get("model_response"), dict)
+            else None,
+            measurement_review=doc.get("measurement_review")
+            if isinstance(doc.get("measurement_review"), dict)
+            else None,
         )
 
 
@@ -303,12 +317,12 @@ class TrailEntry:
 # `validate_block_evidence` allowlists `MODEL_REASON_CODES`, so a runtime-forced
 # code can never become model-declarable — including a future fourth one.
 INTENT_STATUSES = frozenset({"pending", "completed", "blocked"})
-# Declarable BY THE MODEL, on evidence (04 §B.1). Exactly two: both are the
-# non-retryable denials. `DATABASE_NOT_ALLOWED`/`TABLE_NOT_FOUND` were dropped on
+# Declarable BY THE MODEL, on evidence: access, unavailable data, or runtime-confirmed
+# repeated execution failure. A single syntax error cannot establish EXECUTION_FAILED. `DATABASE_NOT_ALLOWED`/`TABLE_NOT_FOUND` were dropped on
 # review — they are `retryable=True` in `denial_mapping.py` (the codebase's own
 # "the model got the name wrong" bucket) and `TABLE_NOT_FOUND` is also how a
 # column-scope denial surfaces from `sampleRows`.
-MODEL_REASON_CODES = frozenset({"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE"})
+MODEL_REASON_CODES = frozenset({"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED"})
 # Written ONLY by the runtime's forced-block paths (05 §F), never by the model.
 # `ENFORCEMENT_EXHAUSTED` means "enforcement could not establish a disposition" —
 # NOT that the system proved the intent impossible.
@@ -505,6 +519,7 @@ class PauseCheckpoint:
     # model never chose. `None` for every askUser/budget-cap pause and every
     # untagged call.
     serves_intent: str | None = None
+    serves_intents: tuple[str, ...] = ()
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -518,6 +533,7 @@ class PauseCheckpoint:
             "completed_nodes_json": self.completed_nodes_json,
             "awaiting_node": self.awaiting_node,
             "serves_intent": self.serves_intent,
+            "serves_intents": list(self.serves_intents),
         }
 
     @classmethod
@@ -536,6 +552,7 @@ class PauseCheckpoint:
             completed_nodes_json=doc.get("completed_nodes_json"),
             awaiting_node=int(awaiting_node) if awaiting_node is not None else None,
             serves_intent=doc.get("serves_intent"),
+            serves_intents=tuple(doc.get("serves_intents", [])),
         )
 
 
@@ -579,6 +596,7 @@ class SessionDoc:
     # still, so a counter local to that function makes forced re-rounds unbounded.
     # Written by 05's enforcement path; declared here as part of 03's schema work.
     finalization_blocks: dict[str, int] | None = None
+    review_states: dict[str, Any] = field(default_factory=dict)
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -592,6 +610,7 @@ class SessionDoc:
             "pause_checkpoint": (self.pause_checkpoint.to_doc() if self.pause_checkpoint else None),
             "learning_content_hash": self.learning_content_hash,
             "analysis_state": (self.analysis_state.to_doc() if self.analysis_state else None),
+            "review_states": self.review_states,
             "finalization_blocks": (
                 dict(self.finalization_blocks) if self.finalization_blocks is not None else None
             ),
@@ -615,6 +634,7 @@ class SessionDoc:
             # loads with `None` and behaves exactly as it always did.
             analysis_state=AnalysisState.from_doc(as_doc) if as_doc else None,
             finalization_blocks=({str(k): int(v) for k, v in fb_doc.items()} if fb_doc else None),
+            review_states=dict(doc.get("review_states") or {}),
         )
 
 

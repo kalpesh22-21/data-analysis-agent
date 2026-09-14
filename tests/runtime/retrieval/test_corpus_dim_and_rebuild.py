@@ -41,7 +41,9 @@ from data_agent.runtime.retrieval.corpus_loader import (
 
 
 class _Result:
-    def __init__(self, *, row: dict[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self, *, row: dict[str, Any] | None = None, rows: list[dict[str, Any]] | None = None
+    ) -> None:
         self._row = row
         self._rows = rows or []
 
@@ -228,8 +230,8 @@ async def test_nuke_graph_drops_indexes_constraints_and_deletes_all_nodes() -> N
     # Every drop statement ran…
     for stmt in _NUKE_STATEMENTS:
         assert stmt in issued
-    # …the 2 vector indexes + 6 constraints are all covered.
-    assert sum("DROP INDEX" in q for q in issued) == 2
+    # …the 2 vector indexes, full-text index, and 6 constraints are covered.
+    assert sum("DROP INDEX" in q for q in issued) == 3
     assert sum("DROP CONSTRAINT" in q for q in issued) == 6
     # …and every node (incl. the CatalogMeta/CorpusMeta singletons) is deleted.
     assert _NUKE_DELETE_NODES in issued

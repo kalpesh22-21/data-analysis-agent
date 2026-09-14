@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -38,6 +40,9 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer, work_trail
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -72,7 +77,9 @@ def _credentials(scope: frozenset[str]) -> RuntimeCredentials:
     return RuntimeCredentials(session_id=SESSION_ID, jwt=JWT, column_scope=scope)
 
 
-def _build_loop(model: ScriptedModelClient, mcp: FakeMCPClient) -> tuple[AgentLoop, InMemorySessionStore]:
+def _build_loop(
+    model: ScriptedModelClient, mcp: FakeMCPClient
+) -> tuple[AgentLoop, InMemorySessionStore]:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, CATALOG)
     assembler = ContextAssembler(store)
@@ -112,7 +119,7 @@ async def test_successful_out_of_scope_sample_rows_never_reaches_model_same_turn
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Here is what I found."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(
@@ -137,7 +144,7 @@ async def test_successful_out_of_scope_sample_rows_never_reaches_model_same_turn
     )
     assert outcome.status == "done"
 
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert len(trail) == 1
     assert trail[0].status == "ok"
     assert trail[0].provenance == frozenset(
@@ -172,7 +179,7 @@ async def test_denied_current_turn_entry_is_still_surfaced_same_turn() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Let me try a different table."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [MCPToolError("TABLE_NOT_FOUND", "no such table")]})
@@ -180,11 +187,13 @@ async def test_denied_current_turn_entry_is_still_surfaced_same_turn() -> None:
 
     narrow_scope = frozenset({f"{_E}.EmployeeCode"})
     outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(narrow_scope), user_message="Query the ghost table."
+        session_id=SESSION_ID,
+        credentials=_credentials(narrow_scope),
+        user_message="Query the ghost table.",
     )
     assert outcome.status == "done"
 
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert len(trail) == 1
     assert trail[0].status == "denied"
     assert trail[0].provenance is None

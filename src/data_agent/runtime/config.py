@@ -335,6 +335,13 @@ class RuntimeSettings(BaseSettings):
 
     # --- OpenAI model provider (D71) ---
     openai_api_key: str = Field("", description="OpenAI API key (secret).")
+    measurement_review_enabled: bool = Field(
+        True,
+        description="Review measurement meaning before warehouse execution when a model endpoint is configured.",
+    )
+    use_reasoning_metadata: bool = Field(
+        False, description="Preserve provider reasoning metadata in internal conversation history."
+    )
     openai_model: str = Field("gpt-4.1", description="Model name for Responses/Chat Completions.")
     openai_base_url: str = Field("", description="Optional OpenAI-compatible base URL override.")
     model_context_window: int = Field(
@@ -956,6 +963,12 @@ class RuntimeSettings(BaseSettings):
         30,
         ge=1,
         description="High-recall per-corpus recall fan-out (precision restored by rerank).",
+    )
+    retrieval_blueprint_recall_k: int = Field(
+        60,
+        ge=1,
+        le=200,
+        description="Candidates per semantic/keyword channel before blueprint reranking; displayed card limits are separate.",
     )
     retrieval_top_k_blueprints: int = Field(
         3, ge=1, description="Blueprint thin cards pre-injected (03 fixes 3)."

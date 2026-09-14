@@ -1138,12 +1138,12 @@
       badge.removeAttribute("title");
       return;
     }
-    badge.textContent = "verified ✓";
+    badge.textContent = "Structure checked ✓";
     badge.setAttribute(
       "title",
       verification.grain_checked === false
-        ? "verified (grain not checked)"
-        : "verified via blueprint gate"
+        ? "Output columns checked; grouping was not checked."
+        : "Output columns and grouping checked; this does not prove the calculation answers the question."
     );
     badge.hidden = false;
   }
@@ -1364,12 +1364,12 @@
       badge.removeAttribute("title");
       return;
     }
-    badge.textContent = "verified ✓";
+    badge.textContent = "Structure checked ✓";
     // grain_checked===false → grain probe was skipped; keep it subtle via title.
     if (verification.grain_checked === false) {
-      badge.setAttribute("title", "verified (grain not checked)");
+      badge.setAttribute("title", "Output columns checked; grouping was not checked.");
     } else {
-      badge.setAttribute("title", "verified via blueprint gate");
+      badge.setAttribute("title", "Output columns and grouping checked; this does not prove the calculation answers the question.");
     }
     badge.hidden = false;
   }

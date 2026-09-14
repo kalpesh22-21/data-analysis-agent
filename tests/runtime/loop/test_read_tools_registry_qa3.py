@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import ContextAssembler
@@ -32,6 +34,9 @@ from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview, TrailEntry
+from tests.runtime.final_answer import final_answer, work_trail
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -124,7 +129,7 @@ async def test_read_tool_crash_is_isolated_turn_survives() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_sb_call("c1")]),
-            ModelTurnResult(assistant_text="recovered."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     tool = SearchBlueprintsTool(pipeline=_RaisingPipeline(), default_k=5, max_k=20)  # type: ignore[arg-type]
@@ -133,9 +138,9 @@ async def test_read_tool_crash_is_isolated_turn_survives() -> None:
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="hi")
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "recovered."
-    assert outcome.tool_calls_made == 1
-    trail = await store.load_trail(SESSION_ID)
+    assert outcome.assistant_text == "I don't have any information to answer your question."
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.status, e.error_code) for e in trail] == [
         ("searchBlueprints", "error", "RETRIEVAL_TOOL_INTERNAL_ERROR")
     ]
@@ -185,7 +190,7 @@ async def test_mixed_runtime_and_mcp_calls_order_and_counts() -> None:
                         ToolCallRequest(id="c3", name="listDatabases", arguments={}),
                     ]
                 ),
-                ModelTurnResult(assistant_text="done"),
+                final_answer(evidence=["c3"], assistant_text="done"),
             ]
         ),
         tool_dispatcher=dispatcher,
@@ -202,8 +207,8 @@ async def test_mixed_runtime_and_mcp_calls_order_and_counts() -> None:
         session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi"
     )
 
-    assert outcome.tool_calls_made == 3
-    trail = await store.load_trail(SESSION_ID)
+    assert outcome.tool_calls_made == 4  # Includes the explicit final-answer call.
+    trail = await work_trail(store, SESSION_ID)
     assert [e.tool_name for e in trail] == ["searchBlueprints", "resolveValues", "listDatabases"]
     # searchBlueprints never reached the MCP under its own name; only the inner
     # runQuery (from resolveValues) + the real listDatabases did.
@@ -219,7 +224,7 @@ async def test_per_iteration_cap_boundary_at_8() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_sb_call(f"c{i}") for i in range(9)]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _build(
@@ -230,9 +235,12 @@ async def test_per_iteration_cap_boundary_at_8() -> None:
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi"
     )
-    assert outcome.tool_calls_made == 8  # the 9th is not dispatched this round
-    trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 8
+    assert (
+        outcome.tool_calls_made == 9
+    )  # Includes the explicit final-answer call.  # the 9th is not dispatched this round
+    trail = await work_trail(store, SESSION_ID)
+    assert len(trail) == 9
+    assert sum(e.error_code == "TOOL_NOT_EXECUTED" for e in trail) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +290,8 @@ async def test_ask_user_short_circuits_runtime_tool_in_same_response() -> None:
     assert outcome.status == "paused_ask_user"
     assert tool.ran is False  # the runtime tool was never executed
     assert outcome.tool_calls_made == 0
-    assert await store.load_trail(SESSION_ID) == []  # nothing dispatched
+    trail = await work_trail(store, SESSION_ID)
+    assert [e.error_code for e in trail] == ["TOOL_NOT_EXECUTED", "CLARIFICATION_REQUESTED"]
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +303,7 @@ async def test_duplicate_tool_call_ids_both_execute_and_trail() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_sb_call("dup", "q1"), _sb_call("dup", "q2")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _build(
@@ -308,8 +317,8 @@ async def test_duplicate_tool_call_ids_both_execute_and_trail() -> None:
     # PIN: the loop does not de-duplicate ids — both run, both are trailed under
     # the same tool_call_id. (Replay would synthesize two assistant/tool pairs
     # with a colliding id — see the report's ambiguity note for runBlueprint.)
-    assert outcome.tool_calls_made == 2
-    trail = await store.load_trail(SESSION_ID)
+    assert outcome.tool_calls_made == 3  # Includes the explicit final-answer call.
+    trail = await work_trail(store, SESSION_ID)
     assert [e.tool_call_id for e in trail] == ["dup", "dup"]
 
 
@@ -361,7 +370,7 @@ async def test_runtime_tool_named_runquery_shadows_the_mcp_tool() -> None:
                     ToolCallRequest(id="c1", name="runQuery", arguments={"sql": "SELECT 1"})
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ]
     )
     loop, store = _build(model=model, mcp=mcp, runtime_tools={"runQuery": shadow})
@@ -380,14 +389,14 @@ async def test_advertised_but_unwired_read_tool_returns_unavailable() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_sb_call("c1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     # searchBlueprints is NOT wired into the registry (retrieval inactive).
     loop, store = _build(model=model, mcp=mcp, runtime_tools={})
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="hi")
-    assert outcome.tool_calls_made == 1
-    trail = await store.load_trail(SESSION_ID)
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.
+    trail = await work_trail(store, SESSION_ID)
     assert (trail[0].tool_name, trail[0].status, trail[0].error_code) == (
         "searchBlueprints",
         "error",
@@ -471,7 +480,7 @@ async def test_loop_wraps_a_raising_runtime_tool_turn_survives() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_sb_call("c1")]),
-            ModelTurnResult(assistant_text="recovered."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _build(
@@ -481,9 +490,9 @@ async def test_loop_wraps_a_raising_runtime_tool_turn_survives() -> None:
     )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="hi")
     assert outcome.status == "done"
-    assert outcome.assistant_text == "recovered."
-    assert outcome.tool_calls_made == 1
-    trail = await store.load_trail(SESSION_ID)
+    assert outcome.assistant_text == "I don't have any information to answer your question."
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.status, e.error_code) for e in trail] == [
         ("searchBlueprints", "error", "RUNTIME_TOOL_INTERNAL_ERROR")
     ]
@@ -522,7 +531,7 @@ async def test_loop_validates_runtime_tool_provenance_type_coerces_to_none() -> 
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_sb_call("c1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _build(
@@ -534,5 +543,5 @@ async def test_loop_validates_runtime_tool_provenance_type_coerces_to_none() -> 
         session_id=SESSION_ID, credentials=_creds(frozenset({"a.b.c"})), user_message="hi"
     )
     assert outcome.status == "done"
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert trail[0].provenance is None  # coerced fail-closed, not the bad string

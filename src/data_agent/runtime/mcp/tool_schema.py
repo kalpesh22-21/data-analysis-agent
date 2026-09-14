@@ -117,13 +117,15 @@ SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
     "name": "searchBlueprints",
     "description": (
         "Search the blueprint library for reusable, validated analyses that match an "
-        "intent. Call it for EVERY analytical deliverable the request contains, in your "
-        "own words — one search per deliverable, not one for the whole question — "
-        "whether or not one of the blueprint cards already offered to you fits. Those "
-        "cards were recalled from the whole question as ONE string, so on a multi-part "
-        "request they under-serve every part of it. This is normal practice, not a "
-        "fallback for when they miss. It re-searches for THIS user's scope and returns "
-        "more candidate cards. Each card carries id, intent, slots summary, score, each slot's "
+        "intent. For multiple analytical deliverables, use deliverables with one focused "
+        "query per part. Supply exactly one of query or deliverables; omit query entirely "
+        "when using deliverables. Search each part even when an offered card fits one part: the initial cards were "
+        "recalled from the whole question and may miss the others. Include each part's "
+        "metric, grouping, period and relevant filters. Results are grouped by input "
+        "position; k is the shared card budget, raised to at least one slot per part. "
+        "For a single analytical deliverable, use query when no offered card fits. "
+        "Searches use the current user's scope. Each card carries id, intent, slots "
+        "summary, score, each slot's "
         "name/type/required, any pinned term-to-column resolutions, and the result grain — "
         "enough to CHOOSE between candidates and to fill runBlueprint, so you do NOT need a "
         "getBlueprint on every candidate to decide. A card carries no SQL, though, and its "
@@ -131,8 +133,8 @@ SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
         "on it and read what it actually does before runBlueprint — the runtime refuses a "
         "runBlueprint for an id you have not expanded in this turn. Call getBlueprint too "
         "when a card carries `slots_omitted`, which means it lists only the first few slots "
-        "and the rest are on getBlueprint. A `degraded` flag of true means semantic ranking "
-        "was unavailable and the order is weaker — treat scores with less confidence."
+        "and the rest are on getBlueprint. A `degraded` flag of true means reranking "
+        "was unavailable or no candidates survived and the order may be weaker — treat scores with less confidence."
     ),
     "parameters": {
         "type": "object",
@@ -141,13 +143,20 @@ SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": "The intent to search for, in your own words. Free text.",
             },
+            "deliverables": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "minItems": 1,
+                "maxItems": 4,
+                "description": "Focused queries, one per analytical deliverable. Include metric, grouping, period and relevant filters. Use instead of query; for more than four deliverables, make another batch.",
+            },
             "k": {
                 "type": "integer",
                 "description": "Optional. How many cards to return (clamped to a sane maximum). "
                 "Omit for a small default.",
             },
         },
-        "required": ["query"],
+        "required": [],
     },
 }
 
@@ -220,16 +229,13 @@ SEARCH_KNOWLEDGE_TOOL_SCHEMA: dict[str, Any] = {
 # (`analysis_state.split_serves_intent`): the MCP server never sees it. The
 # description tells the model when it is meaningful, because an optional parameter
 # with no stated purpose is one a model fills with a placeholder.
-SERVES_INTENT_PARAM: dict[str, Any] = {
-    "type": "string",
-    "description": (
-        "Optional. The id of the tracked intent this call is for, e.g. 'i2' — the "
-        "runtime uses it to close that intent when you later mark it completed or "
-        "blocked, which is why it needs nothing else from you then. Only meaningful "
-        "when you have declared intents with updateAnalysisState; leave it empty "
-        "otherwise."
-    ),
+SERVES_INTENTS_PARAM: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": "IDs of declared intents this execution serves.",
 }
+# Historical import name; the advertised protocol is plural.
+SERVES_INTENT_PARAM = SERVES_INTENTS_PARAM
 # The two MCP-advertised tools the tag is injected into. `runBlueprint` is not
 # here: it is locally authored and declares the property directly.
 _INTENT_TAGGABLE_MCP_TOOLS: frozenset[str] = frozenset({"runQuery", "getTableSchema"})
@@ -281,7 +287,7 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
             # Injected below on the two MCP-backed taggable tools; written out here
             # because `runBlueprint` is locally authored. Same object either way —
             # see `SERVES_INTENT_PARAM`.
-            "serves_intent": SERVES_INTENT_PARAM,
+            "serves_intents": SERVES_INTENTS_PARAM,
         },
         "required": ["id", "slot_bindings"],
     },
@@ -520,48 +526,17 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "name": "updateAnalysisState",
     "description": (
-        "Track the separate deliverables a question asks for, so none is silently "
-        "dropped. Use it whenever the user asks for more than one thing ('headcount "
-        "and average salary by department, and who left last month'). "
-        "FIRST call — BEFORE any substantive tool call, that is before any runQuery, "
-        "runBlueprint, sampleRows or resolveValues in this turn — list each "
-        "deliverable as an object with just a 'description': one short sentence in "
-        "the user's own terms, and no other field. Do not invent ids: the runtime "
-        "assigns them (i1, i2, …) and the result of that call tells you what they "
-        "are. Once one of those four has run, a first declaration is refused and the "
-        "turn goes untracked. "
-        "DOING THE WORK — pass 'serves_intent' with an intent's id (e.g. 'i2') on the "
-        "runQuery, runBlueprint or getTableSchema you run for it. That tag is how the "
-        "intent is closed later, so tag the call when you make it. "
-        "LATER calls — update the intents you already declared, several at a time in "
-        "ONE call. Send 'intent_id' and the new 'status', and NOTHING ELSE: a "
-        "description cannot be changed and an intent cannot be added or removed. "
-        "Mark an intent 'completed' once a call you tagged with its id has succeeded. "
-        "You never name the call: the runtime looks up the work you tagged for that "
-        "intent, and if you tagged nothing it uses the one call that could have served "
-        "it. Marking it completed records that you bound that work to this "
-        "deliverable, not that the figure is right; check the work yourself. Mark it "
-        "'blocked' when a call for it was refused for permissions or came back with no "
-        "rows — the runtime reads which of those happened off that call, so there is "
-        "no reason to state; tag a DIFFERENT call for each blocked intent. If a query "
-        "legitimately returns nothing, that is a completed intent whose answer is "
-        "'none found', not a blocked one. "
-        "IF ONE CALL ANSWERS TWO DELIVERABLES: tag it with one of them and simply mark "
-        "the other completed too — a tag names a single intent, so the runtime binds "
-        "that same call to the second one. "
-        "IMPORTANT: tag in the round you do the work and close the intent in a LATER "
-        "message. This tool runs before the other calls in the same message, so a call "
-        "you are making right now has not run yet and cannot close anything until your "
-        "next message. "
-        "CLOSING YOUR LAST INTENT IS NOT THE END OF THE TURN: the answer still has to "
-        "be sent. When the answer is a table, send both in the SAME response — this "
-        "call closing what remains, and answerWithTable beside it; this tool runs "
-        "first, so one response does both. An ordinary written answer cannot share a "
-        "response with a tool call, so there close the intents first and send it next. "
-        "Every item uses one object shape, so if you must send a field that does not "
-        "apply, leave it EMPTY ('') — an empty field is read as absent. On the first "
-        "call 'status' is ignored (every intent starts pending), so leave it as "
-        "'pending' there."
+        "Track distinct requested deliverables. First declare short descriptions; the runtime "
+        "returns IDs and freezes the list. Prefer declaring before work, but a late initial "
+        "declaration is allowed. Tag each execution with serves_intents (one or several IDs). "
+        "After receiving results, update intent_id and status, optionally binding a specific "
+        "result_id from this turn. Existing results can explicitly serve several intents; "
+        "the runtime never guesses which untagged execution you mean. Completion records "
+        "evidence binding, not semantic correctness. Empty successful results can complete "
+        "an intent with 'none found'. Blocked intents need distinct evidence establishing "
+        "the limitation. Updates run before other calls in a batch, so newly proposed work "
+        "cannot supply evidence until the next response. You may close existing intents and "
+        "call finalizeAnswer together. Empty optional fields are treated as absent."
     ),
     "parameters": {
         "type": "object",
@@ -579,6 +554,10 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
                             "the deliverable, in the user's own terms. Max 500 "
                             "characters. Leave it empty on later calls — a "
                             "description cannot be changed once declared.",
+                        },
+                        "result_id": {
+                            "type": "string",
+                            "description": "Successful current-turn execution explicitly supporting completion. Required when the work was not tagged.",
                         },
                         "intent_id": {
                             "type": "string",
@@ -635,7 +614,7 @@ GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": "An article id returned by searchHelpCenter.",
             },
-            "serves_intent": SERVES_INTENT_PARAM,
+            "serves_intents": SERVES_INTENTS_PARAM,
         },
         "required": ["id"],
     },
@@ -668,7 +647,47 @@ GET_CAPABILITY_TOOL_SCHEMA: dict[str, Any] = {
 # live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
 # names are ours" — the name-collision guard (§6.1) asserts the MCP never
 # advertises one of them.
+FINALIZE_ANSWER_SCHEMA = {
+    "type": "function",
+    "name": "finalizeAnswer",
+    "description": "Send the complete final answer after all work and preparation finishes. This is the only finalization tool. Select existing result IDs for paginated tables and prepared capability refs for UI options. Cite successful current-turn result IDs in evidence. Preserve supported parts and disclose gaps.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "tables": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"result_id": {"type": "string"}, "caption": {"type": "string"}},
+                    "required": ["result_id"],
+                },
+            },
+            "capability_refs": {"type": "array", "items": {"type": "string"}},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "deliverables": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "intent_id": {"type": "string"},
+                        "answer": {"type": "string"},
+                        "result_ids": {"type": "array", "items": {"type": "string"}},
+                        "evidence_type": {
+                            "type": "string",
+                            "enum": ["warehouse", "product", "catalog", "capability"],
+                        },
+                    },
+                    "required": ["intent_id", "answer", "result_ids"],
+                },
+            },
+        },
+        "required": ["answer", "tables", "capability_refs", "evidence"],
+    },
+}
+
 _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
+    FINALIZE_ANSWER_SCHEMA,
     ASK_USER_TOOL_SCHEMA,
     RESOLVE_VALUES_TOOL_SCHEMA,
     SEARCH_BLUEPRINTS_TOOL_SCHEMA,
@@ -676,8 +695,6 @@ _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
     RUN_BLUEPRINT_TOOL_SCHEMA,
     RECORD_ASSUMPTIONS_TOOL_SCHEMA,
-    ANSWER_WITH_TEXT_TOOL_SCHEMA,
-    ANSWER_WITH_TABLE_TOOL_SCHEMA,
     UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
 )
 _LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCHEMAS)
@@ -723,7 +740,14 @@ def augment_with_serves_intent(schema: dict[str, Any]) -> dict[str, Any]:
         **schema,
         "parameters": {
             **parameters,
-            "properties": {**properties, "serves_intent": SERVES_INTENT_PARAM},
+            "properties": {
+                **properties,
+                "serves_intents": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "IDs of declared intents this execution serves.",
+                },
+            },
         },
     }
 

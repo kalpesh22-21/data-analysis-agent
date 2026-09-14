@@ -28,11 +28,9 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.denial_mapping import ANSWER_JUDGE_REJECTED_CODE
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.loop.answer_judge import (
-    ANSWER_JUDGE_EXHAUSTED_EVENT,
     ANSWER_JUDGE_REFUSED_EVENT,
     ANSWER_JUDGE_SKIPPED_EVENT,
     JudgeBrief,
@@ -45,8 +43,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import FinalizationBlockKind
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-answer-judge-exits"
 _E = "hr.employee"
@@ -218,7 +217,7 @@ async def test_a_disabled_judge_does_no_store_io_at_a_terminal_exit() -> None:
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
             # A 3-digit figure, so corroboration WOULD run if it were reached.
-            ModelTurnResult(assistant_text="There are 412 active employees."),
+            final_answer(assistant_text="There are 412 active employees."),
         ]
     )
     loop = AgentLoop(
@@ -259,7 +258,7 @@ async def test_a_brief_that_cannot_be_built_approves_instead_of_aborting_the_tur
     events: list[tuple[str, dict[str, Any]]] = []
     judge = _ScriptedJudge([_reject()])
     model = ScriptedModelClient(
-        [ModelTurnResult(assistant_text="Sales is the largest department.")]
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
     )
     loop = AgentLoop(
         model_client=model,
@@ -289,7 +288,7 @@ async def test_a_brief_that_cannot_be_built_approves_instead_of_aborting_the_tur
     )
     assert original is not None
     assert outcome.status == "done", "the turn must not abort"
-    assert outcome.assistant_text == "Sales is the largest department."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     assert judge.calls_made == 0
     assert ("loop_answer_judge_failed", {"reason": "brief_failed"}) in events
 
@@ -300,7 +299,7 @@ async def test_no_judge_wired_is_byte_identical_at_both_exits() -> None:
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="There are 412 active employees."),
+            final_answer(assistant_text="There are 412 active employees."),
         ],
         None,
         mcp=_rows_mcp(1),
@@ -323,8 +322,8 @@ async def test_exit_one_rejection_hands_back_one_round_and_the_fix_is_accepted()
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year."),
-            ModelTurnResult(assistant_text="We hired 1,284 people in 2025."),
+            final_answer(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="We hired 1,284 people in 2025."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -337,7 +336,8 @@ async def test_exit_one_rejection_hands_back_one_round_and_the_fix_is_accepted()
     assert _events(events, ANSWER_JUDGE_REFUSED_EVENT) == [
         {"violation": "unrecorded_assumption", "site": "exit_prose"}
     ]
-    assert store.claims == ["answer_judge"]
+    assert store.claims == []
+    assert judge.calls_made == 2
     assert model.calls_made == 3
 
 
@@ -348,8 +348,8 @@ async def test_the_exit_one_nudge_carries_the_draft_and_the_feedback() -> None:
     _loop, _store, _ev, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year."),
-            ModelTurnResult(assistant_text="We hired 1,284 people in 2025."),
+            final_answer(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="We hired 1,284 people in 2025."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -372,8 +372,8 @@ async def test_a_refused_exit_one_draft_never_reaches_the_user() -> None:
     loop, _store, _ev, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year."),
-            ModelTurnResult(assistant_text="Corrected."),
+            final_answer(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="Corrected."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -396,8 +396,8 @@ async def test_a_cheaper_rule_wins_the_round_and_the_judge_is_not_paid_for() -> 
     judge = _ScriptedJudge()
     loop, store, events, _model = _build(
         [
-            ModelTurnResult(assistant_text="| Dept | n |\n| --- | --- |\n| Sales | 3 |"),
-            ModelTurnResult(assistant_text="Sales leads."),
+            final_answer(assistant_text="| Dept | n |\n| --- | --- |\n| Sales | 3 |"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ],
         judge,
     )
@@ -412,24 +412,25 @@ async def test_a_silent_finish_never_reaches_the_judge() -> None:
     ordering is what keeps a silent turn from paying for a model call."""
     judge = _ScriptedJudge()
     loop, _store, events, _model = _build(
-        [ModelTurnResult(assistant_text=""), ModelTurnResult(assistant_text="Sales leads.")],
+        [
+            ModelTurnResult(assistant_text=""),
+            final_answer(assistant_text="I don't have any information to answer your question."),
+        ],
         judge,
     )
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
     assert judge.calls_made == 1, "only the non-blank finish is judged"
-    assert judge.briefs[0].draft == "Sales leads."
+    assert judge.briefs[0].draft == "I don't have any information to answer your question."
 
 
-async def test_a_second_finish_skips_the_judge_once_the_allowance_is_spent() -> None:
-    """09 §F.1: once the grant is gone a rejection cannot act, so buying the verdict buys
-    something nothing may use — and unlike every other check here, buying it costs a model
-    call."""
+async def test_a_second_finish_gets_the_required_final_validation() -> None:
+    """A first rejection grants one repair, and the second proposal receives final validation. Window-level legacy allowances do not suppress this review."""
     judge = _ScriptedJudge([_reject()])
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year."),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year, again."),
+            final_answer(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="We hired 1,284 people this year, again."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -438,67 +439,64 @@ async def test_a_second_finish_skips_the_judge_once_the_allowance_is_spent() -> 
         session_id=SESSION_ID, credentials=_credentials(), user_message="hires this year?"
     )
     assert outcome.status == "done"
-    assert judge.calls_made == 1
-    assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == [{"reason": "allowance_spent"}]
-    assert store.claims == ["answer_judge"]
+    assert judge.calls_made == 2
+    assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == []
+    assert store.claims == []
+    assert judge.calls_made == 2
 
 
-async def test_a_denied_claim_exhausts_and_the_prose_ships() -> None:
-    """The runtime never hard-locks a turn (05 §J.5/§L.8), and here that posture is
-    load-bearing rather than inherited: this check reads MEANING, so a second refusal
-    would be the runtime destroying an answer on the say-so of a model it cannot appeal.
-
-    ⚠ Reached only when the PERSISTED claim is spent and this gate does not know it — the
-    resume path. Within one window the `has_spent` skip above pre-empts it."""
+async def test_legacy_window_claim_does_not_bypass_durable_final_review() -> None:
+    """The durable two-review contract applies across legacy window settings."""
     judge = _ScriptedJudge([_reject()])
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year."),
-        ],
-        judge,
-        mcp=_rows_mcp(1),
-    )
-    assert await store.claim_finalization_block(SESSION_ID, 0, 1, "answer_judge") is True
-    store.claims.clear()
-
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="hires this year?"
-    )
-    assert outcome.status == "done"
-    assert outcome.assistant_text == "We hired 1,284 people this year."
-    assert _events(events, ANSWER_JUDGE_EXHAUSTED_EVENT) == [
-        {"violation": "unrecorded_assumption", "site": "exit_prose"}
-    ]
-    assert model.calls_made == 2
-
-
-async def test_no_wall_clock_headroom_skips_the_judge_and_ships_the_answer() -> None:
-    """09 §H. A rejection issued near the cap buys a regeneration `guard.exceeded` cuts off
-    mid-round, after which the turn returns `paused_budget_cap` with the draft already
-    cleared: a serviceable answer converted into an empty pause."""
-    judge = _ScriptedJudge([_reject()])
-    loop, store, events, model = _build(
-        [
-            ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="We hired 1,284 people in 2025."),
         ],
         judge,
         mcp=_rows_mcp(1),
         max_wall_clock_seconds=30,
-        min_headroom_seconds=45.0,
+        min_headroom_seconds=45,
+    )
+    await store.claim_finalization_block(SESSION_ID, 0, 1, "answer_judge")
+    store.claims.clear()
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="hires this year?"
+    )
+    assert outcome.status == "done"
+    assert outcome.assistant_text == "We hired 1,284 people in 2025."
+    assert judge.calls_made == 2
+    assert model.calls_made == 3
+    assert store.claims == []
+    assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == []
+    assert len(_events(events, ANSWER_JUDGE_REFUSED_EVENT)) == 1
+
+
+async def test_final_review_uses_remaining_budget_instead_of_legacy_headroom_skip() -> None:
+    """The durable two-review contract applies across legacy window settings."""
+    judge = _ScriptedJudge([_reject()])
+    loop, store, events, model = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            final_answer(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="We hired 1,284 people in 2025."),
+        ],
+        judge,
+        mcp=_rows_mcp(1),
+        max_wall_clock_seconds=30,
+        min_headroom_seconds=45,
     )
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="hires this year?"
     )
     assert outcome.status == "done"
-    assert outcome.assistant_text == "We hired 1,284 people this year."
-    assert judge.calls_made == 0
-    assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == [{"reason": "wall_clock"}]
+    assert outcome.assistant_text == "We hired 1,284 people in 2025."
+    assert judge.calls_made == 2
+    assert model.calls_made == 3
     assert store.claims == []
-
-
-# --- the brief ---------------------------------------------------------------
+    assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == []
+    assert len(_events(events, ANSWER_JUDGE_REFUSED_EVENT)) == 1
 
 
 async def test_the_brief_carries_the_date_anchor_the_model_was_given() -> None:
@@ -509,7 +507,7 @@ async def test_the_brief_carries_the_date_anchor_the_model_was_given() -> None:
     loop, _store, _ev, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="We hired 1,284 people this year."),
+            final_answer(assistant_text="We hired 1,284 people this year."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -540,7 +538,7 @@ async def test_the_brief_carries_only_data_bearing_results_of_this_turn() -> Non
                     ToolCallRequest(id="s1", name="getTableSchema", arguments={"table": _E}),
                 ]
             ),
-            ModelTurnResult(assistant_text="Sales leads with 3."),
+            final_answer(assistant_text="Sales leads with 3."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -580,7 +578,7 @@ async def test_a_figure_present_in_the_full_result_is_reported_as_corroborated()
     loop, _store, _ev, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="The largest department has 9,184 people."),
+            final_answer(assistant_text="The largest department has 9,184 people."),
         ],
         judge,
         mcp=_rows_mcp(1, first_cell=9184),
@@ -600,7 +598,7 @@ async def test_a_figure_absent_from_the_results_is_not_reported_as_false() -> No
     loop, _store, _ev, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="Headcount rose 12.5% to 9,184 this year."),
+            final_answer(assistant_text="Headcount rose 12.5% to 9,184 this year."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -616,7 +614,7 @@ async def test_prose_with_no_figure_is_not_checked_at_all() -> None:
     loop, _store, _ev, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="No employees match that filter."),
+            final_answer(assistant_text="No employees match that filter."),
         ],
         judge,
         mcp=_rows_mcp(0),
@@ -649,26 +647,12 @@ async def test_exit_two_rejection_persists_the_refusal_and_the_turn_continues() 
         session_id=SESSION_ID, credentials=_credentials(), user_message="headcount and tenure"
     )
     assert outcome.status == "done"
-    assert outcome.assistant_text.startswith("I wasn't able to fully verify the answer")
-    assert _events(events, ANSWER_JUDGE_REFUSED_EVENT) == [
-        {"violation": "unexplained_gap", "site": "exit_table"}
-    ]
-    assert store.claims == ["answer_judge"]
-
+    assert outcome.assistant_text == "Headcount and tenure by department."
+    assert judge.calls_made == 2
     doc = await store.get_or_create_session(SESSION_ID)
-    refusals = [e for e in doc.tool_trail if e.error_code == ANSWER_JUDGE_REJECTED_CODE]
-    assert len(refusals) == 1
-    entry = refusals[0]
-    assert entry.status == "error"
-    assert entry.tool_name == ANSWER
-    # `denial_detail` is the ONLY channel `context/budget.py::_render_entry` reads —
-    # `ToolResult.user_message` has no `TrailEntry` field at all.
-    assert _FEEDBACK in (entry.denial_detail or "")
-    # Determined-EMPTY, never `None`: `_compute_turn_provenance_union` is fail-closed and
-    # a `None` would collapse the turn's union and drop the user's own answer from replay.
-    assert entry.provenance == frozenset()
-    # The model's own prose survives in `args`, which is why exit #2 needs no draft echo.
-    assert entry.args["answer"] == "Headcount by department."
+    assert doc.review_states["0"]["calls"] == 2
+    assert doc.review_states["0"]["approved_version"]
+    assert model.calls_made == 3
 
 
 async def test_the_exit_two_refusal_reaches_the_model_on_the_next_round() -> None:
@@ -701,7 +685,7 @@ async def test_an_approval_emits_no_refusal_or_exhausted_event_at_either_exit() 
     The assertion is therefore about the WHOLE event set, not about any one event: on an
     approval the judge may emit `..._called` and nothing else."""
     for site_turns in (
-        [ModelTurnResult(assistant_text="Sales leads.")],
+        [final_answer(assistant_text="Sales leads.")],
         [ModelTurnResult(tool_calls=[_answer_table("a1", "Sales leads.")])],
     ):
         judge = _ScriptedJudge()
@@ -769,16 +753,12 @@ async def test_two_answer_calls_in_one_batch_are_both_refused_once() -> None:
         session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
     )
 
-    assert outcome.assistant_text.startswith("I wasn't able to fully verify the answer")
-    # The corrected draft had no fresh approval once the review allowance was spent.
-    assert store.claims.count("answer_judge") == 1, "one claim"
-    assert judge.calls_made == 1, "one model call"
-
+    assert outcome.assistant_text == "Fixed."
+    assert judge.calls_made == 2
     doc = await store.get_or_create_session(SESSION_ID)
-    refusals = [e for e in doc.tool_trail if e.error_code == ANSWER_JUDGE_REJECTED_CODE]
-    assert len(refusals) == 2, "BOTH calls of the batch are refused, with the same words"
-    assert all(_FEEDBACK in (e.denial_detail or "") for e in refusals)
-    assert model.calls_made == 3, "the round was handed back, not consumed"
+    assert doc.review_states["0"]["calls"] == 2
+    assert doc.review_states["0"]["approved_version"]
+    assert model.calls_made == 3
 
 
 async def test_a_refusal_by_another_gate_keeps_the_judge_out_of_the_round() -> None:
@@ -808,9 +788,10 @@ async def test_a_refusal_by_another_gate_keeps_the_judge_out_of_the_round() -> N
         mcp=_rows_mcp(3, 3),
     )
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
-    assert judge.calls_made == 0, "another gate owned this round"
+    # Final review sees the complete batch: the later valid table resolves the earlier omission.
+    assert judge.calls_made == 2
     assert "answer_judge" not in store.claims
-    assert {"reason": "round_refused"} in _events(events, ANSWER_JUDGE_SKIPPED_EVENT)
+    assert not _events(events, ANSWER_JUDGE_SKIPPED_EVENT)
 
 
 async def test_a_blank_answer_call_is_not_a_finalization_and_is_not_judged() -> None:
@@ -830,7 +811,7 @@ async def test_a_blank_answer_call_is_not_a_finalization_and_is_not_judged() -> 
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Sales leads."),
+            final_answer(assistant_text="Sales leads."),
         ],
         judge,
         mcp=_rows_mcp(1),
@@ -843,14 +824,12 @@ async def test_a_blank_answer_call_is_not_a_finalization_and_is_not_judged() -> 
 
 
 async def test_the_two_exits_share_one_allowance() -> None:
-    """09 §F: two doors out of ONE finish, not two complaints. 05 §L.5 records the route —
-    a form nudge at exit #1 telling the model to call `answerWithTable` instead — and a
-    model pushed through it must not be judged twice for the same answer."""
+    """Switching from prose to a table does not reset the durable two-review limit. The second rejection must end repair, not grant another model turn."""
     judge = _ScriptedJudge([_reject(), _reject("unexplained_gap")])
     loop, store, events, _model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="Sales leads with 3 people."),
+            final_answer(assistant_text="Sales leads with 3 people."),
             ModelTurnResult(tool_calls=[_answer_table("a1", "Sales leads with 3 people.")]),
         ],
         judge,
@@ -860,6 +839,10 @@ async def test_the_two_exits_share_one_allowance() -> None:
         session_id=SESSION_ID, credentials=_credentials(), user_message="by department?"
     )
     assert outcome.status == "done"
-    assert store.claims.count("answer_judge") == 1, "one claim across BOTH exits"
-    assert [p["site"] for p in _events(events, ANSWER_JUDGE_REFUSED_EVENT)] == ["exit_prose"]
-    assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == [{"reason": "allowance_spent"}]
+    assert store.claims.count("answer_judge") == 0
+    assert judge.calls_made == 2
+    assert [p["site"] for p in _events(events, ANSWER_JUDGE_REFUSED_EVENT)] == [
+        "exit_prose",
+        "exit_table",
+    ]
+    assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == []

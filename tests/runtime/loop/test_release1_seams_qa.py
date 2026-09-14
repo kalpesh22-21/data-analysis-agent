@@ -36,9 +36,6 @@ from data_agent.runtime.blueprint.tool import RunBlueprintTool
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.denial_mapping import (
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -51,8 +48,9 @@ from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import live_analysis_state
 from data_agent.runtime.session.store import CASMismatchError
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-r1-seams"
 _E = "dbpcm_warehouse.employee"
@@ -265,7 +263,7 @@ async def test_the_window_local_state_governs_after_a_blueprint_mid_dag_resume()
         [
             # The model tries to finalize the moment the blueprint comes back.
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text="ok, I will resolve them"),
+            final_answer(assistant_text="ok, I will resolve them"),
         ],
         store=store,
         blueprint_mcp=_resume_mcp(),
@@ -280,7 +278,8 @@ async def test_the_window_local_state_governs_after_a_blueprint_mid_dag_resume()
     ]
     trail = await store.load_trail(SESSION_ID)
     refusal = next(e for e in trail if e.tool_call_id == "a1")
-    assert refusal.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
+    assert refusal.status == "ok"
+    assert refusal.error_code is None
     assert outcome.status == "done"
     del events
 
@@ -320,7 +319,7 @@ async def test_a_resumed_blueprint_entry_is_valid_completion_evidence() -> None:
                     {
                         "intent_id": "i1",
                         "status": "completed",
-                        "evidence_tool_call_id": resumed[-1].tool_call_id,
+                        "result_id": resumed[-1].tool_call_id,
                     },
                 ),
                 _answer_call("a1", answer="Flagged 2 departments."),
@@ -344,7 +343,7 @@ async def test_a_resumed_blueprint_entry_is_valid_completion_evidence() -> None:
         {
             "intent_id": "i1",
             "evidence_tool_name": "runBlueprint",
-            "evidence_binding": "auto_bound",
+            "evidence_binding": "tagged",
         }
     ]
 
@@ -393,8 +392,8 @@ async def test_the_intent_tag_survives_a_mid_dag_blueprint_pause() -> None:
                     _update_call("s2", {"intent_id": "i1", "status": "completed"}),
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         store=store,
         blueprint_mcp=_resume_mcp(),
@@ -440,12 +439,15 @@ async def test_a_blueprint_resume_does_not_hand_out_a_second_forced_reround() ->
     await expand_blueprint(store, SESSION_ID, _BID)
     paused = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="one thing")
     assert paused.status == "paused_ask_user"
-    assert _events(events, "loop_finalization_block_spent") == [{"window": 1}]
+    assert _events(events, "loop_finalization_block_spent") == []
     doc = await store.get_or_create_session(SESSION_ID)
-    assert doc.finalization_blocks == {"0:1:intents": 1}
+    assert not doc.finalization_blocks
 
     resumed_loop, _s2, resume_events = _build(
-        [ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a2")])],
+        [
+            ModelTurnResult(tool_calls=[_answer_call("a2")]),
+            ModelTurnResult(tool_calls=[_answer_call("a3")]),
+        ],
         store=store,
         blueprint_mcp=_resume_mcp(),
     )
@@ -455,8 +457,8 @@ async def test_a_blueprint_resume_does_not_hand_out_a_second_forced_reround() ->
 
     assert outcome.status == "done"
     # No second re-round was granted, and the counter did not advance again.
-    assert not _events(resume_events, "loop_finalization_refused")
-    assert not _events(resume_events, "loop_finalization_block_spent")
+    assert len(_events(resume_events, "loop_finalization_refused")) == 1
+    assert _events(resume_events, "loop_finalization_block_spent") == [{"window": 1}]
     assert (await store.get_or_create_session(SESSION_ID)).finalization_blocks == {"0:1:intents": 1}
     assert _events(resume_events, "loop_enforcement_exhausted") == [{"intent_count": 1}]
     state = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
@@ -630,7 +632,10 @@ async def test_a_failing_force_block_returns_the_answer_and_claims_no_transition
     # The user still gets their answer — losing the forced disposition is bad,
     # aborting the answer to record it is worse.
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Done."
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     assert store.forced_attempts == 1
     # ...but nothing may CLAIM the write landed.
     assert not _events(events, "loop_intent_force_blocked")
@@ -723,7 +728,7 @@ async def test_ask_user_past_the_dispatch_cap_still_pauses_the_turn() -> None:
                     ToolCallRequest(id="ask", name="askUser", arguments={"question": "which?"}),
                 ],
             ),
-            ModelTurnResult(assistant_text="answered without asking"),
+            final_answer(assistant_text="answered without asking"),
         ],
         store=store,
         mcp=FakeMCPClient(scripted={"runQuery": [_rq(["x"], [[1]]), _rq(["x"], [[2]])]}),
@@ -768,7 +773,7 @@ async def test_an_answer_first_batch_still_commits_the_state_before_the_answer()
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                 ],
@@ -812,7 +817,7 @@ async def test_a_surplus_state_call_cannot_launder_a_pending_intent_past_the_ans
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                     ToolCallRequest(id="s3", name=STATE, arguments={"intents": []}),
@@ -821,12 +826,12 @@ async def test_a_surplus_state_call_cannot_launder_a_pending_intent_past_the_ans
                         {
                             "intent_id": "i2",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                 ],
             ),
-            ModelTurnResult(assistant_text="giving up"),
+            final_answer(assistant_text="giving up"),
         ],
         store=store,
         mcp=FakeMCPClient(scripted={"runQuery": [_rq(["x"], [[1]])]}),
@@ -876,7 +881,7 @@ async def test_two_state_calls_in_one_batch_are_applied_in_order_and_the_local_f
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                     _update_call(
@@ -884,7 +889,7 @@ async def test_two_state_calls_in_one_batch_are_applied_in_order_and_the_local_f
                         {
                             "intent_id": "i2",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                 ],
@@ -926,7 +931,7 @@ async def test_a_second_turn_gets_its_own_forced_reround() -> None:
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text="giving up"),
+            final_answer(assistant_text="giving up"),
         ],
         store=store,
     )
@@ -941,7 +946,7 @@ async def test_a_second_turn_gets_its_own_forced_reround() -> None:
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s2", ATTRITION)]),
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a2")]),
-            ModelTurnResult(assistant_text="second answer"),
+            final_answer(assistant_text="second answer"),
         ],
         store=store,
     )

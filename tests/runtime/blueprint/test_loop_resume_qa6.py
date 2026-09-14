@@ -30,10 +30,19 @@ from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import AlreadyConsumedError, InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
-    {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    {
+        _E: {
+            "EmployeeCode": "String",
+            "Department": "Nullable(String)",
+            "AnnualSalary": "Nullable(Float64)",
+        }
+    }
 )
 SESSION_ID = "sess-qa6"
 _BID = "bp-flag"
@@ -44,21 +53,19 @@ def _creds() -> RuntimeCredentials:
 
 
 def _prose_resume_script(text: str) -> list[ModelTurnResult]:
-    """A resume script whose model finishes in bare prose — TWICE.
-
-    The resumed blueprint returns TWO rows, so the first prose finish trips the
-    ANSWER-SHAPE GATE (05 §J): refused once, nudged, handed back a round. These
-    tests are about the exactly-once trail write and the CAS-consume, not about
-    answer shape, so the model re-sends the same prose and the second finish
-    passes on the spent grant. The gate itself — including the trail seeding this
-    helper depends on — is covered in `tests/runtime/loop/test_answer_shape_gate.py`.
-
-    This helper proves nothing on its own: `ScriptedModelClient` does not raise on
-    leftover turns, so a seed regression would leave the second turn unconsumed and
-    every test here would stay green. Callers that want the claim asserted must say
-    `assert resume_model.calls_made == 2` — one of them does.
-    """
-    return [ModelTurnResult(assistant_text=text), ModelTurnResult(assistant_text=text)]
+    """Propose prose, then select the verified resumed blueprint. Two consumed rounds prove the persisted multi-row result reached shape review."""
+    return [
+        final_answer(assistant_text=text),
+        ModelTurnResult(
+            tool_calls=[
+                ToolCallRequest(
+                    id="select_resumed",
+                    name="answerWithTable",
+                    arguments={"answer": text, "blueprint_id": _BID},
+                )
+            ]
+        ),
+    ]
 
 
 def _rq(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
@@ -76,7 +83,11 @@ def _detail() -> BlueprintDetail:
         hit_count=0,
         catalog_sha="",
         composes=[
-            {"order": 0, "output": {"n": "scalar"}, "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee"},
+            {
+                "order": 0,
+                "output": {"n": "scalar"},
+                "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee",
+            },
             {
                 "order": 1,
                 "node_kind": "approval",
@@ -94,7 +105,9 @@ async def _tools_provider(_c: RuntimeCredentials) -> list[dict]:
     return [{"type": "function", "name": "runBlueprint", "description": "", "parameters": {}}]
 
 
-def _make_loop(store: InMemorySessionStore, model: ScriptedModelClient, mcp: FakeMCPClient) -> AgentLoop:
+def _make_loop(
+    store: InMemorySessionStore, model: ScriptedModelClient, mcp: FakeMCPClient
+) -> AgentLoop:
     index = FakeVectorIndex()
     index.add_detail(_detail())
     executor = BlueprintExecutor(tool_dispatcher=ToolDispatcher(mcp, CATALOG), vector_index=index)
@@ -118,14 +131,16 @@ def _run_model() -> ScriptedModelClient:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}
+                    )
                 ]
             )
         ]
     )
 
 
-async def test_paused_call_writes_no_trail_entry_and_no_count() -> None:
+async def test_paused_call_records_pause_without_counting_completed_execution() -> None:
     store = InMemorySessionStore()
     run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
     loop = _make_loop(store, _run_model(), run_mcp)
@@ -138,9 +153,9 @@ async def test_paused_call_writes_no_trail_entry_and_no_count() -> None:
     assert paused.status == "paused_ask_user"
     # The paused runBlueprint call is NOT counted (loop returns before += 1).
     assert paused.tool_calls_made == 0
-    # And it wrote NO trail entry — a paused tool did not complete (§2.5).
+    # Record the unfinished call explicitly for conversation replay.
     trail = await store.load_trail(SESSION_ID)
-    assert [e for e in trail if e.tool_name == "runBlueprint"] == []
+    assert [e.error_code for e in trail if e.tool_name == "runBlueprint"] == ["TOOL_PAUSED"]
     # The inner node-0 runQuery ran but is the tool's implementation — never a
     # model-facing trail entry.
     assert [e for e in trail if e.tool_name == "runQuery"] == []
@@ -176,7 +191,7 @@ async def test_completion_on_resume_writes_exactly_one_runblueprint_entry() -> N
     assert resume_model.calls_made == 2
 
     trail = await store.load_trail(SESSION_ID)
-    bp_entries = [e for e in trail if e.tool_name == "runBlueprint"]
+    bp_entries = [e for e in trail if e.tool_name == "runBlueprint" and e.status == "ok"]
     # EXACTLY ONE runBlueprint entry across the whole pause+resume turn — the
     # completion, not the pause (§2.7: the DAG is one tool call, counted once).
     assert len(bp_entries) == 1
@@ -202,9 +217,7 @@ async def test_double_resume_is_exactly_once() -> None:
             ]
         }
     )
-    loop2 = _make_loop(
-        store, ScriptedModelClient(_prose_resume_script("done")), resume_mcp
-    )
+    loop2 = _make_loop(store, ScriptedModelClient(_prose_resume_script("done")), resume_mcp)
     await loop2.resume(session_id=SESSION_ID, credentials=_creds(), answer="approve")
     n_calls_after_first = len(resume_mcp.calls)
 

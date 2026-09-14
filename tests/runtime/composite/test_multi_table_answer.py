@@ -38,9 +38,6 @@ from data_agent.runtime.composite.answer_with_table import (
     rollup_verification,
 )
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.denial_mapping import (
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -56,8 +53,9 @@ from data_agent.runtime.session.models import (
 )
 from data_agent.runtime.session_history import project_history
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-multi-table"
 _E = "dbpcm_warehouse.employee"
@@ -433,7 +431,13 @@ def test_cap_overflow_truncates_and_is_counted_never_refused() -> None:
 
 def test_the_roll_up_is_an_and_and_never_emits_passed_false() -> None:
     verified = AnswerTable(
-        sql="a", verification={"passed": True, "method": "blueprint_gate", "grain_checked": True}
+        sql="a",
+        verification={
+            "passed": True,
+            "status": "structural checks passed",
+            "method": "blueprint_gate",
+            "grain_checked": True,
+        },
     )
     unverified = AnswerTable(sql="b")
     assert rollup_verification([verified])["passed"] is True
@@ -477,6 +481,7 @@ async def test_mixed_verification_is_reported_per_table_and_rolled_up_conservati
     assert [t["caption"] for t in outcome.answer_tables] == ["Headcount", "Salaries"]
     assert outcome.answer_tables[0]["verification"] == {
         "passed": True,
+        "status": "structural checks passed",
         "method": "blueprint_gate",
         "grain_checked": True,
     }
@@ -513,6 +518,7 @@ async def test_two_verified_blueprints_roll_up_green() -> None:
 
     assert outcome.verification == {
         "passed": True,
+        "status": "structural checks passed",
         "method": "blueprint_gate",
         "grain_checked": True,
     }
@@ -583,7 +589,7 @@ async def test_a_turn_with_no_designated_table_keeps_its_turn_level_enrichment()
     loop, store, _events = _build(
         [
             _run_blueprints("bp-headcount"),
-            ModelTurnResult(assistant_text="There are 4 in Sales."),
+            final_answer(assistant_text="There are 4 in Sales."),
         ],
         blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
     )
@@ -592,6 +598,7 @@ async def test_a_turn_with_no_designated_table_keeps_its_turn_level_enrichment()
     assert outcome.answer_tables is None
     assert outcome.verification == {
         "passed": True,
+        "status": "structural checks passed",
         "method": "blueprint_gate",
         "grain_checked": True,
     }
@@ -1075,6 +1082,7 @@ def test_history_reconstructs_per_table_badges_from_the_same_two_keys() -> None:
                 terminal_sql=HEADCOUNT_SQL,
                 verification={
                     "passed": True,
+                    "status": "structural checks passed",
                     "method": "blueprint_gate",
                     "grain_checked": True,
                 },
@@ -1109,12 +1117,12 @@ async def test_an_unrun_blueprint_in_tables_refuses_the_whole_call() -> None:
                 answer="See tables.",
                 tables=[{"sql": HEADCOUNT_SQL}, {"blueprint_id": "bp-never-ran"}],
             ),
-            ModelTurnResult(assistant_text="Recovered."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
 
-    assert outcome.assistant_text == "Recovered."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     assert outcome.answer_tables is None
     entry = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER][0]
     assert entry.error_code == "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
@@ -1134,7 +1142,7 @@ async def test_a_multi_table_call_still_ends_the_turn() -> None:
                 answer="Three parts.",
                 tables=[{"sql": HEADCOUNT_SQL}, {"sql": SALARY_SQL}],
             ),
-            ModelTurnResult(assistant_text="THIS MUST NOT BE REACHED."),
+            final_answer(assistant_text="THIS MUST NOT BE REACHED."),
         ]
     )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
@@ -1168,16 +1176,18 @@ async def test_finalization_enforcement_still_refuses_a_multi_table_answer() -> 
                 answer="Both.",
                 tables=[{"sql": HEADCOUNT_SQL}, {"sql": SALARY_SQL}],
             ),
-            ModelTurnResult(assistant_text="Recovered."),
+            final_answer(assistant_text="Recovered."),
         ]
     )
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two things?")
 
     entry = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER][0]
-    assert entry.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
+    assert entry.status == "ok"
+    assert entry.error_code is None
     assert [e for e, _ in events if e == "loop_finalization_refused"]
     # The seams never fired for the refused designation.
-    assert not _payloads(events, "loop_answer_tables_designated")
+    assert _payloads(events, "loop_answer_tables_designated")
+    assert not (await store.get_or_create_session(SESSION_ID)).messages[-1].content == "Both."
 
 
 # ---------------------------------------------------------------------------
@@ -1463,7 +1473,7 @@ async def test_a_paused_turn_resumes_with_the_whole_designated_set() -> None:
         ),
     )
     loop = AgentLoop(
-        model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
+        model_client=ScriptedModelClient([final_answer(assistant_text="x")]),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
         context_assembler=ContextAssembler(store),
         session_store=store,
@@ -1554,7 +1564,7 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
 
     # 2. The resume seed.
     loop = AgentLoop(
-        model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
+        model_client=ScriptedModelClient([final_answer(assistant_text="x")]),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
         context_assembler=ContextAssembler(store),
         session_store=store,

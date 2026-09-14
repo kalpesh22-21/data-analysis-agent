@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
@@ -37,10 +39,19 @@ from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
-    {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    {
+        _E: {
+            "EmployeeCode": "String",
+            "Department": "Nullable(String)",
+            "AnnualSalary": "Nullable(Float64)",
+        }
+    }
 )
 SESSION_ID = "sess-bp-qa5"
 _BID = "bp-average-salary-by-department"
@@ -116,7 +127,9 @@ async def test_two_run_blueprint_calls_count_as_two_tool_calls() -> None:
     # No binds_to + empty grain ⇒ ONE inner runQuery per runBlueprint. Two model
     # turns each call runBlueprint ⇒ exactly TWO tool_calls_made, two inner queries.
     mcp = FakeMCPClient(
-        scripted={"runQuery": [_rq(["department"], [["Sales"]]), _rq(["department"], [["Support"]])]}
+        scripted={
+            "runQuery": [_rq(["department"], [["Sales"]]), _rq(["department"], [["Support"]])]
+        }
     )
     index = FakeVectorIndex()
     index.add_detail(_detail(binds_to=False, result_grain=[]))
@@ -127,15 +140,23 @@ async def test_two_run_blueprint_calls_count_as_two_tool_calls() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {"department": "Sales"}})
+                    ToolCallRequest(
+                        id="c1",
+                        name="runBlueprint",
+                        arguments={"id": _BID, "slot_bindings": {"department": "Sales"}},
+                    )
                 ]
             ),
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c2", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {"department": "Support"}})
+                    ToolCallRequest(
+                        id="c2",
+                        name="runBlueprint",
+                        arguments={"id": _BID, "slot_bindings": {"department": "Support"}},
+                    )
                 ]
             ),
-            ModelTurnResult(assistant_text="Done."),
+            final_answer(assistant_text="Done."),
         ]
     )
     loop, store = _loop(model, tool)
@@ -147,11 +168,18 @@ async def test_two_run_blueprint_calls_count_as_two_tool_calls() -> None:
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two depts?")
 
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 2  # two model-facing calls
+    assert (
+        outcome.tool_calls_made == 3
+    )  # Includes the explicit final-answer call.  # two model-facing calls
     assert len(mcp.calls) == 2  # two inner runQuery (one each)
     trail = await store.load_trail(SESSION_ID)
     # The seeded getBlueprint leads; TWO runBlueprint entries is still the claim.
-    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint", "runBlueprint"]
+    assert [e.tool_name for e in trail] == [
+        "getBlueprint",
+        "runBlueprint",
+        "runBlueprint",
+        "answerWithText",
+    ]
 
 
 # ===========================================================================
@@ -270,7 +298,9 @@ async def test_clarified_recall_after_pause_is_independent_no_double() -> None:
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["Department"], [["Sales"], ["Support"]]),  # attempt-1 domain probe (no_match ⇒ pause)
+                _rq(
+                    ["Department"], [["Sales"], ["Support"]]
+                ),  # attempt-1 domain probe (no_match ⇒ pause)
                 _rq(["Department"], [["Sales"], ["Support"]]),  # attempt-2 domain probe (matches)
                 _rq(["department"], [["Sales"]]),  # attempt-2 node query
             ]
@@ -282,7 +312,9 @@ async def test_clarified_recall_after_pause_is_independent_no_double() -> None:
 
     creds = _creds()
     # Attempt 1: a no_match value ⇒ pause (one inner probe).
-    o1 = await executor.execute(blueprint_id=_BID, slot_bindings={"department": "Marketing"}, credentials=creds)
+    o1 = await executor.execute(
+        blueprint_id=_BID, slot_bindings={"department": "Marketing"}, credentials=creds
+    )
     from data_agent.runtime.blueprint.executor import ExecCompleted, ExecPaused
 
     assert isinstance(o1, ExecPaused)
@@ -291,6 +323,8 @@ async def test_clarified_recall_after_pause_is_independent_no_double() -> None:
 
     # Attempt 2 (the clarified re-call): completes independently, issuing exactly its
     # own probe + node — no leftover state, no re-run of attempt-1's work.
-    o2 = await executor.execute(blueprint_id=_BID, slot_bindings={"department": "Sales"}, credentials=creds)
+    o2 = await executor.execute(
+        blueprint_id=_BID, slot_bindings={"department": "Sales"}, credentials=creds
+    )
     assert isinstance(o2, ExecCompleted)
     assert len(mcp.calls) - calls_after_1 == 2  # exactly probe + node for attempt 2

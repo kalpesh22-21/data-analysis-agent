@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_answer_prose
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
@@ -47,6 +49,9 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import FinalizationBlockKind
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-empty-answer"
 _E = "dbpcm_warehouse.employee"
@@ -66,7 +71,7 @@ _SHORTER_MARK = "Keep this one SHORT"
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [{"type": "function", "name": name, "parameters": {}} for name in ["runQuery"]]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -188,7 +193,7 @@ async def test_a_silent_finish_is_refused_and_the_answer_lands_next_round() -> N
     loop, store, events, model = _build(
         [
             ModelTurnResult(assistant_text=None),
-            ModelTurnResult(assistant_text="Sales has 3 people."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
 
@@ -197,7 +202,7 @@ async def test_a_silent_finish_is_refused_and_the_answer_lands_next_round() -> N
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Sales has 3 people.", (
+    assert outcome.assistant_text == "I don't have any information to answer your question.", (
         "the recovered answer must reach the user unchanged"
     )
     assert _events(events, EMPTY_ANSWER_REFUSED_EVENT) == [{"incomplete_reason": ""}]
@@ -214,15 +219,16 @@ async def test_whitespace_only_prose_is_treated_as_silence() -> None:
     it becomes a blank bubble AND a content-free assistant message replayed into
     every later turn."""
     loop, _store, events, _model = _build(
-        [ModelTurnResult(assistant_text="  \n\t "), ModelTurnResult(assistant_text="Answered.")]
+        [
+            ModelTurnResult(assistant_text="  \n\t "),
+            final_answer(assistant_text="I don't have any information to answer your question."),
+        ]
     )
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="q"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Answered."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     assert len(_events(events, EMPTY_ANSWER_REFUSED_EVENT)) == 1
 
 
@@ -239,9 +245,7 @@ async def test_a_second_silent_finish_is_substituted_and_persisted() -> None:
         [ModelTurnResult(assistant_text=""), ModelTurnResult(assistant_text="")]
     )
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="q"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
     assert outcome.assistant_text == EMPTY_ANSWER_FALLBACK_TEXT
@@ -295,7 +299,10 @@ async def test_the_payload_carries_an_empty_string_not_none_for_an_ordinary_comp
     completion" indistinguishable from "attribute missing" for the one field these
     events exist to carry."""
     loop, _store, events, _model = _build(
-        [ModelTurnResult(assistant_text=None), ModelTurnResult(assistant_text="ok")]
+        [
+            ModelTurnResult(assistant_text=None),
+            final_answer(assistant_text="I don't have any information to answer your question."),
+        ]
     )
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
@@ -319,17 +326,15 @@ async def test_tool_calls_with_no_prose_are_untouched() -> None:
     loop, store, events, _model = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="Sales 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="q"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Sales 3, Eng 2, Ops 1."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     assert not _events(events, EMPTY_ANSWER_REFUSED_EVENT)
     assert store.claims == []
 
@@ -337,92 +342,63 @@ async def test_tool_calls_with_no_prose_are_untouched() -> None:
 async def test_ordinary_prose_is_untouched() -> None:
     """The other silent half: a turn that answers normally must not see the store
     at all."""
-    loop, store, events, _model = _build([ModelTurnResult(assistant_text="Here it is.")])
-
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="q"
+    loop, store, events, _model = _build(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
     )
 
-    assert outcome.assistant_text == "Here it is."
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     assert not _events(events, EMPTY_ANSWER_REFUSED_EVENT)
     assert store.claims == []
 
 
-async def test_the_shape_gate_takes_precedence_and_keeps_its_own_allowance() -> None:
-    """PRECEDENCE: the empty-answer branch is LAST in the chain, so a silent finish
-    holding untabled multi-row results is the answer-shape gate's complaint — the
-    more specific one, about work that exists and was not presented.
-
-    And the allowances stay independent: the shape refusal must not consume the
-    empty-answer grant, or the silent finish that follows it would go unchallenged
-    — which is exactly the starvation §J.3 was written about, arriving one gate
-    later.
-    """
-    loop, store, events, _model = _build(
-        [
-            ModelTurnResult(tool_calls=[_query("q1")]),
-            # Silent finish holding three untabled rows: BOTH gates qualify.
-            ModelTurnResult(assistant_text=None),
-            # Silent again, and now the shape gate's grant is spent — so the
-            # empty-answer gate takes its own.
-            ModelTurnResult(assistant_text=None),
-            ModelTurnResult(assistant_text="Sales 3, Eng 2, Ops 1."),
-        ],
+async def test_silence_requires_a_proposal_before_shape_review() -> None:
+    """Untabled rows do not turn a missing final proposal into an answer."""
+    loop, store, events, model = _build(
+        [ModelTurnResult(tool_calls=[_query("q1")]), ModelTurnResult(), ModelTurnResult()],
         mcp=_rows_mcp("runQuery", 3),
     )
-
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="by department"
     )
-
     assert outcome.status == "done"
-    assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
-    assert _events(events, EMPTY_ANSWER_REFUSED_EVENT) == [{"incomplete_reason": ""}]
-    # The order of the two GRANTED refusals is the precedence claim: the shape gate
-    # spoke first, and the empty-answer gate still had its own grant afterwards.
-    # (`claims` records attempts, so the spent shape allowance appears again on each
-    # later qualifying round — see `CountingStore`.)
-    assert store.claims[0] == "answer_shape"
-    assert store.claims.count("empty_answer") == 1, "the empty-answer grant was starved"
+    assert outcome.assistant_text == EMPTY_ANSWER_FALLBACK_TEXT
+    assert outcome.answer_tables is None
+    assert not _events(events, ANSWER_SHAPE_REFUSED_EVENT)
+    assert store.claims == ["empty_answer", "empty_answer"]
+    assert len(_events(events, EMPTY_ANSWER_REFUSED_EVENT)) == 1
+    assert len(_events(events, EMPTY_ANSWER_EXHAUSTED_EVENT)) == 1
+    assert model.calls_made == 3
 
 
-async def test_the_intents_nudge_takes_precedence_over_silence() -> None:
-    """Same precedence rule at the top of the chain: a pending intent is the most
-    specific complaint of the three, and it wins even when the finish is silent.
-
-    The empty-answer allowance is untouched by that refusal — asserted through
-    `store.claims`, which is the only place the independence is visible.
-    """
-    loop, store, events, _model = _build(
+async def test_an_explicit_proposal_is_required_before_pending_intent_review() -> None:
+    loop, store, events, model = _build(
         [
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="s1",
-                        name=STATE,
-                        arguments={"intents": [{"description": "headcount by department"}]},
+                        id="s1", name=STATE, arguments={"intents": [{"description": "headcount"}]}
                     )
                 ]
             ),
-            # Silent finish with an intent pending: the intents refusal fires.
-            ModelTurnResult(assistant_text=None),
-            ModelTurnResult(assistant_text="Sales 3."),
-        ]
+            ModelTurnResult(),
+            final_answer(assistant_text="I cannot answer this yet."),
+            final_answer(assistant_text="I cannot answer this yet."),
+        ],
     )
-
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="headcount"
     )
-
     assert outcome.status == "done"
+    assert store.claims == ["empty_answer", "intents", "intents"]
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "no_tool_calls", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
-    assert not _events(events, EMPTY_ANSWER_REFUSED_EVENT)
-    # The intents gate asked (and, on the later round where the intent was still
-    # pending, asked again and was refused). The empty-answer allowance was never
-    # touched — it is the silent finish's own, and this turn spent none of it.
-    assert set(store.claims) == {"intents"}
+    assert len(_events(events, EMPTY_ANSWER_REFUSED_EVENT)) == 1
+    assert (await store.get_or_create_session(SESSION_ID)).analysis_state.intents[
+        0
+    ].status == "blocked"
 
 
 async def test_a_later_turn_of_the_same_session_is_refused_on_its_own_merits() -> None:
@@ -432,20 +408,24 @@ async def test_a_later_turn_of_the_same_session_is_refused_on_its_own_merits() -
     had (05 §C.1 — the bug the intents allowance already fell into once)."""
     store = CountingStore()
     loop, _store, events, _model = _build(
-        [ModelTurnResult(assistant_text=None), ModelTurnResult(assistant_text="one")],
+        [
+            ModelTurnResult(assistant_text=None),
+            final_answer(assistant_text="I don't have any information to answer your question."),
+        ],
         store=store,
     )
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q1")
 
     loop2, _store2, events2, _model2 = _build(
-        [ModelTurnResult(assistant_text=None), ModelTurnResult(assistant_text="two")],
+        [
+            ModelTurnResult(assistant_text=None),
+            final_answer(assistant_text="I cannot answer from this turn."),
+        ],
         store=store,
     )
-    outcome = await loop2.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="q2"
-    )
+    outcome = await loop2.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q2")
 
-    assert outcome.assistant_text == "two"
+    assert outcome.assistant_text == "I cannot answer from this turn."
     assert len(_events(events, EMPTY_ANSWER_REFUSED_EVENT)) == 1
     assert len(_events(events2, EMPTY_ANSWER_REFUSED_EVENT)) == 1, (
         "the second turn was denied a re-round it never had"
@@ -474,7 +454,10 @@ async def test_the_nudge_is_an_ephemeral_user_message_at_the_tail() -> None:
     yet.
     """
     loop, _store, _events, model = _build(
-        [ModelTurnResult(assistant_text=None), ModelTurnResult(assistant_text="Sales has 3.")]
+        [
+            ModelTurnResult(assistant_text=None),
+            final_answer(assistant_text="I don't have any information to answer your question."),
+        ]
     )
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="how many")
@@ -486,7 +469,7 @@ async def test_the_nudge_is_an_ephemeral_user_message_at_the_tail() -> None:
     # there is nothing to echo, so the message must be self-sufficient — it names
     # the two acceptable shapes of a next response instead of asking for a repair.
     assert "You drafted:" not in str(nudged["content"])
-    assert "the final answer as TEXT" in str(nudged["content"])
+    assert "a finalizeAnswer call" in str(nudged["content"])
     # And it is gone from the round after that — no test above reads the request
     # that FOLLOWS the recovery, because the recovery ends the turn.
     assert _requests_carrying_the_nudge(model) == [1]
@@ -559,7 +542,9 @@ async def test_a_budget_cap_resume_grants_a_fresh_empty_answer_allowance() -> No
             # Window 2, after the resume: silent again on a brand-new grant...
             ModelTurnResult(assistant_text=None, usage={"total_tokens": 10}),
             # ...and the round handed back lands the answer.
-            ModelTurnResult(assistant_text="Sales has 3 people.", usage={"total_tokens": 10}),
+            final_answer(
+                assistant_text="Sales has 3 people.", evidence=["q1"], usage={"total_tokens": 10}
+            ),
         ],
         mcp=_rows_mcp("runQuery", 1),
         max_loop_iterations=2,
@@ -616,9 +601,7 @@ async def test_a_budget_cap_stop_resume_is_not_gated() -> None:
     claims_at_the_pause = list(store.claims)
     events.clear()
 
-    outcome = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="stop"
-    )
+    outcome = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     assert outcome.status == "done"
     assert outcome.assistant_text is not None
@@ -717,9 +700,7 @@ def test_the_fallback_text_survives_the_prose_scrub_byte_identical() -> None:
     populated USES set, which is what arms the double-quoted arm.
     """
     for provenance in (None, frozenset({(_E, "Department"), (_E, "Name")})):
-        scrubbed, redactions = scrub_answer_prose(
-            EMPTY_ANSWER_FALLBACK_TEXT, provenance=provenance
-        )
+        scrubbed, redactions = scrub_answer_prose(EMPTY_ANSWER_FALLBACK_TEXT, provenance=provenance)
         assert scrubbed == EMPTY_ANSWER_FALLBACK_TEXT, (
             f"the fallback was mangled by the scrub under provenance={provenance!r}"
         )
@@ -740,9 +721,7 @@ async def test_the_substituted_fallback_emits_no_redaction_event() -> None:
         [ModelTurnResult(assistant_text=None), ModelTurnResult(assistant_text=None)]
     )
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="q"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.assistant_text == EMPTY_ANSWER_FALLBACK_TEXT
     assert not _events(events, ANSWER_PROSE_REDACTED_EVENT)
@@ -788,57 +767,29 @@ async def test_the_fallback_reads_back_from_history_exactly_as_it_was_shown() ->
 
 
 async def test_a_spent_intents_grant_does_not_silence_the_empty_answer_gate() -> None:
-    """THE PLACEMENT DECISION, at the top of the chain (05 §K.4).
-
-    `test_the_shape_gate_takes_precedence_and_keeps_its_own_allowance` proves the
-    same rule one branch lower, but this is the branch where the `elif` would be
-    most tempting and where its failure mode is worst: the pending-intents `else` is
-    not a no-op. It force-blocks every surviving intent `ENFORCEMENT_EXHAUSTED`,
-    writes the ledger and emits — a full, terminal-looking disposition — and THEN
-    lets the finish proceed. As an `elif`, the round that wrote all of that would
-    also be the round on which a totally silent response sailed through: the user
-    would get a blank bubble on the one turn the runtime had just recorded as
-    unfinishable.
-
-    So the sequence here is the measured one, moved up a gate: refuse for intents
-    (grant spent), silence again, close the ledger, and STILL get a word in about
-    the silence — on this gate's own untouched allowance.
-    """
-    loop, store, events, _model = _build(
+    loop, store, events, model = _build(
         [
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="s1",
-                        name=STATE,
-                        arguments={"intents": [{"description": "headcount by department"}]},
+                        id="s1", name=STATE, arguments={"intents": [{"description": "headcount"}]}
                     )
                 ]
             ),
-            # Round 1: silent, intents pending -> the INTENTS refusal (more specific).
-            ModelTurnResult(assistant_text=None),
-            # Round 2: silent again, intents still pending -> the intents grant is
-            # spent, so that branch force-blocks instead of refusing. Nothing has
-            # been refused this round, so the silence finally gets answered.
-            ModelTurnResult(assistant_text=None),
-            ModelTurnResult(assistant_text="Sales 3, Eng 2."),
-        ]
+            final_answer(assistant_text="I cannot answer yet."),
+            ModelTurnResult(),
+            ModelTurnResult(),
+        ],
     )
-
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="headcount"
     )
-
-    assert outcome.status == "done"
-    assert outcome.assistant_text == "Sales 3, Eng 2.", (
-        "the answer arrived on the round the empty-answer gate handed back"
-    )
+    assert outcome.assistant_text == EMPTY_ANSWER_FALLBACK_TEXT
+    assert store.claims == ["intents", "empty_answer", "empty_answer"]
     assert len(_events(events, "loop_finalization_refused")) == 1
     assert len(_events(events, "loop_enforcement_exhausted")) == 1
-    assert _events(events, EMPTY_ANSWER_REFUSED_EVENT) == [{"incomplete_reason": ""}], (
-        "the silent finish went unchallenged on the round the intents ledger closed"
-    )
-    assert not _events(events, EMPTY_ANSWER_EXHAUSTED_EVENT)
-    # The intents gate asked twice (granted, then refused); the empty-answer gate
-    # asked once, on its own untouched allowance, and was granted.
-    assert store.claims == ["intents", "intents", "empty_answer"]
+    assert len(_events(events, EMPTY_ANSWER_REFUSED_EVENT)) == 1
+    assert len(_events(events, EMPTY_ANSWER_EXHAUSTED_EVENT)) == 1
+    assert (await store.get_or_create_session(SESSION_ID)).analysis_state.intents[
+        0
+    ].status == "blocked"

@@ -66,6 +66,19 @@ def turn(*calls, text=None):
     return ModelTurnResult(tool_calls=list(calls), assistant_text=text)
 
 
+def finalize_options(*names, ident="final", answer="Use the displayed option."):
+    return turn(
+        call(
+            "finalizeAnswer",
+            ident,
+            answer=answer,
+            tables=[],
+            capability_refs=list(names),
+            evidence=[],
+        )
+    )
+
+
 def ok(name, payload=None, terminal=False):
     return ToolResult(
         status="ok",
@@ -188,7 +201,7 @@ async def test_ordered_summary_precedes_one_matching_dispatch_pair():
             return "Preparing the option."
 
     loop, _, events, _, _ = build(
-        [turn(call("show_profile", "card-7"))],
+        [turn(call("show_profile", "card-7")), finalize_options("show_profile")],
         tools={"show_profile": CardTool()},
         summarizer=Summarizer(),
     )
@@ -196,7 +209,8 @@ async def test_ordered_summary_precedes_one_matching_dispatch_pair():
     progress = [
         (name, p["tool_call_id"])
         for name, p in events
-        if name.startswith("tool_dispatch_") or name == "tool_progress_summary"
+        if p.get("tool_call_id") == "card-7"
+        and (name.startswith("tool_dispatch_") or name == "tool_progress_summary")
     ]
     assert progress == [
         ("tool_progress_summary", "card-7"),
@@ -222,7 +236,9 @@ async def test_card_fatal_refusal_cannot_escape_through_fail_open(violation):
     loop, store, events, _, _ = build(
         [
             turn(call("show_profile", "card-1")),
+            finalize_options("show_profile", ident="a1"),
             turn(call("show_profile", "card-2")),
+            finalize_options("show_profile", ident="a2"),
         ],
         judge=judge,
         tools={"show_profile": CardTool()},
@@ -246,7 +262,12 @@ async def test_actual_approval_allows_replacement_card():
         ]
     )
     loop, _, _, _, _ = build(
-        [turn(call("show_profile", "c1")), turn(call("show_profile", "c2"))],
+        [
+            turn(call("show_profile", "c1")),
+            finalize_options("show_profile", ident="a1"),
+            turn(call("show_profile", "c2")),
+            finalize_options("show_profile", ident="a2"),
+        ],
         judge=judge,
         tools={"show_profile": CardTool()},
     )
@@ -308,12 +329,22 @@ def test_scope_and_leak_precedence_with_help_evidence():
     assert first_match("See https://example.com/help", [SQL]) is None
 
 
-def test_blueprint_gate_is_once_per_window_and_batch_order_independent():
+def test_blueprint_gate_requires_received_discovery():
     gate = BlueprintSearchGate("How many employees work here?", [], 0)
     assert gate.check("runQuery").error_code == "BLUEPRINT_NOT_SEARCHED"
-    assert gate.check("runQuery") is None
-    gate = BlueprintSearchGate("How many employees work here?", [], 0)
+    assert gate.check("runQuery").error_code == "BLUEPRINT_NOT_SEARCHED"
     gate.observe_batch([call("runQuery"), call("searchBlueprints")])
+    assert gate.check("runQuery").error_code == "BLUEPRINT_NOT_SEARCHED"
+    gate.observe_context(
+        [
+            {
+                "role": "tool",
+                "content": json.dumps(
+                    {"tool_name": "searchBlueprints", "status": "ok", "turn_index": 0}
+                ),
+            }
+        ]
+    )
     assert gate.check("runQuery") is None
 
 
@@ -546,10 +577,14 @@ async def test_failed_summary_does_not_prevent_dispatch_or_emit_a_late_summary()
             raise TimeoutError("private input")
 
     loop, _, events, _, _ = build(
-        [turn(call("show_profile"))], tools={"show_profile": CardTool()}, summarizer=Summarizer()
+        [turn(call("show_profile")), finalize_options("show_profile")],
+        tools={"show_profile": CardTool()},
+        summarizer=Summarizer(),
     )
     assert (await run(loop)).capability_cards
-    assert [n for n, _ in events if n.startswith("tool_dispatch_")] == [
+    assert [
+        n for n, p in events if n.startswith("tool_dispatch_") and p.get("tool_call_id") == "call-1"
+    ] == [
         "tool_dispatch_start",
         "tool_dispatch_ok",
     ]
@@ -643,6 +678,7 @@ async def test_blueprint_advisory_refuses_once_then_dispatches_a_retry():
     loop, store, events, _, mcp = build(
         [
             turn(call("runQuery", "query-1", sql=SQL)),
+            turn(call("searchBlueprints", "discovery", query="employees")),
             turn(call("runQuery", "query-2", sql=SQL)),
             turn(
                 call(
@@ -656,7 +692,9 @@ async def test_blueprint_advisory_refuses_once_then_dispatches_a_retry():
     )
     outcome = await run(loop, "How many employees work here?")
     trail = await store.load_trail(CREDS.session_id)
-    assert [(t.tool_call_id, t.status, t.error_code) for t in trail[:2]] == [
+    assert [
+        (t.tool_call_id, t.status, t.error_code) for t in trail if t.tool_name == "runQuery"
+    ] == [
         ("query-1", "error", "BLUEPRINT_NOT_SEARCHED"),
         ("query-2", "ok", None),
     ]
@@ -677,6 +715,7 @@ async def test_same_batch_blueprint_consultation_allows_query_even_when_query_is
             turn(
                 call("runQuery", "q1", sql=SQL), call("searchBlueprints", "s1", query="Employees")
             ),
+            turn(call("runQuery", "q2", sql=SQL)),
             turn(
                 call("answerWithTable", "a1", answer="Here are the results.", tables=[{"sql": SQL}])
             ),
@@ -684,7 +723,9 @@ async def test_same_batch_blueprint_consultation_allows_query_even_when_query_is
         tools={"searchBlueprints": Search()},
     )
     await run(loop, "How many employees work here?")
-    assert (await store.load_trail(CREDS.session_id))[0].status == "ok"
+    trail = await store.load_trail(CREDS.session_id)
+    assert trail[0].error_code == "BLUEPRINT_NOT_SEARCHED"
+    assert next(e for e in trail if e.tool_call_id == "q2").status == "ok"
 
 
 async def test_direct_resolver_failure_has_one_generated_correlation_id():
@@ -713,17 +754,32 @@ def test_resumed_cards_retain_judge_kind_without_exposing_internal_evidence():
         "_agent_evidence": {"kind": "data_widget", "parameters": [{"name": "employees"}]},
     }
     accum = TurnAccumulators(capability_cards=[payload])
+    accum.select_capabilities(["profile"])
     assert "_agent_evidence" not in accum.capability_cards[0]
     assert accum.capability_judge_context[0]["kind"] == "data_widget"
     assert accum.capability_judge_context[0]["parameter_names"] == ["employees"]
 
 
-@pytest.mark.parametrize("verdict,visible", [(APPROVED, False), (replace(APPROVED, reviewed=True), True), (JudgeVerdict(False, "unrecorded_assumption", "Clarify the employee filter.", reviewed=True), False)])
-async def test_data_widget_needs_actual_approval_even_when_a_hedge_would_keep_navigation(verdict, visible):
+@pytest.mark.parametrize(
+    "verdict,visible",
+    [
+        (APPROVED, False),
+        (replace(APPROVED, reviewed=True), True),
+        (
+            JudgeVerdict(
+                False, "unrecorded_assumption", "Clarify the employee filter.", reviewed=True
+            ),
+            False,
+        ),
+    ],
+)
+async def test_data_widget_needs_actual_approval_even_when_a_hedge_would_keep_navigation(
+    verdict, visible
+):
     judge = Judge([verdict])
-    script = [turn(call("show_profile", "c1"))]
+    script = [turn(call("show_profile", "c1")), finalize_options("show_profile", ident="a1")]
     if not verdict.approved:
-        script.append(turn(call("show_profile", "c2")))
+        script.append(finalize_options("show_profile", ident="a2"))
     loop, _, _, _, _ = build(script, judge=judge, tools={"show_profile": CardTool()})
     outcome = await run(loop)
     assert bool(outcome.capability_cards) is visible
@@ -731,23 +787,39 @@ async def test_data_widget_needs_actual_approval_even_when_a_hedge_would_keep_na
         assert outcome.answer_tables is None
 
 
-@pytest.mark.parametrize("draft", ["I can’t verify those instructions.", "I don’t have verified information.", "I cannot answer that request."])
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "I can’t verify those instructions.",
+        "I don’t have verified information.",
+        "I cannot answer that request.",
+    ],
+)
 def test_honest_declines_do_not_need_fabricated_evidence(draft):
     assert first_match(draft, []) is None
 
 
-@pytest.mark.parametrize("draft", ["I’ll open Banking Center.", "I opened Banking Center.", "I've already opened the page."])
+@pytest.mark.parametrize(
+    "draft",
+    ["I’ll open Banking Center.", "I opened Banking Center.", "I've already opened the page."],
+)
 def test_navigation_claims_include_curly_apostrophes_and_past_tense(draft):
     from data_agent.runtime.loop.agent_loop import _claims_navigation_was_performed
-    assert _claims_navigation_was_performed(draft, [{"metadata": {"preamble_url": "ember:GenericButton"}}])
+
+    assert _claims_navigation_was_performed(
+        draft, [{"metadata": {"preamble_url": "ember:GenericButton"}}]
+    )
 
 
-@pytest.mark.parametrize('name,status,payload', [
-    ('searchHelpCenter', 'error', None),
-    ('searchHelpCenter', 'ok', {'documents': [], 'count': 0}),
-    ('getHelpCenterDocument', 'ok', {'found': False}),
-    ('getHelpCenterDocument', 'ok', {'found': True, 'content': ''}),
-])
+@pytest.mark.parametrize(
+    "name,status,payload",
+    [
+        ("searchHelpCenter", "error", None),
+        ("searchHelpCenter", "ok", {"documents": [], "count": 0}),
+        ("getHelpCenterDocument", "ok", {"found": False}),
+        ("getHelpCenterDocument", "ok", {"found": True, "content": ""}),
+    ],
+)
 async def test_help_unavailable_cannot_launder_instructions(name, status, payload):
     from data_agent.runtime.loop.help_grounding import HELP_UNAVAILABLE_TEXT
 
@@ -755,103 +827,163 @@ async def test_help_unavailable_cannot_launder_instructions(name, status, payloa
         async def run(self, arguments, credentials, turn=None, tool_call_id=None):
             return replace(ok(name, payload), status=status)
 
-    loop, store, _, _, _ = build([
-        turn(call(name)),
-        turn(call('answerWithText', answer="I can't verify this, but open Time Clock and select Start.", evidence=[])),
-    ], tools={name: HelpTool()}, judge=Judge([APPROVED]))
-    outcome = await run(loop, 'How do I clock in?')
+    loop, store, _, _, _ = build(
+        [
+            turn(call(name)),
+            turn(
+                call(
+                    "answerWithText",
+                    answer="I can't verify this, but open Time Clock and select Start.",
+                    evidence=[],
+                )
+            ),
+        ],
+        tools={name: HelpTool()},
+        judge=Judge([APPROVED]),
+    )
+    outcome = await run(loop, "How do I clock in?")
     assert outcome.assistant_text == HELP_UNAVAILABLE_TEXT
     doc = await store.get_or_create_session(CREDS.session_id)
-    assert project_history(doc.messages, doc.tool_trail, frozenset(), None)['turns'][0]['answer'] == HELP_UNAVAILABLE_TEXT
-    message = [m for m in doc.messages if m.role == 'assistant'][-1]
-    assert message.ship_disposition == 'decline_only'
+    assert (
+        project_history(doc.messages, doc.tool_trail, frozenset(), None)["turns"][0]["answer"]
+        == HELP_UNAVAILABLE_TEXT
+    )
+    message = [m for m in doc.messages if m.role == "assistant"][-1]
+    assert message.ship_disposition == "decline_only"
     assert message.retained_assumption_count == 0
 
 
 def test_help_grounding_preserves_fetched_document_and_mixed_data():
     from data_agent.runtime.loop.help_grounding import HelpGrounding
+
     state = HelpGrounding()
-    state.observe('searchHelpCenter', 'error', None)
+    state.observe("searchHelpCenter", "error", None)
     assert state.needs_decline(set(), False)
-    assert not state.needs_decline({'runQuery'}, False)
+    assert not state.needs_decline({"runQuery"}, False)
     assert not state.needs_decline(set(), True)
-    state.observe('getHelpCenterDocument', 'ok', {'found': True, 'content': 'Select Clock In.'})
+    state.observe("getHelpCenterDocument", "ok", {"found": True, "content": "Select Clock In."})
     assert not state.needs_decline(set(), False)
 
 
-@pytest.mark.parametrize('title,expected', [
-    ('Forms: W-2', ('Forms: W-2',)), ('Q3: 2026 filing plan', ('Q3: 2026 filing plan',)),
-    ('javascript: alert(1)', ()), ('ember:javascript:AlertCard', ()),
-    ('java\x00script:alert(1)', ()), ('custom+scheme:payload', ()),
-    ('../internal/page', ()), ('https://example.invalid/page', ()),
-])
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("Forms: W-2", ("Forms: W-2",)),
+        ("Q3: 2026 filing plan", ("Q3: 2026 filing plan",)),
+        ("javascript: alert(1)", ()),
+        ("ember:javascript:AlertCard", ()),
+        ("java\x00script:alert(1)", ()),
+        ("custom+scheme:payload", ()),
+        ("../internal/page", ()),
+        ("https://example.invalid/page", ()),
+    ],
+)
 def test_v2_navigation_title_fallback(title, expected):
-    assert metadata_data_digest('navigation', {'arguments': {'links': [{'webPage': title}]}}) == expected
+    assert (
+        metadata_data_digest("navigation", {"arguments": {"links": [{"webPage": title}]}})
+        == expected
+    )
 
 
-@pytest.mark.parametrize('text,leak', [
-    ('```SELECT name FROM employees```', True),
-    ('`drop table employees`', True), ('select count(*) from employees', True),
-    ('select name from employees order by name', True),
-    ('select name from employees where status = 1', True),
-    ('select name from employees;', True), ('SHOW DATABASES', True),
-    ('We select from each group by hand.', False),
-    ('You can select from the menu, limit 3 per person.', False),
-    ('Select one from the plans where coverage > 80%.', False),
-    ('We select from staff; contractors are excluded.', False),
-    ('Select **the best** from the menu.', False),
-])
+@pytest.mark.parametrize(
+    "text,leak",
+    [
+        ("```SELECT name FROM employees```", True),
+        ("`drop table employees`", True),
+        ("select count(*) from employees", True),
+        ("select name from employees order by name", True),
+        ("select name from employees where status = 1", True),
+        ("select name from employees;", True),
+        ("SHOW DATABASES", True),
+        ("We select from each group by hand.", False),
+        ("You can select from the menu, limit 3 per person.", False),
+        ("Select one from the plans where coverage > 80%.", False),
+        ("We select from staff; contractors are excluded.", False),
+        ("Select **the best** from the menu.", False),
+    ],
+)
 def test_v2_sql_reference_distinguishes_statements_from_business_prose(text, leak):
     from data_agent.runtime.loop.answer_rules import contains_sql
+
     assert contains_sql(text) is leak
 
 
 def test_v2_judge_has_one_consistent_prose_and_assumption_contract():
     from data_agent.runtime.loop.answer_judge import _system_prompt
-    for site in ('exit_prose', 'exit_table', 'exit_capability'):
+
+    for site in ("exit_prose", "exit_table", "exit_capability"):
         prompt = _system_prompt(site)
-        assert 'Formatting, markdown, tables, SQL or schema names' not in prompt
-        assert '`recorded_assumptions` SHIP to the user VERBATIM' in prompt
-        assert 'honest preface does not license unsupported steps' in prompt
-        assert 'leaks_sql_or_schema' in prompt
-    assert 'Disclosure alone does not justify a merely adjacent option' in _system_prompt('exit_capability')
-    assert 'recorded_after_refusal' not in _system_prompt('ask_user')
+        assert "Formatting, markdown, tables, SQL or schema names" not in prompt
+        assert "`recorded_assumptions` SHIP to the user VERBATIM" in prompt
+        assert "honest preface does not license unsupported steps" in prompt
+        assert "leaks_sql_or_schema" in prompt
+    assert "Disclosure alone does not justify a merely adjacent option" in _system_prompt(
+        "exit_capability"
+    )
+    assert "recorded_after_refusal" not in _system_prompt("ask_user")
 
 
 def test_v2_pending_intent_nudge_marks_truncated_draft():
     from data_agent.runtime.loop.finalization import MAX_NUDGE_DRAFT_CHARS, finalization_nudge_text
-    text = finalization_nudge_text('x' * (MAX_NUDGE_DRAFT_CHARS + 10), [])
-    assert '…[truncated]' in text
+
+    text = finalization_nudge_text("x" * (MAX_NUDGE_DRAFT_CHARS + 10), [])
+    assert "…[truncated]" in text
 
 
-@pytest.mark.parametrize('code', ['TIMEOUT', 'INTERNAL_ERROR', 'UNAVAILABLE'])
+@pytest.mark.parametrize("code", ["TIMEOUT", "INTERNAL_ERROR", "UNAVAILABLE"])
 async def test_v2_observed_provider_codes_survive_closed_mapping(code):
     from data_agent.runtime.capabilities.client import safe_provider_code
+
     assert safe_provider_code(code) == code
-    assert safe_provider_code(code.lower()) == 'SERVICE_ERROR'
-    assert safe_provider_code('PRIVATE_UPPERCASE_SECRET') == 'SERVICE_ERROR'
+    assert safe_provider_code(code.lower()) == "SERVICE_ERROR"
+    assert safe_provider_code("PRIVATE_UPPERCASE_SECRET") == "SERVICE_ERROR"
 
 
 async def test_v2_refused_card_repick_fixture():
-    invented = 'Enrollment closes on Friday at midnight without exception.'
+    invented = "Enrollment closes on Friday at midnight without exception."
+
     class Navigation:
         def __init__(self, name):
             self.name = name
+
         async def run(self, arguments, credentials, turn=None, tool_call_id=None):
-            return ok(self.name, {'name': self.name, 'metadata': {'preamble_url': 'ember:Button'},
-                '_agent_evidence': {'kind': 'navigation'}, 'answer': arguments.get('answer', 'Use this option.')}, terminal=True)
-    names = ['view_benefits_summary', 'enroll_in_benefits']
-    judge = Judge([
-        JudgeVerdict(False, 'unsupported_by_evidence', 'The deadline is unsupported.', reviewed=True),
-        JudgeVerdict(False, 'capability_coverage_gap', 'The option cannot show the deadline.', reviewed=True),
-    ])
-    loop, store, events, model, _ = build([
-        turn(call(names[0], 'cap_1', answer=invented)),
-        turn(call(names[1], 'cap_2', answer=invented)),
-        turn(call(names[1], 'cap_3')),
-    ], judge=judge, tools={n: Navigation(n) for n in names})
-    outcome = await run(loop, 'How do I enroll in benefits, and when does enrollment close?')
-    assert outcome.status == 'done'
+            return ok(
+                self.name,
+                {
+                    "name": self.name,
+                    "metadata": {"preamble_url": "ember:Button"},
+                    "_agent_evidence": {"kind": "navigation"},
+                    "answer": arguments.get("answer", "Use this option."),
+                },
+                terminal=True,
+            )
+
+    names = ["view_benefits_summary", "enroll_in_benefits"]
+    judge = Judge(
+        [
+            JudgeVerdict(
+                False, "unsupported_by_evidence", "The deadline is unsupported.", reviewed=True
+            ),
+            JudgeVerdict(
+                False,
+                "capability_coverage_gap",
+                "The option cannot show the deadline.",
+                reviewed=True,
+            ),
+        ]
+    )
+    loop, store, events, model, _ = build(
+        [
+            turn(call(names[0], "cap_1")),
+            finalize_options(names[0], ident="a1", answer=invented),
+            turn(call(names[1], "cap_2")),
+            finalize_options(names[1], ident="a2", answer=invented),
+        ],
+        judge=judge,
+        tools={n: Navigation(n) for n in names},
+    )
+    outcome = await run(loop, "How do I enroll in benefits, and when does enrollment close?")
+    assert outcome.status == "done"
     assert not outcome.capability_cards
     assert invented not in outcome.assistant_text
     assert len(judge.briefs) == 2
@@ -859,30 +991,52 @@ async def test_v2_refused_card_repick_fixture():
     assert names[1] in json.dumps(judge.briefs[1].capability_presented)
     assert names[0] not in json.dumps(judge.briefs[1].capability_presented)
     trail = await store.load_trail(CREDS.session_id)
-    assert [(t.tool_name, t.status) for t in trail] == [(names[0], 'ok'), (names[1], 'ok'), (names[1], 'ok')]
-    guarded = [p for n,p in events if n == 'loop_answer_judge_ship_guarded']
-    assert len(guarded) == 1 and guarded[0]['disposition'] == 'decline_only'
+    assert [(t.tool_name, t.status) for t in trail if t.tool_name in names] == [
+        (names[0], "ok"),
+        (names[1], "ok"),
+    ]
+    guarded = [p for n, p in events if n == "loop_answer_judge_ship_guarded"]
+    assert len(guarded) == 1 and guarded[0]["disposition"] == "decline_only"
 
 
-@pytest.mark.parametrize('ready', [True, False])
+@pytest.mark.parametrize("ready", [True, False])
 async def test_v2_same_batch_registration_and_declined_negative(ready):
     from data_agent.runtime.capabilities.client import CapabilityDefinition
     from data_agent.runtime.capabilities.tools import GetCapabilityTool
-    definition = CapabilityDefinition(name='show_profile', version='1', kind='data_widget',
-        description='Employee profile', parameters=(), metadata={'preamble_url': 'ember:EmployeeCard'})
+
+    definition = CapabilityDefinition(
+        name="show_profile",
+        version="1",
+        kind="data_widget",
+        description="Employee profile",
+        parameters=(),
+        metadata={"preamble_url": "ember:EmployeeCard"},
+    )
     client = SimpleNamespace(get_definition=AsyncMock(return_value=definition))
+
     def hydrate(definition):
         if ready:
             loop._runtime_tools[definition.name] = CardTool()
         return ready
+
     lookup = GetCapabilityTool(client=client, hydrate=hydrate, visible_names=set())
-    loop, store, events, _, _ = build([
-        turn(call('getCapabilityTool', 'load', tool_name='show_profile'), call('show_profile', 'present')),
-        turn(call('answerWithText', 'decline', answer="I can't show that information.", evidence=[])),
-    ], tools={'getCapabilityTool': lookup}, judge=Judge([replace(APPROVED, reviewed=True)]))
+    loop, store, events, _, _ = build(
+        [
+            turn(
+                call("getCapabilityTool", "load", tool_name="show_profile"),
+                call("show_profile", "present"),
+            ),
+            finalize_options(
+                *(["show_profile"] if ready else []),
+                answer="Use the displayed option." if ready else "I can't show that information.",
+            ),
+        ],
+        tools={"getCapabilityTool": lookup},
+        judge=Judge([replace(APPROVED, reviewed=True)]),
+    )
     outcome = await run(loop)
     trail = await store.load_trail(CREDS.session_id)
-    assert trail[0].tool_name == 'getCapabilityTool' and trail[0].status == 'ok'
-    assert trail[1].error_code == (None if ready else 'UNKNOWN_TOOL')
+    assert trail[0].tool_name == "getCapabilityTool" and trail[0].status == "ok"
+    assert trail[1].error_code == (None if ready else "UNKNOWN_TOOL")
     assert bool(outcome.capability_cards) is ready
-    assert bool([n for n,p in events if n == 'loop_unknown_tool_rejected']) is not ready
+    assert bool([n for n, p in events if n == "loop_unknown_tool_rejected"]) is not ready

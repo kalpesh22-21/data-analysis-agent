@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -38,6 +40,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 # `InMemorySessionStore.resume_checkpoint` checks `pause_checkpoint.consumed`
 # on the shared/live doc BEFORE comparing the CAS token (see memory_store.py).
@@ -68,7 +73,9 @@ async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
 
 
 def _credentials() -> RuntimeCredentials:
-    return RuntimeCredentials(session_id=SESSION_ID, jwt="jwt-not-under-test", column_scope=frozenset())
+    return RuntimeCredentials(
+        session_id=SESSION_ID, jwt="jwt-not-under-test", column_scope=frozenset()
+    )
 
 
 class _YieldingCasStore:
@@ -113,15 +120,23 @@ async def test_two_truly_concurrent_resumes_exactly_one_wins_and_loser_reruns_no
     model = ScriptedModelClient(
         [
             ModelTurnResult(
-                tool_calls=[ToolCallRequest(id="call_1", name="askUser", arguments={"question": "Which dept?"})]
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1", name="askUser", arguments={"question": "Which dept?"}
+                    )
+                ]
             ),
-            ModelTurnResult(assistant_text="Winner's answer."),  # only ONE more round-trip may occur
+            final_answer(
+                assistant_text="I don't have any information to answer your question."
+            ),  # only ONE more round-trip may occur
         ]
     )
     mcp = FakeMCPClient()
     loop = _build_loop(model_client=model, mcp_client=mcp, store=yielding_store)
 
-    paused = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll.")
+    paused = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="Show payroll."
+    )
     assert paused.status == "paused_ask_user"
     assert model.calls_made == 1
 
@@ -140,7 +155,7 @@ async def test_two_truly_concurrent_resumes_exactly_one_wins_and_loser_reruns_no
         f"loser must raise AlreadyConsumedError or CASMismatchError, got {failures[0]!r}"
     )
     assert successes[0].status == "done"
-    assert successes[0].assistant_text == "Winner's answer."
+    assert successes[0].assistant_text == "I don't have any information to answer your question."
 
     # The turn body did NOT re-run for the loser: exactly 2 model round-trips
     # total (the initial askUser turn + the ONE winning resume's follow-up),
@@ -165,9 +180,13 @@ async def test_loser_of_the_race_never_reaches_the_mcp_either() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(
-                tool_calls=[ToolCallRequest(id="call_1", name="askUser", arguments={"question": "Which dept?"})]
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1", name="askUser", arguments={"question": "Which dept?"}
+                    )
+                ]
             ),
-            ModelTurnResult(assistant_text="done, no tool needed"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient()  # no scripted tool responses at all
@@ -200,7 +219,11 @@ async def test_resume_via_loop_with_stale_cas_from_unrelated_write_raises_cas_mi
     model = ScriptedModelClient(
         [
             ModelTurnResult(
-                tool_calls=[ToolCallRequest(id="call_1", name="askUser", arguments={"question": "Which dept?"})]
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1", name="askUser", arguments={"question": "Which dept?"}
+                    )
+                ]
             ),
         ]
     )

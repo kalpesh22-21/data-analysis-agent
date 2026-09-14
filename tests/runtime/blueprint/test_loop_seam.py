@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.blueprint.executor import BlueprintExecutor, ExecPaused
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
@@ -31,6 +33,9 @@ from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -147,7 +152,7 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="The average salary in Sales is $60,000."),
+            final_answer(assistant_text="The average salary in Sales is $60,000."),
         ]
     )
     loop, store = _loop(model, runtime_tools={"runBlueprint": tool})
@@ -162,12 +167,14 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
     )
 
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 1  # ONE model-facing call...
+    assert (
+        outcome.tool_calls_made == 2
+    )  # Includes the explicit final-answer call.  # ONE model-facing call...
     assert len(mcp.calls) == 3  # ...despite THREE inner runQuery probes
     trail = await store.load_trail(SESSION_ID)
     # The seeded getBlueprint leads; the point of the assertion is unchanged —
     # ONE runBlueprint entry despite three inner runQuery probes.
-    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint"]
+    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint", "answerWithText"]
     assert trail[0].status == "ok"
 
 
@@ -254,7 +261,8 @@ async def test_slot_askuser_pauses_the_turn_via_the_seam() -> None:
     # No trail entry was persisted for the paused (un-completed) tool call — the
     # seeded getBlueprint expansion is the only entry there is.
     trail = await store.load_trail(SESSION_ID)
-    assert [e.tool_name for e in trail] == ["getBlueprint"]
+    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint"]
+    assert trail[-1].error_code == "TOOL_PAUSED"
 
 
 async def test_pause_checkpoint_round_trips_blueprint_fields() -> None:
@@ -302,7 +310,7 @@ async def test_unwired_run_blueprint_is_clean_unavailable() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="I'll answer from the raw tools instead."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _loop(model, runtime_tools={})  # runBlueprint NOT wired

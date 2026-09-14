@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -31,6 +33,9 @@ from data_agent.runtime.observability.progress import ProgressEmitter, combine_o
 from data_agent.runtime.observability.redaction import mask_sql
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Salary": "Decimal(18,2)"}})
@@ -80,7 +85,10 @@ async def test_dispatcher_observer_never_receives_pii_sql_or_result_rows() -> No
             "runQuery": [
                 {
                     "columns": ["EmployeeCode", "Name", "Salary"],
-                    "rows": [["E1", PII_NAME, PII_SALARY], ["employee_row_value_E1", PII_NAME, PII_SALARY]],
+                    "rows": [
+                        ["E1", PII_NAME, PII_SALARY],
+                        ["employee_row_value_E1", PII_NAME, PII_SALARY],
+                    ],
                     "row_count": 2,
                     "truncated": False,
                 }
@@ -138,9 +146,11 @@ async def test_progress_emitter_wired_into_a_real_turn_never_carries_pii() -> No
     model = ScriptedModelClient(
         [
             ModelTurnResult(
-                tool_calls=[ToolCallRequest(id="call_1", name="runQuery", arguments={"sql": PII_SQL})]
+                tool_calls=[
+                    ToolCallRequest(id="call_1", name="runQuery", arguments={"sql": PII_SQL})
+                ]
             ),
-            ModelTurnResult(assistant_text="Here is Jane's record."),
+            final_answer(assistant_text="Here is Jane's record."),
         ]
     )
     dispatcher = ToolDispatcher(mcp, CATALOG, observer=observer)
@@ -164,7 +174,9 @@ async def test_progress_emitter_wired_into_a_real_turn_never_carries_pii() -> No
     emitter.close()
 
     progress_events = [e async for e in emitter.stream()]
-    progress_blob = json.dumps([{"step": e.step, "shape": e.shape} for e in progress_events], default=str)
+    progress_blob = json.dumps(
+        [{"step": e.step, "shape": e.shape} for e in progress_events], default=str
+    )
     _assert_no_pii(progress_blob)
     assert PII_SCOPE_COLUMN not in progress_blob
 

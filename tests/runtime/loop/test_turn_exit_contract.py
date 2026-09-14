@@ -49,8 +49,9 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-turn-exit"
 _E = "dbpcm_warehouse.employee"
@@ -165,12 +166,14 @@ async def test_the_resume_stop_exit_returns_done_and_emits_no_loop_turn_done() -
 async def test_the_two_in_body_done_exits_do_emit_loop_turn_done() -> None:
     """The other half of the same contract, so the assertion above cannot pass by
     the event having been deleted outright."""
-    loop, _store, events = _build([ModelTurnResult(assistant_text="Here it is.")])
+    loop, _store, events = _build(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert outcome.status == "done"
-    assert [p for n, p in events if n == "loop_turn_done"] == [{"tool_calls_made": 0}]
+    assert [p for n, p in events if n == "loop_turn_done"] == [{"tool_calls_made": 1}]
 
 
 # --- 1b. the no-tool-calls exit's append is CONDITIONAL ---------------------
@@ -243,7 +246,7 @@ async def test_an_ask_user_pause_carries_no_provenance_even_when_determined() ->
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Sales, then."),
+            final_answer(evidence=["q1"], assistant_text="Sales, then."),
         ]
     )
 
@@ -422,7 +425,7 @@ async def test_a_done_exit_persists_its_answer_before_it_announces_it() -> None:
     for."""
     log: list[tuple[str, dict[str, Any]]] = []
     loop, _store, events = _build(
-        [ModelTurnResult(assistant_text="Here it is.")],
+        [final_answer(assistant_text="I don't have any information to answer your question.")],
         store=_OrderRecordingStore(log),
         events=log,
     )

@@ -262,6 +262,14 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         await self._mutate_with_cas_retry(session_id, _mutate)
         return applied[-1]
 
+    async def write_review_state(
+        self, session_id: str, turn_index: int, state: dict[str, Any]
+    ) -> None:
+        await self._ensure_connected()
+        await self._mutate_with_cas_retry(
+            session_id, lambda doc: doc.review_states.__setitem__(str(turn_index), dict(state))
+        )
+
     async def claim_finalization_block(
         self,
         session_id: str,

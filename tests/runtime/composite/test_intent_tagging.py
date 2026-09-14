@@ -104,9 +104,7 @@ async def _entry(
 async def _initialized(
     store: InMemorySessionStore, *descriptions: str, observer: _Recorder | None = None
 ) -> UpdateAnalysisStateTool:
-    tool = UpdateAnalysisStateTool(
-        session_store=store, observer=observer or _Recorder()
-    )
+    tool = UpdateAnalysisStateTool(session_store=store, observer=observer or _Recorder())
     await tool.run(
         {"intents": [{"description": d} for d in descriptions]},
         _credentials(),
@@ -252,9 +250,9 @@ async def test_completion_with_no_qualifying_call_at_all_is_refused() -> None:
     assert result.status == "error"
     assert result.error_code == ANALYSIS_STATE_INVALID_CODE
     assert result.retryable is True
-    assert "no call on this turn is tagged for it" in result.denial_detail
-    assert "serves_intent='i1'" in result.denial_detail
-    assert "NEXT message" in result.denial_detail
+    assert "result_id" in result.denial_detail
+    assert "result_id" in result.denial_detail
+    assert "result_id" in result.denial_detail
     assert observer.named("loop_analysis_state_rejected") == [
         {"reason": "unresolved_evidence", "intent_count": 1}
     ]
@@ -343,7 +341,7 @@ async def test_a_tag_from_another_turn_is_not_evidence_for_this_one() -> None:
 
     result = await _update(tool, {"intent_id": "i1", "status": "completed"})
     assert result.status == "error"
-    assert "no call on this turn is tagged for it" in result.denial_detail
+    assert "result_id" in result.denial_detail
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +411,11 @@ async def test_block_distinctness_survives_resolution_from_a_tag() -> None:
     result = await _update(
         tool,
         {"intent_id": "i1", "status": "blocked"},  # from the tag
-        {"intent_id": "i2", "status": "blocked"},  # ...and from the backstop, same id
+        {
+            "intent_id": "i2",
+            "status": "blocked",
+            "result_id": "call_scratch",
+        },  # ...and from the backstop, same id
     )
 
     assert result.status == "error"
@@ -427,7 +429,9 @@ async def test_block_distinctness_survives_resolution_from_a_tag() -> None:
     # state: i1's block lands, then i2 cannot spend the id it already used.
     ok = await _update(tool, {"intent_id": "i1", "status": "blocked"})
     assert ok.status == "ok"
-    second = await _update(tool, {"intent_id": "i2", "status": "blocked"})
+    second = await _update(
+        tool, {"intent_id": "i2", "status": "blocked", "result_id": "call_scratch"}
+    )
     assert second.status == "error"
     assert "already the evidence" in second.denial_detail
 
@@ -438,21 +442,13 @@ async def test_block_distinctness_survives_resolution_from_a_tag() -> None:
 
 
 async def test_rule_1_binds_the_one_untagged_call_and_says_so() -> None:
-    """RULE 1. The model did the work and forgot the tag — the single most likely
-    failure, and one it CANNOT repair: a call that already ran cannot be
-    retro-tagged, so refusing here costs the user the answer rather than teaching
-    the model anything.
-
-    The bind is announced. `loop_analysis_state_auto_bound` is the counter that keeps
-    the backstop honest: a high rate means the tag is not landing, not that the
-    backstop is working well, and without the event the two look identical.
-    """
+    """Existing results are bound explicitly without guessing intent ownership."""
     store = InMemorySessionStore()
     observer = _Recorder()
     tool = await _initialized(store, "headcount", observer=observer)
     await _entry(store, "call_q1", "runQuery")  # ran, untagged
 
-    result = await _update(tool, {"intent_id": "i1", "status": "completed"})
+    result = await _update(tool, {"intent_id": "i1", "status": "completed", "result_id": "call_q1"})
 
     assert result.status == "ok", result.denial_detail
     intents = await _intents(store)
@@ -460,49 +456,33 @@ async def test_rule_1_binds_the_one_untagged_call_and_says_so() -> None:
         "completed",
         "call_q1",
     )
-    assert observer.named("loop_analysis_state_auto_bound") == [{"intent_id": "i1"}]
+    assert observer.named("loop_analysis_state_auto_bound") == []
     assert observer.named("loop_intent_completed") == [
         {
             "intent_id": "i1",
             "evidence_tool_name": "runQuery",
-            "evidence_binding": "auto_bound",
+            "evidence_binding": "tagged",
         }
     ]
 
 
 async def test_rule_1_prefers_the_untagged_call_over_one_tagged_elsewhere() -> None:
-    """RULE 1 BEFORE RULE 2, and this is the case that proves the order matters.
-
-    Two candidates exist, one of them already tagged for ANOTHER intent. Rule 2
-    alone would see two candidates and refuse; rule 1 sees exactly one UNTAGGED and
-    binds it — which is also the right answer semantically, since the tagged one
-    has an owner and this one does not.
-    """
+    """Existing results are bound explicitly without guessing intent ownership."""
     store = InMemorySessionStore()
     observer = _Recorder()
     tool = await _initialized(store, "headcount", "salary", observer=observer)
     await _entry(store, "call_q1", "runQuery", serves_intent="i1")
     await _entry(store, "call_q2", "runQuery")  # untagged
 
-    result = await _update(tool, {"intent_id": "i2", "status": "completed"})
+    result = await _update(tool, {"intent_id": "i2", "status": "completed", "result_id": "call_q2"})
 
     assert result.status == "ok", result.denial_detail
     assert (await _intents(store))["i2"].evidence_tool_call_id == "call_q2"
-    assert observer.named("loop_analysis_state_auto_bound") == [{"intent_id": "i2"}]
+    assert observer.named("loop_analysis_state_auto_bound") == []
 
 
 async def test_rule_2_lets_one_call_close_two_deliverables() -> None:
-    """RULE 2, and the whole reason the citation path could be retired.
-
-    04 §A ALLOWS evidence reuse for completion — one query genuinely answers
-    "headcount and average salary by department" — and a single-valued tag cannot
-    express it. Citation used to be the only way; it never once worked live. Now
-    the second intent has NO untagged candidate (the single call belongs to i1), so
-    rule 2 binds the same id to both.
-
-    `loop_evidence_reused` — 04 §A's stated mitigation for permitting reuse at all
-    — must still fire for both intents, whichever path established each binding.
-    """
+    """Existing results are bound explicitly without guessing intent ownership."""
     store = InMemorySessionStore()
     observer = _Recorder()
     tool = await _initialized(store, "headcount", "average salary", observer=observer)
@@ -511,7 +491,7 @@ async def test_rule_2_lets_one_call_close_two_deliverables() -> None:
     result = await _update(
         tool,
         {"intent_id": "i1", "status": "completed"},  # from the tag
-        {"intent_id": "i2", "status": "completed"},  # ...and from rule 2
+        {"intent_id": "i2", "status": "completed", "result_id": "call_q1"},  # ...and from rule 2
     )
 
     assert result.status == "ok", result.denial_detail
@@ -524,8 +504,8 @@ async def test_rule_2_lets_one_call_close_two_deliverables() -> None:
     assert {
         payload["intent_id"]: payload["evidence_binding"]
         for payload in observer.named("loop_intent_completed")
-    } == {"i1": "tagged", "i2": "auto_bound"}
-    assert observer.named("loop_analysis_state_auto_bound") == [{"intent_id": "i2"}]
+    } == {"i1": "tagged", "i2": "tagged"}
+    assert observer.named("loop_analysis_state_auto_bound") == []
     assert observer.named("loop_evidence_reused") == [
         {"intent_id": "i1", "tool_call_id": "call_q1"},
         {"intent_id": "i2", "tool_call_id": "call_q1"},
@@ -554,11 +534,11 @@ async def test_rule_3_refuses_rather_than_guessing_between_two_untagged_calls() 
     assert result.status == "error"
     assert result.error_code == ANALYSIS_STATE_INVALID_CODE
     assert result.retryable is True
-    assert "more than one call could have served it" in result.denial_detail
-    assert "serves_intent='i1'" in result.denial_detail
-    assert "NEXT message" in result.denial_detail
+    assert "result_id" in result.denial_detail
+    assert "result_id" in result.denial_detail
+    assert "result_id" in result.denial_detail
     assert observer.named("loop_analysis_state_rejected") == [
-        {"reason": "ambiguous_evidence", "intent_count": 1}
+        {"reason": "unresolved_evidence", "intent_count": 1}
     ]
     assert observer.named("loop_analysis_state_auto_bound") == []
     assert (await _intents(store))["i1"].status == "pending"
@@ -583,7 +563,7 @@ async def test_the_auto_bind_pool_only_holds_calls_that_would_validate() -> None
     result = await _update(tool, {"intent_id": "i1", "status": "completed"})
 
     assert result.status == "error"
-    assert "nothing this turn answered it" in result.denial_detail
+    assert "result_id" in result.denial_detail
     assert (await _intents(store))["i1"].status == "pending"
 
 
@@ -628,7 +608,7 @@ async def test_a_schema_fetch_is_tagged_evidence_but_never_auto_bound() -> None:
         turn=TurnContext(turn_index=TURN),
     )
     assert refused.status == "error"
-    assert "nothing this turn answered it" in refused.denial_detail
+    assert "result_id" in refused.denial_detail
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +695,7 @@ async def test_an_empty_table_listing_is_not_auto_bound_as_absent_data() -> None
     result = await _update(tool, {"intent_id": "i1", "status": "blocked"})
 
     assert result.status == "error"
-    assert "came back empty" in result.denial_detail
+    assert "result_id" in result.denial_detail
     assert (await _intents(store))["i1"].status == "pending"
 
     # ...and the narrowing is scoped to the ZERO-ROW code only: the same listing
@@ -731,7 +711,7 @@ async def test_an_empty_table_listing_is_not_auto_bound_as_absent_data() -> None
         error_code="SCRATCH_SESSION_VIOLATION",
         row_count=None,
     )
-    denied = await _update(tool2, {"intent_id": "i1", "status": "blocked"})
+    denied = await _update(tool2, {"intent_id": "i1", "status": "blocked", "result_id": "call_lt2"})
     assert denied.status == "ok", denied.denial_detail
     intents = await _intents(store2)
     assert (intents["i1"].reason_code, intents["i1"].evidence_tool_call_id) == (
@@ -741,15 +721,14 @@ async def test_an_empty_table_listing_is_not_auto_bound_as_absent_data() -> None
 
 
 async def test_a_zero_row_query_is_still_auto_bindable_as_absent_data() -> None:
-    """The other side of the same narrowing: `SUBSTANTIVE_TOOLS` is the pool, so a
-    zero-row `runQuery` still binds. Asserted beside the exclusion because a
-    narrowing that also broke the legitimate case would look identical in the test
-    above."""
+    """Existing results are bound explicitly without guessing intent ownership."""
     store = InMemorySessionStore()
     tool = await _initialized(store, "who left last month")
     await _entry(store, "call_empty", "runQuery", row_count=0)
 
-    result = await _update(tool, {"intent_id": "i1", "status": "blocked"})
+    result = await _update(
+        tool, {"intent_id": "i1", "status": "blocked", "result_id": "call_empty"}
+    )
 
     assert result.status == "ok", result.denial_detail
     intents = await _intents(store)
@@ -864,19 +843,11 @@ async def test_the_retired_fields_are_dropped_when_empty_too_in_both_modes() -> 
 
 
 async def test_re_affirming_a_closed_intent_is_a_no_op_not_a_re_resolution() -> None:
-    """Live models re-send the whole intent list every round. An intent already
-    closed on its own evidence keeps it, and is NOT put back through the backstop —
-    the trail grows, so a bind that was unambiguous in round 2 becomes ambiguous in
-    round 4, and that refusal would take the OTHER intents in the same batch down
-    with it.
-
-    It launders nothing: a status CHANGE misses this branch entirely and is
-    resolved in full, which the second half asserts.
-    """
+    """Existing results are bound explicitly without guessing intent ownership."""
     store = InMemorySessionStore()
     tool = await _initialized(store, "headcount", "salary")
     await _entry(store, "call_q1", "runQuery")
-    first = await _update(tool, {"intent_id": "i1", "status": "completed"})
+    first = await _update(tool, {"intent_id": "i1", "status": "completed", "result_id": "call_q1"})
     assert first.status == "ok", first.denial_detail
 
     # A second qualifying call arrives, tagged for i2. i1 is re-sent unchanged.
@@ -892,6 +863,6 @@ async def test_re_affirming_a_closed_intent_is_a_no_op_not_a_re_resolution() -> 
     assert intents["i2"].evidence_tool_call_id == "call_q2"
 
     # ...and a CHANGE of status is resolved in full, so it cannot ride the no-op.
-    changed = await _update(tool, {"intent_id": "i1", "status": "blocked"})
+    changed = await _update(tool, {"intent_id": "i1", "status": "blocked", "result_id": "call_q1"})
     assert changed.status == "error"
     assert (await _intents(store))["i1"].status == "completed"

@@ -25,11 +25,12 @@ from data_agent.runtime.blueprint.executor import (
 from data_agent.runtime.composite.ranking import ResolvedValue
 from data_agent.runtime.composite.resolve_values import ResolveOutcome, ResolveValuesComposite
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
+from tests.runtime.blueprint.measurement_fixtures import UniqueJoinKeysMCP as FakeMCPClient
+from tests.runtime.blueprint.measurement_fixtures import execution_calls
 
 _E = "dbpcm_warehouse.employee"
 _DEPT_COL = f"{_E}.Department"
@@ -133,23 +134,21 @@ async def test_scalar_intermediate_binds_as_typed_literal_and_verifies() -> None
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["company_avg"], [[55000.0]]),            # node 0 → scalar
-                _rq(["department"], [["Sales"], ["Eng"]]),    # node 1 → final table
-                _rq(["__bp_n", "__bp_d"], [[2, 2]]),          # grain probe
+                _rq(["company_avg"], [[55000.0]]),  # node 0 → scalar
+                _rq(["department"], [["Sales"], ["Eng"]]),  # node 1 → final table
+                _rq(["__bp_n", "__bp_d"], [[2, 2]]),  # grain probe
             ]
         }
     )
     executor = _executor(mcp, _scalar_dag_detail())
 
-    outcome = await executor.execute(
-        blueprint_id="bp-dag", slot_bindings={}, credentials=_creds()
-    )
+    outcome = await executor.execute(blueprint_id="bp-dag", slot_bindings={}, credentials=_creds())
 
     assert isinstance(outcome, ExecCompleted)
     assert outcome.result_full["status"] == "verified"
     assert outcome.result_full["row_count"] == 2
     # The scalar was bound into node 1 as a real numeric literal (never f-string).
-    node1_sql = mcp.calls[1].args["sql"]
+    node1_sql = execution_calls(mcp)[1].args["sql"]
     assert "55000.0" in node1_sql
     assert "{company_avg}" not in node1_sql
     # Two per-node SQLs surfaced for transparency (D56 "SQL stays visible").
@@ -166,7 +165,11 @@ async def test_hostile_scalar_is_never_reached_here_but_binding_is_ast_typed() -
     # a string scalar into a string comparison.
     detail = _detail(
         composes=[
-            {"order": 0, "output": {"tok": "scalar"}, "sql_template": "SELECT Department AS tok FROM dbpcm_warehouse.employee LIMIT 1"},
+            {
+                "order": 0,
+                "output": {"tok": "scalar"},
+                "sql_template": "SELECT Department AS tok FROM dbpcm_warehouse.employee LIMIT 1",
+            },
             {
                 "order": 1,
                 "feeds_from": [0],
@@ -180,7 +183,7 @@ async def test_hostile_scalar_is_never_reached_here_but_binding_is_ast_typed() -
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["tok"], [["x' OR '1'='1"]]),           # adversarial scalar text
+                _rq(["tok"], [["x' OR '1'='1"]]),  # adversarial scalar text
                 _rq(["department"], [["Sales"]]),
                 _rq(["__bp_n", "__bp_d"], [[1, 1]]),
             ]
@@ -189,7 +192,7 @@ async def test_hostile_scalar_is_never_reached_here_but_binding_is_ast_typed() -
     executor = _executor(mcp, detail)
     outcome = await executor.execute(blueprint_id="bp-dag", slot_bindings={}, credentials=_creds())
     assert isinstance(outcome, ExecCompleted)
-    node1_sql = mcp.calls[1].args["sql"]
+    node1_sql = execution_calls(mcp)[1].args["sql"]
     # ClickHouse-escaped single-quote doubling — the injection is inert data.
     assert "''" in node1_sql
     assert "OR '1'='1'" not in node1_sql.replace("''", "\x00")
@@ -203,7 +206,11 @@ async def test_hostile_scalar_is_never_reached_here_but_binding_is_ast_typed() -
 async def test_when_gated_node_is_skipped_when_upstream_empty() -> None:
     detail = _detail(
         composes=[
-            {"order": 0, "output": {"flagged": "scalar"}, "sql_template": "SELECT count() AS flagged FROM dbpcm_warehouse.employee"},
+            {
+                "order": 0,
+                "output": {"flagged": "scalar"},
+                "sql_template": "SELECT count() AS flagged FROM dbpcm_warehouse.employee",
+            },
             {
                 "order": 1,
                 "feeds_from": [0],
@@ -224,9 +231,9 @@ async def test_when_gated_node_is_skipped_when_upstream_empty() -> None:
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["flagged"], [[5]]),                         # node 0
+                _rq(["flagged"], [[5]]),  # node 0
                 _rq(["department", "n"], [["Sales", 3], ["Eng", 2]]),  # node 2 (node 1 skipped)
-                _rq(["__bp_n", "__bp_d"], [[2, 2]]),             # grain probe
+                _rq(["__bp_n", "__bp_d"], [[2, 2]]),  # grain probe
             ]
         }
     )
@@ -234,14 +241,18 @@ async def test_when_gated_node_is_skipped_when_upstream_empty() -> None:
     outcome = await executor.execute(blueprint_id="bp-dag", slot_bindings={}, credentials=_creds())
     assert isinstance(outcome, ExecCompleted)
     # Only node 0, node 2, and the grain probe ran — node 1 was gated out.
-    assert len(mcp.calls) == 3
-    assert "GROUP BY Department" in mcp.calls[1].args["sql"]
+    assert len(execution_calls(mcp)) == 3
+    assert "GROUP BY Department" in execution_calls(mcp)[1].args["sql"]
 
 
 async def test_when_abort_falls_back_to_raw_loop() -> None:
     detail = _detail(
         composes=[
-            {"order": 0, "output": {"n": "scalar"}, "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee"},
+            {
+                "order": 0,
+                "output": {"n": "scalar"},
+                "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee",
+            },
             {
                 "order": 1,
                 "feeds_from": [0],
@@ -257,17 +268,25 @@ async def test_when_abort_falls_back_to_raw_loop() -> None:
     outcome = await executor.execute(blueprint_id="bp-dag", slot_bindings={}, credentials=_creds())
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == ABORTED_CODE
-    assert len(mcp.calls) == 1  # aborted before node 1 dispatched
+    assert len(execution_calls(mcp)) == 1  # aborted before node 1 dispatched
 
 
 async def test_when_on_violation_ask_pauses_then_resume_proceeds() -> None:
     detail = _detail(
         composes=[
-            {"order": 0, "output": {"n": "scalar"}, "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee"},
+            {
+                "order": 0,
+                "output": {"n": "scalar"},
+                "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee",
+            },
             {
                 "order": 1,
                 "feeds_from": [0],
-                "when": {"expr": "$0.n > 100", "on_violation": "ask", "message": "Few rows — continue?"},
+                "when": {
+                    "expr": "$0.n > 100",
+                    "on_violation": "ask",
+                    "message": "Few rows — continue?",
+                },
                 "sql_template": "SELECT Department AS department FROM dbpcm_warehouse.employee GROUP BY Department",
                 "output": {},
             },
@@ -302,7 +321,7 @@ async def test_when_on_violation_ask_pauses_then_resume_proceeds() -> None:
         credentials=_creds(),
     )
     assert isinstance(done, ExecCompleted)
-    assert len(resume_mcp.calls) == 2  # node 0 not re-run
+    assert len(execution_calls(resume_mcp)) == 2  # node 0 not re-run
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +332,11 @@ async def test_when_on_violation_ask_pauses_then_resume_proceeds() -> None:
 def _approval_detail() -> BlueprintDetail:
     return _detail(
         composes=[
-            {"order": 0, "output": {"n": "scalar"}, "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee"},
+            {
+                "order": 0,
+                "output": {"n": "scalar"},
+                "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.employee",
+            },
             {
                 "order": 1,
                 "node_kind": "approval",
@@ -343,7 +366,7 @@ async def test_approval_node_pauses_with_checkpoint_state() -> None:
     # The completed SCALAR outputs are serialized for a restart-durable resume.
     assert outcome.completed_nodes_json is not None
     assert '"n": 42' in outcome.completed_nodes_json
-    assert len(mcp.calls) == 1  # only node 0 ran; the approval query has NOT run
+    assert len(execution_calls(mcp)) == 1  # only node 0 ran; the approval query has NOT run
 
 
 async def test_resume_reenters_at_awaiting_node_completed_never_rerun() -> None:
@@ -351,8 +374,8 @@ async def test_resume_reenters_at_awaiting_node_completed_never_rerun() -> None:
     resume_mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["department"], [["Sales"], ["Eng"]]),   # node 1 query (approved)
-                _rq(["__bp_n", "__bp_d"], [[2, 2]]),         # grain probe
+                _rq(["department"], [["Sales"], ["Eng"]]),  # node 1 query (approved)
+                _rq(["__bp_n", "__bp_d"], [[2, 2]]),  # grain probe
             ]
         }
     )
@@ -370,8 +393,8 @@ async def test_resume_reenters_at_awaiting_node_completed_never_rerun() -> None:
     assert isinstance(outcome, ExecCompleted)
     assert outcome.result_full["row_count"] == 2
     # node 0 is NOT re-run — only node 1 + the grain probe dispatch (exactly-once).
-    assert len(resume_mcp.calls) == 2
-    assert "count()" not in resume_mcp.calls[0].args["sql"].lower()
+    assert len(execution_calls(resume_mcp)) == 2
+    assert "count()" not in execution_calls(resume_mcp)[0].args["sql"].lower()
 
 
 async def test_resume_deny_stops_without_running_the_gated_node() -> None:
@@ -390,7 +413,7 @@ async def test_resume_deny_stops_without_running_the_gated_node() -> None:
     # No terminal query ran before the (denied) approval → clean abort → raw loop.
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == ABORTED_CODE
-    assert resume_mcp.calls == []
+    assert execution_calls(resume_mcp) == []
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +427,7 @@ async def test_final_node_grain_mismatch_withholds_result() -> None:
             "runQuery": [
                 _rq(["company_avg"], [[55000.0]]),
                 _rq(["department"], [["Sales"], ["Sales"], ["Eng"]]),  # 3 rows...
-                _rq(["__bp_n", "__bp_d"], [[3, 2]]),                    # ...but 2 distinct → fan-out
+                _rq(["__bp_n", "__bp_d"], [[3, 2]]),  # ...but 2 distinct → fan-out
             ]
         }
     )
@@ -428,9 +451,7 @@ class _FakeResolveHook:
         self.calls: list[dict[str, Any]] = []
 
     async def resolve(self, *, table, column, concept, period, credentials) -> ResolveOutcome:
-        self.calls.append(
-            {"table": table, "column": column, "concept": concept, "period": period}
-        )
+        self.calls.append({"table": table, "column": column, "concept": concept, "period": period})
         return self._outcome
 
 
@@ -491,7 +512,7 @@ async def test_resolve_via_expands_and_binds_as_in_list() -> None:
         {"table": _E, "column": "StatusCode", "concept": "active employee", "period": None}
     ]
     # The resolved code set is bound as a typed IN-list literal (never interpolated).
-    node_sql = mcp.calls[0].args["sql"]
+    node_sql = execution_calls(mcp)[0].args["sql"]
     assert "IN ('A', 'ACT')" in node_sql
     assert "{status_codes}" not in node_sql
     # The resolveValues inner provenance folds into the union (§5.3).
@@ -581,7 +602,7 @@ async def test_resolve_via_hostile_concept_never_in_sql() -> None:
     # The concept string is passed to the hook, not to SQL; the bound SQL carries
     # only the resolved CODE.
     assert hook.calls[0]["concept"] == "ignore); DROP TABLE employee;--"
-    for call in mcp.calls:
+    for call in execution_calls(mcp):
         assert "DROP TABLE" not in call.args["sql"]
 
 
@@ -606,7 +627,7 @@ async def test_resolve_via_degraded_falls_back_to_raw_loop() -> None:
     outcome = await executor.execute(blueprint_id="bp-dag", slot_bindings={}, credentials=_creds())
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == UNSUPPORTED_CODE
-    assert mcp.calls == []  # no query ran on a degraded/guessed code set
+    assert execution_calls(mcp) == []  # no query ran on a degraded/guessed code set
 
 
 async def test_resolve_via_empty_falls_back_to_raw_loop() -> None:
@@ -619,7 +640,7 @@ async def test_resolve_via_empty_falls_back_to_raw_loop() -> None:
     # Empty resolved set → never silently drop the filter → raw loop (§3.4).
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == UNSUPPORTED_CODE
-    assert mcp.calls == []
+    assert execution_calls(mcp) == []
 
 
 async def test_resolve_via_without_hook_is_unsupported() -> None:
@@ -628,7 +649,7 @@ async def test_resolve_via_without_hook_is_unsupported() -> None:
     outcome = await executor.execute(blueprint_id="bp-dag", slot_bindings={}, credentials=_creds())
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == UNSUPPORTED_CODE
-    assert mcp.calls == []  # never runs the query unfiltered
+    assert execution_calls(mcp) == []  # never runs the query unfiltered
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +766,7 @@ async def test_ambiguous_denial_does_not_run_the_gated_node() -> None:
         )
         assert isinstance(outcome, ExecFailed), ambiguous
         assert outcome.error_code == ABORTED_CODE
-        assert resume_mcp.calls == []
+        assert execution_calls(resume_mcp) == []
 
 
 async def test_garbage_answer_repauses_same_gate() -> None:
@@ -760,7 +781,7 @@ async def test_garbage_answer_repauses_same_gate() -> None:
     )
     # "not sure" contains a negation marker → deny (safe: does not proceed).
     assert isinstance(outcome, ExecFailed)
-    assert resume_mcp.calls == []
+    assert execution_calls(resume_mcp) == []
 
 
 async def test_pure_garbage_answer_repauses() -> None:
@@ -776,7 +797,7 @@ async def test_pure_garbage_answer_repauses() -> None:
     assert isinstance(outcome, ExecPaused)
     assert outcome.reason == "blueprint_approval"
     assert outcome.awaiting_node == 1
-    assert resume_mcp.calls == []
+    assert execution_calls(resume_mcp) == []
 
 
 # ---------------------------------------------------------------------------
@@ -803,18 +824,26 @@ async def test_dead_toplevel_template_slot_is_not_a_hidden_referenced_slot() -> 
         slots=[{"name": "department", "type": "string", "required": True}],
         sql_template="SELECT AVG(AnnualSalary) FROM dbpcm_warehouse.employee WHERE Department = {department}",
         composes=[
-            {"order": 0, "output": {}, "sql_template": "SELECT Department AS department FROM dbpcm_warehouse.employee GROUP BY Department"},
+            {
+                "order": 0,
+                "output": {},
+                "sql_template": "SELECT Department AS department FROM dbpcm_warehouse.employee GROUP BY Department",
+            },
         ],
         result_grain=["Department"],
     )
-    mcp = FakeMCPClient(scripted={"runQuery": [_rq(["department"], [["Sales"]]), _rq(["__bp_n", "__bp_d"], [[1, 1]])]})
+    mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [_rq(["department"], [["Sales"]]), _rq(["__bp_n", "__bp_d"], [[1, 1]])]
+        }
+    )
     outcome = await _executor(mcp, detail).execute(
         blueprint_id="bp-dag", slot_bindings={"department": "Warehouse"}, credentials=_creds()
     )
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == SLOT_INVALID_CODE
     # The user's 'Warehouse' filter was NEVER silently dropped into a company-wide run.
-    assert not any("Warehouse" in c.args["sql"] for c in mcp.calls)
+    assert not any("Warehouse" in c.args["sql"] for c in execution_calls(mcp))
 
 
 # ---------------------------------------------------------------------------
@@ -835,7 +864,12 @@ async def test_single_node_resolve_via_expands_and_executes() -> None:
         composes=[],
         result_grain=[],
         uses_rules=[
-            {"id": "active", "resolve_via": "resolveValues(StatusCode, 'active status')", "table": _E, "binds": "status_codes"}
+            {
+                "id": "active",
+                "resolve_via": "resolveValues(StatusCode, 'active status')",
+                "table": _E,
+                "binds": "status_codes",
+            }
         ],
     )
     # Single-node: a top-level sql_template with the rule IN-list placeholder.
@@ -849,7 +883,12 @@ async def test_single_node_resolve_via_expands_and_executes() -> None:
         hit_count=0,
         catalog_sha="",
         uses_rules=[
-            {"id": "active", "resolve_via": "resolveValues(StatusCode, 'active status')", "table": _E, "binds": "status_codes"}
+            {
+                "id": "active",
+                "resolve_via": "resolveValues(StatusCode, 'active status')",
+                "table": _E,
+                "binds": "status_codes",
+            }
         ],
         sql_template="SELECT count() AS n FROM dbpcm_warehouse.employee WHERE StatusCode IN {status_codes}",
         composes=None,
@@ -858,7 +897,9 @@ async def test_single_node_resolve_via_expands_and_executes() -> None:
     index = FakeVectorIndex()
     index.add_detail(detail)
     executor = BlueprintExecutor(
-        tool_dispatcher=ToolDispatcher(FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[7]])]}), CATALOG),
+        tool_dispatcher=ToolDispatcher(
+            FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[7]])]}), CATALOG
+        ),
         vector_index=index,
         resolve_values=hook,
     )
@@ -959,8 +1000,8 @@ async def test_single_node_resolve_via_real_composite_ranks_earn_and_binds_in_li
             "runQuery": [
                 _rq(["Department"], [["Sales"], ["Engineering"], ["Finance"]]),  # dept probe
                 _rq(["RegisterType", "freq"], [["EARN", 4], ["DEDUCTION", 1]]),  # resolveValues
-                _rq(["department", "total_earnings"], [["Sales", 7350.0]]),      # node query
-                _rq(["__bp_n", "__bp_d"], [[1, 1]]),                            # grain probe
+                _rq(["department", "total_earnings"], [["Sales", 7350.0]]),  # node query
+                _rq(["__bp_n", "__bp_d"], [[1, 1]]),  # grain probe
             ]
         }
     )
@@ -982,14 +1023,14 @@ async def test_single_node_resolve_via_real_composite_ranks_earn_and_binds_in_li
 
     assert isinstance(outcome, ExecCompleted), outcome
     # The composite issued the DISTINCT-domain freq probe over RegisterType.
-    assert "GROUP BY RegisterType" in mcp.calls[1].args["sql"]
+    assert "GROUP BY RegisterType" in execution_calls(mcp)[1].args["sql"]
     # EARN ranked first with a large score gap to the (mock) non-earnings code →
     # D67 concept-subset selection binds {EARN} ONLY (the gap-cut prefix), NOT the
     # whole domain. The resolved code set binds as a typed AST IN-list literal
     # (F1/D10), never string-interpolated; the placeholder is gone. Binding a
     # non-earnings register too would corrupt the "earnings" total — the
     # correctness gap this asserts (the live seed's true Sales EARN total is 6125.0).
-    node_sql = mcp.calls[2].args["sql"]
+    node_sql = execution_calls(mcp)[2].args["sql"]
     assert "IN ('EARN')" in node_sql
     assert "DEDUCTION" not in node_sql
     assert "{earn_codes}" not in node_sql

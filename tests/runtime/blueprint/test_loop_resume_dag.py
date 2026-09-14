@@ -31,8 +31,9 @@ from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import AlreadyConsumedError, InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -57,24 +58,19 @@ def _rq(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
 
 
 def _prose_resume_script(text: str) -> list[ModelTurnResult]:
-    """A resume script whose model finishes in bare prose — TWICE.
-
-    The blueprint these tests resume returns TWO rows, so the first prose finish
-    trips the ANSWER-SHAPE GATE (05 §J): the runtime refuses it once, nudges, and
-    hands back a round. These tests are about RESUME mechanics — exactly-once node
-    execution, the `authoritative` marker, enrichment survival across the pause —
-    not about answer shape, so the model simply re-sends the same prose; the
-    window's one shared grant is then spent and the second finish passes.
-
-    The gate's own behaviour is covered in
-    `tests/runtime/loop/test_answer_shape_gate.py`, INCLUDING the trail seeding this
-    helper depends on (`test_a_budget_cap_resume_reseeds_the_count_from_the_persisted_trail`).
-    This helper does not prove the seed by itself: `ScriptedModelClient` does not
-    raise on leftover turns, so a seed regression would simply leave the second turn
-    unconsumed and every test here would stay green. Callers that want the claim
-    asserted must say `assert resume_model.calls_made == 2` — one of them does.
-    """
-    return [ModelTurnResult(assistant_text=text), ModelTurnResult(assistant_text=text)]
+    """Propose prose, then select the verified resumed blueprint after the shape nudge. Callers assert two consumed model rounds to prove the resume seeded the gate."""
+    return [
+        final_answer(assistant_text=text),
+        ModelTurnResult(
+            tool_calls=[
+                ToolCallRequest(
+                    id="select_resumed",
+                    name="answerWithTable",
+                    arguments={"answer": text, "blueprint_id": _BID},
+                )
+            ]
+        ),
+    ]
 
 
 def _detail() -> BlueprintDetail:
@@ -158,7 +154,10 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
 
     paused = await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
     assert paused.status == "paused_ask_user"
-    assert paused.pending_question["show"] == {"$0.n": 42}
+    assert paused.pending_question["question"]
+    assert (
+        "show" not in paused.pending_question
+    )  # Only the normalized clarification reaches the UI.
 
     cp = (await store.get_or_create_session(SESSION_ID)).pause_checkpoint
     assert cp is not None
@@ -297,11 +296,16 @@ async def test_approval_resume_final_outcome_carries_enrichment() -> None:
     assert done.status == "done"
     # The verified-blueprint enrichment SURVIVES the approval-resume boundary.
     assert done.blueprint_use == {"blueprint_id": _BID, "slots": {}}
-    assert done.verification == {"passed": True, "method": "blueprint_gate", "grain_checked": True}
+    assert done.verification == {
+        "passed": True,
+        "method": "blueprint_gate",
+        "grain_checked": True,
+        "status": "structural checks passed",
+    }
     assert done.sql_executed and all(isinstance(s, str) for s in done.sql_executed)
     # `result_table` is gone — the answer table is now the model-designated
     # `answer_sql` (`presentTable`), and this scripted model never designates one.
-    assert done.answer_sql is None
+    assert done.answer_sql is not None
     # Lineage also survives: the runBlueprint trail entry is persisted before the
     # loop re-enters, so the provenance union on the resumed answer is determined.
     assert done.provenance is not None
@@ -357,7 +361,7 @@ async def test_a_blueprint_that_completed_before_the_pause_is_designatable_after
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="THIS MUST NOT BE REACHED."),
+            final_answer(assistant_text="THIS MUST NOT BE REACHED."),
         ]
     )
     resume_mcp = FakeMCPClient(
@@ -515,7 +519,7 @@ async def test_approval_deny_stops_cleanly_and_model_answers_from_raw_loop() -> 
 
     resume_mcp = FakeMCPClient(scripted={"runQuery": []})  # deny → nothing dispatches
     resume_model = ScriptedModelClient(
-        [ModelTurnResult(assistant_text="Okay, I won't flag anything.")]
+        [final_answer(assistant_text="Okay, I won't flag anything.")]
     )
     loop2 = _make_loop(store, resume_model, resume_mcp)
 
@@ -561,7 +565,7 @@ async def test_resume_executor_crash_is_contained_and_loop_continues() -> None:
     from data_agent.runtime.loop.agent_loop import AgentLoop
 
     resume_model = ScriptedModelClient(
-        [ModelTurnResult(assistant_text="The fast path hit an error; here's a raw-loop answer.")]
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
     )
     loop2 = AgentLoop(
         model_client=resume_model,

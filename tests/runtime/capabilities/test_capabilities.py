@@ -280,7 +280,7 @@ async def test_navigation_hydration_does_not_forward_end_user_jwt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> None:
+async def test_hydrate_then_prepare_nonterminal_widget_card_without_invocation() -> None:
     definitions = []
     hydrate = GetCapabilityTool(client=_client(), hydrate=definitions.append, visible_names=set())
     credentials = RuntimeCredentials(jwt="jwt", session_id="session", column_scope=frozenset())
@@ -307,8 +307,9 @@ async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> N
             "not present it. Omit optional arguments the user did not supply."
         ),
     }
-    assert result.terminal is True
-    assert {"answer", "serves_intent"} <= set(schema["parameters"]["properties"])
+    assert result.terminal is False
+    assert "serves_intents" in schema["parameters"]["properties"]
+    assert "answer" not in schema["parameters"]["properties"]
     assert schema["parameters"]["properties"]["employees"] == {
         "type": "array",
         "items": {"type": "string"},
@@ -334,6 +335,8 @@ async def test_hydrate_then_build_terminal_widget_card_without_invocation() -> N
         "resolved_entities": {"employee": ["Jane Doe"]},
         "additional_arguments": {},
         "answer": "Jane is active.",
+        "prepared": True,
+        "capability_ref": "show_employee_profile",
         "_agent_evidence": {
             "kind": "data_widget",
             "activation": "user_interaction_required",
@@ -370,7 +373,7 @@ async def test_disabled_agent_has_no_capability_schema_or_prompt() -> None:
     settings = RuntimeSettings(capability_tools_enabled=False)
     schemas = await ToolSchemaCache(FakeMCP()).get_schemas(jwt="jwt", session_id="session")
 
-    assert "capability" not in settings.effective_agent_system_prompt().lower()
+    assert "## UI capabilities" not in settings.effective_agent_system_prompt()
     assert not {"searchCapabilityTools", "getCapabilityTool"} & {
         schema["name"] for schema in schemas
     }

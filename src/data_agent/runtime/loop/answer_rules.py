@@ -295,7 +295,7 @@ _OFF_TOPIC_ASK = re.compile(
 # refused as off-topic content. First-person hedge shapes a decline is actually
 # written in, and nothing vaguer.
 _SCOPE_DECLINE = re.compile(
-    r"\b(?:i (?:can'?t|cannot|couldn'?t|won'?t|don'?t have|am (?:not able|unable)|'?m (?:not able|unable))\b"
+    r"\b(?:i (?:can'?t|cannot|couldn'?t|could not|won'?t|don'?t have|am (?:not able|unable)|'?m (?:not able|unable))\b"
     r"|(?:isn'?t|is not|that'?s not|that is not) something i\b"
     r"|outside (?:my|the|this) (?:scope|remit)\b)",
     re.IGNORECASE,
@@ -330,15 +330,15 @@ def contains_schema_reference(prose: str) -> bool:
 
 
 def _scope_nudge(draft):
-    return "The turn is NOT over. This request asks for creative content outside this assistant's scope. Decline through answerWithText and offer HR/payroll analysis or product help. Do not repeat the content or run SQL to justify it."
+    return "The turn is NOT over. This request asks for creative content outside this assistant's scope. Decline through finalizeAnswer and offer HR/payroll analysis or product help. Do not repeat the content or run SQL to justify it."
 
 
 def _schema_nudge(draft):
-    return "The turn is NOT over. Remove internal database/table/column identifiers from the answer. Use business language and submit the corrected answer through answerWithText or answerWithTable."
+    return "The turn is NOT over. Remove internal database/table/column identifiers from the answer. Use business language and submit the corrected answer through finalizeAnswer."
 
 
 def _no_evidence_nudge(draft):
-    return "The turn is NOT over. Ground the answer in current tool evidence, or finish through answerWithText with an honest explanation of what cannot be answered."
+    return "The turn is NOT over. Ground the answer in current tool evidence, or finish through finalizeAnswer with an honest explanation of what cannot be answered."
 
 
 # --- nudges -----------------------------------------------------------------
@@ -383,9 +383,9 @@ def _markdown_table_nudge(draft: str | None) -> str:
         "rows replace it with a truncated copy."
     )
     lines.append(
-        "The turn is NOT over and answerWithTable is still available to you: call it in "
-        "your NEXT response. Pass one table per part you answered — blueprint_id for a "
-        "result a blueprint produced, sql otherwise — and keep your prose as the "
+        "The turn is NOT over and finalizeAnswer is still available to you: call it in "
+        "your NEXT response. Select each table with its successful execution result_id "
+        "and keep your prose as the "
         "answer, with the rows taken out of it."
     )
     return "\n".join(lines)

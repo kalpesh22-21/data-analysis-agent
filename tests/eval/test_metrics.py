@@ -63,9 +63,7 @@ def _entry(
         result_preview=(
             None
             if row_count is None
-            else ResultPreview(
-                columns=["x"], row_count=row_count, truncated=False, preview_rows=[]
-            )
+            else ResultPreview(columns=["x"], row_count=row_count, truncated=False, preview_rows=[])
         ),
         result_full_ref=None,
         ts="2026-08-11T00:00:00Z",
@@ -74,9 +72,7 @@ def _entry(
 
 
 def _state_call(tool_call_id: str, bindings: list[dict[str, Any]], **kwargs: Any) -> TrailEntry:
-    return _entry(
-        tool_call_id, "updateAnalysisState", args={"intents": bindings}, **kwargs
-    )
+    return _entry(tool_call_id, "updateAnalysisState", args={"intents": bindings}, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -85,17 +81,13 @@ def _state_call(tool_call_id: str, bindings: list[dict[str, Any]], **kwargs: Any
 
 
 def test_pending_on_a_done_turn_is_a_violation() -> None:
-    records = [
-        metrics.TurnRecord("c", 0, "done", _state(0, _intent("i1", "pending")))
-    ]
+    records = [metrics.TurnRecord("c", 0, "done", _state(0, _intent("i1", "pending")))]
     assert metrics.pending_on_terminal_turns(records) == [("c", "i1")]
 
 
 def test_hard_ceiling_is_terminal_too() -> None:
     records = [
-        metrics.TurnRecord(
-            "c", 0, "stopped_hard_ceiling", _state(0, _intent("i1", "pending"))
-        )
+        metrics.TurnRecord("c", 0, "stopped_hard_ceiling", _state(0, _intent("i1", "pending")))
     ]
     assert metrics.pending_on_terminal_turns(records) == [("c", "i1")]
 
@@ -114,9 +106,7 @@ def test_abandoned_pauses_and_cas_races_are_excluded() -> None:
 def test_a_state_from_another_turn_is_history_not_a_violation() -> None:
     """The `live_analysis_state` rule, in the sweep: turn 1 finishing `done` while
     turn 0's abandoned state is still on the doc is not a dropped intent."""
-    records = [
-        metrics.TurnRecord("c", 1, "done", _state(0, _intent("i1", "pending")))
-    ]
+    records = [metrics.TurnRecord("c", 1, "done", _state(0, _intent("i1", "pending")))]
     assert metrics.pending_on_terminal_turns(records) == []
 
 
@@ -143,7 +133,7 @@ def test_buckets_are_derived_from_the_enum_not_a_hard_coded_list() -> None:
     silently uncounted."""
     report = metrics.blocked_intent_report([])
     assert REASON_CODES <= set(report.buckets)
-    assert len(REASON_CODES) == 5
+    assert len(REASON_CODES) == 6
 
 
 def test_report_folds_per_intent_final_state() -> None:
@@ -264,7 +254,9 @@ def test_a1_shaped_input_is_definitionally_one() -> None:
     the number is understood rather than reported beside the A1 results as though
     it had been measured."""
     observations = [
-        metrics.DetectionObservation(f"case-{n}", multi_intent=True, analysis_state_initialized=True)
+        metrics.DetectionObservation(
+            f"case-{n}", multi_intent=True, analysis_state_initialized=True
+        )
         for n in range(9)
     ]
     assert metrics.multi_intent_detection(observations).rate == 1.0
@@ -467,19 +459,21 @@ def test_the_bool_is_exactly_the_judgement_being_true() -> None:
     drift: every caller that kept the bool (A1's fixtures, production telemetry)
     keeps asking "did it happen", and only that."""
     cases: list[tuple[list[TrailEntry], dict[str, Any]]] = [
-        ([_entry("b1", "runBlueprint", authoritative=False), _entry("q1", "runQuery")],
-         {"b1": "i1", "q1": "i1"}),
+        (
+            [_entry("b1", "runBlueprint", authoritative=False), _entry("q1", "runQuery")],
+            {"b1": "i1", "q1": "i1"},
+        ),
         ([_entry("b1", "runBlueprint", authoritative=True), _entry("q1", "runQuery")], {}),
         (_blueprint_then_query("i1"), {"b1": "i1", "q1": "i1"}),
         (_blueprint_then_query("i2"), {"b1": "i1", "q1": "i2"}),
-        ([_entry("q1", "runQuery"), _entry("b1", "runBlueprint", authoritative=True)],
-         {"b1": "i1", "q1": "i1"}),
+        (
+            [_entry("q1", "runQuery"), _entry("b1", "runBlueprint", authoritative=True)],
+            {"b1": "i1", "q1": "i1"},
+        ),
     ]
     for trail, mapping in cases:
         judgement = metrics.re_derivation_judgement(trail, mapping, turn_index=0)
-        assert metrics.re_derivation(trail, mapping, turn_index=0) == (
-            judgement.re_derived is True
-        )
+        assert metrics.re_derivation(trail, mapping, turn_index=0) == (judgement.re_derived is True)
 
 
 # ---------------------------------------------------------------------------
@@ -530,3 +524,19 @@ def test_blocked_report_renders_only_non_empty_buckets() -> None:
     line = metrics.format_blocked_report(metrics.blocked_intent_report(records))
     assert "NO_ACCESS=1" in line
     assert "USER_STOPPED" not in line
+
+
+def test_plural_tags_and_late_result_bindings_both_count():
+    from dataclasses import replace
+
+    trail = [
+        replace(_entry("q1", "runQuery"), serves_intents=("i1", "i2")),
+        _state_call("late", [{"intent_id": "i3", "status": "completed", "result_id": "q1"}]),
+        _state_call(
+            "denied",
+            [{"intent_id": "i4", "status": "completed", "result_id": "q1"}],
+            status="error",
+        ),
+    ]
+    assert metrics.serves_intent_from_trail(trail, 0) == {"q1": {"i1", "i2", "i3"}}
+    assert metrics.serves_intent_from_trail(trail, 1) == {}

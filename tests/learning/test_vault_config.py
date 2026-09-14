@@ -141,9 +141,7 @@ def test_each_group_is_read_from_its_own_path(vault_on) -> None:
     assert by_key["LEARNING_AUDIT_USERNAME"] == settings.learning_audit_vault_path
     assert by_key["LEARNING_CANDIDATES_USERNAME"] == settings.learning_candidates_vault_path
     assert by_key["LEARNING_CORPUS_USERNAME"] == settings.learning_corpus_vault_path
-    assert (
-        by_key["LEARNING_EXTRACTOR_API_KEY"] == settings.learning_extractor_api_key_vault_path
-    )
+    assert by_key["LEARNING_EXTRACTOR_API_KEY"] == settings.learning_extractor_api_key_vault_path
 
 
 def test_vault_disabled_reads_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,9 +165,7 @@ def test_vault_disabled_reads_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- (b) an empty path skips its group --------------------------------------
 
 
-def test_empty_corpus_path_skips_that_group_only(
-    vault_on, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_empty_corpus_path_skips_that_group_only(vault_on, monkeypatch: pytest.MonkeyPatch) -> None:
     """`LEARNING_CORPUS_VAULT_PATH=""` ⇒ the corpus group keeps env/default and NOTHING
     is read for it, while the other four groups are read as normal."""
     monkeypatch.setenv("LEARNING_CORPUS_VAULT_PATH", "")
@@ -256,20 +252,22 @@ def test_a_raising_key_keeps_env_and_the_rest_of_its_group_lands(
     assert settings.learning_extractor_api_key == "vault:LEARNING_EXTRACTOR_API_KEY"
 
 
+@pytest.mark.parametrize("audit_username", ["", "env-audit"])
 def test_a_totally_broken_vault_degrades_to_env_for_every_field(
-    vault_on, monkeypatch: pytest.MonkeyPatch
+    vault_on, monkeypatch: pytest.MonkeyPatch, audit_username: str
 ) -> None:
     """The shape of the fail-soft an operator has to know about: when EVERY read fails,
     the load still succeeds and every value is the env one. It is only distinguishable
     from a healthy load by the warning `_read_vault_secret` logs — which is why that
     warning has to exist."""
     monkeypatch.setenv("LEARNING_EXTRACTOR_API_KEY", "env-key")
+    monkeypatch.setenv("LEARNING_AUDIT_USERNAME", audit_username)
     vault_on(_StubVaultClient(raise_on=frozenset(key for _, key in _ALL_FIELDS)))
 
     settings = load_learning_settings_from_vault()
 
     assert settings.learning_extractor_api_key == "env-key"
-    assert settings.learning_audit_username == ""  # the shipped default
+    assert settings.learning_audit_username == audit_username
 
 
 def test_a_failed_read_is_logged_with_no_secret_material(

@@ -14,6 +14,8 @@ the D45 resume path (design §3.3/§6):
 
 from __future__ import annotations
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -30,6 +32,9 @@ from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TurnMessage
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 _Q = "sales overtime"
 CATALOG = CatalogHandle({"dbpcm_warehouse.employee": {"Department": "String"}})
@@ -52,7 +57,9 @@ def _index() -> FakeVectorIndex:
     )
 
 
-def _pipeline(embedder: FakeEmbeddingClient, index: FakeVectorIndex | None = None) -> RetrievalPipeline:
+def _pipeline(
+    embedder: FakeEmbeddingClient, index: FakeVectorIndex | None = None
+) -> RetrievalPipeline:
     return RetrievalPipeline(
         embedding_client=embedder,
         reranker=FakeRerankerClient(),
@@ -75,7 +82,9 @@ async def test_scope_change_busts_memo_and_re_embeds() -> None:
     assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     memo: dict = {}
     await assembler.assemble("s", frozenset({"db.t.a"}), user_message=_Q, retrieval_memo=memo)
-    await assembler.assemble("s", frozenset(), user_message=_Q, retrieval_memo=memo)  # scope changed
+    await assembler.assemble(
+        "s", frozenset(), user_message=_Q, retrieval_memo=memo
+    )  # scope changed
     # Two DISTINCT scope hashes → two memo keys → embedded twice. The memo never
     # serves a result computed under a different scope.
     assert embedder.calls == [[_Q], [_Q]]
@@ -169,7 +178,7 @@ def _ask_user_loop(store, embedder) -> AgentLoop:
                 ],
                 usage={"total_tokens": 5},
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     return AgentLoop(
@@ -214,7 +223,9 @@ async def _plain_tools(_c: RuntimeCredentials) -> list[dict]:
 
 def _done_loop(store, embedder) -> AgentLoop:
     assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="done")])
+    model = ScriptedModelClient(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
     return AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
@@ -235,8 +246,12 @@ async def test_two_agentloops_do_not_share_a_memo() -> None:
     emb_b = FakeEmbeddingClient()
     creds_a = RuntimeCredentials(session_id="sa", jwt="j", column_scope=frozenset())
     creds_b = RuntimeCredentials(session_id="sb", jwt="j", column_scope=frozenset())
-    out_a = await _done_loop(store, emb_a).run(session_id="sa", credentials=creds_a, user_message="qa")
-    out_b = await _done_loop(store, emb_b).run(session_id="sb", credentials=creds_b, user_message="qb")
+    out_a = await _done_loop(store, emb_a).run(
+        session_id="sa", credentials=creds_a, user_message="qa"
+    )
+    out_b = await _done_loop(store, emb_b).run(
+        session_id="sb", credentials=creds_b, user_message="qb"
+    )
     assert out_a.status == "done" and out_b.status == "done"
     assert emb_a.calls == [["qa"]]
     assert emb_b.calls == [["qb"]]

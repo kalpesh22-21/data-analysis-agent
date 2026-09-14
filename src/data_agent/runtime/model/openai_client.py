@@ -47,6 +47,15 @@ def _safe_json_loads(text: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _argument_error(raw: str | None) -> str | None:
+    try:
+        if not isinstance(json.loads(raw or ""), dict):
+            return "Tool arguments must be a JSON object. Resubmit this call with valid JSON."
+    except (TypeError, ValueError):
+        return "Tool arguments are malformed JSON. Resubmit this call with valid JSON."
+    return None
+
+
 def _as_plain_dict(obj: Any) -> dict[str, Any]:
     if obj is None:
         return {}
@@ -114,18 +123,18 @@ def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[st
 
 def _responses_incomplete_reason(response: Any) -> str | None:
     """Why the provider ended this Responses round-trip early, or `None` for an ordinary
-        completion.
+    completion.
 
-        A Responses object carries `status="incomplete"` with an `incomplete_details.reason`
-        (`max_output_tokens`, `content_filter`, ...) and, crucially, an `output` list that may
-        hold NO message item at all — so the turn arrives at the loop looking exactly like a
-        model that chose to say nothing. The reason is the only thing that tells those two
-        apart, and it is carried out for TELEMETRY, not for branching (see
-        `ModelTurnResult.incomplete_reason`).
+    A Responses object carries `status="incomplete"` with an `incomplete_details.reason`
+    (`max_output_tokens`, `content_filter`, ...) and, crucially, an `output` list that may
+    hold NO message item at all — so the turn arrives at the loop looking exactly like a
+    model that chose to say nothing. The reason is the only thing that tells those two
+    apart, and it is carried out for TELEMETRY, not for branching (see
+    `ModelTurnResult.incomplete_reason`).
 
-        `"incomplete"` is the fallback when the status says the response was cut short but no
-        reason is given: an empty string here would read as "ordinary completion" at every
-        `if reason:` downstream, which is the one thing this must never do.
+    `"incomplete"` is the fallback when the status says the response was cut short but no
+    reason is given: an empty string here would read as "ordinary completion" at every
+    `if reason:` downstream, which is the one thing this must never do.
     """
     if getattr(response, "status", None) != "incomplete":
         return None
@@ -159,6 +168,8 @@ def _responses_result_to_turn(response: Any) -> ModelTurnResult:
                     id=item.call_id,
                     name=item.name,
                     arguments=_safe_json_loads(item.arguments),
+                    argument_error=_argument_error(item.arguments),
+                    raw_arguments=item.arguments,
                 )
             )
     assistant_text = "\n".join(assistant_text_parts) if assistant_text_parts else None
@@ -190,6 +201,9 @@ def _messages_to_chat(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         role = message["role"]
         if role == "assistant":
             entry: dict[str, Any] = {"role": "assistant", "content": message.get("content")}
+            for key in ("reasoning_content", "reasoning", "reasoning_details"):
+                if key in message:
+                    entry[key] = message[key]
             tool_calls = message.get("tool_calls")
             if tool_calls:
                 entry["tool_calls"] = [dict(tc) for tc in tool_calls]
@@ -245,6 +259,8 @@ def _chat_result_to_turn(response: Any) -> ModelTurnResult:
                 id=tool_call.id,
                 name=function.name,
                 arguments=_safe_json_loads(function.arguments),
+                argument_error=_argument_error(function.arguments),
+                raw_arguments=function.arguments,
             )
         )
     # THE REFUSAL, on this transport too: a Chat message carries it as a sibling
@@ -258,6 +274,11 @@ def _chat_result_to_turn(response: Any) -> ModelTurnResult:
         assistant_text=assistant_text,
         tool_calls=tool_calls,
         usage=usage,
+        reasoning_metadata={
+            key: getattr(message, key)
+            for key in ("reasoning_content", "reasoning", "reasoning_details")
+            if getattr(message, key, None) is not None
+        },
         incomplete_reason=(
             finish_reason if finish_reason in _CHAT_INCOMPLETE_FINISH_REASONS else None
         ),
@@ -278,7 +299,9 @@ class OpenAIModelClient:
         max_retries: int = 2,
         backoff_base_seconds: float = 0.5,
         sleep: _AsyncSleep = asyncio.sleep,
+        use_reasoning_metadata: bool = False,
     ) -> None:
+        self._use_reasoning_metadata = use_reasoning_metadata
         self._client = client
         self._model = model
         self._max_retries = max_retries
@@ -289,9 +312,9 @@ class OpenAIModelClient:
     def begin_turn(self) -> OpenAIModelClient:
         """Return a FRESH handle with reset Responses/Chat fallback stickiness.
 
-                Deliberately does NOT mutate `self`, which may be a process-wide singleton
-                shared across concurrent `/turn` requests. The returned wrapper reuses the same
-                `AsyncOpenAI` transport; callers must use it for every `send_turn` in the turn.
+        Deliberately does NOT mutate `self`, which may be a process-wide singleton
+        shared across concurrent `/turn` requests. The returned wrapper reuses the same
+        `AsyncOpenAI` transport; callers must use it for every `send_turn` in the turn.
         """
         return OpenAIModelClient(
             self._client,
@@ -299,11 +322,14 @@ class OpenAIModelClient:
             max_retries=self._max_retries,
             backoff_base_seconds=self._backoff_base_seconds,
             sleep=self._sleep,
+            use_reasoning_metadata=self._use_reasoning_metadata,
         )
 
     async def send_turn(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurnResult:
+        if self._use_reasoning_metadata:
+            return await self._call_chat_with_retry(messages, tools)
         if not self._fell_back_this_turn:
             try:
                 return await self._call_responses(messages, tools)
@@ -320,6 +346,7 @@ class OpenAIModelClient:
             model=self._model,
             input=_messages_to_responses_input(messages),
             tools=list(tools),
+            **({"tool_choice": "required"} if tools else {}),
         )
         return _responses_result_to_turn(response)
 
@@ -327,12 +354,24 @@ class OpenAIModelClient:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurnResult:
         chat_messages = _messages_to_chat(messages)
+        if not self._use_reasoning_metadata:
+            chat_messages = [
+                {
+                    k: v
+                    for k, v in m.items()
+                    if k not in {"reasoning_content", "reasoning", "reasoning_details"}
+                }
+                for m in chat_messages
+            ]
         chat_tools = _tools_to_chat(tools)
         attempt = 0
         while True:
             try:
                 response = await self._client.chat.completions.create(
-                    model=self._model, messages=chat_messages, tools=chat_tools
+                    model=self._model,
+                    messages=chat_messages,
+                    tools=chat_tools,
+                    **({"tool_choice": "required"} if chat_tools else {}),
                 )
                 return _chat_result_to_turn(response)
             except Exception as exc:
@@ -343,15 +382,15 @@ class OpenAIModelClient:
 
 
 def build_openai_model_client(
-    *, api_key: str, model: str, base_url: str = ""
+    *, api_key: str, model: str, base_url: str = "", use_reasoning_metadata: bool = False
 ) -> OpenAIModelClient:
     """Construct an `OpenAIModelClient` wired to a real `AsyncOpenAI` client.
 
-        Kept separate from `__init__` so tests can inject a mock `client` without
-        constructing a real `AsyncOpenAI` (which validates `api_key` eagerly).
+    Kept separate from `__init__` so tests can inject a mock `client` without
+    constructing a real `AsyncOpenAI` (which validates `api_key` eagerly).
     """
     client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None)
-    return OpenAIModelClient(client, model=model)
+    return OpenAIModelClient(client, model=model, use_reasoning_metadata=use_reasoning_metadata)
 
 
 __all__ = [

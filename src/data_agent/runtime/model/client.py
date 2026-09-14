@@ -28,34 +28,37 @@ class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any]
+    argument_error: str | None = None
+    raw_arguments: str | None = None
 
 
 @dataclass(frozen=True)
 class ModelTurnResult:
     """The outcome of one `ModelClient.send_turn` round-trip.
 
-        Empty `tool_calls` is an invalid non-terminal model response; final answers use
-        an explicit answer tool. `assistant_text` contains any incidental model prose.
-        `usage` carries whatever token counters the provider reports;
-        `loop/budget_guard.py` reads `total_tokens` if present.
+    Empty `tool_calls` is an invalid non-terminal model response; final answers use
+    an explicit answer tool. `assistant_text` contains any incidental model prose.
+    `usage` carries whatever token counters the provider reports;
+    `loop/budget_guard.py` reads `total_tokens` if present.
 
-        `incomplete_reason` IS A DIAGNOSTIC, NEVER CONTROL FLOW. A provider can end a
-        round-trip with NO text and NO tool calls — a truncated completion, a response the
-        provider marked `incomplete` — and from the loop's side that is indistinguishable
-        from a model that simply said nothing. The loop's empty-answer gate treats both the
-        same way (it refuses the finish once either way); this field exists so the event it
-        emits says WHICH it was, because "the model returned nothing" and "the completion
-        was cut off at the token cap" call for opposite fixes. `None` means the provider
-        reported an ordinary completion — it does NOT mean the text is non-empty.
+    `incomplete_reason` IS A DIAGNOSTIC, NEVER CONTROL FLOW. A provider can end a
+    round-trip with NO text and NO tool calls — a truncated completion, a response the
+    provider marked `incomplete` — and from the loop's side that is indistinguishable
+    from a model that simply said nothing. The loop's empty-answer gate treats both the
+    same way (it refuses the finish once either way); this field exists so the event it
+    emits says WHICH it was, because "the model returned nothing" and "the completion
+    was cut off at the token cap" call for opposite fixes. `None` means the provider
+    reported an ordinary completion — it does NOT mean the text is non-empty.
 
-        Providers set it from their own vocabulary (`max_output_tokens`,
-        `content_filter`, ...), so it is free text for telemetry, not an enum to branch on.
+    Providers set it from their own vocabulary (`max_output_tokens`,
+    `content_filter`, ...), so it is free text for telemetry, not an enum to branch on.
     """
 
     assistant_text: str | None = None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
     incomplete_reason: str | None = None
+    reasoning_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class ModelClient(Protocol):
@@ -66,19 +69,19 @@ class ModelClient(Protocol):
     ) -> ModelTurnResult:
         """One model round-trip: canonical *messages* + *tools* -> `ModelTurnResult`.
 
-                Must not mutate *messages* or *tools* in place, and must never transmit
-                anything beyond what those two arguments already contain (D5).
+        Must not mutate *messages* or *tools* in place, and must never transmit
+        anything beyond what those two arguments already contain (D5).
         """
         ...
 
     def begin_turn(self) -> ModelClient:
         """Optional: return a per-turn-scoped `ModelClient` handle.
 
-                One `ModelClient` instance is shared across concurrent `/turn` requests, so any
-                implementation carrying per-turn state MUST return a fresh, independent handle
-                here, and every `send_turn` in that turn must go through it. Stateless
-                implementations may `return self`; callers go through `begin_turn_client()`,
-                which degrades for doubles that omit this method entirely.
+        One `ModelClient` instance is shared across concurrent `/turn` requests, so any
+        implementation carrying per-turn state MUST return a fresh, independent handle
+        here, and every `send_turn` in that turn must go through it. Stateless
+        implementations may `return self`; callers go through `begin_turn_client()`,
+        which degrades for doubles that omit this method entirely.
         """
         ...
 
@@ -86,8 +89,8 @@ class ModelClient(Protocol):
 def begin_turn_client(model_client: ModelClient) -> ModelClient:
     """Return a per-turn-scoped handle for *model_client*.
 
-        Calls `begin_turn()` if the client implements it (duck-typed), else returns
-        *model_client* unchanged. The single place the loop obtains a turn handle.
+    Calls `begin_turn()` if the client implements it (duck-typed), else returns
+    *model_client* unchanged. The single place the loop obtains a turn handle.
     """
     begin_turn = getattr(model_client, "begin_turn", None)
     if callable(begin_turn):

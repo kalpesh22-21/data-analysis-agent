@@ -22,6 +22,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.budget import _SUMMARY_CONTEXT_PREFIX
@@ -33,6 +35,9 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import RetrievedContext, ThinCard
 from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
@@ -98,7 +103,9 @@ class _FatRunQueryMCP:
         return []
 
 
-async def test_base_prompt_is_messages0_on_every_main_loop_call_through_cap_resume_and_compaction() -> None:
+async def test_base_prompt_is_messages0_on_every_main_loop_call_through_cap_resume_and_compaction() -> (
+    None
+):
     main_model = _RecordingLoopModel()
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatRunQueryMCP(), CATALOG)
@@ -208,7 +215,9 @@ class _MultiTurnModel:
                     ToolCallRequest(
                         id=f"q{self._n}",
                         name="runQuery",
-                        arguments={"sql": f"SELECT EmployeeCode FROM employee WHERE Department='C{self._n}'"},
+                        arguments={
+                            "sql": f"SELECT EmployeeCode FROM employee WHERE Department='C{self._n}'"
+                        },
                     )
                 ],
                 usage={"total_tokens": 5000},
@@ -220,12 +229,14 @@ class _MultiTurnModel:
                     ToolCallRequest(
                         id=f"q{self._n}",
                         name="runQuery",
-                        arguments={"sql": f"SELECT EmployeeCode, Department FROM employee WHERE Department='A{self._n}'"},
+                        arguments={
+                            "sql": f"SELECT EmployeeCode, Department FROM employee WHERE Department='A{self._n}'"
+                        },
                     )
                 ],
                 usage={"total_tokens": 5000},
             )
-        return ModelTurnResult(
+        return final_answer(
             assistant_text=f"[{self.turn_label}] {_BIG_ANSWER}", usage={"total_tokens": 5000}
         )
 
@@ -233,7 +244,9 @@ class _MultiTurnModel:
         return self
 
 
-async def test_base_prompt_survives_across_n_real_turns_with_history_replay_compaction_and_later_cap() -> None:
+async def test_base_prompt_survives_across_n_real_turns_with_history_replay_compaction_and_later_cap() -> (
+    None
+):
     model = _MultiTurnModel()
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatRunQueryMCP(), CATALOG)
@@ -259,7 +272,9 @@ async def test_base_prompt_survives_across_n_real_turns_with_history_replay_comp
         )
         statuses.append(outcome.status)
         while outcome.status == "paused_budget_cap":
-            outcome = await loop.resume(session_id=SESSION_ID, credentials=_creds(), answer="continue")
+            outcome = await loop.resume(
+                session_id=SESSION_ID, credentials=_creds(), answer="continue"
+            )
             statuses.append(outcome.status)
 
     # The later cap turn really tripped the guardrail; all other turns completed.
@@ -358,7 +373,9 @@ class _StubRetrieval:
         )
 
 
-async def test_base_prompt_is_sole_system_message_with_retrieval_wired_through_cap_and_compaction() -> None:
+async def test_base_prompt_is_sole_system_message_with_retrieval_wired_through_cap_and_compaction() -> (
+    None
+):
     main_model = _RecordingLoopModel()
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatRunQueryMCP(), CATALOG)

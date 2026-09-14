@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.dispatch.sql_diagnostics import encode_diagnostic
 from data_agent.runtime.mcp.client import MCPClient, MCPToolError
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.redaction import tool_span_args
@@ -54,12 +55,12 @@ async def resolve_catalog(
     catalog: CatalogHandle | CatalogProvider, credentials: RuntimeCredentials
 ) -> CatalogHandle:
     """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a provider is
-        awaited with the turn's credentials (D75).
+    awaited with the turn's credentials (D75).
 
-        Lives here, beside the `CatalogProvider` alias it destructures, because BOTH holders
-        of a `CatalogHandle | CatalogProvider` have to agree on what the union means: the
-        `isinstance` branch IS the contract, so a third holder should call this rather than
-        re-derive which arm is which.
+    Lives here, beside the `CatalogProvider` alias it destructures, because BOTH holders
+    of a `CatalogHandle | CatalogProvider` have to agree on what the union means: the
+    `isinstance` branch IS the contract, so a third holder should call this rather than
+    re-derive which arm is which.
     """
     if isinstance(catalog, CatalogHandle):
         return catalog
@@ -88,10 +89,10 @@ def _default_observer(event: str, payload: dict[str, Any]) -> None:
 class ToolPause:
     """A runtime tool's request to PAUSE the turn — the generalized `askUser` seam.
 
-        Carried on `ToolResult.pause`; the loop honors it by writing a `PauseCheckpoint` and
-        returning `paused_ask_user`, exactly as for `askUser`. Only RUNTIME tools set it —
-        dispatched MCP tools never pause, and the loop ignores it on a dispatched result.
-        The `blueprint_*` fields carry the D45 mid-DAG resume state.
+    Carried on `ToolResult.pause`; the loop honors it by writing a `PauseCheckpoint` and
+    returning `paused_ask_user`, exactly as for `askUser`. Only RUNTIME tools set it —
+    dispatched MCP tools never pause, and the loop ignores it on a dispatched result.
+    The `blueprint_*` fields carry the D45 mid-DAG resume state.
     """
 
     reason: str  # "blueprint_slot" (Slice C: "blueprint_approval" | "blueprint_when_ask")
@@ -106,14 +107,14 @@ class ToolPause:
 class ToolResult:
     """The outcome of one dispatched tool call — never carries credentials.
 
-        `pause` is set ONLY by a runtime tool that needs to pause the turn, and is `None`
-        for every dispatched MCP tool and every non-pausing runtime tool.
+    `pause` is set ONLY by a runtime tool that needs to pause the turn, and is `None`
+    for every dispatched MCP tool and every non-pausing runtime tool.
 
-        `authoritative` is set True ONLY by `runBlueprint` on a SUCCESSFUL, D56-VERIFIED
-        result. It is False for a `runQuery`, for any denied/errored/paused outcome, and for
-        a blueprint whose verify did not pass — so a `result_preview` shaped identically to
-        a raw query result still carries an unambiguous "this is the trusted answer, do not
-        re-derive" signal into the model's tool message.
+    `authoritative` is set True ONLY by `runBlueprint` on a SUCCESSFUL, D56-VERIFIED
+    result. It is False for a `runQuery`, for any denied/errored/paused outcome, and for
+    a blueprint whose verify did not pass — so a `result_preview` shaped identically to
+    a raw query result still carries an unambiguous "this is the trusted answer, do not
+    re-derive" signal into the model's tool message.
     """
 
     status: Literal["ok", "denied", "error"]
@@ -136,7 +137,8 @@ class ToolResult:
     # every model-facing tool message — regenerates the text from `error_code`
     # alone. So a specific message set on `user_message` is silently dropped, and
     # the model is told only the generic string. `denial_detail` is the persisted
-    # channel that actually arrives.
+    # channel that actually arrives. SQL diagnostics use a bounded JSON payload
+    # with a sql_diagnostic: prefix, decoded into a separate model-facing field.
     denial_detail: str | None = None
     # `window_note` (additive, J7): the one-line honesty note for a blueprint whose
     # window is DATA-anchored — it counts back from the latest data on record, not from
@@ -184,20 +186,20 @@ def _cap_list_under_key(
     raw_result: dict[str, Any], key: str, max_result_tokens: int
 ) -> tuple[dict[str, Any], int, int]:
     """Keep the HEAD of `raw_result[key]` — as many leading items as fit under
-        *max_result_tokens* — and return `(capped_dict, kept_count, total_count)`.
+    *max_result_tokens* — and return `(capped_dict, kept_count, total_count)`.
 
-        The head is kept because the caller hands in a RANKED list (the score-ordered
-        blueprint cards), so dropping the tail degrades it the way a ranked list should. The
-        other top-level keys ride along untouched, so the result stays the SAME SHAPE the
-        model expects — a dict with a shorter list under *key*, never a string.
+    The head is kept because the caller hands in a RANKED list (the score-ordered
+    blueprint cards), so dropping the tail degrades it the way a ranked list should. The
+    other top-level keys ride along untouched, so the result stays the SAME SHAPE the
+    model expects — a dict with a shorter list under *key*, never a string.
 
-        NOT for column lists: a schema's columns are ordered but NOT ranked, and head-cutting
-        them dropped the NAMES of everything past the cut. That branch delegates to
-        `schema_preview.fit_schema_under_cap`, which degrades per-column detail instead.
+    NOT for column lists: a schema's columns are ordered but NOT ranked, and head-cutting
+    them dropped the NAMES of everything past the cut. That branch delegates to
+    `schema_preview.fit_schema_under_cap`, which degrades per-column detail instead.
 
-        No minimum-one carve-out: if not even the first item fits, the list comes back empty.
-        Forcing an over-cap item back in would reintroduce exactly the unbounded cell this
-        cap exists to prevent, and the caller's `_truncated` marker names the drop either way.
+    No minimum-one carve-out: if not even the first item fits, the list comes back empty.
+    Forcing an over-cap item back in would reintroduce exactly the unbounded cell this
+    cap exists to prevent, and the caller's `_truncated` marker names the drop either way.
     """
     items = raw_result[key]
     base = {k: v for k, v in raw_result.items() if k != key}
@@ -220,33 +222,33 @@ def _cap_nontabular_result(
     schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
 ) -> tuple[Any, bool]:
     """Bound a non-tabular tool result stored as ONE preview cell (especially a wide
-        `getTableSchema`) so it can never be an unbounded blob that the row-count-only trail
-        budget never trims. Returns `(capped_value, truncated)`, always valid and parseable:
+    `getTableSchema`) so it can never be an unbounded blob that the row-count-only trail
+    budget never trims. Returns `(capped_value, truncated)`, always valid and parseable:
 
-          * a `{... "columns": [...]}` dict ALWAYS goes through
-            `schema_preview.fit_schema_under_cap`;
-          * a `{... "blueprints": [...]}` dict keeps the HEAD of the ranked card list;
-          * any other over-cap value is rendered to a string and truncated at the cap with a
-            `…[truncated: N of M chars omitted]` marker.
+      * a `{... "columns": [...]}` dict ALWAYS goes through
+        `schema_preview.fit_schema_under_cap`;
+      * a `{... "blueprints": [...]}` dict keeps the HEAD of the ranked card list;
+      * any other over-cap value is rendered to a string and truncated at the cap with a
+        `…[truncated: N of M chars omitted]` marker.
 
-        THE SCHEMA BRANCH RUNS FIRST AND UNCONDITIONALLY: it is the one branch that is not a
-        size cap — it also strips the PRE-APPLIED TENANCY COLUMNS, which are not the model's
-        to filter on at any size, so a small schema must go through it too. It then fits the
-        COLUMNS SECTION ALONE under *schema_columns_token_budget*, with the table-level
-        sections riding complete and unbudgeted. A schema whose columns fit is returned
-        COMPACTED-STABLE rather than byte-identical. *question*, when the caller has one,
-        only ORDERS the columns (D25).
+    THE SCHEMA BRANCH RUNS FIRST AND UNCONDITIONALLY: it is the one branch that is not a
+    size cap — it also strips the PRE-APPLIED TENANCY COLUMNS, which are not the model's
+    to filter on at any size, so a small schema must go through it too. It then fits the
+    COLUMNS SECTION ALONE under *schema_columns_token_budget*, with the table-level
+    sections riding complete and unbudgeted. A schema whose columns fit is returned
+    COMPACTED-STABLE rather than byte-identical. *question*, when the caller has one,
+    only ORDERS the columns (D25).
 
-        Only `getTableSchema` reaches that branch: `_build_preview` has already routed every
-        tabular result and every bare list elsewhere, and no other non-tabular tool result
-        carries a top-level `columns` list.
+    Only `getTableSchema` reaches that branch: `_build_preview` has already routed every
+    tabular result and every bare list elsewhere, and no other non-tabular tool result
+    carries a top-level `columns` list.
 
-        The card branch exists because a `searchBlueprints` result carries no top-level
-        `columns` key: without it, maximally-slotted cards crossing the cap fell through to
-        stringify-and-truncate and the model received a MANGLED JSON STRING ending in a
-        truncation marker instead of a card list, on the release's primary route.
+    The card branch exists because a `searchBlueprints` result carries no top-level
+    `columns` key: without it, maximally-slotted cards crossing the cap fell through to
+    stringify-and-truncate and the model received a MANGLED JSON STRING ending in a
+    truncation marker instead of a card list, on the release's primary route.
 
-        Under the cap a non-schema value is returned unchanged (`truncated=False`).
+    Under the cap a non-schema value is returned unchanged (`truncated=False`).
     """
     if isinstance(raw_result, dict) and isinstance(raw_result.get("columns"), list):
         fitted, report = fit_schema_under_cap(
@@ -323,6 +325,23 @@ def _cap_nontabular_result(
         capped, kept_count, total_cards = _cap_list_under_key(
             raw_result, "blueprints", max_result_tokens
         )
+        if isinstance(capped.get("searches"), list):
+            visible_ids = {
+                card.get("id") for card in capped["blueprints"] if isinstance(card, dict)
+            }
+            groups = []
+            for group in capped["searches"]:
+                if not isinstance(group, dict) or not isinstance(group.get("blueprint_ids"), list):
+                    continue
+                visible = [ident for ident in group["blueprint_ids"] if ident in visible_ids]
+                groups.append(
+                    {
+                        **group,
+                        "blueprint_ids": visible,
+                        "omitted_count": len(group["blueprint_ids"]) - len(visible),
+                    }
+                )
+            capped["searches"] = groups
         omitted = total_cards - kept_count
         if kept_count == 0:
             # The cap is too small for even ONE card (no minimum-one carve-out, see
@@ -339,6 +358,12 @@ def _cap_nontabular_result(
                 f"…[truncated: the {omitted} lowest-scoring of {total_cards} blueprint "
                 f"cards were omitted to fit — the {kept_count} best matches are shown "
                 f"in full; search again with a narrower intent if none of them fits]"
+            )
+        if "searches" in capped:
+            capped["_truncated"] = (
+                f"{omitted} of {total_cards} blueprint cards were omitted to fit the preview. "
+                "Each search group identifies its visible matches and omitted count. "
+                "An empty group with omissions is not evidence of no matching blueprint."
             )
         # RECONCILE THE RIDDEN-ALONG COUNT. `count` is set by
         # `retrieval/tools.py::SearchBlueprintsTool` to the PRE-cap card total and
@@ -406,18 +431,18 @@ def _build_preview(
 ) -> ResultPreview:
     """Build the `{columns, row_count, truncated, preview_rows}` preview object.
 
-        Handles the three MCP result shapes the tools return: `{columns, rows, row_count,
-        truncated}`, a bare list of dicts, and a small non-tabular dict. The first two
-        enforce the N-row preview cap. A non-tabular dict is additionally SIZE-capped to
-        `max_result_tokens` — except a `getTableSchema`, whose COLUMNS SECTION is budgeted
-        separately by `schema_columns_token_budget` while its table-level sections ride
-        complete, and which is reshaped on EVERY path so the pre-applied tenancy columns
-        never reach the model (see `_cap_nontabular_result`).
+    Handles the three MCP result shapes the tools return: `{columns, rows, row_count,
+    truncated}`, a bare list of dicts, and a small non-tabular dict. The first two
+    enforce the N-row preview cap. A non-tabular dict is additionally SIZE-capped to
+    `max_result_tokens` — except a `getTableSchema`, whose COLUMNS SECTION is budgeted
+    separately by `schema_columns_token_budget` while its table-level sections ride
+    complete, and which is reshaped on EVERY path so the pre-applied tenancy columns
+    never reach the model (see `_cap_nontabular_result`).
 
-        *observer*/*tool_name* are used ONLY to report a size-cap degrade. *question* is the
-        turn's raw user text, supplied ONLY by the agent loop's dispatch site; it reaches the
-        schema fitter, where it orders which columns keep their documentation, and is never
-        written into any output (D25).
+    *observer*/*tool_name* are used ONLY to report a size-cap degrade. *question* is the
+    turn's raw user text, supplied ONLY by the agent loop's dispatch site; it reaches the
+    schema fitter, where it orders which columns keep their documentation, and is never
+    written into any output (D25).
     """
     if isinstance(raw_result, dict) and "rows" in raw_result and "columns" in raw_result:
         rows = raw_result["rows"]
@@ -533,16 +558,16 @@ class ToolDispatcher:
     ) -> frozenset[tuple[str, str]] | None:
         """The D44 USES set of a query that is NOT being dispatched.
 
-                `answerWithTable` may designate a query the agent never ran — that is the
-                documented contract, because the executed query usually carries a LIMIT the agent
-                chose for its own reading and paging needs the un-capped shape. Such a query
-                appears in no trail entry's provenance, so the turn union does not cover it and
-                the read path cannot otherwise tell whether the table it offers is still in scope.
+        `answerWithTable` may designate a query the agent never ran — that is the
+        documented contract, because the executed query usually carries a LIMIT the agent
+        chose for its own reading and paging needs the un-capped shape. Such a query
+        appears in no trail entry's provenance, so the turn union does not cover it and
+        the read path cannot otherwise tell whether the table it offers is still in scope.
 
-                SAME extractor, SAME catalog, SAME `capture_provenance` entry point as a real
-                `runQuery` dispatch, so the two can never disagree about one query. Reads NOTHING
-                and dispatches NOTHING: it parses a string. Degrades to `None` (undetermined)
-                rather than raising.
+        SAME extractor, SAME catalog, SAME `capture_provenance` entry point as a real
+        `runQuery` dispatch, so the two can never disagree about one query. Reads NOTHING
+        and dispatches NOTHING: it parses a string. Degrades to `None` (undetermined)
+        rather than raising.
         """
         try:
             catalog = await self._resolve_catalog(credentials)
@@ -568,25 +593,25 @@ class ToolDispatcher:
         question: str | None = None,
     ) -> ToolResult:
         """Dispatch one tool call. `emit_progress=False` silences the
-                `tool_dispatch_start`/`ok`/`denied`/`error` OBSERVER events for THIS call and
-                nothing else.
+        `tool_dispatch_start`/`ok`/`denied`/`error` OBSERVER events for THIS call and
+        nothing else.
 
-                `blueprint/executor.py` runs every node of a composed blueprint through this same
-                choke point, and those events are UI progress labels — so a single `runBlueprint`
-                otherwise painted the user a "running runQuery…" line per internal node, exposing
-                that the answer is assembled from queries over internal tables. The OUTER
-                `runBlueprint` dispatch from the agent loop still emits normally, so the turn is
-                never silent.
+        `blueprint/executor.py` runs every node of a composed blueprint through this same
+        choke point, and those events are UI progress labels — so a single `runBlueprint`
+        otherwise painted the user a "running runQuery…" line per internal node, exposing
+        that the answer is assembled from queries over internal tables. The OUTER
+        `runBlueprint` dispatch from the agent loop still emits normally, so the turn is
+        never silent.
 
-                SCOPE, deliberately narrow — this gates the OBSERVER channel only. The
-                Phoenix/OTel span is UNAFFECTED (an operator debugging a blueprint needs every
-                inner node's span), `tool_dispatch_cards_dropped` is UNAFFECTED (an operator
-                degrade signal that never reached the UI), and control flow is UNAFFECTED.
+        SCOPE, deliberately narrow — this gates the OBSERVER channel only. The
+        Phoenix/OTel span is UNAFFECTED (an operator debugging a blueprint needs every
+        inner node's span), `tool_dispatch_cards_dropped` is UNAFFECTED (an operator
+        degrade signal that never reached the UI), and control flow is UNAFFECTED.
 
-                `question` is the turn's raw user text, supplied ONLY by the agent loop's own
-                dispatch site. Its ONE use is to order which columns of an over-cap schema keep
-                their documentation; it is never persisted, never spanned, never echoed into a
-                result (D25).
+        `question` is the turn's raw user text, supplied ONLY by the agent loop's own
+        dispatch site. Its ONE use is to order which columns of an over-cap schema keep
+        their documentation; it is never persisted, never spanned, never echoed into a
+        result (D25).
         """
         # One local, resolved once: the four progress events below route through it,
         # so a future event added to this method cannot silently escape the gate by
@@ -611,7 +636,7 @@ class ToolDispatcher:
             # (catalog metadata only — not PII / cell values), so showing it lets
             # the model self-correct by seeing WHICH columns it lacks instead of
             # retrying blind. All other codes (and the transport path below) stay
-            # canned.
+            # canned, except for allowlisted structured SQL diagnostics (never raw text).
             #
             # It rides `denial_detail`, NOT `user_message`. This carve-out used to
             # set only `user_message` and claim the specific text "already reached
@@ -630,7 +655,13 @@ class ToolDispatcher:
             denial_detail: str | None = None
             if denial.code == "COLUMN_SCOPE_VIOLATION" and exc.message:
                 denial_detail = exc.message
-            user_message = denial_detail or denial.user_message
+            if denial.code == "CLICKHOUSE_QUERY_ERROR":
+                denial_detail = encode_diagnostic(exc.message or "", str(model_args.get("sql", "")))
+            user_message = (
+                denial.user_message
+                if denial.code == "CLICKHOUSE_QUERY_ERROR"
+                else denial_detail or denial.user_message
+            )
             emit(
                 "tool_dispatch_denied",
                 {"tool_name": tool_name, "error_code": denial.code, "tool_call_id": tool_call_id},

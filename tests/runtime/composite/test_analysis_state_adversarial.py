@@ -46,9 +46,7 @@ class _Recorder:
 
 
 def _tool(store: InMemorySessionStore, observer: _Recorder | None = None):
-    return UpdateAnalysisStateTool(
-        session_store=store, observer=observer or _Recorder()
-    )
+    return UpdateAnalysisStateTool(session_store=store, observer=observer or _Recorder())
 
 
 async def _entry(
@@ -176,11 +174,17 @@ async def test_an_update_tolerates_the_same_placeholders() -> None:
     intent pending until enforcement force-blocked it."""
     store = InMemorySessionStore()
     observer = _Recorder()
-    tool = await _initialized(store, "headcount by dept", "avg salary by dept",
-                              observer=observer)
+    tool = await _initialized(store, "headcount by dept", "avg salary by dept", observer=observer)
     await _entry(store, "call_q", "runQuery", serves_intent="i1")
-    await _entry(store, "call_denied", "runQuery", status="denied",
-                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None, serves_intent="i2")
+    await _entry(
+        store,
+        "call_denied",
+        "runQuery",
+        status="denied",
+        error_code="COLUMN_SCOPE_VIOLATION",
+        row_count=None,
+        serves_intent="i2",
+    )
 
     result = await tool.run(
         {
@@ -226,8 +230,16 @@ async def test_a_pending_update_tolerates_the_placeholder_enum_too() -> None:
     store = InMemorySessionStore()
     tool = await _initialized(store, "a")
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "pending",
-                      "evidence_tool_call_id": "", "reason_code": "NO_ACCESS"}]},
+        {
+            "intents": [
+                {
+                    "intent_id": "i1",
+                    "status": "pending",
+                    "evidence_tool_call_id": "",
+                    "reason_code": "NO_ACCESS",
+                }
+            ]
+        },
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
@@ -242,8 +254,17 @@ async def test_an_empty_intent_id_is_absent_but_a_supplied_one_is_still_rejected
     observer = _Recorder()
     result = await _reject(
         _tool(InMemorySessionStore(), observer),
-        {"intents": [{"description": "a", "intent_id": "i7", "status": "pending",
-                      "evidence_tool_call_id": "", "reason_code": "NO_ACCESS"}]},
+        {
+            "intents": [
+                {
+                    "description": "a",
+                    "intent_id": "i7",
+                    "status": "pending",
+                    "evidence_tool_call_id": "",
+                    "reason_code": "NO_ACCESS",
+                }
+            ]
+        },
     )
     assert "assigned by the runtime" in result.denial_detail
     assert {"reason": "model_supplied_intent_id", "intent_count": 1} in observer.named(
@@ -261,8 +282,17 @@ async def test_a_non_pending_status_on_initialize_is_rejected_not_ignored() -> N
         observer = _Recorder()
         result = await _reject(
             _tool(store, observer),
-            {"intents": [{"description": "a", "intent_id": "", "status": status,
-                          "evidence_tool_call_id": "", "reason_code": "NO_ACCESS"}]},
+            {
+                "intents": [
+                    {
+                        "description": "a",
+                        "intent_id": "",
+                        "status": status,
+                        "evidence_tool_call_id": "",
+                        "reason_code": "NO_ACCESS",
+                    }
+                ]
+            },
         )
         assert status in result.denial_detail
         assert {"reason": "status_on_initialize", "intent_count": 1} in observer.named(
@@ -288,8 +318,17 @@ async def test_an_all_placeholder_item_has_no_description_at_all() -> None:
     observer = _Recorder()
     result = await _reject(
         _tool(InMemorySessionStore(), observer),
-        {"intents": [{"description": "  ", "intent_id": "", "status": "pending",
-                      "evidence_tool_call_id": "", "reason_code": "NO_ACCESS"}]},
+        {
+            "intents": [
+                {
+                    "description": "  ",
+                    "intent_id": "",
+                    "status": "pending",
+                    "evidence_tool_call_id": "",
+                    "reason_code": "NO_ACCESS",
+                }
+            ]
+        },
     )
     assert "non-empty 'description'" in result.denial_detail
     assert {"reason": "missing_description", "intent_count": 1} in observer.named(
@@ -308,8 +347,7 @@ async def test_adding_an_intent_by_update_is_rejected() -> None:
     await _entry(store, "call_q", "runQuery")
     await _reject(
         tool,
-        {"intents": [{"intent_id": "i9", "status": "completed",
-                      "evidence_tool_call_id": "call_q"}]},
+        {"intents": [{"intent_id": "i9", "status": "completed", "result_id": "call_q"}]},
     )
 
 
@@ -320,8 +358,7 @@ async def test_dropping_an_intent_is_structurally_impossible() -> None:
     tool = await _initialized(store, "easy", "hard")
     await _entry(store, "call_q", "runQuery")
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "completed",
-                      "evidence_tool_call_id": "call_q"}]},
+        {"intents": [{"intent_id": "i1", "status": "completed", "result_id": "call_q"}]},
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
@@ -352,9 +389,7 @@ async def test_rewriting_a_description_is_rejected() -> None:
 
 async def test_model_supplied_intent_id_on_initialize_is_rejected() -> None:
     store = InMemorySessionStore()
-    result = await _reject(
-        _tool(store), {"intents": [{"description": "a", "intent_id": "i7"}]}
-    )
+    result = await _reject(_tool(store), {"intents": [{"description": "a", "intent_id": "i7"}]})
     assert "assigned by the runtime" in result.denial_detail
 
 
@@ -415,18 +450,27 @@ async def test_a_runtime_only_reason_code_from_the_model_is_unreachable() -> Non
     for code in ("ENFORCEMENT_EXHAUSTED", "BUDGET_EXHAUSTED", "USER_STOPPED"):
         store = InMemorySessionStore()
         tool = await _initialized(store, "a")
-        await _entry(store, "call_q", "runQuery", status="denied",
-                     error_code="COLUMN_SCOPE_VIOLATION", row_count=None,
-                     serves_intent="i1")
+        await _entry(
+            store,
+            "call_q",
+            "runQuery",
+            status="denied",
+            error_code="COLUMN_SCOPE_VIOLATION",
+            row_count=None,
+            serves_intent="i1",
+        )
         result = await tool.run(
             {"intents": [{"intent_id": "i1", "status": "blocked", "reason_code": code}]},
             _credentials(),
             turn=TurnContext(turn_index=TURN),
         )
         assert result.status == "ok", result.denial_detail
-        assert live_analysis_state(
-            await store.get_or_create_session(SESSION_ID), TURN
-        ).intents[0].reason_code == "NO_ACCESS"
+        assert (
+            live_analysis_state(await store.get_or_create_session(SESSION_ID), TURN)
+            .intents[0]
+            .reason_code
+            == "NO_ACCESS"
+        )
 
 
 async def test_a_terminal_status_cannot_be_reached_with_no_binding_at_all() -> None:
@@ -446,14 +490,20 @@ async def test_a_terminal_status_cannot_be_reached_with_no_binding_at_all() -> N
     # ...and the retired names cannot smuggle one in either.
     await _entry(store, "call_q", "runQuery")
     for legacy in ({"evidence_tool_call_id": "call_q"}, {"reason_code": "NO_ACCESS"}):
-        await _reject(
-            tool, {"intents": [{"intent_id": "i1", "status": "blocked", **legacy}]}
-        )
+        await _reject(tool, {"intents": [{"intent_id": "i1", "status": "blocked", **legacy}]})
     # `pending` is accepted and records NOTHING — the placeholder cannot make an
     # unresolved intent look evidenced.
     pending = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "pending",
-                      "evidence_tool_call_id": "call_q", "reason_code": "NO_ACCESS"}]},
+        {
+            "intents": [
+                {
+                    "intent_id": "i1",
+                    "status": "pending",
+                    "evidence_tool_call_id": "call_q",
+                    "reason_code": "NO_ACCESS",
+                }
+            ]
+        },
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
@@ -470,15 +520,25 @@ async def test_one_denial_cannot_block_three_intents() -> None:
     store = InMemorySessionStore()
     observer = _Recorder()
     tool = await _initialized(store, "a", "b", "c", observer=observer)
-    await _entry(store, "call_scratch", "getTableSchema", status="denied",
-                 error_code="SCRATCH_SESSION_VIOLATION", row_count=None)
+    await _entry(
+        store,
+        "call_scratch",
+        "getTableSchema",
+        status="denied",
+        error_code="SCRATCH_SESSION_VIOLATION",
+        row_count=None,
+    )
 
     result = await _reject(
         tool,
         {
             "intents": [
-                {"intent_id": i, "status": "blocked", "reason_code": "NO_ACCESS",
-                 "evidence_tool_call_id": "call_scratch"}
+                {
+                    "intent_id": i,
+                    "status": "blocked",
+                    "reason_code": "NO_ACCESS",
+                    "result_id": "call_scratch",
+                }
                 for i in ("i1", "i2", "i3")
             ]
         },
@@ -496,19 +556,41 @@ async def test_block_evidence_distinctness_holds_across_separate_calls() -> None
     earlier call already used."""
     store = InMemorySessionStore()
     tool = await _initialized(store, "a", "b")
-    await _entry(store, "call_denied", "runQuery", status="denied",
-                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None)
+    await _entry(
+        store,
+        "call_denied",
+        "runQuery",
+        status="denied",
+        error_code="COLUMN_SCOPE_VIOLATION",
+        row_count=None,
+    )
     ok = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "blocked", "reason_code": "NO_ACCESS",
-                      "evidence_tool_call_id": "call_denied"}]},
+        {
+            "intents": [
+                {
+                    "intent_id": "i1",
+                    "status": "blocked",
+                    "reason_code": "NO_ACCESS",
+                    "result_id": "call_denied",
+                }
+            ]
+        },
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
     assert ok.status == "ok"
     await _reject(
         tool,
-        {"intents": [{"intent_id": "i2", "status": "blocked", "reason_code": "NO_ACCESS",
-                      "evidence_tool_call_id": "call_denied"}]},
+        {
+            "intents": [
+                {
+                    "intent_id": "i2",
+                    "status": "blocked",
+                    "reason_code": "NO_ACCESS",
+                    "result_id": "call_denied",
+                }
+            ]
+        },
     )
 
 
@@ -516,15 +598,14 @@ async def test_completion_evidence_reuse_is_permitted_and_flagged() -> None:
     """The deliberate asymmetry: one query genuinely answers two asks."""
     store = InMemorySessionStore()
     observer = _Recorder()
-    tool = await _initialized(store, "headcount by dept", "avg salary by dept",
-                              observer=observer)
+    tool = await _initialized(store, "headcount by dept", "avg salary by dept", observer=observer)
     await _entry(store, "call_q", "runQuery")
 
     result = await tool.run(
         {
             "intents": [
-                {"intent_id": "i1", "status": "completed", "evidence_tool_call_id": "call_q"},
-                {"intent_id": "i2", "status": "completed", "evidence_tool_call_id": "call_q"},
+                {"intent_id": "i1", "status": "completed", "result_id": "call_q"},
+                {"intent_id": "i2", "status": "completed", "result_id": "call_q"},
             ]
         },
         _credentials(),
@@ -554,9 +635,16 @@ async def test_manufactured_block_evidence_is_permitted_today_and_is_measured() 
     await _entry(store, "call_empty", "runQuery", row_count=0)
 
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "blocked",
-                      "reason_code": "REQUIRED_DATA_UNAVAILABLE",
-                      "evidence_tool_call_id": "call_empty"}]},
+        {
+            "intents": [
+                {
+                    "intent_id": "i1",
+                    "status": "blocked",
+                    "reason_code": "REQUIRED_DATA_UNAVAILABLE",
+                    "result_id": "call_empty",
+                }
+            ]
+        },
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
@@ -573,8 +661,7 @@ async def test_the_same_zero_row_result_completing_an_intent_is_counted_separate
     await _entry(store, "call_empty", "runQuery", row_count=0)
 
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "completed",
-                      "evidence_tool_call_id": "call_empty"}]},
+        {"intents": [{"intent_id": "i1", "status": "completed", "result_id": "call_empty"}]},
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
@@ -600,8 +687,7 @@ async def test_no_event_payload_ever_carries_a_description(monkeypatch) -> None:
     tool = await _initialized(store, secret, "second deliverable", observer=observer)
     await _entry(store, "call_q", "runQuery", row_count=0)
     await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "completed",
-                      "evidence_tool_call_id": "call_q"}]},
+        {"intents": [{"intent_id": "i1", "status": "completed", "result_id": "call_q"}]},
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )

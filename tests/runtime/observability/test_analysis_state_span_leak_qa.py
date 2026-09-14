@@ -23,6 +23,7 @@ import json
 import re
 from typing import Any
 
+import pytest
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -47,6 +48,9 @@ from data_agent.runtime.observability.progress import combine_observers
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import INTENT_STATUSES, REASON_CODES
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-span-leak-qa"
 _E = "dbpcm_warehouse.employee"
@@ -78,7 +82,17 @@ def _credentials() -> RuntimeCredentials:
 
 
 async def _tools_provider(_c: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in [
+            "runQuery",
+            "getTableSchema",
+            "listDatabases",
+            "listTables",
+            "sampleRows",
+            "explainQuery",
+        ]
+    ]
 
 
 def _init_call(call_id: str, *descriptions: str) -> ToolCallRequest:
@@ -139,7 +153,7 @@ def _script() -> list[ModelTurnResult]:
                 ToolCallRequest(id="s3", name=STATE, arguments={"description": DESC_ONE}),
             ],
         ),
-        ModelTurnResult(assistant_text=f"{CELL_VALUE}: 12 people."),
+        final_answer(assistant_text=f"{CELL_VALUE}: 12 people."),
     ]
 
 
@@ -176,9 +190,7 @@ async def _run_turn() -> tuple[list[Any], list[tuple[str, dict[str, Any]]]]:
         max_budget_windows=3,
         observer=observer,
         runtime_tools={
-            STATE: UpdateAnalysisStateTool(
-                session_store=store, observer=observer, tracer=tracer
-            ),
+            STATE: UpdateAnalysisStateTool(session_store=store, observer=observer, tracer=tracer),
             ANSWER: AnswerWithTableTool(),
         },
     )
@@ -196,9 +208,7 @@ async def test_no_span_from_a_multi_intent_turn_carries_content() -> None:
 
     assert spans, "the scan proved nothing — no spans were exported"
     assert any(name.startswith("loop_analysis_state") for name, _ in events)
-    blob = json.dumps(
-        [[span.name, dict(span.attributes or {})] for span in spans], default=str
-    )
+    blob = json.dumps([[span.name, dict(span.attributes or {})] for span in spans], default=str)
     for canary in CANARIES:
         assert canary not in blob, (
             f"{canary!r} reached a span attribute. Telemetry is shape-only (D25): "
@@ -326,7 +336,7 @@ async def test_every_string_on_an_analysis_state_event_matches_a_closed_shape() 
 
 
 def test_a_rogue_payload_key_never_reaches_a_span() -> None:
-    """"An emitter that adds an unexpected key" — the failure mode the allowlist
+    """ "An emitter that adds an unexpected key" — the failure mode the allowlist
     exists for, exercised directly. It is deliberately NOT a type filter: a bare
     `isinstance` check leaked `loop_paused_ask_user`'s `question` once. So a new
     emit site that forgets D25 and sends `description`/`sql`/`column_scope` is

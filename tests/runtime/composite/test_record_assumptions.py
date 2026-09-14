@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.record_assumptions import (
     RecordAssumptionsTool,
@@ -27,6 +29,9 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TrailEntry, TurnMessage
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 SESSION_ID = "sess-assumptions"
 CATALOG = CatalogHandle({"db.t": {"c": "String"}})
@@ -106,7 +111,9 @@ def test_clean_assumptions_exactly_at_count_cap_is_kept() -> None:
 
 async def test_tool_returns_ok_confirmation_shape() -> None:
     tool = RecordAssumptionsTool()
-    result = await tool.run({"assumptions": ["A was taken to mean B", "A was taken to mean B"]}, _creds())
+    result = await tool.run(
+        {"assumptions": ["A was taken to mean B", "A was taken to mean B"]}, _creds()
+    )
     assert result.status == "ok"
     assert result.tool_name == "recordAssumptions"
     assert result.error_code is None
@@ -169,7 +176,7 @@ async def test_loop_surfaces_assumptions_on_done_deduped() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Here is the count."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _ = _build_loop(model)
@@ -182,7 +189,9 @@ async def test_loop_surfaces_assumptions_on_done_deduped() -> None:
 
 
 async def test_loop_no_recordassumptions_yields_null_not_empty() -> None:
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="chat only")])
+    model = ScriptedModelClient(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
     loop, _ = _build_loop(model)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="hi")
     assert outcome.status == "done"
@@ -210,10 +219,12 @@ async def test_resume_surfaces_pre_pause_assumptions_on_live_outcome() -> None:
             ),
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="c2", name="askUser", arguments={"question": "Which period?"})
+                    ToolCallRequest(
+                        id="c2", name="askUser", arguments={"question": "Which period?"}
+                    )
                 ]
             ),
-            ModelTurnResult(assistant_text="For Sales in 2026, the answer is 7."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _build_loop(model)
@@ -254,7 +265,7 @@ async def test_recordassumptions_does_not_poison_answer_in_history_e2e() -> None
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="The answer is 42."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _build_loop(model)
@@ -267,7 +278,7 @@ async def test_recordassumptions_does_not_poison_answer_in_history_e2e() -> None
     body = project_history(doc.messages, doc.tool_trail, frozenset(), None)
     turn = body["turns"][0]
     # BOTH the answer and the assumptions must survive (non-None).
-    assert turn["answer"] == "The answer is 42."
+    assert turn["answer"] == "I don't have any information to answer your question."
     assert turn["assumptions"] == ["Assumed the current fiscal year"]
     # The turn's provenance union is determined-empty (a pure recordAssumptions
     # turn read no warehouse data), NOT None — the carve-out held.
@@ -289,13 +300,13 @@ async def test_loop_single_recordassumptions_counts_as_exactly_one_tool_call() -
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Done."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _ = _build_loop(model)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 1
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.
     assert outcome.assumptions == ["Assumed the fiscal year is 2026"]
 
 
@@ -319,19 +330,17 @@ async def test_loop_multiple_recordassumptions_calls_union_and_dedupe() -> None:
                     ToolCallRequest(
                         id="c2",
                         name="recordAssumptions",
-                        arguments={
-                            "assumptions": ["Shared assumption", "Second assumption"]
-                        },
+                        arguments={"assumptions": ["Shared assumption", "Second assumption"]},
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Answer."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _ = _build_loop(model)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 2
+    assert outcome.tool_calls_made == 3  # Includes the explicit final-answer call.
     # UNION across both calls, "Shared assumption" appears once (first-occurrence).
     assert outcome.assumptions == [
         "First assumption",
@@ -359,13 +368,13 @@ async def test_loop_two_recordassumptions_calls_in_one_turn_union_and_dedupe() -
                     ),
                 ]
             ),
-            ModelTurnResult(assistant_text="Answer."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _ = _build_loop(model)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 2
+    assert outcome.tool_calls_made == 3  # Includes the explicit final-answer call.
     assert outcome.assumptions == ["A", "B", "C"]
 
 
@@ -384,14 +393,16 @@ async def test_loop_empty_and_all_blank_recordassumptions_yields_null() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="No assumptions."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _ = _build_loop(model)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 1  # the call happened
-    assert outcome.assumptions is None   # ...but nothing survived cleaning
+    assert (
+        outcome.tool_calls_made == 2
+    )  # Includes the explicit final-answer call.  # the call happened
+    assert outcome.assumptions is None  # ...but nothing survived cleaning
 
 
 # --- session_history answer-survival posture -------------------------------
@@ -415,9 +426,7 @@ def _rec_entry(assumptions: list[Any]) -> TrailEntry:
 def test_history_surfaces_assumptions_when_answer_survives() -> None:
     messages = [
         TurnMessage(turn_index=0, role="user", content="q", ts="t"),
-        TurnMessage(
-            turn_index=0, role="assistant", content="a", ts="t", provenance=frozenset()
-        ),
+        TurnMessage(turn_index=0, role="assistant", content="a", ts="t", provenance=frozenset()),
     ]
     trail = [_rec_entry(["Assumed the fiscal year", "  "])]
     body = project_history(messages, trail, frozenset(), None)
@@ -469,9 +478,9 @@ def test_history_withholds_assumptions_when_answer_scope_dropped() -> None:
 
     turn = body["turns"][0]
     assert turn["question"] == "what is the salary?"  # user question always survives
-    assert turn["answer"] is None                     # answer scope-dropped
+    assert turn["answer"] is None  # answer scope-dropped
     assert turn["provenance_union"] is None
-    assert turn["assumptions"] is None                # ...assumptions withheld WITH it
+    assert turn["assumptions"] is None  # ...assumptions withheld WITH it
 
 
 def test_history_surfaces_assumptions_when_answer_survives_narrowed_scope() -> None:
@@ -553,7 +562,10 @@ async def test_successful_call_reaches_the_model_as_its_real_confirmation() -> N
     await store.append_message(
         session_id,
         TurnMessage(
-            turn_index=0, role="user", content="How many hires?", ts="t0",
+            turn_index=0,
+            role="user",
+            content="How many hires?",
+            ts="t0",
             provenance=frozenset(),
         ),
     )
@@ -605,10 +617,16 @@ async def _store_with_assumptions_at_turn0() -> InMemorySessionStore:
     await store.append_trail_entry(
         SESSION_ID,
         TrailEntry(
-            turn_index=0, tool_call_id="ra0", tool_name="recordAssumptions",
-            args={"assumptions": [_SECRETISH]}, status=result.status,
-            error_code=result.error_code, provenance=result.provenance,
-            result_preview=result.result_preview, result_full_ref=None, ts="t1",
+            turn_index=0,
+            tool_call_id="ra0",
+            tool_name="recordAssumptions",
+            args={"assumptions": [_SECRETISH]},
+            status=result.status,
+            error_code=result.error_code,
+            provenance=result.provenance,
+            result_preview=result.result_preview,
+            result_full_ref=None,
+            ts="t1",
         ),
     )
     await store.append_message(
@@ -624,7 +642,8 @@ async def _store_with_assumptions_at_turn0() -> InMemorySessionStore:
 
 def _assemble(store: InMemorySessionStore, current_turn_index: int | None):
     return ContextAssembler(
-        session_store=store, base_system_prompt="BASE",
+        session_store=store,
+        base_system_prompt="BASE",
         preview_row_count=20,
     ).assemble(SESSION_ID, frozenset(), current_turn_index=current_turn_index)
 
@@ -645,7 +664,10 @@ async def test_prior_turn_assumptions_never_re_enter_model_context() -> None:
     assert _SECRETISH not in blob
     assert not [m for m in assembled.messages if m.get("tool_name") == "recordAssumptions"]
     # The rest of turn 0 still replays — this drops one entry, not the history.
-    assert [m.get("content") for m in assembled.messages if m.get("role") == "user"] == ["Q0?", "Q1?"]
+    assert [m.get("content") for m in assembled.messages if m.get("role") == "user"] == [
+        "Q0?",
+        "Q1?",
+    ]
 
 
 async def test_dropping_a_prior_turn_assumption_never_orphans_a_tool_call() -> None:

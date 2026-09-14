@@ -264,7 +264,7 @@ def answer_table_no_table_designated() -> ToolResult:
     otherwise degrades to a generic message.
     """
     detail = (
-        "Your answerWithTable named no table, so there is nothing for the user to "
+        "Your finalizeAnswer named no table, so there is nothing for the user to "
         "look at. Every table goes in `tables`, one entry per part of your answer: "
         '`tables: [{sql: "SELECT …"}]` for a query you wrote, or '
         '`tables: [{blueprint_id: "bp-…"}]` for a blueprint you ran this turn. '
@@ -401,24 +401,24 @@ def answer_shape_nudge_text(
         lines.append("")
     lines.append(
         f"That answer is not finished. This turn produced {multi_row_calls} multi-row "
-        "result(s), and a multi-row answer must be delivered through answerWithTable."
+        "result(s), and a multi-row answer must be delivered through finalizeAnswer."
     )
     lines.append(
-        "The turn is NOT over and answerWithTable is still available to you: you can "
+        "The turn is NOT over and finalizeAnswer is still available to you: you can "
         "and must call it in your NEXT response."
     )
     lines.append(
-        "Pass one table per part you answered — blueprint_id for a result a blueprint "
-        "produced, sql otherwise — and keep the prose you just wrote as the answer."
+        "Select each table by its successful execution result_id and keep the prose "
+        "you just wrote as the answer."
     )
     lines.append(
         "If your answer really is a single figure or an empty result, re-send your "
-        "full answer through answerWithText, with the exact successful evidence tool names."
+        "full answer through finalizeAnswer, with the successful evidence result IDs."
     )
     if refusal_actioned:
         lines = lines[:2] + [
-            "The turn is NOT over. Fix what the review feedback named and use answerWithTable "
-            "for corrected rows, or decline through answerWithText explaining what the results "
+            "The turn is NOT over. Fix what the review feedback named and use finalizeAnswer "
+            "for corrected rows, or decline through finalizeAnswer explaining what the results "
             "cannot support. A correct decline is a complete answer; a refused answer in a new envelope is not."
         ]
     if cards_present:
@@ -465,11 +465,11 @@ def empty_answer_nudge_text(incomplete_reason: str | None = None) -> str:
         )
     lines.append(
         "The turn is NOT over and every tool is still available to you. Your next "
-        "response must be one of exactly two things: the final answer as TEXT, or a "
+        "response must be one of exactly two things: a finalizeAnswer call, or a "
         "tool call that gets you closer to it."
     )
     lines.append(
-        "If you cannot answer the question, say so in text and say what blocked you — "
+        "If you cannot answer the question, use finalizeAnswer.answer to say what blocked you — "
         "that is a valid, complete answer. Silence is not."
     )
     return "\n".join(lines)

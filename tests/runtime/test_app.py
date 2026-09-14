@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from data_agent.runtime import app as app_module
@@ -25,6 +26,9 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-app-smoke"
 HEADERS = {"Authorization": "Bearer test-jwt", "X-Session-Id": SESSION_ID}
@@ -76,12 +80,14 @@ def _build_client(monkeypatch, model_client: ScriptedModelClient) -> TestClient:
 
 
 def test_create_app_builds_without_live_infra(monkeypatch) -> None:
-    client = _build_client(monkeypatch, ScriptedModelClient([ModelTurnResult(assistant_text="hi")]))
+    client = _build_client(monkeypatch, ScriptedModelClient([final_answer(assistant_text="hi")]))
     assert client.app is not None
 
 
 def test_turn_endpoint_streams_progress_and_result(monkeypatch) -> None:
-    model_client = ScriptedModelClient([ModelTurnResult(assistant_text="Here is your answer.")])
+    model_client = ScriptedModelClient(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
     client = _build_client(monkeypatch, model_client)
 
     response = client.post("/turn", json={"message": "How many employees?"}, headers=HEADERS)
@@ -92,9 +98,9 @@ def test_turn_endpoint_streams_progress_and_result(monkeypatch) -> None:
     data = events[-1]["data"]
     # (a) the 4 original keys are unchanged (backward compat).
     assert data["status"] == "done"
-    assert data["assistant_text"] == "Here is your answer."
+    assert data["assistant_text"] == "I don't have any information to answer your question."
     assert data["pending_question"] is None
-    assert data["tool_calls_made"] == 0
+    assert data["tool_calls_made"] == 1  # Includes the explicit final-answer call.
     # (b) the 5 UI Slice 1 keys are present.
     for key in ("sql_executed", "answer_sql", "blueprint_use", "verification", "provenance"):
         assert key in data, f"missing enriched-result key {key!r}"
@@ -145,7 +151,7 @@ def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch)
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Done."),
+            final_answer(assistant_text="Done."),
         ]
     )
     app = create_app(
@@ -193,8 +199,8 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
     )
     model_client = ScriptedModelClient(
         [
-            ModelTurnResult(assistant_text="Here is your answer."),
-            ModelTurnResult(assistant_text="Second answer."),
+            final_answer(assistant_text="Here is your answer."),
+            final_answer(assistant_text="Second answer."),
         ]
     )
     app = create_app(
@@ -332,7 +338,7 @@ def test_full_ask_user_pause_then_resume_round_trip_over_http(monkeypatch) -> No
                     ToolCallRequest(id="c1", name="askUser", arguments={"question": "Which dept?"})
                 ]
             ),
-            ModelTurnResult(assistant_text="Using Sales."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     client = _build_client(monkeypatch, model_client)
@@ -353,7 +359,10 @@ def test_full_ask_user_pause_then_resume_round_trip_over_http(monkeypatch) -> No
     assert second.status_code == 200
     second_events = _parse_sse(second.text)
     assert second_events[-1]["data"]["status"] == "done"
-    assert second_events[-1]["data"]["assistant_text"] == "Using Sales."
+    assert (
+        second_events[-1]["data"]["assistant_text"]
+        == "I don't have any information to answer your question."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +453,7 @@ def test_read_tool_wired_when_retrieval_active_handled_not_dispatched(monkeypatc
                     ToolCallRequest(id="gb1", name="getBlueprint", arguments={"id": "bp-x"})
                 ]
             ),
-            ModelTurnResult(assistant_text="Found bp-x."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     client, store, mcp = _read_tools_app(monkeypatch, model, with_retrieval=True)
@@ -471,7 +480,7 @@ def test_read_tool_unavailable_when_retrieval_absent(monkeypatch) -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="No search available."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     client, store, mcp = _read_tools_app(monkeypatch, model, with_retrieval=False)
@@ -622,7 +631,7 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="The average salary in Sales is $60,000."),
+            final_answer(assistant_text="The average salary in Sales is $60,000."),
         ]
     )
     client, store, mcp = _run_blueprint_app(monkeypatch, model, with_retrieval=True)
@@ -639,6 +648,7 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
         "passed": True,
         "method": "blueprint_gate",
         "grain_checked": True,
+        "status": "structural checks passed",
     }
     assert data["sql_executed"] and all(isinstance(s, str) for s in data["sql_executed"])
     # `result_table` is gone. A blueprint answer still reports what it EXECUTED;
@@ -650,7 +660,7 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
     import anyio
 
     trail = anyio.run(store.load_trail, SESSION_ID)
-    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint"]
+    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint", "answerWithText"]
     # HANDLED by the executor through the composition root (NOT the unwired path):
     # a verified result, not RUN_BLUEPRINT_UNAVAILABLE — and never the
     # BLUEPRINT_DEFINITION_NOT_READ refusal, since the expansion preceded it.
@@ -672,7 +682,7 @@ def test_run_blueprint_unavailable_when_retrieval_absent(monkeypatch) -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="I'll use the raw tools instead."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     client, store, mcp = _run_blueprint_app(monkeypatch, model, with_retrieval=False)
@@ -753,7 +763,7 @@ def test_raw_loop_turn_enriched_result_no_blueprint(monkeypatch) -> None:
             ModelTurnResult(
                 tool_calls=[ToolCallRequest(id="q1", name="runQuery", arguments={"sql": _RAW_SQL})]
             ),
-            ModelTurnResult(assistant_text="The average salary in Sales is $60,000."),
+            final_answer(assistant_text="The average salary in Sales is $60,000."),
         ]
     )
     client, store, mcp = _raw_loop_app(monkeypatch, model)
@@ -875,7 +885,7 @@ def test_raw_loop_multi_query_sql_list_ordered_and_deduped(monkeypatch) -> None:
                     ToolCallRequest(id="q3", name="runQuery", arguments={"sql": _MULTI_SQL_A}),
                 ]
             ),
-            ModelTurnResult(assistant_text="Sales avg is $60,000 across 9 people."),
+            final_answer(assistant_text="Sales avg is $60,000 across 9 people."),
         ]
     )
     app = create_app(
@@ -1130,7 +1140,7 @@ def test_history_survives_an_unreadable_blueprint_result(monkeypatch) -> None:
         settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
         session_store=store,
         mcp_client=FakeMCPClient(),
-        model_client=ScriptedModelClient([ModelTurnResult(assistant_text="hi")]),
+        model_client=ScriptedModelClient([final_answer(assistant_text="hi")]),
         catalog=CatalogHandle({}),
     )
     client = TestClient(app)
@@ -1197,7 +1207,7 @@ def test_update_analysis_state_is_wired_and_gets_the_loops_own_turn_index(
     store = InMemorySessionStore()
     model_client = ScriptedModelClient(
         [
-            ModelTurnResult(assistant_text="first answer"),
+            final_answer(assistant_text="I cannot answer from the available information."),
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
@@ -1212,7 +1222,8 @@ def test_update_analysis_state_is_wired_and_gets_the_loops_own_turn_index(
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="second answer"),
+            final_answer(assistant_text="I cannot answer from the available information."),
+            final_answer(assistant_text="I cannot answer from the available information."),
         ]
     )
     mcp_client = FakeMCPClient(tools=[], scripted={})
@@ -1275,7 +1286,7 @@ def test_extra_observers_receive_loop_events_on_both_endpoints(monkeypatch) -> N
                     ToolCallRequest(id="c1", name="askUser", arguments={"question": "Which?"})
                 ]
             ),
-            ModelTurnResult(assistant_text="Using Sales."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     app = create_app(
@@ -1308,6 +1319,11 @@ def test_extra_observers_receive_loop_events_on_both_endpoints(monkeypatch) -> N
 
 
 def test_create_app_without_extra_observers_is_unchanged(monkeypatch) -> None:
-    client = _build_client(monkeypatch, ScriptedModelClient([ModelTurnResult(assistant_text="hi")]))
+    client = _build_client(
+        monkeypatch,
+        ScriptedModelClient(
+            [final_answer(assistant_text="I don't have any information to answer your question.")]
+        ),
+    )
     response = client.post("/turn", json={"message": "hello"}, headers=HEADERS)
     assert _parse_sse(response.text)[-1]["data"]["status"] == "done"

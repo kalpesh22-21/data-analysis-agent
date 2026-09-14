@@ -61,7 +61,14 @@ model_script:
         args:
           sql: SELECT count() AS total FROM dbpcm_warehouse.employee
   # Turn 1, round 2 — finalizes on prose (terminal exit #1).
-  - assistant_text: There are 7 people in total.
+  - tool_calls:
+      - name: finalizeAnswer
+        id: final
+        args:
+          answer: There are 7 people in total.
+          tables: []
+          capability_refs: []
+          evidence: [q1]
 expect:
   intents_terminal: 0
   re_derivation: false

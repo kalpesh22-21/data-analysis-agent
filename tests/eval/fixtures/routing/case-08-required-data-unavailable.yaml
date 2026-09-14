@@ -58,8 +58,8 @@ model_script:
         id: s2
         args:
           intents:
-            - {intent_id: i1, status: completed, evidence_tool_call_id: q1}
-            - {intent_id: i2, status: blocked, reason_code: REQUIRED_DATA_UNAVAILABLE, evidence_tool_call_id: q2}
+            - {intent_id: i1, status: completed, result_id: q1}
+            - {intent_id: i2, status: blocked, reason_code: REQUIRED_DATA_UNAVAILABLE, result_id: q2}
       - name: answerWithTable
         id: a1
         args:

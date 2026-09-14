@@ -198,6 +198,7 @@ def test_enrichment_rebinds_the_turn_level_chip_and_badge() -> None:
     assert envelope.blueprint_use == {"blueprint_id": "bp-1", "slots": {"dept": "eng"}}
     assert envelope.verification == {
         "passed": True,
+        "status": "structural checks passed",
         "method": "blueprint_gate",
         "grain_checked": True,
     }
@@ -227,6 +228,7 @@ def test_an_unverified_blueprint_does_not_clear_an_earlier_badge() -> None:
     assert envelope.blueprint_use["blueprint_id"] == "bp-2"
     assert envelope.verification == {
         "passed": True,
+        "status": "structural checks passed",
         "method": "blueprint_gate",
         "grain_checked": True,
     }
@@ -302,9 +304,7 @@ def test_capture_blueprint_run_is_a_no_op_off_its_own_tool_or_on_a_refusal() -> 
     accum = TurnAccumulators()
 
     accum.capture_blueprint_run("runQuery", _ok("runQuery", _blueprint_result()))
-    accum.capture_blueprint_run(
-        "runBlueprint", _refused("runBlueprint", _blueprint_result())
-    )
+    accum.capture_blueprint_run("runBlueprint", _refused("runBlueprint", _blueprint_result()))
     accum.capture_blueprint_run("runBlueprint", _ok("runBlueprint", None))
 
     assert accum.blueprint_runs == {}
@@ -468,9 +468,7 @@ def test_answer_tables_ignore_a_refused_call_and_every_other_tool() -> None:
     accum.note_answer_tables(
         "answerWithTable", _refused("answerWithTable"), [AnswerTable(sql="SELECT refused")]
     )
-    accum.note_answer_tables(
-        "runQuery", _ok("runQuery"), [AnswerTable(sql="SELECT wrong tool")]
-    )
+    accum.note_answer_tables("runQuery", _ok("runQuery"), [AnswerTable(sql="SELECT wrong tool")])
 
     assert accum.has_answer_tables is False
     assert accum.envelope().answer_tables is None

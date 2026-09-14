@@ -27,10 +27,6 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.denial_mapping import (
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-    classify_denial,
-)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.hooks.answer_table import AnswerTableHooks
 from data_agent.runtime.loop.agent_loop import AgentLoop
@@ -47,8 +43,9 @@ from data_agent.runtime.session.models import (
     live_analysis_state,
 )
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-finalization"
 _E = "dbpcm_warehouse.employee"
@@ -160,7 +157,7 @@ def _completed(intent_id: str, evidence: str) -> dict[str, Any]:
     return {
         "intent_id": intent_id,
         "status": "completed",
-        "evidence_tool_call_id": evidence,
+        "result_id": evidence,
     }
 
 
@@ -171,7 +168,9 @@ def _answer_call(call_id: str, answer: str = "Here is the answer.") -> ToolCallR
 
 
 def _query_call(call_id: str) -> ToolCallRequest:
-    return ToolCallRequest(id=call_id, name="runQuery", arguments={"sql": f"SELECT {call_id}"})
+    return ToolCallRequest(
+        id=call_id, name="runQuery", arguments={"sql": f"SELECT '{call_id}' AS marker"}
+    )
 
 
 def _query_mcp(count: int = 10, *, row_count: int = 1) -> FakeMCPClient:
@@ -210,7 +209,10 @@ async def test_a_turn_with_no_live_state_finalizes_through_both_exits() -> None:
     never declare a state at all, so both exits must finalize untouched and the
     check must cost nothing — no claim, no state write, no telemetry."""
     for script, expected in (
-        ([ModelTurnResult(assistant_text="plain prose")], "plain prose"),
+        (
+            [final_answer(assistant_text="I don't have any information to answer your question.")],
+            "I don't have any information to answer your question.",
+        ),
         (
             [
                 ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
@@ -245,7 +247,7 @@ async def test_a_prior_turns_pending_state_does_not_govern_the_next_turn() -> No
                     ToolCallRequest(id="ask", name="askUser", arguments={"question": "which?"}),
                 ],
             ),
-            ModelTurnResult(assistant_text="an unrelated answer"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
 
@@ -256,7 +258,7 @@ async def test_a_prior_turns_pending_state_does_not_govern_the_next_turn() -> No
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "an unrelated answer"
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     doc = await store.get_or_create_session(SESSION_ID)
     turn0 = live_analysis_state(doc, 0)
     assert turn0 is not None
@@ -279,7 +281,7 @@ async def test_all_intents_completed_finalizes() -> None:
             ModelTurnResult(
                 assistant_text=None, tool_calls=[_update_call("s2", _completed("i1", "q1"))]
             ),
-            ModelTurnResult(assistant_text="both answered"),
+            final_answer(assistant_text="both answered"),
         ],
         mcp=_query_mcp(),
     )
@@ -298,16 +300,14 @@ async def test_all_intents_completed_finalizes() -> None:
 
 
 async def test_exit_two_is_refused_with_a_retryable_error_naming_the_intents() -> None:
-    """05 §B.1. The refusal is written INSTEAD of the successful designation, so
-    the persisted trail entry IS the refusal — and `denial_detail` is the only
-    channel that reaches the model, so it must name what is still pending."""
-    loop, store, events, _ = _build(
+    """Proposal receipt succeeds; coverage review then names the pending intents in a repair nudge. Exhaustion closes the intents without publishing the draft."""
+    loop, store, events, model = _build(
         [
             ModelTurnResult(
                 assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT, ATTRITION)]
             ),
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text="second thoughts"),
+            final_answer(assistant_text="second thoughts"),
         ]
     )
 
@@ -317,19 +317,21 @@ async def test_exit_two_is_refused_with_a_retryable_error_naming_the_intents() -
 
     # The turn CONTINUED — the refusal is not terminal.
     assert outcome.status == "done"
-    assert outcome.assistant_text == "second thoughts"
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     doc = await store.get_or_create_session(SESSION_ID)
     entry = next(e for e in doc.tool_trail if e.tool_call_id == "a1")
-    assert entry.status == "error"
-    assert entry.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
-    assert entry.denial_detail is not None
-    assert "i1" in entry.denial_detail and "i2" in entry.denial_detail
-    assert HEADCOUNT in entry.denial_detail
+    assert entry.status == "ok"  # Proposal received; review happens after the batch.
+    assert entry.error_code is None
+    nudge = model.calls[2].messages[-1]["content"]
+    assert "i1" in nudge and "i2" in nudge and HEADCOUNT in nudge
     # `provenance=frozenset()` — determined-empty — is what keeps the entry in
     # scope on its own merits; `None` would be dropped fail-closed from replay.
     assert entry.provenance == frozenset()
     # Retryable, or the turn it exists to keep alive would end here.
-    assert classify_denial(entry.error_code).retryable is True
+    assert doc.finalization_blocks["0:1:intents"] == 1
     assert _events(events, "loop_finalization_refused") == [
         {"exit": "answer_with_table", "pending_count": 2}
     ]
@@ -338,11 +340,7 @@ async def test_exit_two_is_refused_with_a_retryable_error_naming_the_intents() -
 
 
 async def test_the_refusal_precedes_answer_sql_resolution_and_its_hooks() -> None:
-    """05 §B.1 — WHERE the check sits. `_resolve_answer_sql` fires the two dormant
-    `hooks/answer_table.py` seams and can rewrite the result into the
-    blueprint-not-run nudge. A designation that is about to be refused must not
-    fire the answer-table lifecycle, and checking afterwards would also clobber
-    that more actionable message with this less actionable one."""
+    """An unresolved table reference is rejected before complete-proposal coverage review. Its lifecycle hook must still report the unresolved selection."""
     fired: list[Any] = []
 
     def _record(event: Any) -> str | None:
@@ -374,7 +372,8 @@ async def test_the_refusal_precedes_answer_sql_resolution_and_its_hooks() -> Non
                         )
                     ],
                 ),
-                ModelTurnResult(assistant_text="ok"),
+                final_answer(assistant_text="I cannot answer yet."),
+                final_answer(assistant_text="I cannot answer yet."),
             ]
         ),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=_observe),
@@ -396,14 +395,12 @@ async def test_the_refusal_precedes_answer_sql_resolution_and_its_hooks() -> Non
 
     doc = await store.get_or_create_session(SESSION_ID)
     entry = next(e for e in doc.tool_trail if e.tool_call_id == "a1")
-    assert entry.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
-    assert not fired, "the answer-table lifecycle fired for a designation being refused"
+    assert entry.error_code == "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
+    assert fired, "Unresolvable selections must still report the lifecycle hook."
 
 
 async def test_a_blank_answer_is_not_a_finalization_and_is_not_refused() -> None:
-    """The terminal condition is `ok` + a dict + NON-BLANK `answer`. A call that
-    would not have ended the turn is not a finalization, so refusing it would burn
-    the window's one forced re-round on nothing."""
+    """A blank proposal is received but cannot finish the turn. Empty-answer repair and later pending-intent review retain separate allowances."""
     loop, store, events, _ = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
@@ -417,8 +414,8 @@ async def test_a_blank_answer_is_not_a_finalization_and_is_not_refused() -> None
                     )
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ]
     )
 
@@ -430,7 +427,7 @@ async def test_a_blank_answer_is_not_a_finalization_and_is_not_refused() -> None
     assert designation.error_code is None, "a blank answer was refused as a finalization"
     # Only the later prose exits are refusals; the designation is not one.
     assert all(
-        payload["exit"] == "no_tool_calls"
+        payload["exit"] == "answer_with_text"
         for payload in _events(events, "loop_finalization_refused")
     )
 
@@ -446,8 +443,8 @@ async def test_exit_one_refuses_without_persisting_and_nudges_with_the_draft() -
     loop, store, events, model = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
-            ModelTurnResult(assistant_text="THE DRAFT ANSWER"),
-            ModelTurnResult(assistant_text="the real answer"),
+            final_answer(assistant_text="THE DRAFT ANSWER"),
+            final_answer(assistant_text="the real answer"),
         ]
     )
 
@@ -456,14 +453,17 @@ async def test_exit_one_refuses_without_persisting_and_nudges_with_the_draft() -
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "the real answer"
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     # The loop RE-ENTERED: three model round-trips, not two.
     assert model.calls_made == 3
     doc = await store.get_or_create_session(SESSION_ID)
     assistant_messages = [m.content for m in doc.messages if m.role == "assistant"]
-    assert assistant_messages == ["the real answer"], "the refused draft was persisted"
+    assert assistant_messages == [outcome.assistant_text], "the refused draft was persisted"
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "no_tool_calls", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
     # The nudge quotes the draft back on the re-round.
     nudged = model.calls[2].messages[-1]
@@ -480,9 +480,9 @@ async def test_the_nudge_is_never_persisted_and_lives_exactly_one_round_trip() -
     loop, store, _events_, model = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
-            ModelTurnResult(assistant_text="draft"),
+            final_answer(assistant_text="draft"),
             ModelTurnResult(assistant_text=None, tool_calls=[_query_call("q1")]),
-            ModelTurnResult(assistant_text="final"),
+            final_answer(assistant_text="final"),
         ],
         mcp=_query_mcp(),
     )
@@ -504,8 +504,8 @@ async def test_the_state_block_precedes_the_question_and_the_nudge_is_last() -> 
     loop, _store, _events_, model = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
-            ModelTurnResult(assistant_text="draft"),
-            ModelTurnResult(assistant_text="final"),
+            final_answer(assistant_text="draft"),
+            final_answer(assistant_text="final"),
         ]
     )
 
@@ -532,7 +532,7 @@ async def test_a_refused_round_is_charged_to_the_budget() -> None:
     loop, store, events, model = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
-            ModelTurnResult(assistant_text="draft"),
+            final_answer(assistant_text="draft"),
         ],
         max_loop_iterations=2,
         max_budget_windows=2,
@@ -596,8 +596,8 @@ async def test_the_second_attempt_is_enforcement_exhausted_and_finalization_proc
             ModelTurnResult(
                 assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT, ATTRITION)]
             ),
-            ModelTurnResult(assistant_text="draft"),
-            ModelTurnResult(assistant_text="still no closure"),
+            final_answer(assistant_text="draft"),
+            final_answer(assistant_text="still no closure"),
         ]
     )
 
@@ -606,7 +606,10 @@ async def test_the_second_attempt_is_enforcement_exhausted_and_finalization_proc
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "still no closure"
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     doc = await store.get_or_create_session(SESSION_ID)
     state = live_analysis_state(doc, 0)
     assert [i.status for i in state.intents] == ["blocked", "blocked"]
@@ -626,14 +629,14 @@ async def test_the_counter_is_not_reset_by_an_ask_user_resume() -> None:
     loop, store, events, _ = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
-            ModelTurnResult(assistant_text="draft one"),
+            final_answer(assistant_text="draft one"),
             ModelTurnResult(
                 assistant_text=None,
                 tool_calls=[
                     ToolCallRequest(id="ask", name="askUser", arguments={"question": "which?"})
                 ],
             ),
-            ModelTurnResult(assistant_text="draft two"),
+            final_answer(assistant_text="draft two"),
         ]
     )
 
@@ -643,9 +646,10 @@ async def test_the_counter_is_not_reset_by_an_ask_user_resume() -> None:
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "draft two", (
-        "the resumed window granted a SECOND forced re-round — the counter reset"
-    )
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    ), "the resumed window granted a SECOND forced re-round — the counter reset"
     doc = await store.get_or_create_session(SESSION_ID)
     assert doc.finalization_blocks == {"0:1:intents": 1}
     assert len(_events(events, "loop_finalization_block_spent")) == 1

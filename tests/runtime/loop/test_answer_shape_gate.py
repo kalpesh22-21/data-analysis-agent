@@ -47,8 +47,9 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import FinalizationBlockKind
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-answer-shape"
 _E = "dbpcm_warehouse.employee"
@@ -63,8 +64,8 @@ ANSWER = "answerWithTable"
 # request (or its absence from a persisted message) is unambiguous. Deliberately
 # NOT the pending-intents nudge's "re-send your final answer": the two nudges must
 # be tellable apart, since precedence between them is part of the contract.
-_NUDGE_MARK = "answerWithTable is still available to you"
-_ESCAPE_MARK = "re-send your full answer"
+_NUDGE_MARK = "Use finalizeAnswer.tables"
+_ESCAPE_MARK = "include the complete answer"
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
@@ -211,7 +212,7 @@ async def test_a_multi_row_prose_finish_is_refused_and_the_table_lands_next_roun
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="Sales has 3, Eng has 2, Ops has 1."),
+            final_answer(assistant_text="Sales has 3, Eng has 2, Ops has 1."),
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
@@ -252,9 +253,9 @@ async def test_a_multi_row_prose_finish_is_refused_and_the_table_lands_next_roun
     )
     assert _is_a_user_message(model.calls[2].messages, nudge)
     # (a) the turn is not over and the tool is available — the belief being corrected.
-    assert "NOT over" in nudge and "NEXT response" in nudge
+    assert "NOT over" in nudge and "finalizeAnswer" in nudge
     # (b) one table per part, and HOW to name each.
-    assert "blueprint_id" in nudge and "sql otherwise" in nudge
+    assert "result IDs" in nudge and "finalizeAnswer.tables" in nudge
     # (c) the escape hatch, without which a legitimate single-figure answer is stuck.
     assert _ESCAPE_MARK in nudge
     # The draft is carried back, or the model must regenerate its answer blind.
@@ -262,14 +263,12 @@ async def test_a_multi_row_prose_finish_is_refused_and_the_table_lands_next_roun
 
 
 async def test_the_refused_draft_and_the_nudge_are_never_persisted() -> None:
-    """05 §B.2, unchanged for this gate: exit #1 persists NOTHING. A persisted
-    nudge would appear in `/session/history` as something the user said, and a
-    persisted draft would show the user an answer the runtime refused."""
+    """Neither rejected draft reaches conversational history. Tool receipts remain available for audit; the final assistant message contains the limitation."""
     loop, store, _, _ = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="REFUSED DRAFT"),
-            ModelTurnResult(assistant_text="REFUSED DRAFT"),
+            final_answer(assistant_text="REFUSED DRAFT"),
+            final_answer(assistant_text="REFUSED DRAFT"),
         ],
         mcp=_rows_mcp("runQuery", 3),
     )
@@ -281,20 +280,19 @@ async def test_the_refused_draft_and_the_nudge_are_never_persisted() -> None:
     assert not any(_NUDGE_MARK in c for c in contents), "the nudge was persisted"
     # The FINAL prose is persisted once (it passed on the spent grant) — the
     # REFUSED one is not persisted twice.
-    assert contents.count("REFUSED DRAFT") == 1
+    assert contents.count("REFUSED DRAFT") == 0
+    assert contents[-1] == "I could not verify every requested part from the available evidence."
     history = project_history(doc.messages, doc.tool_trail, frozenset(), doc.pause_checkpoint)
     assert not any(_NUDGE_MARK in str(item) for item in history)
 
 
 async def test_a_second_prose_finish_passes_and_records_exhausted() -> None:
-    """The runtime records what it can and NEVER hard-locks a turn — the same
-    posture `ENFORCEMENT_EXHAUSTED` takes for intents. A model that answers in
-    prose twice gets its answer through; the operator gets a counter."""
+    """Two untabled proposals exhaust shape repair and produce an honest limitation. The unverified draft must not become the final answer."""
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="Sales leads."),
-            ModelTurnResult(assistant_text="Sales leads."),
+            final_answer(assistant_text="Sales leads."),
+            final_answer(assistant_text="Sales leads."),
         ],
         mcp=_rows_mcp("runQuery", 4),
     )
@@ -304,7 +302,10 @@ async def test_a_second_prose_finish_passes_and_records_exhausted() -> None:
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Sales leads."
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
     assert _events(events, ANSWER_SHAPE_EXHAUSTED_EVENT) == [{}]
     # ITS OWN allowance, asked for twice: the second claim is refused by the store,
@@ -320,8 +321,8 @@ async def test_the_count_reported_is_every_untabled_multi_row_call() -> None:
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
             ModelTurnResult(tool_calls=[_query("q2")]),
-            ModelTurnResult(assistant_text="two tables' worth, in prose"),
-            ModelTurnResult(assistant_text="two tables' worth, in prose"),
+            final_answer(assistant_text="two tables' worth, in prose"),
+            final_answer(assistant_text="two tables' worth, in prose"),
         ],
         mcp=_rows_mcp("runQuery", 3, 5),
     )
@@ -341,7 +342,7 @@ async def test_a_zero_row_result_never_trips_the_gate() -> None:
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="No employees match that filter."),
+            final_answer(assistant_text="No employees match that filter."),
         ],
         mcp=_rows_mcp("runQuery", 0),
     )
@@ -364,7 +365,7 @@ async def test_a_single_row_result_never_trips_the_gate() -> None:
     loop, store, events, _ = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="Headcount is 412."),
+            final_answer(assistant_text="Headcount is 412."),
         ],
         mcp=_rows_mcp("runQuery", 1),
     )
@@ -394,7 +395,7 @@ async def test_discovery_reads_never_trip_the_gate_however_many_rows_they_return
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="The Department column is free text."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ],
         mcp=_rows_mcp("sampleRows", 10),
     )
@@ -545,9 +546,9 @@ async def test_a_later_turn_is_not_gated_by_an_earlier_turns_rows() -> None:
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="in prose, sorry"),
-            ModelTurnResult(assistant_text="in prose, sorry"),
-            ModelTurnResult(assistant_text="yes, that is right"),
+            final_answer(assistant_text="in prose, sorry"),
+            final_answer(assistant_text="in prose, sorry"),
+            final_answer(assistant_text="I cannot independently verify that in this turn."),
         ],
         mcp=_rows_mcp("runQuery", 3),
     )
@@ -561,7 +562,7 @@ async def test_a_later_turn_is_not_gated_by_an_earlier_turns_rows() -> None:
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "yes, that is right"
+    assert outcome.assistant_text == "I cannot independently verify that in this turn."
     assert store.claims == claims_after_turn_zero, "turn 1 asked for a grant it did not need"
     assert not _events(events, ANSWER_SHAPE_REFUSED_EVENT)
     assert not _events(events, ANSWER_SHAPE_EXHAUSTED_EVENT)
@@ -590,8 +591,8 @@ async def test_a_budget_cap_resume_reseeds_the_count_from_the_persisted_trail() 
             ModelTurnResult(tool_calls=[_query("q1")], usage={"total_tokens": 10}),
             ModelTurnResult(tool_calls=[_query("q2")], usage={"total_tokens": 10}),
             # Window 2, after the resume: prose, refused, then prose again.
-            ModelTurnResult(assistant_text="in prose"),
-            ModelTurnResult(assistant_text="in prose"),
+            final_answer(assistant_text="in prose", evidence=["q1", "q2"]),
+            final_answer(assistant_text="in prose", evidence=["q1", "q2"]),
         ],
         mcp=_rows_mcp("runQuery", 3, 4),
         max_loop_iterations=2,
@@ -629,8 +630,8 @@ async def test_a_truncated_draft_echo_is_marked_and_the_hatch_asks_for_the_full_
     loop, store, _, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text=draft),
-            ModelTurnResult(assistant_text="the full answer, again"),
+            final_answer(assistant_text=draft),
+            final_answer(assistant_text="the full answer, again"),
         ],
         mcp=_rows_mcp("runQuery", 3),
     )
@@ -658,8 +659,8 @@ async def test_a_short_draft_echo_carries_no_truncation_marker() -> None:
     loop, _, _, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="Sales 3, Eng 2."),
-            ModelTurnResult(assistant_text="Sales 3, Eng 2."),
+            final_answer(assistant_text="Sales 3, Eng 2."),
+            final_answer(assistant_text="Sales 3, Eng 2."),
         ],
         mcp=_rows_mcp("runQuery", 3),
     )
@@ -690,7 +691,7 @@ async def test_a_refused_round_is_charged_to_the_budget_and_writes_no_ledger_ent
     loop, _, events, _ = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")], usage={"total_tokens": 10}),
-            ModelTurnResult(assistant_text="in prose", usage={"total_tokens": 10}),
+            final_answer(assistant_text="in prose", usage={"total_tokens": 10}),
         ],
         mcp=_rows_mcp("runQuery", 3),
         max_loop_iterations=2,
@@ -742,7 +743,7 @@ async def test_the_intents_nudge_no_longer_starves_the_shape_gate() -> None:
             ),
             # (1) Bare-text finish: intent pending AND three rows untabled. BOTH
             # gates qualify; the intents one wins.
-            ModelTurnResult(assistant_text="Sales 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="Sales 3, Eng 2, Ops 1."),
             # (2) Closes the ledger...
             ModelTurnResult(
                 tool_calls=[
@@ -754,7 +755,7 @@ async def test_the_intents_nudge_no_longer_starves_the_shape_gate() -> None:
                                 {
                                     "intent_id": "i1",
                                     "status": "completed",
-                                    "evidence_tool_call_id": "q1",
+                                    "result_id": "q1",
                                 }
                             ]
                         },
@@ -763,7 +764,7 @@ async def test_the_intents_nudge_no_longer_starves_the_shape_gate() -> None:
             ),
             # ...and finishes in prose again. Nothing is pending now, so the SHAPE
             # gate reaches its own, untouched allowance.
-            ModelTurnResult(assistant_text="Sales 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="Sales 3, Eng 2, Ops 1."),
             # (3) The table finally lands.
             ModelTurnResult(
                 tool_calls=[
@@ -795,7 +796,7 @@ async def test_the_intents_nudge_no_longer_starves_the_shape_gate() -> None:
     # Precedence: the intents refusal fired on the round where both qualified, and
     # its payload is byte-identical to a turn where only it qualifies.
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "no_tool_calls", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
     # ...and the shape gate got its own round LATER, from its own allowance.
     assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
@@ -820,11 +821,11 @@ async def test_each_turn_gets_its_own_shape_allowance() -> None:
     loop, store, events, _ = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            ModelTurnResult(assistant_text="turn zero, in prose"),
-            ModelTurnResult(assistant_text="turn zero, in prose"),
+            final_answer(assistant_text="turn zero, in prose"),
+            final_answer(assistant_text="turn zero, in prose"),
             ModelTurnResult(tool_calls=[_query("q2")]),
-            ModelTurnResult(assistant_text="turn one, in prose"),
-            ModelTurnResult(assistant_text="turn one, in prose"),
+            final_answer(assistant_text="turn one, in prose"),
+            final_answer(assistant_text="turn one, in prose"),
         ],
         mcp=_rows_mcp("runQuery", 3, 4),
     )
@@ -862,19 +863,7 @@ def _empty_answer(
 
 
 async def test_an_answer_with_no_table_is_nudged_and_the_table_lands_next_round() -> None:
-    """PROBE A. `{answer: <prose>, tables: []}` on a turn holding a 6-row result.
-
-    Measured on the live loop before the fix: `status=done`, no tables, and ZERO
-    events or log lines. The call succeeded (the tool is stateless and refuses
-    nothing), carried non-blank prose, and therefore TERMINATED the turn — through
-    the one exit the 05 §J gate does not watch. The user asked for a breakdown,
-    the turn held six rows of it, and the answer was prose with no grid.
-
-    This is `_answer_table_blueprint_not_run`'s failure one step earlier: there the
-    model named a table that could not be resolved, here it named none at all. So
-    it takes the same treatment — a retryable refusal, before the trail entry is
-    written, so the persisted entry IS the nudge and the model reads it next round.
-    """
+    """An explicit empty table selection after a multi-row query is reviewed after the batch. Its nudge leads to a corrected table selection in the next proposal."""
     loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
@@ -907,20 +896,13 @@ async def test_an_answer_with_no_table_is_nudged_and_the_table_lands_next_round(
     # …and the empty designation itself is reported where it happened.
     assert _events(events, "loop_answer_table_empty_designation") == [{}]
     # The refusal is PERSISTED as the entry, so the model reads it on the rebuild.
-    trail = await store.load_trail(SESSION_ID)
-    refusals = [e for e in trail if e.error_code == "ANSWER_TABLE_NO_TABLE_DESIGNATED"]
-    assert len(refusals) == 1
-    assert refusals[0].status == "error"
-    assert "Every table goes in `tables`" in (refusals[0].denial_detail or "")
+    doc = await store.get_or_create_session(SESSION_ID)
+    # Refusal state is separate from the successfully received proposal tool call.
+    assert doc.finalization_blocks["0:1:answer_shape"] == 1
 
 
 async def test_the_empty_designation_passes_once_its_allowance_is_spent() -> None:
-    """NEVER A HARD LOCK. The allowance is shared with the shape gate, so a model
-    that empties the array twice is refused once and then let through — the same
-    posture `ENFORCEMENT_EXHAUSTED` takes for intents. The event still fires on the
-    second one, so the behaviour stays visible after the grant is gone: an
-    allowance is a bound on REFUSALS, never on reporting.
-    """
+    """Repeated empty selections exhaust the one shape repair and produce a limitation without a grid."""
     loop, store, events, _ = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
@@ -936,7 +918,10 @@ async def test_the_empty_designation_passes_once_its_allowance_is_spent() -> Non
 
     assert outcome.status == "done"
     assert outcome.answer_sql is None, "there was never a table to show"
-    assert outcome.assistant_text == "Sales has 3, Eng 2, Ops 1."
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
     assert _events(events, ANSWER_SHAPE_EXHAUSTED_EVENT) == [{}]
     # Reported BOTH times — the second call was let through, not un-noticed.
@@ -966,8 +951,8 @@ async def test_an_empty_designation_does_not_disarm_the_gate_for_the_prose_finis
                     ToolCallRequest(id="a1", name=ANSWER, arguments={"answer": "", "tables": []})
                 ]
             ),
-            ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),
-            ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="Sales has 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="Sales has 3, Eng 2, Ops 1."),
         ],
         mcp=_rows_mcp("runQuery", 6),
     )
@@ -981,18 +966,14 @@ async def test_an_empty_designation_does_not_disarm_the_gate_for_the_prose_finis
     assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
     # Two claims: refused on the first prose finish, spent on the second (the model
     # repeated itself), which is the ordinary refuse-then-exhaust sequence.
-    assert store.claims == ["answer_shape", "answer_shape"]
+    assert store.claims == ["empty_answer", "answer_shape", "answer_shape"]
     assert _events(events, ANSWER_SHAPE_EXHAUSTED_EVENT) == [{}]
     assert _requests_carrying_the_nudge(model), "the shape nudge never reached the model"
 
 
-async def test_a_blank_answer_call_that_designates_a_table_still_disarms_the_gate() -> None:
-    """The other side of the flag rule, so it is not read as "only terminal calls
-    count". A blank-`answer` call does not end the turn, but the tables it
-    designated DO reach the user through the envelope — which is the whole thing
-    the gate protects — so the gate is done for this turn.
-    """
-    loop, store, events, _ = _build(
+async def test_clearing_an_earlier_table_rearms_shape_review() -> None:
+    """A previous proposal must not exempt the currently selected empty table list."""
+    loop, store, events, model = _build(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
             ModelTurnResult(
@@ -1004,19 +985,23 @@ async def test_a_blank_answer_call_that_designates_a_table_still_disarms_the_gat
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="Sales has 3, Eng 2, Ops 1."),
+            final_answer(
+                assistant_text="Sales has 3, Eng 2, Ops 1.",
+                tables=[{"result_id": "q1"}],
+                evidence=["q1"],
+            ),
         ],
         mcp=_rows_mcp("runQuery", 6),
     )
-
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="headcount by department"
     )
-
     assert outcome.status == "done"
-    assert outcome.answer_sql == "SELECT 1"
-    assert not _events(events, ANSWER_SHAPE_REFUSED_EVENT)
-    assert store.claims == []
+    assert outcome.answer_sql == _query("q1").arguments["sql"]
+    assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
+    assert store.claims == ["empty_answer", "answer_shape"]
+    assert model.calls_made == 4
 
 
 async def test_a_turn_holding_no_multi_row_result_is_never_nudged_for_an_empty_table() -> None:
@@ -1077,6 +1062,20 @@ async def test_a_dropped_table_is_not_treated_as_an_empty_designation() -> None:
                     )
                 ]
             ),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="a2",
+                        name="finalizeAnswer",
+                        arguments={
+                            "answer": "By department.",
+                            "tables": [{"result_id": "q1"}],
+                            "capability_refs": [],
+                            "evidence": ["q1"],
+                        },
+                    )
+                ]
+            ),
         ],
         mcp=_rows_mcp("runQuery", 6),
     )
@@ -1086,6 +1085,6 @@ async def test_a_dropped_table_is_not_treated_as_an_empty_designation() -> None:
     )
 
     assert outcome.status == "done"
-    assert len(model.calls) == 2, "a dropped table must not be nudged as an empty one"
-    assert not _events(events, "loop_answer_table_empty_designation")
-    assert store.claims == []
+    assert len(model.calls) == 3
+    assert outcome.answer_tables
+    assert "Name" not in outcome.answer_tables[0]["sql"]

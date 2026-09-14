@@ -18,10 +18,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     ANALYSIS_STATE_INVALID_CODE,
-    ANALYSIS_STATE_LATE_INIT_CODE,
     MAX_STATE_CALLS,
     UpdateAnalysisStateTool,
 )
@@ -34,6 +35,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import live_analysis_state
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-analysis-loop"
 _E = "dbpcm_warehouse.employee"
@@ -43,7 +47,7 @@ STATE = "updateAnalysisState"
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [{"type": "function", "name": name, "parameters": {}} for name in ["runQuery"]]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -70,9 +74,7 @@ def _build(
         max_wall_clock_seconds=60,
         max_budget_windows=3,
         observer=_observe,
-        runtime_tools={
-            STATE: UpdateAnalysisStateTool(session_store=store, observer=_observe)
-        },
+        runtime_tools={STATE: UpdateAnalysisStateTool(session_store=store, observer=_observe)},
     )
     return loop, store, events
 
@@ -97,8 +99,8 @@ def _finalizing_turns() -> list[ModelTurnResult]:
     tests that assert this behaviour rather than merely surviving it.
     """
     return [
-        ModelTurnResult(assistant_text="done"),
-        ModelTurnResult(assistant_text="done"),
+        final_answer(assistant_text="done"),
+        final_answer(assistant_text="done"),
     ]
 
 
@@ -109,9 +111,7 @@ def _query_call(call_id: str) -> ToolCallRequest:
 def _query_mcp(count: int = 10) -> FakeMCPClient:
     return FakeMCPClient(
         scripted={
-            "runQuery": [
-                {"columns": ["x"], "rows": [[1]], "row_count": 1, "truncated": False}
-            ]
+            "runQuery": [{"columns": ["x"], "rows": [[1]], "row_count": 1, "truncated": False}]
             * count
         }
     )
@@ -163,31 +163,42 @@ async def test_state_calls_dispatch_before_everything_else_in_the_batch() -> Non
     doc = await store.get_or_create_session(SESSION_ID)
     assert live_analysis_state(doc, 0) is not None
     # And the ordering is visible in the trail, which is what the boundary reads.
-    assert [e.tool_name for e in doc.tool_trail] == [STATE, "runQuery"]
+    assert [e.tool_name for e in doc.tool_trail] == [
+        STATE,
+        "runQuery",
+        "answerWithText",
+        "answerWithText",
+    ]
 
 
-async def test_a_state_call_that_follows_a_query_in_an_earlier_round_is_late() -> None:
-    """The boundary is real, not defeated by the reorder: the reorder only covers
-    ONE response. A `runQuery` in a previous round-trip still locks."""
+async def test_a_late_declaration_can_bind_the_previous_rounds_result() -> None:
     loop, store, events = _build(
         [
-            ModelTurnResult(assistant_text=None, tool_calls=[_query_call("call_q")]),
+            ModelTurnResult(tool_calls=[_query_call("call_q")]),
+            ModelTurnResult(tool_calls=[_state_call("call_state", "headcount")]),
             ModelTurnResult(
-                assistant_text=None, tool_calls=[_state_call("call_state", "headcount")]
+                tool_calls=[
+                    ToolCallRequest(
+                        id="bind",
+                        name=STATE,
+                        arguments={
+                            "intents": [
+                                {"intent_id": "i1", "status": "completed", "result_id": "call_q"}
+                            ]
+                        },
+                    )
+                ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="The result is available.", evidence=["call_q"]),
         ],
         mcp=_query_mcp(),
     )
-
-    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
-
-    doc = await store.get_or_create_session(SESSION_ID)
-    assert live_analysis_state(doc, 0) is None
-    state_entry = next(e for e in doc.tool_trail if e.tool_name == STATE)
-    assert state_entry.error_code == ANALYSIS_STATE_LATE_INIT_CODE
-    assert ("loop_analysis_state_late_init_rejected",
-            {"proposed_count": 1, "blocking_tool_name": "runQuery"}) in events
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+    assert outcome.status == "done"
+    state = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
+    assert state.intents[0].status == "completed"
+    assert state.intents[0].evidence_tool_call_id == "call_q"
+    assert not any(name == "loop_analysis_state_late_init_rejected" for name, _ in events)
 
 
 async def test_state_is_committed_before_the_ask_user_pause() -> None:
@@ -244,13 +255,15 @@ async def test_the_ask_user_pause_still_dispatches_nothing_else() -> None:
         mcp=_query_mcp(),
     )
 
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="q"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "paused_ask_user"
     doc = await store.get_or_create_session(SESSION_ID)
-    assert [e.tool_name for e in doc.tool_trail] == [STATE]
+    assert [e.tool_name for e in doc.tool_trail] == [STATE, "runQuery", "askUser"]
+    assert [e.error_code for e in doc.tool_trail[1:]] == [
+        "TOOL_NOT_EXECUTED",
+        "CLARIFICATION_REQUESTED",
+    ]
 
 
 async def test_surplus_state_calls_are_rejected_not_silently_dropped() -> None:
@@ -287,8 +300,10 @@ async def test_surplus_state_calls_are_rejected_not_silently_dropped() -> None:
     assert surplus.status == "error"
     assert surplus.error_code == ANALYSIS_STATE_INVALID_CODE
     assert surplus.denial_detail  # the model is told why, on the channel it reads
-    assert ("loop_analysis_state_rejected",
-            {"reason": "surplus_state_call", "intent_count": 0}) in events
+    assert (
+        "loop_analysis_state_rejected",
+        {"reason": "surplus_state_call", "intent_count": 0},
+    ) in events
     # The two accepted calls still landed.
     assert live_analysis_state(doc, 0) is not None
 
@@ -355,14 +370,14 @@ async def test_evidence_from_a_previous_round_trip_validates() -> None:
                                 {
                                     "intent_id": "i1",
                                     "status": "completed",
-                                    "evidence_tool_call_id": "call_q",
+                                    "result_id": "call_q",
                                 }
                             ]
                         },
                     )
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         mcp=_query_mcp(),
     )
@@ -391,14 +406,12 @@ async def test_state_from_an_abandoned_turn_does_not_govern_the_next_turn() -> N
                     ),
                 ],
             ),
-            ModelTurnResult(assistant_text="a plain answer"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="two things")
-    await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="something else"
-    )
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="something else")
 
     doc = await store.get_or_create_session(SESSION_ID)
     assert doc.analysis_state is not None  # still on the doc, as history

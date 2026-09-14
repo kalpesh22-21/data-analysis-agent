@@ -145,10 +145,25 @@ def project_history(
         bp_id: BlueprintRun(terminal_sql=sql)
         for bp_id, sql in (blueprint_terminal_sql or {}).items()
     }
+    runs = dict(runs)
+    for entry in trail:
+        if (
+            entry.status == "ok"
+            and entry.tool_name == "runQuery"
+            and isinstance(entry.args.get("sql"), str)
+        ):
+            runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
     terminal_by_id = terminal_sql_by_id(runs)
     answer_tables_by_turn: dict[int, list[AnswerTable]] = {}
     scope_dropped_by_turn: dict[int, int] = {}
     for entry in trail:
+        if (
+            entry.status == "ok"
+            and entry.tool_name == "answerWithText"
+            and entry.args.get("tables") == []
+        ):
+            answer_tables_by_turn.pop(entry.turn_index, None)
+            scope_dropped_by_turn.pop(entry.turn_index, None)
         if entry.status != "ok" or entry.tool_name != ANSWER_TABLE_TOOL_NAME:
             continue
         finalized = finalize_designations(resolve_designations(entry.args, terminal_by_id).items)

@@ -232,6 +232,7 @@ class ContextAssembler:
             # in-scope streams verbatim by (turn_index, ts, stream_rank), folding the
             # D94 withheld/idempotent-read sentinels into their chronological slot.
             messages = self._interleave(
+                scope_hash=scope_hash,
                 in_scope_trail=in_scope_trail,
                 in_scope_messages=in_scope_messages,
                 raw_trail=raw_trail,
@@ -372,6 +373,7 @@ class ContextAssembler:
         current_turn_index: int | None,
         withheld_call_ids: set[str] | None,
         observer: Observer | None,
+        scope_hash: str | None = None,
     ) -> list[dict[str, Any]]:
         """Merge the two in-scope streams into ONE chronological render list.
 
@@ -412,6 +414,10 @@ class ContextAssembler:
         for entry in raw_trail:
             if _is_stale_model_text_entry(entry, current_turn_index):
                 continue
+            if entry.tool_name in {"answerWithText", "answerWithTable", "finalizeAnswer"}:
+                original_scope = (entry.model_response or {}).get("scope_hash")
+                if original_scope and scope_hash and original_scope != scope_hash:
+                    continue
             if id(entry) in in_scope_ids:
                 items.append(
                     (
@@ -699,7 +705,15 @@ def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:
 # it under ANY `column_scope`, in EVERY later turn, and `_render_entry` replays
 # those args verbatim plus a `result_preview` that the tool's own contract
 # requires to contain the full state, descriptions included.
-_STALE_CROSS_TURN_TOOLS = frozenset({"recordAssumptions", "updateAnalysisState"})
+_STALE_CROSS_TURN_TOOLS = frozenset(
+    {
+        "recordAssumptions",
+        "updateAnalysisState",
+        "answerWithText",
+        "answerWithTable",
+        "finalizeAnswer",
+    }
+)
 
 # The SAME rule, keyed on the ERROR CODE instead of the tool name — because the
 # third carrier of this text is not a tool of its own. The finalization refusal
@@ -764,6 +778,12 @@ def _is_stale_model_text_entry(entry: TrailEntry, current_turn_index: int | None
     the `analysisState` ledger all still read the persisted document.
     """
     if (
+        entry.tool_name in {"answerWithText", "answerWithTable", "finalizeAnswer"}
+        and entry.model_response is None
+        and entry.error_code not in _STALE_CROSS_TURN_ERROR_CODES
+    ):
+        return False  # Legacy sessions rely on these entries for answer replay.
+    if (
         entry.tool_name not in _STALE_CROSS_TURN_TOOLS
         and entry.error_code not in _STALE_CROSS_TURN_ERROR_CODES
     ):
@@ -797,6 +817,7 @@ def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:
     return {
         "role": "tool",
         "tool_call_id": entry.tool_call_id,
+        "model_response": entry.model_response,
         "tool_name": entry.tool_name,
         "args": dict(entry.args),
         "withheld_sentinel": True,

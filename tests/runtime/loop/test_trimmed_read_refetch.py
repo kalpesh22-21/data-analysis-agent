@@ -45,6 +45,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TrailEntry
+from tests.runtime.final_answer import final_answer, work_trail
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-trim-refetch"
 _DB = "dbpcm_warehouse"
@@ -140,7 +143,7 @@ async def test_a_visible_repeat_is_still_guarded() -> None:
         [
             ModelTurnResult(tool_calls=[_schema_call("m1")]),
             ModelTurnResult(tool_calls=[_schema_call("m2")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(evidence=["m1"], assistant_text="done"),
         ]
     )
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response()]})
@@ -153,7 +156,7 @@ async def test_a_visible_repeat_is_still_guarded() -> None:
     assert len(recorder.payloads("loop_repeated_idempotent_read_guarded")) == 1
     assert recorder.payloads("loop_trimmed_read_refetch_allowed") == []
     # The model got the "you already have this" nudge, not a second schema.
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [e.error_code for e in trail] == [None, "IDEMPOTENT_READ_ALREADY_SERVED"]
 
 
@@ -164,7 +167,7 @@ async def test_a_repeat_whose_result_was_trimmed_away_is_re_dispatched() -> None
         [
             ModelTurnResult(tool_calls=[_schema_call("m1")]),
             ModelTurnResult(tool_calls=[_schema_call("m2")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response(), _schema_response()]})
@@ -189,7 +192,7 @@ async def test_a_repeat_whose_result_was_trimmed_away_is_re_dispatched() -> None
     assert allowed[0]["refetch_cap"] == _MAX_TRIMMED_READ_REFETCHES
 
     # Two real entries — neither is a data-free guard marker.
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [(e.tool_name, e.error_code) for e in trail] == [
         ("getTableSchema", None),
         ("getTableSchema", None),
@@ -207,7 +210,7 @@ async def test_two_identical_reads_in_one_response_still_dedup_to_one_dispatch()
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_schema_call("m1"), _schema_call("m2")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response()]})
@@ -269,7 +272,7 @@ async def test_a_stranded_read_rendered_as_a_sentinel_is_not_counted_as_readable
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_schema_call("m1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(evidence=["m1"], assistant_text="done"),
         ]
     )
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response()]})
@@ -299,7 +302,7 @@ async def test_the_guards_own_nudge_never_counts_as_the_readable_result() -> Non
             ModelTurnResult(tool_calls=[_schema_call("m1")]),
             ModelTurnResult(tool_calls=[_schema_call("m2")]),  # guarded -> marker
             ModelTurnResult(tool_calls=[_schema_call("m3")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(evidence=["m1"], assistant_text="done"),
         ]
     )
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response(), _schema_response()]})
@@ -318,7 +321,7 @@ async def test_the_guards_own_nudge_never_counts_as_the_readable_result() -> Non
     assert _dispatched(mcp, "getTableSchema") == 1
     assert len(recorder.payloads("loop_repeated_idempotent_read_guarded")) == 2
     assert recorder.payloads("loop_trimmed_read_refetch_allowed") == []
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [e.error_code for e in trail] == [
         None,
         "IDEMPOTENT_READ_ALREADY_SERVED",
@@ -340,7 +343,7 @@ async def test_the_refetch_exemption_is_capped_and_the_guard_resumes() -> None:
     rounds = _MAX_TRIMMED_READ_REFETCHES + 3  # comfortably past the cap
     model = ScriptedModelClient(
         [ModelTurnResult(tool_calls=[_schema_call(f"m{n}")]) for n in range(rounds)]
-        + [ModelTurnResult(assistant_text="done")]
+        + [final_answer(assistant_text="I don't have any information to answer your question.")]
     )
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response()] * rounds})
     recorder = _Recorder()
@@ -384,12 +387,10 @@ async def test_the_cap_is_per_signature_not_global() -> None:
             ModelTurnResult(tool_calls=[_schema_call("m4")]),  # capped by now
             ModelTurnResult(tool_calls=[other]),
             ModelTurnResult(tool_calls=[other2]),  # still has its own allowance
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
-    mcp = FakeMCPClient(
-        scripted={"getTableSchema": [_schema_response()] * 3 + [payroll] * 2}
-    )
+    mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response()] * 3 + [payroll] * 2})
     recorder = _Recorder()
     loop, _store = _trimming_loop(model=model, mcp=mcp, observer=recorder)
 
@@ -418,6 +419,7 @@ async def test_the_exemption_covers_every_guarded_read_not_just_schemas(
 ) -> None:
     """Uniform across `IDEMPOTENT_READ_TOOLS`. A per-tool carve-out would leave the
     prompt's re-fetch escape silently working for some reads and not others."""
+
     def call(call_id: str) -> ToolCallRequest:
         return ToolCallRequest(id=call_id, name=tool_name, arguments=dict(arguments))
 
@@ -425,7 +427,7 @@ async def test_the_exemption_covers_every_guarded_read_not_just_schemas(
         [
             ModelTurnResult(tool_calls=[call("r1")]),
             ModelTurnResult(tool_calls=[call("r2")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={tool_name: [response, response]})
@@ -443,6 +445,7 @@ async def test_explain_query_sql_never_reaches_the_exemption_event() -> None:
     PII literals, so it identifies as the empty target rather than by its text — a
     less specific span is the right trade against a query literal in the backend."""
     pii = "SELECT * FROM employee WHERE last_name = 'Rasmussen'"
+
     def call(call_id: str) -> ToolCallRequest:
         return ToolCallRequest(id=call_id, name="explainQuery", arguments={"sql": pii})
 
@@ -450,7 +453,7 @@ async def test_explain_query_sql_never_reaches_the_exemption_event() -> None:
         [
             ModelTurnResult(tool_calls=[call("e1")]),
             ModelTurnResult(tool_calls=[call("e2")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"explainQuery": [{"plan": "x"}, {"plan": "x"}]})
@@ -488,7 +491,7 @@ async def test_emulated_discovery_pairs_are_readable_so_a_re_call_is_still_dedup
         "user_message": None,
         "result_preview": {
             "columns": ["name"],
-            "rows": [[_TABLE]],
+            "preview_rows": [[_TABLE]],
             "row_count": 1,
             "truncated": False,
         },
@@ -508,7 +511,7 @@ async def test_emulated_discovery_pairs_are_readable_so_a_re_call_is_still_dedup
                     ToolCallRequest(id="lt1", name="listTables", arguments={"database": _DB})
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(evidence=["emulated-listTables-dbpcm_warehouse"], assistant_text="done"),
         ]
     )
     mcp = FakeMCPClient(scripted={"listTables": [[{"name": _TABLE}]]})

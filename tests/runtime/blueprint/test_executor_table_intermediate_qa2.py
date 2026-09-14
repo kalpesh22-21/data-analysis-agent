@@ -53,7 +53,6 @@ from data_agent.runtime.blueprint.executor import (
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
 from data_agent.runtime.mcp.client import MCPToolError
-from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.scratch_client import (
     FakeScratchClient,
     ScratchClientError,
@@ -65,6 +64,8 @@ from data_agent.sqlparse.provenance import (
     ScratchSessionError,
     _validate_scratch_name,
 )
+from tests.runtime.blueprint.measurement_fixtures import UniqueJoinKeysMCP as FakeMCPClient
+from tests.runtime.blueprint.measurement_fixtures import execution_calls
 
 _W = "dbpcm_warehouse"
 _EMP = f"{_W}.employee"
@@ -220,9 +221,7 @@ def test_numeric_looking_string_join_key_stays_string_not_mismapped() -> None:
     ('1001') must infer to ``String``, NOT ``Int64`` — otherwise the scratch column
     would mistype and mismatch the ``String`` warehouse key. Native type wins over
     the textual appearance of the value (an explicit toString(...) is honored)."""
-    cols = _infer_scratch_columns(
-        ["EmployeeCode", "earnings"], [["1001", 100.0], ["1002", 200.0]]
-    )
+    cols = _infer_scratch_columns(["EmployeeCode", "earnings"], [["1001", 100.0], ["1002", 200.0]])
     assert cols == [
         {"name": "EmployeeCode", "type": "String"},  # numeric-looking str stays String
         {"name": "earnings", "type": "Float64"},
@@ -289,7 +288,7 @@ async def test_hostile_endpoint_table_name_is_ast_quoted_not_injected() -> None:
         blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
     )
     assert isinstance(outcome, ExecCompleted)
-    consumer_sql = mcp.calls[2].args["sql"]
+    consumer_sql = execution_calls(mcp)[2].args["sql"]
     # Re-parse: it is a SINGLE statement (not a multi-statement Block), i.e. no
     # breakout — the DROP did not become its own statement.
     parsed = sqlglot.parse(consumer_sql, dialect="clickhouse")
@@ -346,8 +345,8 @@ async def test_upstream_cell_with_scratch_and_sql_rides_as_data_only() -> None:
     assert isinstance(outcome, ExecCompleted)
     mat = next(c for c in scratch.calls if c.op == "materialize")
     assert mat.rows == [[hostile_cell, 100.0]]  # the hostile string is a DATA cell
-    assert hostile_cell not in mcp.calls[2].args["sql"]
-    assert "DROP TABLE" not in mcp.calls[2].args["sql"]
+    assert hostile_cell not in execution_calls(mcp)[2].args["sql"]
+    assert "DROP TABLE" not in execution_calls(mcp)[2].args["sql"]
 
 
 # ---------------------------------------------------------------------------
@@ -358,9 +357,7 @@ async def test_upstream_cell_with_scratch_and_sql_rides_as_data_only() -> None:
 async def test_materialize_rejection_fails_closed_to_raw_loop() -> None:
     """A materialize the endpoint REJECTS (over-cap / duplicate columns / bad type,
     surfaced as ScratchClientError) → UNSUPPORTED (raw loop), never a partial JOIN."""
-    scratch = FakeScratchClient(
-        fail=ScratchClientError("SCRATCH_MATERIALIZE_REJECTED", "rejected")
-    )
+    scratch = FakeScratchClient(fail=ScratchClientError("SCRATCH_MATERIALIZE_REJECTED", "rejected"))
     mcp = _mcp(
         _rq(["EmployeeCode", "earnings"], [["1001", 100.0]]),
         _rq(["department", "total_earnings"], [["Sales", 100.0]]),
@@ -379,9 +376,7 @@ async def test_duplicate_producer_columns_forwarded_no_silent_dedup() -> None:
     proven in ch-api). Pins that no client-side dedup masks a malformed producer:
     the forwarded column list preserves the duplicate, and an endpoint rejection
     fails closed."""
-    dup_cols = _infer_scratch_columns(
-        ["k", "k"], [["1001", "1002"], ["1003", "1004"]]
-    )
+    dup_cols = _infer_scratch_columns(["k", "k"], [["1001", "1002"], ["1003", "1004"]])
     assert [c["name"] for c in dup_cols] == ["k", "k"]  # duplicate preserved, not collapsed
 
 
@@ -404,9 +399,7 @@ _APPROVAL_GATED_COMPOSES: list[dict[str, Any]] = [
 ]
 
 
-async def _pause_after_producer(
-    detail: BlueprintDetail, scratch: FakeScratchClient
-) -> ExecPaused:
+async def _pause_after_producer(detail: BlueprintDetail, scratch: FakeScratchClient) -> ExecPaused:
     """Run the first turn of the approval-gated table-intermediate blueprint: domain
     probe + producer run + materialize, then PAUSE at the approval node. Returns the
     pause (whose checkpoint the resume tests then feed back, tampered or not)."""
@@ -558,9 +551,7 @@ async def test_resume_binds_the_exact_table_name_the_endpoint_returned() -> None
     assert isinstance(resumed, ExecCompleted)
     parsed = sqlglot.parse(_consumer_sql(mcp2), dialect="clickhouse")
     assert len(parsed) == 1
-    scratch_tables = {
-        t.name for t in parsed[0].find_all(exp.Table) if t.text("db") == "scratch"
-    }
+    scratch_tables = {t.name for t in parsed[0].find_all(exp.Table) if t.text("db") == "scratch"}
     assert scratch_tables == {returned.split(".", 1)[1]}
 
 
@@ -580,7 +571,7 @@ async def test_checkpoint_naming_a_foreign_session_table_is_not_seeded() -> None
     assert isinstance(resumed, ExecFailed)
     assert resumed.error_code == SLOT_INVALID_CODE
     bare_foreign = foreign.split(".", 1)[1]
-    assert not any(bare_foreign in str(c.args.get("sql", "")) for c in mcp2.calls)
+    assert not any(bare_foreign in str(c.args.get("sql", "")) for c in execution_calls(mcp2))
 
 
 @pytest.mark.parametrize(
@@ -637,7 +628,7 @@ async def test_checkpoint_table_in_the_wrong_database_is_not_seeded() -> None:
     resumed, mcp2, _ = await _resume_fresh(detail, tampered)
     assert isinstance(resumed, ExecFailed)
     assert resumed.error_code == SLOT_INVALID_CODE
-    assert not any(f"s_{_SID}_bp_x" in str(c.args.get("sql", "")) for c in mcp2.calls)
+    assert not any(f"s_{_SID}_bp_x" in str(c.args.get("sql", "")) for c in execution_calls(mcp2))
 
 
 async def test_when_ask_pause_also_restores_the_table_intermediate() -> None:
@@ -775,7 +766,7 @@ def _materialized_name(scratch: FakeScratchClient, nth: int = 0) -> str:
 
 
 def _dispatched_sql(mcp: FakeMCPClient) -> str:
-    return "\n".join(str(c.args.get("sql", "")) for c in mcp.calls)
+    return "\n".join(str(c.args.get("sql", "")) for c in execution_calls(mcp))
 
 
 _COUNT_PROBE_PREFIX = "SELECT COUNT(*) FROM scratch."
@@ -785,7 +776,7 @@ def _count_probes(mcp: FakeMCPClient) -> list[str]:
     """Every dispatched restore count-probe (`SELECT COUNT(*) FROM scratch.…`)."""
     return [
         sql
-        for c in mcp.calls
+        for c in execution_calls(mcp)
         if (sql := str(c.args.get("sql", ""))).startswith(_COUNT_PROBE_PREFIX)
     ]
 
@@ -801,7 +792,7 @@ def _consumer_sql(mcp: FakeMCPClient) -> str:
     a `SELECT COUNT(*)` the moment the restore gate changes."""
     matches = [
         sql
-        for c in mcp.calls
+        for c in execution_calls(mcp)
         if "scratch." in (sql := str(c.args.get("sql", "")))
         and "__bp_n" not in sql
         and not sql.startswith(_COUNT_PROBE_PREFIX)
@@ -1195,15 +1186,14 @@ async def test_two_intermediates_with_one_poisoned_binds_neither() -> None:
     foreign = "scratch.s" + "9" * 32 + "_bp_" + "0" * 32
     tampered = _retable(paused.completed_nodes_json, 1, foreign)
 
-    resumed, mcp2, _ = await _resume_fresh(
-        detail, tampered, counts=[_count(1)], awaiting_node=2
-    )
+    resumed, mcp2, _ = await _resume_fresh(detail, tampered, counts=[_count(1)], awaiting_node=2)
     assert isinstance(resumed, ExecFailed)
     assert resumed.error_code == SLOT_INVALID_CODE
     assert foreign.split(".", 1)[1] not in _dispatched_sql(mcp2)
     bare_good = good.split(".", 1)[1]
     assert not any(
-        bare_good in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+        bare_good in (sql := str(c.args.get("sql", ""))) and _W in sql
+        for c in execution_calls(mcp2)
     )
     assert _count_probes(mcp2) == [f"SELECT COUNT(*) FROM scratch.{bare_good}"]
 
@@ -1293,7 +1283,10 @@ async def test_a_scratch_table_that_died_across_the_pause_is_a_clean_failure(cod
     bare = _materialized_name(scratch1).split(".", 1)[1]
     assert _count_probes(mcp2) == [f"SELECT COUNT(*) FROM scratch.{bare}"]
     # No consumer JOIN was ever dispatched — the run stopped at the probe.
-    assert not any(_W in str(c.args.get("sql", "")) and bare in str(c.args.get("sql", "")) for c in mcp2.calls)
+    assert not any(
+        _W in str(c.args.get("sql", "")) and bare in str(c.args.get("sql", ""))
+        for c in execution_calls(mcp2)
+    )
 
 
 async def test_a_consumer_denial_after_a_verified_restore_passes_through_verbatim() -> None:
@@ -1409,7 +1402,7 @@ async def test_a_row_expired_intermediate_is_refused_not_answered_verified(
     assert _count_probes(mcp2) == [f"SELECT COUNT(*) FROM scratch.{bare}"]
     # The JOIN was never dispatched — nothing bound the expired table.
     assert not any(
-        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in execution_calls(mcp2)
     )
 
 
@@ -1454,7 +1447,7 @@ async def test_a_restore_probe_that_cannot_answer_refuses_the_seed(probe: Any) -
     assert resumed.error_code == SLOT_INVALID_CODE
     bare = _materialized_name(scratch1).split(".", 1)[1]
     assert not any(
-        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in execution_calls(mcp2)
     )
 
 
@@ -1520,7 +1513,7 @@ async def test_an_empty_intermediates_unanswerable_probe_is_still_refused(probe:
     assert resumed.error_code == SLOT_INVALID_CODE
     bare = _materialized_name(scratch1).split(".", 1)[1]
     assert not any(
-        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in execution_calls(mcp2)
     )
 
 
@@ -1533,7 +1526,9 @@ class _DeniedWithABodyDispatcher:
         self.status = status
         self.dispatched: list[str] = []
 
-    async def dispatch(self, tool_name: str, args: dict[str, Any], credentials: Any, **kw: Any) -> Any:
+    async def dispatch(
+        self, tool_name: str, args: dict[str, Any], credentials: Any, **kw: Any
+    ) -> Any:
         self.dispatched.append(str(args.get("sql", "")))
         return ToolResult(
             status=self.status,
@@ -1659,7 +1654,7 @@ async def test_a_live_count_that_is_not_an_integer_is_refused(live: Any, stored:
     assert _count_probes(mcp2) == [f"SELECT COUNT(*) FROM scratch.{bare}"]
     # The JOIN was never dispatched — a truncated value bound nothing.
     assert not any(
-        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in execution_calls(mcp2)
     )
 
 
@@ -1855,7 +1850,8 @@ async def test_two_intermediates_with_one_count_refusal_binds_neither() -> None:
     ]
     # NEITHER was bound: no half-built JOIN was ever dispatched.
     assert not any(
-        "scratch." in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+        "scratch." in (sql := str(c.args.get("sql", ""))) and _W in sql
+        for c in execution_calls(mcp2)
     )
 
 
@@ -1917,7 +1913,9 @@ async def test_a_producer_consumed_twice_is_counted_once() -> None:
     assert "scratch.emp_again" not in consumer_sql
 
 
-def _tamper_foreign_table(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+def _tamper_foreign_table(
+    cp: str | None, creds: RuntimeCredentials
+) -> tuple[str, RuntimeCredentials]:
     return _retable(cp, 0, "scratch.s" + "9" * 32 + "_bp_" + "0" * 32), creds
 
 
@@ -1936,22 +1934,26 @@ def _tamper_null_count(cp: str | None, creds: RuntimeCredentials) -> tuple[str, 
     return _repatch(cp, 0, row_count=None), creds
 
 
-def _resume_as_other_session(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+def _resume_as_other_session(
+    cp: str | None, creds: RuntimeCredentials
+) -> tuple[str, RuntimeCredentials]:
     return cp or "[]", RuntimeCredentials(
         session_id="s" + "9" * 32, jwt="jwt-secret", column_scope=frozenset()
     )
 
 
-def _resume_as_prefix_claimant(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+def _resume_as_prefix_claimant(
+    cp: str | None, creds: RuntimeCredentials
+) -> tuple[str, RuntimeCredentials]:
     return cp or "[]", RuntimeCredentials(
         session_id=f"{_SID}_bp", jwt="jwt-secret", column_scope=frozenset()
     )
 
 
-def _resume_sessionless(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
-    return cp or "[]", RuntimeCredentials(
-        session_id="", jwt="jwt-secret", column_scope=frozenset()
-    )
+def _resume_sessionless(
+    cp: str | None, creds: RuntimeCredentials
+) -> tuple[str, RuntimeCredentials]:
+    return cp or "[]", RuntimeCredentials(session_id="", jwt="jwt-secret", column_scope=frozenset())
 
 
 @pytest.mark.parametrize(
@@ -2131,9 +2133,7 @@ async def test_a_twice_paused_intermediate_survives_and_is_re_gated_each_time() 
     bare = table.split(".", 1)[1]
 
     # --- first resume: approve gate 1, re-pause at gate 2 --------------------
-    mcp2 = FakeMCPClient(
-        scripted={"runQuery": [_rq(["Department"], [["Sales"]]), _count(1)]}
-    )
+    mcp2 = FakeMCPClient(scripted={"runQuery": [_rq(["Department"], [["Sales"]]), _count(1)]})
     scratch2 = FakeScratchClient()
     second_pause = await _executor(mcp2, scratch_client=scratch2, detail=detail).resume(
         blueprint_id="bp-table",
@@ -2219,9 +2219,7 @@ async def test_an_intermediate_that_expires_between_the_second_pause_and_its_res
     mcp2 = FakeMCPClient(
         scripted={"runQuery": [_rq(["Department"], [["Sales"]]), _count(1)]}  # still intact
     )
-    second_pause = await _executor(
-        mcp2, scratch_client=FakeScratchClient(), detail=detail
-    ).resume(
+    second_pause = await _executor(mcp2, scratch_client=FakeScratchClient(), detail=detail).resume(
         blueprint_id="bp-table",
         slot_bindings={"department": "Sales"},
         completed_nodes_json=first_pause.completed_nodes_json,
@@ -2255,7 +2253,7 @@ async def test_an_intermediate_that_expires_between_the_second_pause_and_its_res
     assert done.error_code == SLOT_INVALID_CODE
     assert _count_probes(mcp3) == [f"SELECT COUNT(*) FROM scratch.{bare}"]
     assert not any(
-        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp3.calls
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in execution_calls(mcp3)
     )
 
 
@@ -2400,5 +2398,3 @@ async def test_the_count_gate_is_point_in_time_and_leaves_a_toctou_window_is_a_k
     assert resumed.result_full["status"] == "verified"
     assert resumed.result_full["verify"]["grain_ok"] is True
     assert resumed.result_full["preview_rows"] == [["Sales", 50.0]]
-
-

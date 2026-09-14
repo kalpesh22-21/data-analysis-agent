@@ -276,28 +276,17 @@ class CapabilityDefinition:
     ) -> dict[str, Any]:
         parameters = self.argument_schema(resolution_registry)
         properties = dict(parameters["properties"])
-        properties["answer"] = {
-            "type": "string",
-            "description": (
-                "For a mixed request only: the concise answer to work completed before this "
-                "UI option. Omit when the UI option alone answers the request. Never mention "
-                "cards, widgets, capabilities, tools, or hydration to the user. Navigation "
-                "is never automatic: say the user can use the displayed option, never that "
-                "you are opening, navigating, taking, or redirecting them. Present this option "
-                "ONLY when its declared coverage explicitly answers the request — never present "
-                "the nearest related option and bridge the gap here. If this option cannot "
-                "answer, do not force it: say what it cannot do instead."
-            ),
-        }
-        properties["serves_intent"] = {
-            "type": "string",
-            "description": "Optional analysis-state intent id served by this UI card.",
+        properties["serves_intents"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Declared intent IDs this prepared option serves.",
         }
         parameters["properties"] = properties
         return {
             "type": "function",
             "name": self.name,
-            "description": self.description,
+            "description": self.description
+            + " Prepare this option; include its capability_ref in finalizeAnswer to display it.",
             "parameters": parameters,
         }
 

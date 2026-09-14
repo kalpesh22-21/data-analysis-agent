@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.answer_scrub import (
     ANSWER_PROSE_REDACTED_EVENT,
     SAVED_ANALYSIS_MARKER,
@@ -50,6 +52,9 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-answer-scrub"
 _E = "dbpcm_warehouse.employee"
@@ -76,7 +81,33 @@ def _build(
     *,
     runtime_tools: dict[str, Any] | None = None,
     mcp: FakeMCPClient | None = None,
+    prose_evidence: bool = False,
 ) -> tuple[AgentLoop, InMemorySessionStore, list[tuple[str, dict[str, Any]]]]:
+    if prose_evidence:
+        turns = [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="prose_source",
+                        name="runQuery",
+                        arguments={"sql": "SELECT 3 AS sales, 2 AS engineering"},
+                    )
+                ]
+            ),
+            *turns,
+        ]
+        mcp = FakeMCPClient(
+            scripted={
+                "runQuery": [
+                    {
+                        "columns": ["sales", "engineering"],
+                        "rows": [[3, 2]],
+                        "row_count": 1,
+                        "truncated": False,
+                    }
+                ]
+            }
+        )
     store = InMemorySessionStore()
     events: list[tuple[str, dict[str, Any]]] = []
 
@@ -116,7 +147,8 @@ async def test_the_no_tool_calls_exit_scrubs_the_answer_and_persists_the_same_st
     message). Asserting only the outcome would pass with the persist site
     unscrubbed, which is the worse of the two leaks — it survives the session."""
     loop, store, events = _build(
-        [ModelTurnResult(assistant_text=f"I read {_E} to get this. Sales leads with 3.")]
+        [final_answer(assistant_text=f"I read {_E} to get this. Sales leads with 3.")],
+        prose_evidence=True,
     )
 
     outcome = await loop.run(
@@ -128,7 +160,7 @@ async def test_the_no_tool_calls_exit_scrubs_the_answer_and_persists_the_same_st
         f"I read {SCHEMA_DETAIL_MARKER} to get this. Sales leads with 3."
     )
     assert await _assistant_messages(store) == [outcome.assistant_text]
-    assert _redactions(events) == [{"redaction_count": 1, "exit": "no_tool_calls"}]
+    assert _redactions(events) == [{"redaction_count": 1, "exit": "answer_with_text"}]
 
 
 async def test_a_clean_answer_is_untouched_and_emits_no_event() -> None:
@@ -136,7 +168,8 @@ async def test_a_clean_answer_is_untouched_and_emits_no_event() -> None:
     byte-identical and cost no telemetry, or the event's rate stops meaning
     "disclosures" and the sentence boundaries stop meaning sentences."""
     loop, store, events = _build(
-        [ModelTurnResult(assistant_text="Sales has 3 people. Engineering has 2.")]
+        [final_answer(assistant_text="Sales has 3 people. Engineering has 2.")],
+        prose_evidence=True,
     )
 
     outcome = await loop.run(
@@ -388,12 +421,13 @@ async def test_the_event_carries_a_count_and_a_label_and_never_a_token() -> None
     redaction through the side door, so the payload is asserted by its WHOLE
     contents, not by "the token is absent"."""
     loop, _store, events = _build(
-        [ModelTurnResult(assistant_text=f"From {_E} and employee_master, via {_BP}.")]
+        [final_answer(assistant_text=f"From {_E} and employee_master, via {_BP}.")],
+        prose_evidence=True,
     )
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q?")
 
-    assert _redactions(events) == [{"redaction_count": 3, "exit": "no_tool_calls"}]
+    assert _redactions(events) == [{"redaction_count": 3, "exit": "answer_with_text"}]
     blob = repr(events)
     assert "employee_master" not in blob
     assert _BP not in blob

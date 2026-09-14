@@ -113,8 +113,11 @@ async def test_candidate_missing_payload_falls_back_to_text() -> None:
     class _BareIndex:
         async def recall(self, *, query_vector, kind, k):  # noqa: ANN001, ANN202
             if kind == "blueprint":
-                return [Candidate(id="bare", kind="blueprint", text="the-intent",
-                                  uses=frozenset(), score=0.4)]
+                return [
+                    Candidate(
+                        id="bare", kind="blueprint", text="the-intent", uses=frozenset(), score=0.4
+                    )
+                ]
             return []
 
     ctx = await _retrieve(_pipeline(index=_BareIndex()))  # type: ignore[arg-type]
@@ -198,10 +201,8 @@ async def test_top_k_zero_yields_no_cards() -> None:
     assert ctx.thin_cards == []
 
 
-async def test_recall_k_below_top_k_silently_caps_candidates() -> None:
-    # No cross-field validation forces recall_k >= top_k; when recall_k is
-    # smaller the index returns fewer than top_k and the cut is a no-op ceiling.
-    # Documents that a misconfiguration silently reduces candidates.
+async def test_blueprint_recall_pool_is_at_least_the_display_limit() -> None:
+    # Blueprint retrieval expands an undersized configured pool to its display limit.
     pipeline = RetrievalPipeline(
         embedding_client=FakeEmbeddingClient({_Q: _QVEC}),
         reranker=FakeRerankerClient(),
@@ -212,7 +213,7 @@ async def test_recall_k_below_top_k_silently_caps_candidates() -> None:
         top_k_knowledge=3,
     )
     ctx = await _retrieve(pipeline)
-    assert len(ctx.thin_cards) == 2  # capped by recall_k, not top_k
+    assert len(ctx.thin_cards) == 3
 
 
 # --------------------------------------------------------------------------

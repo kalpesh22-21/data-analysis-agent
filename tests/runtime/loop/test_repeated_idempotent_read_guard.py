@@ -34,6 +34,9 @@ from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 CATALOG = CatalogHandle(
     {
@@ -57,7 +60,13 @@ TOOLS_SCHEMA = [
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return list(TOOLS_SCHEMA)
+    return [
+        *TOOLS_SCHEMA,
+        *[
+            {"type": "function", "name": name, "parameters": {}}
+            for name in ("listTables", "explainQuery")
+        ],
+    ]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -112,9 +121,7 @@ def _mcp_call_count(mcp: FakeMCPClient, tool_name: str) -> int:
 
 def _guard_entries(trail: list[Any]) -> list[Any]:
     return [
-        e
-        for e in trail
-        if e.status == "ok" and e.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
+        e for e in trail if e.status == "ok" and e.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
     ]
 
 
@@ -131,8 +138,10 @@ class _RepeatSchemaModel:
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
         if _sees_nudge(messages):
-            return ModelTurnResult(
-                assistant_text="Using the schema I already have.", usage={"total_tokens": 1}
+            return final_answer(
+                evidence=["getTableSchema"],
+                assistant_text="Using the schema I already have.",
+                usage={"total_tokens": 1},
             )
         self._n += 1
         return ModelTurnResult(
@@ -198,9 +207,7 @@ async def test_seeding_catches_repeat_across_a_budget_window_resume() -> None:
 
     # Window 2 (fresh `_run_loop_body`, fresh in-memory set): the model repeats the
     # identical read. Only trail-seeding can catch it.
-    second = await loop.resume(
-        session_id=SESSION_ID, credentials=_credentials(), answer="continue"
-    )
+    second = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="continue")
     assert second.status == "paused_budget_cap"
 
     # Still exactly one MCP dispatch — the window-2 repeat was guarded via seeding.
@@ -223,7 +230,11 @@ class _TwoTablesModel:
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
         if self._i >= len(self._SEQ):
-            return ModelTurnResult(assistant_text="Got both schemas.", usage={"total_tokens": 1})
+            return final_answer(
+                evidence=["getTableSchema"],
+                assistant_text="Got both schemas.",
+                usage={"total_tokens": 1},
+            )
         table, call_id = self._SEQ[self._i]
         self._i += 1
         return ModelTurnResult(
@@ -243,9 +254,7 @@ class _TwoTablesModel:
 
 async def test_different_args_read_is_not_falsely_guarded() -> None:
     model = _TwoTablesModel()
-    mcp = FakeMCPClient(
-        scripted={"getTableSchema": [_schema_response(), _schema_response()]}
-    )
+    mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response(), _schema_response()]})
     loop, store = _build_loop(model, mcp)
 
     outcome = await loop.run(
@@ -273,7 +282,7 @@ class _RepeatQueryModel:
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
         if self._n >= 2:
-            return ModelTurnResult(assistant_text="Done.", usage={"total_tokens": 1})
+            return final_answer(assistant_text="Done.", usage={"total_tokens": 1})
         self._n += 1
         return ModelTurnResult(
             tool_calls=[
@@ -322,8 +331,9 @@ class _RetrySampleRowsModel:
             for m in messages
         )
         if saw_withheld:
-            return ModelTurnResult(
-                assistant_text="That result is withheld.", usage={"total_tokens": 1}
+            return final_answer(
+                assistant_text="I cannot answer because that result is withheld.",
+                usage={"total_tokens": 1},
             )
         return ModelTurnResult(
             tool_calls=[
@@ -345,9 +355,7 @@ async def test_d94_withheld_provenance_sentinel_still_fires_unchanged() -> None:
     marker must not disturb the original D94 ok+None path — an uncatalogued
     sampleRows still surfaces the WITHHELD sentinel (not the read-guard nudge)."""
     model = _RetrySampleRowsModel()
-    mcp = FakeMCPClient(
-        scripted={"sampleRows": [_query_response() for _ in range(20)]}
-    )
+    mcp = FakeMCPClient(scripted={"sampleRows": [_query_response() for _ in range(20)]})
     loop, store = _build_loop(model, mcp)
 
     outcome = await loop.run(
@@ -367,7 +375,7 @@ async def test_d94_withheld_provenance_sentinel_still_fires_unchanged() -> None:
     assert not _sees_nudge(second_ctx)
     # It was a real stranded ok+None entry, never a guard entry.
     trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 1
+    assert len(trail) == 2
     assert trail[0].status == "ok" and trail[0].provenance is None
     assert _guard_entries(trail) == []
 
@@ -389,9 +397,7 @@ def _assert_valid_tool_pairing(messages: list[dict[str, Any]]) -> None:
         if m.get("role") == "assistant":
             for tc in m.get("tool_calls") or []:
                 tool_call_ids.append(tc["id"])
-    tool_result_ids = [
-        m["tool_call_id"] for m in messages if m.get("role") == "tool"
-    ]
+    tool_result_ids = [m["tool_call_id"] for m in messages if m.get("role") == "tool"]
     assert sorted(tool_call_ids) == sorted(tool_result_ids)
     # No id appears twice on either side (would be an API 400).
     assert len(tool_call_ids) == len(set(tool_call_ids))
@@ -424,7 +430,9 @@ class _OneSchemaPerTurnModel:
                 ],
                 usage={"total_tokens": 1},
             )
-        return ModelTurnResult(assistant_text="Answered.", usage={"total_tokens": 1})
+        return final_answer(
+            evidence=["getTableSchema"], assistant_text="Answered.", usage={"total_tokens": 1}
+        )
 
     def begin_turn(self) -> _OneSchemaPerTurnModel:
         return self
@@ -471,7 +479,11 @@ class _SchemaQueryRepeatModel:
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
         if _sees_nudge(messages):
-            return ModelTurnResult(assistant_text="Here is your answer.", usage={"total_tokens": 1})
+            return final_answer(
+                evidence=["getTableSchema"],
+                assistant_text="Here is your answer.",
+                usage={"total_tokens": 1},
+            )
         self._step += 1
         if self._step == 1:
             call = ToolCallRequest(
@@ -544,7 +556,11 @@ class _DeniedThenRetryModel:
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
         if self._n >= 2:
-            return ModelTurnResult(assistant_text="Got it on retry.", usage={"total_tokens": 1})
+            return final_answer(
+                evidence=["getTableSchema"],
+                assistant_text="Got it on retry.",
+                usage={"total_tokens": 1},
+            )
         self._n += 1
         return ModelTurnResult(
             tool_calls=[
@@ -602,7 +618,10 @@ class _RepeatToolModel:
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
         if _sees_nudge(messages):
-            return ModelTurnResult(assistant_text="Using what I have.", usage={"total_tokens": 1})
+            return final_answer(
+                assistant_text="I cannot answer beyond the information already retrieved.",
+                usage={"total_tokens": 1},
+            )
         self._n += 1
         return ModelTurnResult(
             tool_calls=[

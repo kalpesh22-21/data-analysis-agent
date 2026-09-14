@@ -29,6 +29,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.budget import estimate_message_tokens
@@ -38,6 +40,9 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
@@ -105,7 +110,7 @@ class _PerTurnModel:
                 ],
                 usage={"total_tokens": 5000},
             )
-        return ModelTurnResult(
+        return final_answer(
             assistant_text=f"[{self.turn_label}] the answer", usage={"total_tokens": 5000}
         )
 
@@ -219,9 +224,7 @@ async def test_total_request_budget_pins_base_prompt_and_bounds_every_send_turn(
         question = f"question {label}?"
         questions[label] = question
         model.new_turn(label)
-        outcome = await loop.run(
-            session_id=SESSION_ID, credentials=_creds(), user_message=question
-        )
+        outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message=question)
         assert outcome.status == "done"
 
     # THREE send_turn calls per external turn: one fat query, one answer, and one
@@ -234,9 +237,12 @@ async def test_total_request_budget_pins_base_prompt_and_bounds_every_send_turn(
 
     # A single fat result is genuinely ~30k tokens — so a raw untrimmed request
     # with several of them dwarfs the budget (the scenario the fix must contain).
-    assert estimate_message_tokens(
-        {"role": "tool", "tool_call_id": "x", "content": str(_fat_result())}
-    ) > 25_000
+    assert (
+        estimate_message_tokens(
+            {"role": "tool", "tool_call_id": "x", "content": str(_fat_result())}
+        )
+        > 25_000
+    )
 
     for i, (label, msgs) in enumerate(model.calls):
         # (1) base prompt byte-identical at index 0 — NEVER dropped/front-truncated.
@@ -254,9 +260,9 @@ async def test_total_request_budget_pins_base_prompt_and_bounds_every_send_turn(
             f"call[{i}] total {total} exceeds budget {_REQUEST_TOKEN_BUDGET}"
         )
         # (3) THIS turn's current question survives (pinned tail).
-        assert any(
-            m["role"] == "user" and m.get("content") == questions[label] for m in msgs
-        ), f"call[{i}] ({label}) dropped its current user question"
+        assert any(m["role"] == "user" and m.get("content") == questions[label] for m in msgs), (
+            f"call[{i}] ({label}) dropped its current user question"
+        )
         # (4) pairing intact — no orphan tool / dangling tool_calls.
         _assert_pairing_intact(msgs)
 
@@ -320,9 +326,12 @@ async def test_total_request_budget_bounds_a_runaway_single_turn() -> None:
     assert len(model.calls) == _ITERS_PER_WINDOW * _MAX_WINDOWS
 
     # A single fat result is genuinely ~30k tokens — several dwarf the budget.
-    assert estimate_message_tokens(
-        {"role": "tool", "tool_call_id": "x", "content": str(_fat_result())}
-    ) > 25_000
+    assert (
+        estimate_message_tokens(
+            {"role": "tool", "tool_call_id": "x", "content": str(_fat_result())}
+        )
+        > 25_000
+    )
 
     for i, msgs in enumerate(model.calls):
         # (1) base prompt byte-identical at index 0, and the SOLE system message.
@@ -339,9 +348,9 @@ async def test_total_request_budget_bounds_a_runaway_single_turn() -> None:
             f"call[{i}] total {total} exceeds budget {_RUNAWAY_REQUEST_TOKEN_BUDGET}"
         )
         # (3) the current question survives.
-        assert any(
-            m["role"] == "user" and m.get("content") == "how many?" for m in msgs
-        ), f"call[{i}] dropped the current user question"
+        assert any(m["role"] == "user" and m.get("content") == "how many?" for m in msgs), (
+            f"call[{i}] dropped the current user question"
+        )
         # (4) pairing intact — no orphan tool / dangling tool_calls.
         _assert_pairing_intact(msgs)
 
@@ -349,7 +358,9 @@ async def test_total_request_budget_bounds_a_runaway_single_turn() -> None:
     # current-turn pair (D1) is trimmed, while the most-recent K (=3) survive.
     deepest = model.calls[-1]
     sqls = _tool_pair_sqls(deepest)
-    produced = model.calls[-1] and (len(model.calls) - 1)  # D1..D{produced} are in the deepest payload
+    produced = model.calls[-1] and (
+        len(model.calls) - 1
+    )  # D1..D{produced} are in the deepest payload
     assert not any("'D1'" in s for s in sqls), "oldest current-turn result was NOT trimmed"
     # The three most-recent current-turn results survived (pinned recent-K).
     for k in range(produced - _RUNAWAY_PINNED_K + 1, produced + 1):

@@ -47,16 +47,42 @@ def refusal(name: str, code: str) -> ToolResult:
 class BlueprintSearchGate:
     def __init__(self, question, trail, turn_index):
         self._data = bool(question) and route_uses_data_prefetch(PrefetchRouter().route(question))
-        self._consulted = any(
-            tc.turn_index == turn_index and tc.tool_name in BLUEPRINT_FAMILY for tc in trail
-        )
-        self._used = False
+        self._consulted = False
+        self._discovery_unavailable = False
+        self._turn_index = turn_index
 
     def observe_batch(self, calls) -> None:
-        self._consulted |= any(call.name in BLUEPRINT_FAMILY for call in calls)
+        """Proposed calls are not information received by the model."""
+
+    def observe_context(self, messages) -> None:
+        import json
+
+        for message in messages:
+            if message.get("role") == "tool":
+                try:
+                    payload = json.loads(message.get("content", ""))
+                except (ValueError, TypeError):
+                    payload = {}
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("tool_name") in BLUEPRINT_FAMILY
+                    and payload.get("status") == "ok"
+                    and payload.get("turn_index") == self._turn_index
+                ):
+                    self._consulted = True
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("tool_name") in BLUEPRINT_FAMILY
+                    and payload.get("turn_index") == self._turn_index
+                    and payload.get("error_code")
+                    in {"RETRIEVAL_TOOL_UNAVAILABLE", "RETRIEVAL_TOOL_INTERNAL_ERROR"}
+                ):
+                    self._discovery_unavailable = True
+
+    def observe_prefetch(self):
+        self._consulted = True
 
     def check(self, name: str) -> ToolResult | None:
-        if name != "runQuery" or not self._data or self._consulted or self._used:
+        if name != "runQuery" or not self._data or self._consulted or self._discovery_unavailable:
             return None
-        self._used = True
         return refusal(name, BLUEPRINT_NOT_SEARCHED_CODE)

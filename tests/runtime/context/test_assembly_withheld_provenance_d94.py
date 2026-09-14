@@ -240,6 +240,7 @@ async def test_sentinel_message_carries_only_id_toolname_args_and_content() -> N
         "args",
         "withheld_sentinel",
         "content",
+        "model_response",
     }
     # content is byte-exact the fixed, data-free marker.
     assert sentinel["content"] == EXPECTED_SENTINEL
@@ -332,7 +333,9 @@ async def test_event_payload_shape_runquery() -> None:
     store = InMemorySessionStore()
     await store.append_trail_entry(
         "sess-1",
-        _entry("call_rq", None, tool_name="runQuery", args={"sql": f"SELECT {_SECRET}"}, turn_index=2),
+        _entry(
+            "call_rq", None, tool_name="runQuery", args={"sql": f"SELECT {_SECRET}"}, turn_index=2
+        ),
     )
     events, observer = _events_collector()
     assembler = ContextAssembler(store)
@@ -502,8 +505,13 @@ async def test_mixed_trail_normal_survives_and_stranded_gets_sentinel() -> None:
     # FIX 1 now legitimately replays for correlation).
     await store.append_trail_entry(
         "sess-1",
-        _entry("call_none", None, args={"sql": "SELECT Amount FROM payroll"}, turn_index=0,
-               result_preview=_secret_preview()),
+        _entry(
+            "call_none",
+            None,
+            args={"sql": "SELECT Amount FROM payroll"},
+            turn_index=0,
+            result_preview=_secret_preview(),
+        ),
     )
 
     assembler = ContextAssembler(store)
@@ -511,8 +519,12 @@ async def test_mixed_trail_normal_survives_and_stranded_gets_sentinel() -> None:
     assembled = await assembler.assemble("sess-1", scope, current_turn_index=0)
 
     canonical = _assembled_to_canonical(assembled.messages)
-    ok_tool = next(c for c in canonical if c.get("role") == "tool" and c.get("tool_call_id") == "call_ok")
-    none_tool = next(c for c in canonical if c.get("role") == "tool" and c.get("tool_call_id") == "call_none")
+    ok_tool = next(
+        c for c in canonical if c.get("role") == "tool" and c.get("tool_call_id") == "call_ok"
+    )
+    none_tool = next(
+        c for c in canonical if c.get("role") == "tool" and c.get("tool_call_id") == "call_none"
+    )
     assert json.loads(ok_tool["content"])["status"] == "ok"
     assert none_tool["content"] == EXPECTED_SENTINEL
     # Every assistant tool_call has a matching tool result (valid API pairing).
@@ -593,7 +605,9 @@ async def test_multicall_turn_withheld_call_keeps_its_args_for_correlation() -> 
         and c.get("tool_calls")
         and c["tool_calls"][0]["id"] == "call_ok"
     )
-    assert json.loads(ok_assistant["tool_calls"][0]["function"]["arguments"]) == {"sql": in_scope_sql}
+    assert json.loads(ok_assistant["tool_calls"][0]["function"]["arguments"]) == {
+        "sql": in_scope_sql
+    }
     ok_tool = next(
         c for c in canonical if c.get("role") == "tool" and c.get("tool_call_id") == "call_ok"
     )

@@ -7,6 +7,8 @@ iterations).
 
 from __future__ import annotations
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -23,6 +25,9 @@ from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview, TrailEntry, TurnMessage
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _Q = "sales overtime"
 _COL = ("dbpcm_warehouse.employee", "Department")
@@ -160,9 +165,7 @@ async def test_unconfigured_retrieval_is_byte_identical() -> None:
 async def test_configured_retrieval_but_no_user_message_does_not_run() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(
-        store, retrieval=_pipeline(embedder)
-    )
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     assembled = await assembler.assemble(SESSION_ID, frozenset())  # no user_message
     assert embedder.calls == []  # retrieval never ran
     assert assembled.retrieved_counts == (0, 0)
@@ -171,9 +174,7 @@ async def test_configured_retrieval_but_no_user_message_does_not_run() -> None:
 async def test_memo_prevents_re_embedding_within_a_turn() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(
-        store, retrieval=_pipeline(embedder)
-    )
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     memo: dict = {}
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q, retrieval_memo=memo)
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q, retrieval_memo=memo)
@@ -183,9 +184,7 @@ async def test_memo_prevents_re_embedding_within_a_turn() -> None:
 async def test_no_memo_re_embeds_each_call() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(
-        store, retrieval=_pipeline(embedder)
-    )
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q)
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q)
     assert embedder.calls == [[_Q], [_Q]]
@@ -203,9 +202,7 @@ async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
 async def test_loop_embeds_once_per_turn_across_iterations() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(
-        store, retrieval=_pipeline(embedder)
-    )
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     # Two round-trips: a tool call, then a tool-call-free response.
     model = ScriptedModelClient(
         [
@@ -213,7 +210,7 @@ async def test_loop_embeds_once_per_turn_across_iterations() -> None:
                 tool_calls=[ToolCallRequest(id="c1", name="listDatabases", arguments={})],
                 usage={"total_tokens": 10},
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(evidence=["c1"], assistant_text="done"),
         ]
     )
     mcp = FakeMCPClient(scripted={"listDatabases": [[{"name": "dbpcm_warehouse"}]]})

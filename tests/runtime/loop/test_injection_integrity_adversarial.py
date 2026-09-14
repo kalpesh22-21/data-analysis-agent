@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -31,6 +33,9 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
@@ -134,7 +139,9 @@ async def test_credentials_never_leak_across_multi_window_multi_turn_replay() ->
             ),
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="call_4", name="askUser", arguments={"question": "Which dept?"})
+                    ToolCallRequest(
+                        id="call_4", name="askUser", arguments={"question": "Which dept?"}
+                    )
                 ]
             ),
             # --- Turn 1 resume (same window, askUser is not a budget grant).
@@ -147,15 +154,17 @@ async def test_credentials_never_leak_across_multi_window_multi_turn_replay() ->
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Turn 1 complete."),
+            final_answer(assistant_text="Turn 1 complete."),
             # --- Turn 2: a brand-new external turn on the SAME session — its
             # first model call replays turn 1's trail through ContextAssembler.
-            ModelTurnResult(assistant_text="Turn 2 complete, using replayed history."),
+            final_answer(assistant_text="I cannot answer further without new evidence."),
         ]
     )
     loop = _build_loop(model_client=model, mcp_client=mcp, store=store)
 
-    paused = await loop.run(session_id=session_id, credentials=_credentials(), user_message="Show payroll.")
+    paused = await loop.run(
+        session_id=session_id, credentials=_credentials(), user_message="Show payroll."
+    )
     assert paused.status == "paused_ask_user"
 
     resumed = await loop.resume(session_id=session_id, credentials=_credentials(), answer="Sales")

@@ -123,9 +123,7 @@ def _rq(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
     return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": False}
 
 
-def _detail(
-    *, window_anchor: str | None, result_grain: list[str] | None = None
-) -> BlueprintDetail:
+def _detail(*, window_anchor: str | None, result_grain: list[str] | None = None) -> BlueprintDetail:
     return BlueprintDetail(
         id="bp-hires-per-month",
         intent="New hires per month over a trailing window of the last N months",
@@ -237,8 +235,11 @@ def test_an_absent_anchor_parses_to_none_and_is_the_default() -> None:
     assert parsed.window_anchor is None
     assert Blueprint(id="bp-x", intent="i").window_anchor is None
     assert (
-        Blueprint.parse(id="bp-x", intent="i", sql_template="SELECT 1", window_anchor=None
-    ).window_anchor is None)
+        Blueprint.parse(
+            id="bp-x", intent="i", sql_template="SELECT 1", window_anchor=None
+        ).window_anchor
+        is None
+    )
 
 
 @pytest.mark.parametrize("bad", ["date", "DATA", "today", "", 1, True, [], {"a": 1}])
@@ -324,9 +325,7 @@ def test_the_keyed_fetch_selects_and_maps_the_stored_anchor() -> None:
     from data_agent.runtime.retrieval.vector_index import _GET_BLUEPRINT_QUERY
 
     assert "b.window_anchor AS window_anchor" in _GET_BLUEPRINT_QUERY
-    detail = map_blueprint_detail_record(
-        {"id": "bp-x", "uses": [], "window_anchor": "data"}
-    )
+    detail = map_blueprint_detail_record({"id": "bp-x", "uses": [], "window_anchor": "data"})
     assert detail.window_anchor == "data"
 
 
@@ -339,9 +338,12 @@ def test_a_corrupt_stored_anchor_degrades_to_undeclared_rather_than_failing_the_
     fires for a hand-edited or foreign-written node — and there the honest reading
     is "this blueprint declares nothing", not "print whatever is stored"."""
     assert _coerce_window_anchor(stored) is None
-    assert map_blueprint_detail_record(
-        {"id": "bp-x", "uses": [], "window_anchor": stored}
-    ).window_anchor is None
+    assert (
+        map_blueprint_detail_record(
+            {"id": "bp-x", "uses": [], "window_anchor": stored}
+        ).window_anchor
+        is None
+    )
 
 
 def test_a_blueprint_detail_without_the_field_still_constructs() -> None:
@@ -498,9 +500,7 @@ async def test_the_note_names_the_date_so_responsiveness_is_read_not_inferred() 
     result = blueprint_outcome_to_tool_result(await _run(_detail(window_anchor="data")))
     assert result is not None
     assert result.window_note == _CONCRETE_NOTE
-    assert _CONCRETE_NOTE == DATA_ANCHORED_RESULT_NOTE_TEMPLATE.format(
-        window_end="2021-06-01"
-    )
+    assert _CONCRETE_NOTE == DATA_ANCHORED_RESULT_NOTE_TEMPLATE.format(window_end="2021-06-01")
 
 
 async def test_a_datetime_valued_anchor_column_is_stored_as_a_date() -> None:
@@ -797,8 +797,7 @@ def test_the_model_facing_tool_message_carries_the_note_on_its_own_key() -> None
     assert content["window_note"] == DATA_ANCHORED_RESULT_NOTE
     # The J6a notes are untouched, word for word.
     assert content["note"] == (
-        "Verified blueprint result — authoritative; do not re-derive with "
-        "additional queries."
+        "Verified blueprint result — authoritative; do not re-derive with additional queries."
     )
     assert content["authoritative"] is True
 
@@ -826,6 +825,10 @@ def test_a_runquery_tool_message_is_byte_identical_to_before() -> None:
         "error_code",
         "user_message",
         "result_preview",
+        "result_id",
+        "tool_name",
+        "turn_index",
+        "measurement_review",
     }
 
 
@@ -911,7 +914,5 @@ def test_the_prompt_states_the_standing_rule_the_two_surfaces_instantiate() -> N
     decision to re-derive. `getBlueprint` and the result note carry the specifics."""
     from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
-    assert "DATA-ANCHORED blueprint window ends at the latest data on record" in (
-        AGENT_SYSTEM_PROMPT
-    )
-    assert "never re-run it calendar-anchored" in AGENT_SYSTEM_PROMPT
+    assert "data-anchored blueprint ends at the latest available data" in (AGENT_SYSTEM_PROMPT)
+    assert "rather than rerunning it anchored to today" in AGENT_SYSTEM_PROMPT

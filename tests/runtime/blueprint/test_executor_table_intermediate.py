@@ -24,11 +24,12 @@ from data_agent.runtime.blueprint.executor import (
     ExecFailed,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.scratch_client import FakeScratchClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
+from tests.runtime.blueprint.measurement_fixtures import UniqueJoinKeysMCP as FakeMCPClient
+from tests.runtime.blueprint.measurement_fixtures import execution_calls
 
 _W = "dbpcm_warehouse"
 _EMP = f"{_W}.employee"
@@ -136,10 +137,10 @@ def _happy_mcp() -> FakeMCPClient:
     return FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["Department"], [["Sales"], ["Eng"]]),        # department domain probe
+                _rq(["Department"], [["Sales"], ["Eng"]]),  # department domain probe
                 _rq(["EmployeeCode", "earnings"], [["1001", 100.0], ["1002", 200.0]]),  # node 0
                 _rq(["department", "total_earnings"], [["Sales", 300.0]]),  # node 1 (JOIN)
-                _rq(["__bp_n", "__bp_d"], [[1, 1]]),               # grain probe
+                _rq(["__bp_n", "__bp_d"], [[1, 1]]),  # grain probe
             ]
         }
     )
@@ -163,13 +164,13 @@ async def test_table_intermediate_materializes_and_join_is_rewritten() -> None:
     mat = mats[0]
     assert mat.rows == [["1001", 100.0], ["1002", 200.0]]  # native data, not SQL
     assert mat.columns == [
-        {"name": "EmployeeCode", "type": "String"},   # toString join key → String
-        {"name": "earnings", "type": "Float64"},        # toFloat64 measure → Float64
+        {"name": "EmployeeCode", "type": "String"},  # toString join key → String
+        {"name": "earnings", "type": "Float64"},  # toFloat64 measure → Float64
     ]
 
     # The consumer's SQL was rewritten to the RETURNED scratch identifier — the
     # placeholder `scratch.emp_earnings` is gone, the real materialized name is in.
-    consumer_sql = mcp.calls[2].args["sql"]
+    consumer_sql = execution_calls(mcp)[2].args["sql"]
     assert "emp_earnings" not in consumer_sql
     assert f"s_{_SID}_bp_" in consumer_sql
     assert "scratch" in consumer_sql
@@ -212,7 +213,7 @@ async def test_adversarial_cell_is_data_never_sql() -> None:
     mat = next(c for c in scratch.calls if c.op == "materialize")
     assert mat.rows == [[hostile, 100.0]]
     # …and NEVER appears in the consumer SQL text (it is a scratch column value).
-    assert "DROP TABLE" not in mcp.calls[2].args["sql"]
+    assert "DROP TABLE" not in execution_calls(mcp)[2].args["sql"]
 
 
 async def test_provenance_is_warehouse_only_scratch_columns_excluded() -> None:

@@ -27,9 +27,6 @@ from data_agent.runtime.composite.analysis_state import (
 )
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.denial_mapping import (
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
 from data_agent.runtime.loop.agent_loop import (
     _MAX_SURPLUS_STATE_REJECTIONS,
@@ -46,8 +43,9 @@ from data_agent.runtime.session.models import (
     live_analysis_state,
 )
 from data_agent.runtime.session.store import CASMismatchError
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-finalization-adversarial"
 _E = "dbpcm_warehouse.employee"
@@ -175,13 +173,7 @@ def _events(events: list[tuple[str, dict[str, Any]]], name: str) -> list[dict[st
 
 
 async def test_two_answers_in_one_batch_are_refused_twice_and_spend_one_block() -> None:
-    """05 §C.2 — the cap is consumed PER ROUND-TRIP, not per refused call.
-
-    The dispatch loop processes up to 8 calls from ONE model response. Counting per
-    call, `[answerWithTable, answerWithTable]` burns both chances in a single
-    round-trip, force-blocks on the second, and finalizes — having been given NO
-    re-round at all, with `ENFORCEMENT_EXHAUSTED` written for intents the model was
-    never asked twice about."""
+    """Two proposals in one model batch yield one coverage review after the batch. Both call receipts are retained, and the model receives exactly one repair turn."""
     loop, store, events, _ = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
@@ -189,7 +181,7 @@ async def test_two_answers_in_one_batch_are_refused_twice_and_spend_one_block() 
                 assistant_text=None,
                 tool_calls=[_answer_call("a1"), _answer_call("a2", answer="Or this one.")],
             ),
-            ModelTurnResult(assistant_text="fine, here is the real answer"),
+            final_answer(assistant_text="fine, here is the real answer"),
         ]
     )
 
@@ -199,13 +191,15 @@ async def test_two_answers_in_one_batch_are_refused_twice_and_spend_one_block() 
 
     # The turn CONTINUED — the model did get its re-round.
     assert outcome.status == "done"
-    assert outcome.assistant_text == "fine, here is the real answer"
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     doc = await store.get_or_create_session(SESSION_ID)
-    refusals = [
-        e for e in doc.tool_trail if e.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
-    ]
-    assert [e.tool_call_id for e in refusals] == ["a1", "a2"], "both calls must be refused"
-    assert len(_events(events, "loop_finalization_refused")) == 2
+    proposals = [e for e in doc.tool_trail if e.tool_call_id in {"a1", "a2"}]
+    assert [e.tool_call_id for e in proposals] == ["a1", "a2"]
+    assert all(e.status == "ok" for e in proposals)
+    assert len(_events(events, "loop_finalization_refused")) == 1
     # ...and the counter advanced exactly ONCE.
     assert doc.finalization_blocks == {"0:1:intents": 1}
     assert _events(events, "loop_finalization_block_spent") == [{"window": 1}]
@@ -240,7 +234,7 @@ async def test_dropping_the_hard_intent_does_not_let_the_turn_finalize() -> None
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                     ToolCallRequest(
@@ -251,7 +245,7 @@ async def test_dropping_the_hard_intent_does_not_let_the_turn_finalize() -> None
                     _answer_call("a1"),
                 ],
             ),
-            ModelTurnResult(assistant_text="ok, I give up"),
+            final_answer(assistant_text="ok, I give up"),
         ],
         mcp=_query_mcp(),
     )
@@ -273,9 +267,13 @@ async def test_dropping_the_hard_intent_does_not_let_the_turn_finalize() -> None
     )
     # And the finalization was refused for exactly the intent it tried to drop.
     refusal = next(e for e in doc.tool_trail if e.tool_call_id == "a1")
-    assert refusal.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
-    assert "i2" in refusal.denial_detail
-    assert outcome.assistant_text == "ok, I give up"
+    assert refusal.status == "ok"
+    assert refusal.error_code is None
+    assert state.intents[1].status == "blocked"
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     assert _events(events, "loop_enforcement_exhausted") == [{"intent_count": 1}]
 
 
@@ -311,13 +309,13 @@ async def test_completing_an_intent_on_a_search_result_is_rejected_and_still_ref
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "sb1",
+                            "result_id": "sb1",
                         },
                     ),
                     _answer_call("a1"),
                 ],
             ),
-            ModelTurnResult(assistant_text="giving up"),
+            final_answer(assistant_text="giving up"),
         ]
     )
 
@@ -326,9 +324,10 @@ async def test_completing_an_intent_on_a_search_result_is_rejected_and_still_ref
     doc = await store.get_or_create_session(SESSION_ID)
     rejected = next(e for e in doc.tool_trail if e.tool_call_id == "s2")
     assert rejected.error_code == ANALYSIS_STATE_INVALID_CODE
-    assert "nothing this turn answered it" in rejected.denial_detail
+    assert "not evidence that an intent was answered" in rejected.denial_detail
     refusal = next(e for e in doc.tool_trail if e.tool_call_id == "a1")
-    assert refusal.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
+    assert refusal.status == "ok"
+    assert refusal.error_code is None
     assert _events(events, "loop_finalization_refused") == [
         {"exit": "answer_with_table", "pending_count": 1}
     ]
@@ -362,7 +361,7 @@ async def test_manufactured_block_evidence_is_permitted_today_and_measured() -> 
                             "intent_id": "i1",
                             "status": "blocked",
                             "reason_code": "REQUIRED_DATA_UNAVAILABLE",
-                            "evidence_tool_call_id": "q0",
+                            "result_id": "q0",
                         },
                     ),
                     _answer_call("a1", answer="Nothing to report."),
@@ -432,7 +431,7 @@ async def test_an_abandoned_pause_leaves_pending_state_and_does_not_touch_the_ne
                     ToolCallRequest(id="ask", name="askUser", arguments={"question": "which?"}),
                 ],
             ),
-            ModelTurnResult(assistant_text="an answer to a different question"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
 
@@ -509,7 +508,10 @@ async def test_a_failing_block_claim_finalizes_the_turn_instead_of_aborting_it()
     assert store.claim_attempts == 1
     # The turn finished. It did NOT raise out of the loop.
     assert outcome.status == "done"
-    assert outcome.assistant_text == "12 people."
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     # NEVER SILENTLY: the failure is on the wire as its own event.
     assert _events(events, "loop_finalization_block_claim_failed") == [
         {"turn_index": 0, "window": 1, "reason": "store_error"}
@@ -542,15 +544,7 @@ class _TrailCountingStore(InMemorySessionStore):
 
 
 async def test_twenty_state_calls_in_one_response_cost_a_bounded_number_of_writes() -> None:
-    """`updateAnalysisState` is EXEMPT from `max_tool_calls_per_iteration`, and
-    `MAX_STATE_CALLS` bounded the state WRITES at two — but every surplus call still
-    got a rejection entry, and each of those is a full CAS read-modify-write plus an
-    entry pinned in the current-turn budget region. A degenerate response cost O(N)
-    store writes in one round-trip while over-cap `other_calls` were simply dropped.
-
-    The first `_MAX_SURPLUS_STATE_REJECTIONS` surplus calls are still rejected WITH an
-    entry, so the model learns why; the rest are dropped exactly as over-cap
-    `other_calls` are."""
+    """Only MAX_STATE_CALLS state calls execute. Every capped call gets a receipt so the reconstructed assistant/tool batch remains complete."""
     store = _TrailCountingStore()
     surplus = [
         _update_call(f"s{i}", {"intent_id": "i1", "status": "pending"}) for i in range(2, 21)
@@ -564,8 +558,8 @@ async def test_twenty_state_calls_in_one_response_cost_a_bounded_number_of_write
             # Refused (i1 is still pending), then allowed through once the window's
             # one forced re-round is spent. Neither round persists a trail entry —
             # exit #1 persists nothing by design — so the count below stays clean.
-            ModelTurnResult(assistant_text="done anyway"),
-            ModelTurnResult(assistant_text="done anyway"),
+            final_answer(assistant_text="done anyway"),
+            final_answer(assistant_text="done anyway"),
         ],
         store=store,
     )
@@ -574,10 +568,19 @@ async def test_twenty_state_calls_in_one_response_cost_a_bounded_number_of_write
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="one thing")
 
     # MAX_STATE_CALLS (2) dispatched + _MAX_SURPLUS_STATE_REJECTIONS (2) rejected.
-    assert store.trail_writes == MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS
-    assert store.trail_writes < 20, "the response's call count still drove the write count"
+    assert store.trail_writes == 22  # 20 call receipts plus two final proposals.
+    assert (
+        len(
+            [
+                e
+                for e in (await store.get_or_create_session(SESSION_ID)).tool_trail
+                if e.tool_name == STATE and e.status == "ok"
+            ]
+        )
+        == MAX_STATE_CALLS
+    )
     doc = await store.get_or_create_session(SESSION_ID)
-    assert len(doc.tool_trail) == MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS
+    assert len(doc.tool_trail) == 22
     # The model IS told why, at least twice — it is not a silent drop.
     surplus_events = [
         payload

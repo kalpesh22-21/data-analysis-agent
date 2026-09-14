@@ -70,8 +70,8 @@ model_script:
         id: s2
         args:
           intents:
-            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
-            - {intent_id: i2, status: blocked, reason_code: NO_ACCESS, evidence_tool_call_id: q1}
+            - {intent_id: i1, status: completed, result_id: b1}
+            - {intent_id: i2, status: blocked, reason_code: NO_ACCESS, result_id: q1}
       - name: answerWithTable
         id: a1
         args:

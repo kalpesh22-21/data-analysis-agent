@@ -31,7 +31,14 @@ embedding:
 mcp_tools: []
 mcp_script: {}
 model_script:
-  - assistant_text: I can project that from the hiring run-rate.
+  - tool_calls:
+      - name: finalizeAnswer
+        id: final
+        args:
+          answer: "I don't have any information to answer your question."
+          tables: []
+          capability_refs: []
+          evidence: []
 expect:
   intents_terminal: 0
   re_derivation: false

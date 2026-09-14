@@ -159,6 +159,7 @@ class BlueprintRun:
     # verified this table at all. See `blueprint_verification`.
     verification: dict[str, Any] | None = None
     slots: dict[str, Any] = field(default_factory=dict)
+    source_blueprint_id: str | None = None
 
 
 # J6: the human-readable state of an empty blueprint result's badge. A display
@@ -226,6 +227,7 @@ def blueprint_verification(result_full: Any) -> dict[str, Any] | None:
     return {
         "passed": True,
         "method": "blueprint_gate",
+        "status": "structural checks passed",
         # None-safe: a `verify: None` must not AttributeError.
         "grain_checked": bool((result_full.get("verify") or {}).get("grain_checked")),
     }
@@ -252,7 +254,12 @@ def blueprint_run_from_result(
     return blueprint_id, BlueprintRun(
         terminal_sql=terminal_sql,
         verification=blueprint_verification(result_full),
-        slots=dict(slots or {}),
+        slots=dict(
+            result_full["bound_slots"]
+            if isinstance(result_full.get("bound_slots"), dict)
+            else slots or {}
+        ),
+        source_blueprint_id=blueprint_id,
     )
 
 
@@ -317,6 +324,9 @@ def _resolve_item(item: Any, terminal_by_id: Mapping[str, str]) -> DesignationIt
     "bp-x", "caption": ""}` is the shape that actually arrives, and
     `clean_answer_sql`/`clean_blueprint_id` already map empty and whitespace to `None`.
     """
+    result_id = clean_blueprint_id(item.get("result_id")) if isinstance(item, dict) else None
+    if result_id:
+        item = {**item, "sql": None, "blueprint_id": result_id}
     raw_sql = clean_answer_sql(item.get("sql")) if isinstance(item, dict) else None
     named = clean_blueprint_id(item.get("blueprint_id")) if isinstance(item, dict) else None
     resolved = resolve_designation(item, terminal_by_id)
@@ -516,7 +526,14 @@ def enrich_table(
     return AnswerTable(
         sql=table.sql,
         caption=table.caption,
-        blueprint_use={"blueprint_id": table.blueprint_id, "slots": dict(run.slots)},
+        blueprint_use=(
+            {
+                "blueprint_id": run.source_blueprint_id or table.blueprint_id,
+                "slots": dict(run.slots),
+            }
+            if run.source_blueprint_id or run.verification
+            else None
+        ),
         verification=dict(run.verification) if run.verification else None,
         provenance=provenance,
     )
@@ -559,6 +576,7 @@ def rollup_verification(tables: Sequence[AnswerTable]) -> dict[str, Any] | None:
         return None
     return {
         "passed": True,
+        "status": "structural checks passed",
         "method": "blueprint_gate",
         "grain_checked": all(
             bool((table.verification or {}).get("grain_checked")) for table in tables

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -45,6 +47,9 @@ from data_agent.runtime.session.models import (
     TurnMessage,
 )
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 SESSION_ID = "sess-r1-replay-qa"
 _E = "dbpcm_warehouse.employee"
@@ -112,17 +117,34 @@ async def _refused_turn(store: InMemorySessionStore) -> None:
                 tool_calls=[_init_call("s1", SECRET_INTENT, OTHER_INTENT)],
             ),
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text="giving up"),
+            final_answer(assistant_text="giving up"),
         ],
         store,
     )
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_creds(), user_message="two things"
-    )
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two things")
     assert outcome.status == "done"
-    refusal = next(
-        e for e in await store.load_trail(SESSION_ID) if e.tool_call_id == "a1"
+    refusal = next(e for e in await store.load_trail(SESSION_ID) if e.tool_call_id == "a1")
+    # Seed the legacy persisted refusal shape: new proposals are reviewed after
+    # the batch, but sessions written by the previous runtime must still replay safely.
+    from dataclasses import replace
+
+    from data_agent.runtime.loop.finalization import finalization_blocked
+
+    legacy = finalization_blocked(
+        [
+            TrackedIntent(intent_id="i1", description=SECRET_INTENT, status="pending"),
+            TrackedIntent(intent_id="i2", description=OTHER_INTENT, status="pending"),
+        ]
     )
+    doc = await store.get_or_create_session(SESSION_ID)
+    refusal = replace(
+        refusal,
+        status="error",
+        error_code=legacy.error_code,
+        denial_detail=legacy.denial_detail,
+        result_preview=None,
+    )
+    doc.tool_trail[:] = [refusal if e.tool_call_id == "a1" else e for e in doc.tool_trail]
     assert refusal.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
     assert SECRET_INTENT in (refusal.denial_detail or "")
     # ...and it is `frozenset()` provenance, by design (05 §B.1) — which is what
@@ -211,7 +233,9 @@ async def test_the_assembled_request_is_byte_identical_across_two_rebuilds() -> 
     # The live state IS rendered for its own turn, immediately before the question.
     blob = json.dumps(one.messages, default=str)
     assert "[Analysis state" in blob
-    positions = [i for i, m in enumerate(one.messages) if "[Analysis state" in str(m.get("content"))]
+    positions = [
+        i for i, m in enumerate(one.messages) if "[Analysis state" in str(m.get("content"))
+    ]
     question_at = [
         i for i, m in enumerate(one.messages) if str(m.get("content")) == "next question"
     ]
@@ -287,8 +311,7 @@ async def test_the_refusal_is_dropped_cross_turn_even_under_an_allow_all_scope()
     assert "You cannot finish yet" not in blob
 
 
-async def test_the_refusal_keeps_determined_provenance_so_the_turn_answer_still_replays()\
-        -> None:
+async def test_the_refusal_keeps_determined_provenance_so_the_turn_answer_still_replays() -> None:
     """Why the fix is a turn-scoped DROP and not `provenance=None` on the refusal.
 
     `_compute_turn_provenance_union` is fail-closed: one `None`-provenance entry

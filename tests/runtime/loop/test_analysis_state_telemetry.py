@@ -40,6 +40,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -52,6 +54,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-analysis-telemetry"
 _E = "dbpcm_warehouse.employee"
@@ -114,7 +119,10 @@ EXPECTED_KEYS: dict[str, set[str]] = {
 
 
 async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in ["runQuery", "getTableSchema"]
+    ]
 
 
 def _credentials() -> RuntimeCredentials:
@@ -170,7 +178,8 @@ def _query_call(call_id: str) -> ToolCallRequest:
 
 def _answer_call(call_id: str) -> ToolCallRequest:
     return ToolCallRequest(
-        id=call_id, name=ANSWER,
+        id=call_id,
+        name=ANSWER,
         arguments={"answer": "Here it is.", "tables": [{"sql": "SELECT 1"}]},
     )
 
@@ -206,16 +215,16 @@ async def test_the_finalization_events_fire_at_their_sites_with_the_expected_key
     loop, _store, events = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", LEAK_ONE)]),
-            ModelTurnResult(assistant_text="a first draft"),
+            final_answer(assistant_text="a first draft"),
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text="giving up"),
+            final_answer(assistant_text="giving up"),
         ]
     )
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert _named(events, "loop_finalization_refused") == [
-        {"exit": "no_tool_calls", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
     assert _named(events, "loop_finalization_block_spent") == [{"window": 1}]
     assert _named(events, "loop_enforcement_exhausted") == [{"intent_count": 1}]
@@ -239,7 +248,7 @@ async def test_exit_two_refusal_names_its_exit() -> None:
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", LEAK_ONE)]),
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text="ok"),
+            final_answer(assistant_text="ok"),
         ]
     )
 
@@ -269,19 +278,19 @@ async def test_every_emitted_analysis_state_event_carries_exactly_its_declared_k
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                         {
                             "intent_id": "i2",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                     # ...and a malformed call, so the rejection event fires too.
                     ToolCallRequest(id="s3", name=STATE, arguments={"nope": 1}),
                 ],
             ),
-            ModelTurnResult(assistant_text="both answered"),
+            final_answer(assistant_text="both answered"),
         ],
         mcp=_query_mcp(),
     )
@@ -339,7 +348,7 @@ async def test_no_intent_description_reaches_any_telemetry_payload() -> None:
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     ),
                     # An over-long description: the rejection path builds its own
@@ -353,7 +362,7 @@ async def test_no_intent_description_reaches_any_telemetry_payload() -> None:
             ),
             # ...and a refused finalization, so 05's events are in the scan too.
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         mcp=_query_mcp(),
     )
@@ -394,18 +403,18 @@ async def test_the_zero_row_pair_is_emitted_for_the_ratio() -> None:
                         {
                             "intent_id": "i1",
                             "status": "completed",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                         {
                             "intent_id": "i2",
                             "status": "blocked",
                             "reason_code": "REQUIRED_DATA_UNAVAILABLE",
-                            "evidence_tool_call_id": "q1",
+                            "result_id": "q1",
                         },
                     )
                 ],
             ),
-            ModelTurnResult(assistant_text="none found"),
+            final_answer(assistant_text="none found"),
         ],
         mcp=_query_mcp(row_count=0),
     )
@@ -421,7 +430,7 @@ async def test_the_zero_row_pair_is_emitted_for_the_ratio() -> None:
             "intent_id": "i2",
             "reason_code": "REQUIRED_DATA_UNAVAILABLE",
             "evidence_tool_name": "runQuery",
-            "evidence_binding": "auto_bound",
+            "evidence_binding": "tagged",
         }
     ]
 

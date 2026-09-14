@@ -212,6 +212,8 @@ class PresentCapabilityCardTool(_CapabilityTool):
             )
         result = {
             **result,
+            "prepared": True,
+            "capability_ref": self.tool_name,
             "_agent_evidence": {
                 "kind": self._definition.kind,
                 "activation": (
@@ -237,7 +239,7 @@ class PresentCapabilityCardTool(_CapabilityTool):
         return _ok(
             self.tool_name,
             result,
-            terminal=True,
+            terminal=False,
         )
 
 

@@ -13,6 +13,7 @@ the wiring itself, not just the pure functions.
 
 from __future__ import annotations
 
+import pytest
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -49,6 +50,9 @@ from data_agent.runtime.observability.progress import combine_observers
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview, TrailEntry
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Salary": "Decimal(18,2)"}})
@@ -159,7 +163,9 @@ async def test_ask_user_question_never_appears_in_any_span_attribute() -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="call_1", name="askUser", arguments={"question": PII_QUESTION})
+                    ToolCallRequest(
+                        id="call_1", name="askUser", arguments={"question": PII_QUESTION}
+                    )
                 ]
             )
         ]
@@ -225,7 +231,9 @@ class _RepeatSchemaModel:
             for m in messages
         )
         if saw_nudge:
-            return ModelTurnResult(assistant_text="Using the schema I have.", usage={"total_tokens": 1})
+            return final_answer(
+                assistant_text="Using the schema I have.", usage={"total_tokens": 1}
+            )
         self._n += 1
         return ModelTurnResult(
             tool_calls=[
@@ -306,7 +314,7 @@ async def test_repeated_read_guard_span_is_legible_and_distinct_from_first_dispa
     assert "not re-dispatched" in attrs["note"]
 
 
-async def test_the_auto_bind_event_survives_the_real_guardrail_observer() -> None:
+async def test_explicit_binding_emits_completion_without_auto_binding() -> None:
     """THE PREFIX IS THE TEST. `guardrail_observer` drops every event whose name
     does not start with `loop_`, silently — so an event named
     `analysis_state_auto_bound` (as this one first was) fires perfectly in every
@@ -354,7 +362,7 @@ async def test_the_auto_bind_event_survives_the_real_guardrail_observer() -> Non
         ),
     )
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "completed"}]},
+        {"intents": [{"intent_id": "i1", "status": "completed", "result_id": "call_q1"}]},
         _credentials(),
         turn=TurnContext(turn_index=0),
     )
@@ -362,16 +370,12 @@ async def test_the_auto_bind_event_survives_the_real_guardrail_observer() -> Non
 
     spans = exporter.get_finished_spans()
     auto_bound = [s for s in spans if s.name == ANALYSIS_STATE_AUTO_BOUND_EVENT]
-    assert len(auto_bound) == 1, (
-        "the auto-bind event did not survive guardrail_observer — check the "
-        f"`loop_` prefix on {ANALYSIS_STATE_AUTO_BOUND_EVENT!r}"
-    )
-    assert dict(auto_bound[0].attributes)["intent_id"] == "i1"
+    assert auto_bound == []
     # The binding's provenance reaches telemetry too, on the completion event, so
     # a route derivation can tell a tagged close from a guessed one.
     completed = [s for s in spans if s.name == "loop_intent_completed"]
     assert len(completed) == 1
-    assert dict(completed[0].attributes)["evidence_binding"] == "auto_bound"
+    assert dict(completed[0].attributes)["evidence_binding"] == "tagged"
     # D25, on the same pass: `description` is model-authored from the user's
     # question and reaches no span attribute on any of these events.
     for finished_span in spans:
@@ -426,9 +430,9 @@ async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> 
                 ]
             ),
             # Bare-text finish holding three untabled rows -> refused once...
-            ModelTurnResult(assistant_text="Sales 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="Sales 3, Eng 2, Ops 1."),
             # ...then again on the round handed back -> exhausted, and it passes.
-            ModelTurnResult(assistant_text="Sales 3, Eng 2, Ops 1."),
+            final_answer(assistant_text="Sales 3, Eng 2, Ops 1."),
         ]
     )
     loop = AgentLoop(
@@ -550,9 +554,9 @@ async def test_the_answer_rule_events_survive_the_real_guardrail_observer() -> N
     model = ScriptedModelClient(
         [
             # A figure with no query behind it -> refused once...
-            ModelTurnResult(assistant_text="The active employee count is 9,184."),
+            final_answer(assistant_text="The active employee count is 9,184."),
             # ...and again on the round handed back -> exhausted, prose passes.
-            ModelTurnResult(assistant_text="The active employee count is 9,184."),
+            final_answer(assistant_text="The active employee count is 9,184."),
         ]
     )
     loop = AgentLoop(
@@ -614,7 +618,7 @@ async def test_the_answer_prose_scrub_event_survives_the_observer_without_its_to
     store = InMemorySessionStore()
     loop = AgentLoop(
         model_client=ScriptedModelClient(
-            [ModelTurnResult(assistant_text=f"Read from {_E}, joined employee_master.")]
+            [final_answer(assistant_text=f"I cannot answer from {_E}, joined employee_master.")]
         ),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=observer, tracer=tracer),
         context_assembler=ContextAssembler(store, tracer=tracer),
@@ -643,7 +647,7 @@ async def test_the_answer_prose_scrub_event_survives_the_observer_without_its_to
         "the span exported no `redaction_count` — the key is missing from "
         "_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST, so the span carries nothing"
     )
-    assert attributes["exit"] == "no_tool_calls"
+    assert attributes["exit"] == "answer_with_text"
     # The point: what the answer withheld, the telemetry withholds too.
     for finished_span in spans:
         for value in finished_span.attributes.values():

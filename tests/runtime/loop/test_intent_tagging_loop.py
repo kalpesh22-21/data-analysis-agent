@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -42,6 +44,9 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview, live_analysis_state
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 SESSION_ID = "sess-tagging-loop"
 _E = "dbpcm_warehouse.employee"
@@ -56,7 +61,10 @@ def _credentials() -> RuntimeCredentials:
 
 
 async def _tools_provider(_c: RuntimeCredentials) -> list[dict]:
-    return []
+    return [
+        {"type": "function", "name": name, "parameters": {}}
+        for name in ["runQuery", "getTableSchema"]
+    ]
 
 
 class _RecordingBlueprintTool:
@@ -224,7 +232,7 @@ async def test_the_tag_never_reaches_the_mcp_for_run_query_or_get_table_schema()
                     )
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         mcp=mcp,
     )
@@ -263,8 +271,8 @@ async def test_the_tag_never_reaches_the_blueprint_executor() -> None:
                     _tagged_blueprint("b1", "bp-headcount", "i1"),
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         blueprint_tool=blueprint,
     )
@@ -292,8 +300,8 @@ async def test_two_identically_tagged_reads_still_dedup_to_one_dispatch() -> Non
                     _tagged_schema("m2", "i2"),
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         mcp=mcp,
     )
@@ -327,8 +335,8 @@ async def test_an_unknown_tag_drops_the_tag_and_still_runs_the_query() -> None:
                     _tagged_query("q1", "i7"),  # no such intent
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         mcp=mcp,
     )
@@ -362,8 +370,8 @@ async def test_a_hostile_tag_value_never_reaches_telemetry() -> None:
                     _tagged_query("q1", hostile),
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         mcp=mcp,
     )
@@ -382,7 +390,7 @@ async def test_a_tag_on_a_single_intent_turn_is_dropped_not_fatal() -> None:
     loop, store, events, mcp = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_query("q1", "i1")]),
-            ModelTurnResult(assistant_text="42"),
+            final_answer(assistant_text="42"),
         ],
         mcp=mcp,
     )
@@ -414,8 +422,8 @@ async def test_declaring_and_tagging_in_the_same_message_works() -> None:
                     _tagged_query("q2", "i2", sql="SELECT 2"),
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ],
         mcp=mcp,
     )
@@ -468,7 +476,7 @@ async def test_a_tag_dropped_for_no_live_state_tells_the_model_on_the_next_round
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_schema("m1", "i1")]),
             # Round 2 sees the note; do some untagged work so a round 3 happens.
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_query("q1", None)]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -489,7 +497,7 @@ async def test_a_tag_dropped_for_no_live_state_tells_the_model_on_the_next_round
     # ...and it names the repair AND the deadline, which is what makes it
     # actionable rather than a scolding.
     assert "updateAnalysisState" in INTENT_TAG_DROPPED_NOTE
-    assert "before your next substantive call" in INTENT_TAG_DROPPED_NOTE
+    assert "bind this existing result_id explicitly" in INTENT_TAG_DROPPED_NOTE
     # Request 3 — gone. EXACTLY ONE ROUND-TRIP.
     assert _runtime_notes(model, 2) == []
 
@@ -504,7 +512,7 @@ async def test_the_note_rides_its_own_key_and_never_the_authoritative_one() -> N
     model = ScriptedModelClient(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_schema("m1", "i1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _store, _e, mcp = _build([], mcp=mcp, model=model)
@@ -538,8 +546,8 @@ async def test_a_tag_dropped_against_a_live_state_gets_no_note() -> None:
                     _tagged_query("q1", "i7"),  # a live state exists; the id is a typo
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -562,8 +570,8 @@ async def test_no_drop_at_all_leaves_every_tool_result_untouched() -> None:
                 assistant_text=None,
                 tool_calls=[_init_call("s1", "headcount", "salary"), _tagged_query("q1", "i1")],
             ),
-            ModelTurnResult(assistant_text="done"),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -593,7 +601,7 @@ async def test_two_tags_dropped_in_one_round_produce_exactly_one_note() -> None:
                     _tagged_schema("m2", "i2", table="department"),
                 ],
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -609,19 +617,13 @@ async def test_two_tags_dropped_in_one_round_produce_exactly_one_note() -> None:
     assert _runtime_notes(model, 1) == [("m1", INTENT_TAG_DROPPED_NOTE)]
 
 
-async def test_a_tagged_substantive_call_gets_no_note_because_it_shuts_the_door_itself() -> None:
-    """THE BLOCKER THE REVIEW CAUGHT. `runQuery(serves_intent=…)` with no state drops
-    the tag for `no_live_state` — but the very same call is SUBSTANTIVE, so by the
-    time the model could read a note, `find_locking_tool` reports the turn locked and
-    a first `updateAnalysisState` is refused NON-RETRYABLY. Sending the note here
-    would upgrade a silent drop into an instruction to earn a refusal. No true advice
-    exists in this state, so the correct output is the pre-slice one: drop silently,
-    report to telemetry, say nothing to the model."""
+async def test_a_tagged_substantive_call_gets_a_note_for_late_binding() -> None:
+    """A query without declared intents drops its tag and explains how to bind the received result after a late declaration."""
     mcp = FakeMCPClient(scripted={"runQuery": [_rows()]})
     model = ScriptedModelClient(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_query("q1", "i1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -635,15 +637,13 @@ async def test_a_tagged_substantive_call_gets_no_note_because_it_shuts_the_door_
     assert _events(events, "loop_intent_tag_dropped") == [
         {"tool_name": "runQuery", "reason": "no_live_state"}
     ]
-    assert all(_runtime_notes(model, index) == [] for index in range(len(model.calls)))
+    assert any(_runtime_notes(model, index) for index in range(len(model.calls)))
 
 
-async def test_a_mixed_batch_suppresses_the_note_even_though_the_tagged_call_was_metadata() -> None:
-    """The ordering case, and why the suppression is folded at the END of the batch
-    rather than at the drop site. The tagged `getTableSchema` is selected for the note
-    BEFORE the untagged `runQuery` beside it has been seen — yet that runQuery shuts
-    the same door, so by the next round the advice is false. Draining the batch first
-    makes the two orderings agree."""
+async def test_a_mixed_batch_permits_late_binding_the_note_even_though_the_tagged_call_was_metadata() -> (
+    None
+):
+    """A same-batch query does not close the late-declaration path for an unbound metadata result."""
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema()], "runQuery": [_rows()]})
     model = ScriptedModelClient(
         [
@@ -651,7 +651,7 @@ async def test_a_mixed_batch_suppresses_the_note_even_though_the_tagged_call_was
                 assistant_text=None,
                 tool_calls=[_tagged_schema("m1", "i1"), _tagged_query("q1", None)],
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -661,21 +661,19 @@ async def test_a_mixed_batch_suppresses_the_note_even_though_the_tagged_call_was
     assert _events(events, "loop_intent_tag_dropped") == [
         {"tool_name": "getTableSchema", "reason": "no_live_state"}
     ]
-    assert all(_runtime_notes(model, index) == [] for index in range(len(model.calls)))
+    assert any(_runtime_notes(model, index) for index in range(len(model.calls)))
 
 
-async def test_the_gate_is_turn_scoped_so_an_earlier_rounds_query_still_suppresses() -> None:
-    """The door is shut by the TURN's trail, not by this round's batch. A `runQuery`
-    in round 1 locks late init for good, so a tag dropped in round 2 — on a metadata
-    call, with the batch itself perfectly innocent — still has no true advice to
-    offer. A per-round flag would re-open the note here and send the model at a
-    refusal two rounds after the call that caused it."""
+async def test_the_gate_is_turn_scoped_so_an_earlier_rounds_query_still_permits_late_binding() -> (
+    None
+):
+    """A query from an earlier round does not prevent a later declaration and explicit result binding."""
     mcp = FakeMCPClient(scripted={"runQuery": [_rows()], "getTableSchema": [_schema()]})
     model = ScriptedModelClient(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_query("q1", None)]),
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_schema("m1", "i1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -685,16 +683,11 @@ async def test_the_gate_is_turn_scoped_so_an_earlier_rounds_query_still_suppress
     assert _events(events, "loop_intent_tag_dropped") == [
         {"tool_name": "getTableSchema", "reason": "no_live_state"}
     ]
-    assert all(_runtime_notes(model, index) == [] for index in range(len(model.calls)))
+    assert any(_runtime_notes(model, index) for index in range(len(model.calls)))
 
 
-async def test_the_gate_survives_a_pause_because_it_is_seeded_from_the_trail() -> None:
-    """THE WINDOW BOUNDARY, which is where a plain window-local would silently
-    re-open the hole. A resume enters a FRESH `_run_loop_body`, so an unseeded flag
-    reads False again — while the `runQuery` from before the pause is still in the
-    turn's trail and still has late init locked. The gate is therefore seeded with
-    `find_locking_tool`, the runtime's own predicate, over the session doc the window
-    already loads. Delete that seed and this is the test that goes red."""
+async def test_the_late_binding_note_survives_a_pause() -> None:
+    """The late-binding guidance remains available after a pause on the same external turn."""
     mcp = FakeMCPClient(scripted={"runQuery": [_rows()], "getTableSchema": [_schema()]})
     model = ScriptedModelClient(
         [
@@ -709,7 +702,7 @@ async def test_the_gate_survives_a_pause_because_it_is_seeded_from_the_trail() -
             ),
             # Window 2, a fresh loop body: a tag with still no state anywhere.
             ModelTurnResult(assistant_text=None, tool_calls=[_tagged_schema("m1", "i1")]),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _store, events, mcp = _build([], mcp=mcp, model=model)
@@ -724,7 +717,7 @@ async def test_the_gate_survives_a_pause_because_it_is_seeded_from_the_trail() -
     assert _events(events, "loop_intent_tag_dropped") == [
         {"tool_name": "getTableSchema", "reason": "no_live_state"}
     ]
-    assert all(_runtime_notes(model, index) == [] for index in range(len(model.calls)))
+    assert any(_runtime_notes(model, index) for index in range(len(model.calls)))
 
 
 async def test_the_note_leads_to_an_accepted_late_declaration() -> None:
@@ -753,7 +746,7 @@ async def test_the_note_leads_to_an_accepted_late_declaration() -> None:
                 assistant_text=None,
                 tool_calls=[_update_call("s2", {"intent_id": "i1", "status": "completed"})],
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ]
     )
     loop, store, events, mcp = _build([], mcp=mcp, model=model)
@@ -797,9 +790,9 @@ async def test_a_late_declaration_still_finalizes_through_the_pending_intents_ga
                 tool_calls=[_init_call("s1", "headcount", "salary")],
             ),
             # Answers with both intents still pending -> refused ONCE.
-            ModelTurnResult(assistant_text="a premature answer"),
+            final_answer(assistant_text="a premature answer"),
             # Re-sent -> the allowance grants it and the turn ends.
-            ModelTurnResult(assistant_text="the final answer"),
+            final_answer(assistant_text="the final answer"),
         ]
     )
     loop, store, events, mcp = _build([], mcp=mcp, model=model)
@@ -809,11 +802,14 @@ async def test_a_late_declaration_still_finalizes_through_the_pending_intents_ga
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "the final answer"
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     assert _runtime_notes(model, 1) == [("m1", INTENT_TAG_DROPPED_NOTE)]
     # Refused exactly once, then force-blocked and released — never a loop.
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "no_tool_calls", "pending_count": 2}
+        {"exit": "answer_with_text", "pending_count": 2}
     ]
     assert len(_events(events, "loop_finalization_block_spent")) == 1
     state = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)

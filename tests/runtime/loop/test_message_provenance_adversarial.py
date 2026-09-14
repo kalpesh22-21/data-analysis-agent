@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -22,6 +24,9 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _PAYROLL = "dbpcm_warehouse.payroll_fact"
 _EMPLOYEE = "dbpcm_warehouse.employee"
@@ -52,7 +57,9 @@ def _credentials(scope: frozenset[str] = frozenset()) -> RuntimeCredentials:
     return RuntimeCredentials(session_id=SESSION_ID, jwt=JWT, column_scope=scope)
 
 
-def _build_loop(model: ScriptedModelClient, mcp: FakeMCPClient, store: InMemorySessionStore) -> AgentLoop:
+def _build_loop(
+    model: ScriptedModelClient, mcp: FakeMCPClient, store: InMemorySessionStore
+) -> AgentLoop:
     dispatcher = ToolDispatcher(mcp, CATALOG)
     assembler = ContextAssembler(store)
     return AgentLoop(
@@ -80,14 +87,16 @@ async def test_assistant_message_from_payroll_turn_is_dropped_once_payroll_scope
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
-                        id="call_1", name="runQuery", arguments={"sql": "SELECT GrossPay FROM payroll_fact"}
+                        id="call_1",
+                        name="runQuery",
+                        arguments={"sql": "SELECT GrossPay FROM payroll_fact"},
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text=PII_ANSWER),
+            final_answer(assistant_text=PII_ANSWER),
             # Turn 1 (narrowed scope): the model is asked something else; we
             # only care about what canonical history IT was shown.
-            ModelTurnResult(assistant_text="Here is the department breakdown."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(
@@ -105,7 +114,9 @@ async def test_assistant_message_from_payroll_turn_is_dropped_once_payroll_scope
     loop = _build_loop(model, mcp, store)
 
     turn0 = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(frozenset()), user_message="Show me payroll."
+        session_id=SESSION_ID,
+        credentials=_credentials(frozenset()),
+        user_message="Show me payroll.",
     )
     assert turn0.status == "done"
     assert turn0.assistant_text == PII_ANSWER
@@ -130,8 +141,8 @@ async def test_user_messages_always_survive_narrowing() -> None:
     store = InMemorySessionStore()
     model = ScriptedModelClient(
         [
-            ModelTurnResult(assistant_text="Sure, checking now."),
-            ModelTurnResult(assistant_text="Here you go."),
+            final_answer(assistant_text="I cannot answer without more information."),
+            final_answer(assistant_text="I cannot answer without more information."),
         ]
     )
     mcp = FakeMCPClient()
@@ -161,15 +172,17 @@ async def test_clarification_only_assistant_turn_survives_any_narrowing() -> Non
     store = InMemorySessionStore()
     model = ScriptedModelClient(
         [
-            ModelTurnResult(assistant_text="Sure — what timeframe are you interested in?"),
-            ModelTurnResult(assistant_text="Got it, one moment."),
+            final_answer(assistant_text="I cannot answer without more information."),
+            final_answer(assistant_text="I cannot answer without more information."),
         ]
     )
     mcp = FakeMCPClient()
     loop = _build_loop(model, mcp, store)
 
     await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(frozenset()), user_message="Show me payroll."
+        session_id=SESSION_ID,
+        credentials=_credentials(frozenset()),
+        user_message="Show me payroll.",
     )
     await loop.run(
         session_id=SESSION_ID,
@@ -178,7 +191,7 @@ async def test_clarification_only_assistant_turn_survives_any_narrowing() -> Non
     )
 
     last_call_blob = _messages_blob(model.calls[-1])
-    assert "Sure — what timeframe are you interested in?" in last_call_blob
+    assert "I cannot answer without more information." in last_call_blob
 
 
 async def test_undetermined_provenance_turns_assistant_message_always_dropped() -> None:
@@ -212,24 +225,29 @@ async def test_undetermined_provenance_turns_assistant_message_always_dropped() 
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Sampled the upload — undetermined provenance sentinel answer."),
-            ModelTurnResult(assistant_text="Something else."),
+            final_answer(
+                assistant_text="I cannot verify the sampled upload — undetermined provenance sentinel answer."
+            ),
+            final_answer(assistant_text="I cannot answer without more information."),
         ]
     )
     mcp = FakeMCPClient(
         scripted={
-            "sampleRows": [
-                {"columns": ["x"], "rows": [["v1"]], "row_count": 1, "truncated": False}
-            ]
+            "sampleRows": [{"columns": ["x"], "rows": [["v1"]], "row_count": 1, "truncated": False}]
         }
     )
     loop = _build_loop(model, mcp, store)
 
     turn0 = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(frozenset()), user_message="Sample the upload."
+        session_id=SESSION_ID,
+        credentials=_credentials(frozenset()),
+        user_message="Sample the upload.",
     )
     assert turn0.status == "done"
-    assert turn0.assistant_text == "Sampled the upload — undetermined provenance sentinel answer."
+    assert (
+        turn0.assistant_text
+        == "I cannot verify the sampled upload — undetermined provenance sentinel answer."
+    )
 
     # Re-assemble under the WIDEST possible scope (allow-all) — still dropped.
     turn1 = await loop.run(
@@ -238,4 +256,7 @@ async def test_undetermined_provenance_turns_assistant_message_always_dropped() 
     assert turn1.status == "done"
 
     last_call_blob = _messages_blob(model.calls[-1])
-    assert "Sampled the upload — undetermined provenance sentinel answer." not in last_call_blob
+    assert (
+        "I cannot verify the sampled upload — undetermined provenance sentinel answer."
+        not in last_call_blob
+    )

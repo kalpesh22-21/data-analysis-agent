@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -36,6 +37,9 @@ from data_agent.runtime.retrieval.tools import SearchBlueprintsTool
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 _A = "dbpcm_warehouse.payroll.Amount"
 CATALOG = CatalogHandle({"dbpcm_warehouse.payroll": {"Amount": "Decimal(18,2)"}})
@@ -101,7 +105,9 @@ async def test_query_absent_from_every_span_and_progress_event() -> None:
         tracer=tracer,
     )
     store = InMemorySessionStore()
-    dispatcher = ToolDispatcher(FakeMCPClient(), CATALOG, observer=capturing_observer, tracer=tracer)
+    dispatcher = ToolDispatcher(
+        FakeMCPClient(), CATALOG, observer=capturing_observer, tracer=tracer
+    )
     assembler = ContextAssembler(store, tracer=tracer)
     model = ScriptedModelClient(
         [
@@ -112,7 +118,7 @@ async def test_query_absent_from_every_span_and_progress_event() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Found the overtime blueprint."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop = AgentLoop(

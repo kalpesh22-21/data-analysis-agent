@@ -129,9 +129,7 @@ def _detail(
 def _executor(mcp: FakeMCPClient, detail: BlueprintDetail) -> BlueprintExecutor:
     index = FakeVectorIndex()
     index.add_detail(detail)
-    return BlueprintExecutor(
-        tool_dispatcher=ToolDispatcher(mcp, CATALOG), vector_index=index
-    )
+    return BlueprintExecutor(tool_dispatcher=ToolDispatcher(mcp, CATALOG), vector_index=index)
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +147,7 @@ async def test_a_single_node_blueprint_returning_no_rows_is_not_grain_checked() 
     `empty_result` marker that tells the two skips apart downstream.
     """
     detail = _detail(
-        slots=[
-            {"name": "department", "type": "string", "required": True, "binds_to": _DEPT_COL}
-        ]
+        slots=[{"name": "department", "type": "string", "required": True, "binds_to": _DEPT_COL}]
     )
     mcp = FakeMCPClient(
         scripted={
@@ -192,9 +188,7 @@ async def test_a_non_empty_result_keeps_the_exact_verify_block_it_always_had() -
     and `empty_result` must be absent — not `False` — on the path that already
     worked."""
     detail = _detail(
-        slots=[
-            {"name": "department", "type": "string", "required": True, "binds_to": _DEPT_COL}
-        ]
+        slots=[{"name": "department", "type": "string", "required": True, "binds_to": _DEPT_COL}]
     )
     mcp = FakeMCPClient(
         scripted={
@@ -219,6 +213,7 @@ async def test_a_non_empty_result_keeps_the_exact_verify_block_it_always_had() -
     assert "empty_result" not in verify
     assert blueprint_verification(outcome.result_full) == {
         "passed": True,
+        "status": "structural checks passed",
         "method": "blueprint_gate",
         "grain_checked": True,
     }
@@ -315,7 +310,12 @@ def test_an_unverified_result_is_still_no_badge_at_all_not_an_empty_one() -> Non
     # A poisoned `row_count` must not read as zero rows (`isinstance(True, int)`).
     assert blueprint_verification(
         {"status": "verified", "row_count": False, "verify": {"grain_checked": True}}
-    ) == {"passed": True, "method": "blueprint_gate", "grain_checked": True}
+    ) == {
+        "passed": True,
+        "status": "structural checks passed",
+        "method": "blueprint_gate",
+        "grain_checked": True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -335,23 +335,31 @@ def test_a_lone_empty_table_rolls_up_to_empty_rather_than_to_silence() -> None:
 
 
 def test_a_mixed_set_claims_nothing() -> None:
-    """"Empty" would over-state it — part of the answer has rows. "Verified" would
+    """ "Empty" would over-state it — part of the answer has rows. "Verified" would
     be the original over-claim restated. No claim is the honest reading, and it is
     what this function already returns for any other mixture."""
-    green = {"passed": True, "method": "blueprint_gate", "grain_checked": True}
+    green = {
+        "passed": True,
+        "status": "structural checks passed",
+        "method": "blueprint_gate",
+        "grain_checked": True,
+    }
     assert rollup_verification([_table(green), _table(_EMPTY_BADGE)]) is None
     assert rollup_verification([_table(_EMPTY_BADGE), _table(None)]) is None
 
 
 def test_an_all_verified_set_still_rolls_up_green_unchanged() -> None:
-    green = {"passed": True, "method": "blueprint_gate", "grain_checked": True}
+    green = {
+        "passed": True,
+        "status": "structural checks passed",
+        "method": "blueprint_gate",
+        "grain_checked": True,
+    }
     assert rollup_verification([_table(green), _table(dict(green))]) == green
 
 
 def test_every_table_empty_rolls_up_to_empty() -> None:
-    assert rollup_verification([_table(_EMPTY_BADGE), _table(dict(_EMPTY_BADGE))]) == (
-        _EMPTY_BADGE
-    )
+    assert rollup_verification([_table(_EMPTY_BADGE), _table(dict(_EMPTY_BADGE))]) == (_EMPTY_BADGE)
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +407,7 @@ def test_a_non_empty_authoritative_result_keeps_its_original_note() -> None:
 
     assert content["authoritative"] is True
     assert content["note"] == (
-        "Verified blueprint result — authoritative; do not re-derive with "
-        "additional queries."
+        "Verified blueprint result — authoritative; do not re-derive with additional queries."
     )
 
 
@@ -455,4 +462,5 @@ def test_the_run_captured_from_an_empty_result_carries_the_empty_badge() -> None
         terminal_sql="SELECT 1",
         verification=_EMPTY_BADGE,
         slots={"month": "2026-08"},
+        source_blueprint_id="bp-x",
     )

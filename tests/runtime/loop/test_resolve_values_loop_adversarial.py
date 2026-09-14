@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.scope_filter import filter_trail
@@ -25,6 +27,9 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer, work_trail
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _T = "dbpcm_warehouse.accrual_events"
 CATALOG = CatalogHandle(
@@ -111,7 +116,7 @@ async def test_resolve_values_mixed_with_run_query_same_response() -> None:
                     ),
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ]
     )
     # Two runQuery responses: [0] the composite's inner query, [1] the direct one.
@@ -128,11 +133,11 @@ async def test_resolve_values_mixed_with_run_query_same_response() -> None:
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
     assert outcome.status == "done"
     # Both calls counted; the inner runQuery is NOT double-counted.
-    assert outcome.tool_calls_made == 2
+    assert outcome.tool_calls_made == 3  # Includes the explicit final-answer call.
     # Ordering preserved: resolveValues' inner query fires before the direct one.
     assert [c.tool_name for c in mcp.calls] == ["runQuery", "runQuery"]
 
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert [e.tool_name for e in trail] == ["resolveValues", "runQuery"]
     # Each entry carries its OWN provenance.
     assert trail[0].provenance == frozenset({(_T, "EarnCode"), (_T, "EarnDescription")})
@@ -161,7 +166,7 @@ async def test_resolve_values_as_eighth_call_is_dispatched_at_cap() -> None:
         )
     )
     model = ScriptedModelClient(
-        [ModelTurnResult(tool_calls=calls), ModelTurnResult(assistant_text="done")]
+        [ModelTurnResult(tool_calls=calls), final_answer(assistant_text="done")]
     )
     # 7 direct runQuery + 1 inner runQuery from resolveValues = 8 responses.
     plain = {"columns": ["EarnCode"], "rows": [["PTO"]], "row_count": 1, "truncated": False}
@@ -169,8 +174,8 @@ async def test_resolve_values_as_eighth_call_is_dispatched_at_cap() -> None:
     loop, store = _loop(model_client=model, mcp_client=mcp, max_tool_calls_per_iteration=8)
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
-    assert outcome.tool_calls_made == 8
-    trail = await store.load_trail(SESSION_ID)
+    assert outcome.tool_calls_made == 9  # Includes the explicit final-answer call.
+    trail = await work_trail(store, SESSION_ID)
     assert trail[-1].tool_name == "resolveValues"
     assert trail[-1].status == "ok"
 
@@ -192,7 +197,7 @@ async def test_resolve_values_past_cap_is_dropped_not_dispatched() -> None:
         )
     )
     model = ScriptedModelClient(
-        [ModelTurnResult(tool_calls=calls), ModelTurnResult(assistant_text="done")]
+        [ModelTurnResult(tool_calls=calls), final_answer(assistant_text="done")]
     )
     plain = {"columns": ["EarnCode"], "rows": [["PTO"]], "row_count": 1, "truncated": False}
     # Only the 8 direct runQuery responses — the 9th (resolveValues) is capped
@@ -201,9 +206,12 @@ async def test_resolve_values_past_cap_is_dropped_not_dispatched() -> None:
     loop, store = _loop(model_client=model, mcp_client=mcp, max_tool_calls_per_iteration=8)
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
-    assert outcome.tool_calls_made == 8
-    trail = await store.load_trail(SESSION_ID)
-    assert all(e.tool_name == "runQuery" for e in trail)
+    assert outcome.tool_calls_made == 9  # Includes the explicit final-answer call.
+    trail = await work_trail(store, SESSION_ID)
+    assert all(e.tool_name == "runQuery" for e in trail if e.status == "ok")
+    assert [(e.tool_name, e.error_code) for e in trail if e.status != "ok"] == [
+        ("resolveValues", "TOOL_NOT_EXECUTED")
+    ]
     assert len(mcp.calls) == 8  # the capped resolveValues never issued its inner query
 
 
@@ -224,7 +232,7 @@ async def test_resolve_values_result_appended_to_next_model_call() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="PTO is the code."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [_rq_result()]})
@@ -258,17 +266,19 @@ async def test_resolve_values_inner_denial_persists_denied_entry_no_pause() -> N
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="I could not access that."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(
-        scripted={"runQuery": [MCPToolError("COLUMN_SCOPE_VIOLATION", "[COLUMN_SCOPE_VIOLATION] no")]}
+        scripted={
+            "runQuery": [MCPToolError("COLUMN_SCOPE_VIOLATION", "[COLUMN_SCOPE_VIOLATION] no")]
+        }
     )
     loop, store = _loop(model_client=model, mcp_client=mcp)
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
     assert outcome.status == "done"  # inline, not a pause
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert len(trail) == 1
     assert trail[0].tool_name == "resolveValues"
     assert trail[0].status == "denied"
@@ -293,14 +303,14 @@ async def test_resolve_values_entry_dropped_by_d44_when_scope_narrows() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [_rq_result()]})
     loop, store = _loop(model_client=model, mcp_client=mcp)
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
-    trail = await store.load_trail(SESSION_ID)
+    trail = await work_trail(store, SESSION_ID)
     assert len(trail) == 1
     entry = trail[0]
     assert entry.provenance == frozenset({(_T, "EarnCode"), (_T, "EarnDescription")})

@@ -21,6 +21,7 @@ from data_agent.runtime.context.assembly import (
 )
 from data_agent.runtime.context.discovery_emulation import (
     EmulatedDiscovery,
+    _opaque_discovery_call_id,
     build_emulated_discovery,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult, _build_preview
@@ -38,8 +39,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError
+from tests.runtime.final_answer import final_answer
 
-pytestmark = pytest.mark.usefixtures("blueprint_consulted")
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
@@ -135,14 +137,17 @@ async def test_normal_response_is_rejected_until_answer_with_text_is_called() ->
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Here is your answer."
+    assert (
+        outcome.assistant_text
+        == "I could not verify every requested part from the available evidence."
+    )
     assert outcome.tool_calls_made == 2
 
     doc = await store.get_or_create_session(SESSION_ID)
     roles = [m.role for m in doc.messages]
     assert roles == ["user", "assistant"]
-    assert "cannot finish this turn" in model.calls[1].messages[-1]["content"]
-    assert "Ground the answer" in model.calls[2].messages[-1]["content"]
+    assert "finalizeAnswer" in model.calls[1].messages[-1]["content"]
+    assert "evidence" in model.calls[2].messages[-1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +209,8 @@ async def test_ask_user_limits_model_options_to_five() -> None:
     )
 
     assert outcome.pending_question == {
-        "question": "Which department?",
-        "options": ["A", "B", "C", "D", "E"],
+        "question": "There are several possible matches. Please provide the full name or a more specific description to narrow the selection.",
+        "options": None,
     }
 
 
@@ -229,9 +234,7 @@ async def test_declined_clarification_is_not_shown_again_and_agent_answers_best_
                 ]
             ),
             repeated,
-            ModelTurnResult(
-                assistant_text="I used all departments because you skipped that choice."
-            ),
+            final_answer(assistant_text="I used all departments because you skipped that choice."),
         ]
     )
     loop, _ = _build_loop(model_client=model, mcp_client=FakeMCPClient())
@@ -296,7 +299,7 @@ async def test_ask_user_resume_round_trip_threads_answer_and_completes() -> None
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Using Sales, here is the answer."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient()
@@ -309,7 +312,7 @@ async def test_ask_user_resume_round_trip_threads_answer_and_completes() -> None
 
     resumed = await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="Sales")
     assert resumed.status == "done"
-    assert resumed.assistant_text == "Using Sales, here is the answer."
+    assert resumed.assistant_text == "I don't have any information to answer your question."
 
     doc = await store.get_or_create_session(SESSION_ID)
     assert doc.pause_checkpoint.consumed is True
@@ -327,7 +330,7 @@ async def test_second_concurrent_resume_raises_already_consumed() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient()
@@ -459,7 +462,7 @@ async def test_credentials_never_appear_in_any_model_payload_across_multi_tool_c
                     ),
                 ]
             ),
-            ModelTurnResult(assistant_text="All done."),
+            final_answer(assistant_text="All done."),
         ]
     )
     mcp = FakeMCPClient(
@@ -508,12 +511,12 @@ async def test_dispatched_tool_call_persists_trail_entry_and_full_result() -> No
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Here are the employee codes."),
+            final_answer(assistant_text="Here are the employee codes."),
             # The two-row result trips the ANSWER-SHAPE GATE (05 §J): the first
             # prose finish is refused once and handed back a round. This test is
             # about trail persistence, so it simply answers in prose again — the
             # window's one grant is spent, and the second finish passes.
-            ModelTurnResult(assistant_text="Here are the employee codes."),
+            final_answer(assistant_text="Here are the employee codes."),
         ]
     )
     raw_result = {
@@ -529,10 +532,10 @@ async def test_dispatched_tool_call_persists_trail_entry_and_full_result() -> No
         session_id=SESSION_ID, credentials=_credentials(), user_message="List employee codes."
     )
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 1
+    assert outcome.tool_calls_made == 3
 
     trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 1
+    assert len(trail) == 3
     entry = trail[0]
     assert entry.tool_call_id == "call_1"
     assert entry.tool_name == "runQuery"
@@ -638,7 +641,7 @@ async def test_emulated_discovery_pairs_injected_after_the_current_question() ->
     # anything. The sweep is re-run per budget window against the CURRENT turn, so it
     # was never prior-session history; prepending it broke the sequential layout
     # `context/assembly.py`'s interleave otherwise maintains.
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="Done.")])
+    model = ScriptedModelClient([final_answer(evidence=["listDatabases"], assistant_text="Done.")])
     mcp = FakeMCPClient()
     loop, _store = _build_loop(
         model_client=model,
@@ -659,11 +662,14 @@ async def test_emulated_discovery_pairs_injected_after_the_current_question() ->
         if m["role"] == "assistant" and m.get("tool_calls")
     ]
     assert assistant_calls == [
-        ("listDatabases", "emulated-listDatabases"),
-        ("listTables", f"emulated-listTables-{_DB}"),
+        ("listDatabases", _opaque_discovery_call_id(SESSION_ID, "databases")),
+        ("listTables", _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}")),
     ]
     tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-    assert tool_ids == ["emulated-listDatabases", f"emulated-listTables-{_DB}"]
+    assert tool_ids == [
+        _opaque_discovery_call_id(SESSION_ID, "databases"),
+        _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}"),
+    ]
 
     # THE POINT: every emulated pair FOLLOWS the real user question, and the
     # question immediately precedes the first of them — nothing sits between.
@@ -698,7 +704,12 @@ async def test_emulated_discovery_stays_anchored_at_the_first_question_on_later_
     # at the session's FIRST question they stay put, which is what "emulated once, at
     # the beginning" has to mean in a rebuilt-every-round-trip context.
     model = ScriptedModelClient(
-        [ModelTurnResult(assistant_text="A0."), ModelTurnResult(assistant_text="A1.")]
+        [
+            final_answer(assistant_text="A0.", evidence=["listTables"]),
+            final_answer(
+                assistant_text="I cannot answer this follow-up from the available evidence."
+            ),
+        ]
     )
     loop, _store = _build_loop(
         model_client=model,
@@ -744,7 +755,7 @@ async def test_emulated_discovery_seeds_guard_model_recall_not_dispatched() -> N
                     ToolCallRequest(id="call_lt", name="listTables", arguments={"database": _DB})
                 ]
             ),
-            ModelTurnResult(assistant_text="Done."),
+            final_answer(evidence=["listDatabases"], assistant_text="Done."),
         ]
     )
     mcp = FakeMCPClient()
@@ -773,7 +784,9 @@ async def test_emulated_discovery_seeds_guard_model_recall_not_dispatched() -> N
 
 async def test_emulated_discovery_provider_none_leaves_messages_unchanged() -> None:
     # provider None ⇒ byte-identical: no emulated assistant/tool pairs anywhere.
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="Hi.")])
+    model = ScriptedModelClient(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
     mcp = FakeMCPClient()
     loop, _store = _build_loop(model_client=model, mcp_client=mcp)
 
@@ -792,7 +805,9 @@ async def test_emulated_discovery_provider_exception_degrades_not_fails() -> Non
     async def _provider(_creds: RuntimeCredentials) -> EmulatedDiscovery:
         raise RuntimeError("sweep exploded")
 
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="Hi.")])
+    model = ScriptedModelClient(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
     mcp = FakeMCPClient()
     loop, _store = _build_loop(
         model_client=model, mcp_client=mcp, discovery_emulation_provider=_provider
@@ -803,7 +818,7 @@ async def test_emulated_discovery_provider_exception_degrades_not_fails() -> Non
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Hi."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     for recorded_turn in model.calls:
         assert all(
             not str(m.get("tool_call_id", "")).startswith("emulated-")
@@ -818,7 +833,7 @@ async def test_emulated_pair_deduped_against_colliding_real_trail_id() -> None:
     from data_agent.runtime.session.models import ResultPreview, TrailEntry
 
     store = InMemorySessionStore()
-    colliding_id = f"emulated-listTables-{_DB}"
+    colliding_id = _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}")
     await store.append_trail_entry(
         SESSION_ID,
         TrailEntry(
@@ -837,7 +852,7 @@ async def test_emulated_pair_deduped_against_colliding_real_trail_id() -> None:
         ),
     )
 
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="Done.")])
+    model = ScriptedModelClient([final_answer(evidence=["listDatabases"], assistant_text="Done.")])
     mcp = FakeMCPClient()
     loop, _store = _build_loop(
         model_client=model,
@@ -854,7 +869,7 @@ async def test_emulated_pair_deduped_against_colliding_real_trail_id() -> None:
     # message list stays API-valid (unique tool_call_id per tool message).
     assert tool_ids.count(colliding_id) == 1
     # The non-colliding emulated listDatabases pair is still injected.
-    assert "emulated-listDatabases" in tool_ids
+    assert _opaque_discovery_call_id(SESSION_ID, "databases") in tool_ids
 
 
 async def test_emulated_discovery_real_dispatcher_degrades_when_listdatabases_denied() -> None:
@@ -864,7 +879,9 @@ async def test_emulated_discovery_real_dispatcher_degrades_when_listdatabases_de
     discovery_mcp = FakeMCPClient(
         scripted={"listDatabases": [MCPToolError("PERMISSION_DENIED", "no access")]}
     )
-    model = ScriptedModelClient([ModelTurnResult(assistant_text="Done.")])
+    model = ScriptedModelClient(
+        [final_answer(assistant_text="I don't have any information to answer your question.")]
+    )
     loop, _store = _build_loop(
         model_client=model,
         mcp_client=FakeMCPClient(),
@@ -876,7 +893,7 @@ async def test_emulated_discovery_real_dispatcher_degrades_when_listdatabases_de
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Done."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     # Nothing discovery-shaped reached the model.
     for recorded_turn in model.calls:
         assert all(
@@ -899,7 +916,7 @@ async def test_emulated_discovery_zero_table_db_still_injected_and_guarded() -> 
                     ToolCallRequest(id="call_lt", name="listTables", arguments={"database": _DB})
                 ]
             ),
-            ModelTurnResult(assistant_text="No tables."),
+            final_answer(evidence=["listTables"], assistant_text="No tables."),
         ]
     )
     # No scripted listTables on the loop's MCP — any dispatch would raise, proving
@@ -918,7 +935,7 @@ async def test_emulated_discovery_zero_table_db_still_injected_and_guarded() -> 
     assert outcome.status == "done"
     # The empty-listing emulated pair is present in the model payload.
     tool_ids = [m["tool_call_id"] for m in model.calls[0].messages if m["role"] == "tool"]
-    assert f"emulated-listTables-{_DB}" in tool_ids
+    assert _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}") in tool_ids
     # The re-call was guarded (never dispatched to the MCP).
     assert all(c.tool_name != "listTables" for c in mcp.calls)
     trail = await store.load_trail(SESSION_ID)
@@ -971,6 +988,9 @@ async def test_emulated_listtables_canonical_is_byte_identical_to_a_real_replay(
         assistant, tool = json.loads(json.dumps(pair))  # deep copy
         assistant["tool_calls"][0]["id"] = "ID"
         tool["tool_call_id"] = "ID"
+        content = json.loads(tool["content"])
+        content["result_id"] = "ID"
+        tool["content"] = json.dumps(content)
         return [assistant, tool]
 
     assert _blank_ids(emulated_pair) == _blank_ids(real_pair)
@@ -998,7 +1018,7 @@ async def test_tool_calls_are_capped_per_iteration_never_unbounded() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=many_calls),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="done"),
         ]
     )
     mcp = FakeMCPClient(
@@ -1027,9 +1047,12 @@ async def test_tool_calls_are_capped_per_iteration_never_unbounded() -> None:
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 3  # capped, not 10
+    assert (
+        outcome.tool_calls_made == 4
+    )  # Includes the explicit final-answer call.  # capped, not 10
     trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 3
+    assert len(trail) == 11
+    assert sum(e.error_code == "TOOL_NOT_EXECUTED" for e in trail) == 7
     assert len(mcp.calls) == 3
 
 
@@ -1174,7 +1197,7 @@ async def test_current_turn_denial_is_visible_to_model_within_same_turn() -> Non
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="Let me try a different table."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [MCPToolError("TABLE_NOT_FOUND", "no such table")]})
@@ -1186,7 +1209,7 @@ async def test_current_turn_denial_is_visible_to_model_within_same_turn() -> Non
     assert outcome.status == "done"
 
     trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 1
+    assert len(trail) == 2
     assert trail[0].status == "denied"
     assert trail[0].provenance is None  # confirms the drop would otherwise fire
 
@@ -1217,8 +1240,8 @@ async def test_prior_turn_denial_is_dropped_from_next_turns_context() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="I could not find that table."),
-            ModelTurnResult(assistant_text="Here is something else."),
+            final_answer(assistant_text="I could not find that table."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [MCPToolError("TABLE_NOT_FOUND", "no such table")]})
@@ -1303,7 +1326,7 @@ async def test_resolve_values_inline_result_continues_loop_no_pause() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="PTO is the paid-time-off code."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})
@@ -1315,7 +1338,7 @@ async def test_resolve_values_inline_result_continues_loop_no_pause() -> None:
 
     assert outcome.status == "done"  # inline result, never a pause
     # Exactly one tool call counted — the inner runQuery is not double-counted.
-    assert outcome.tool_calls_made == 1
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.
     # Exactly one MCP call fired: the inner runQuery (resolveValues never
     # reaches the MCP under its own name).
     assert [c.tool_name for c in mcp.calls] == ["runQuery"]
@@ -1333,7 +1356,7 @@ async def test_resolve_values_trail_entry_has_inner_provenance() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})
@@ -1342,7 +1365,7 @@ async def test_resolve_values_trail_entry_has_inner_provenance() -> None:
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 1
+    assert len(trail) == 2
     entry = trail[0]
     assert entry.tool_name == "resolveValues"
     assert entry.status == "ok"
@@ -1369,7 +1392,7 @@ async def test_resolve_values_respects_per_iteration_cap() -> None:
                     ),
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})  # only ONE response
@@ -1399,7 +1422,7 @@ async def test_resolve_values_respects_per_iteration_cap() -> None:
     )
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
-    assert outcome.tool_calls_made == 1  # capped, not 2
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.  # capped, not 2
     assert len(mcp.calls) == 1
 
 
@@ -1415,7 +1438,7 @@ async def test_resolve_values_credentials_never_in_model_payload() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})
@@ -1446,7 +1469,7 @@ async def test_resolve_values_unwired_returns_local_error_never_dispatched() -> 
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="ok"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient()  # no scripted responses — must never be called
@@ -1455,7 +1478,7 @@ async def test_resolve_values_unwired_returns_local_error_never_dispatched() -> 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 1
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.
     assert mcp.calls == []  # resolveValues never dispatched to the MCP
 
     trail = await store.load_trail(SESSION_ID)
@@ -1515,7 +1538,12 @@ class _StubCapabilityCardTool:
             user_message=None,
             provenance=frozenset(),
             result_preview=None,
-            result_full={"tool_name": self.name, "kind": "navigation", "arguments": {}},
+            result_full={
+                "name": self.name,
+                "tool_name": self.name,
+                "kind": "navigation",
+                "arguments": {},
+            },
             terminal=True,
         )
 
@@ -1541,7 +1569,9 @@ class _StubHelpCenterDocumentTool:
             retryable=None,
             user_message=None,
             provenance=frozenset(),
-            result_preview=None,
+            result_preview=_build_preview(
+                {"found": True, "id": "article-1", "content": "The limit is 1,000."}, 20
+            ),
             result_full={"found": True, "id": "article-1", "content": "The limit is 1,000."},
         )
 
@@ -1582,7 +1612,7 @@ async def test_registered_runtime_tool_intercepted_one_call_never_dispatched() -
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient()  # must never be called for searchBlueprints
@@ -1593,7 +1623,7 @@ async def test_registered_runtime_tool_intercepted_one_call_never_dispatched() -
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 1  # inline, exactly one
+    assert outcome.tool_calls_made == 2  # One work call and one final proposal.
     assert len(handler.calls) == 1  # the registry routed to the handler
     assert mcp.calls == []  # never dispatched to the MCP under its own name
 
@@ -1601,6 +1631,23 @@ async def test_registered_runtime_tool_intercepted_one_call_never_dispatched() -
     assert trail[0].tool_name == "searchBlueprints"
     assert trail[0].status == "ok"
     assert trail[0].provenance == frozenset()  # safe-empty, kept in D44 replay
+
+
+def _finalize_options(names, answer="Use the displayed options.", ident="final"):
+    return ModelTurnResult(
+        tool_calls=[
+            ToolCallRequest(
+                id=ident,
+                name="finalizeAnswer",
+                arguments={
+                    "answer": answer,
+                    "tables": [],
+                    "capability_refs": names,
+                    "evidence": [],
+                },
+            )
+        ]
+    )
 
 
 async def test_capability_cards_drain_the_batch_and_finish_together() -> None:
@@ -1613,7 +1660,8 @@ async def test_capability_cards_drain_the_batch_and_finish_together() -> None:
                     ToolCallRequest(id="cap_1", name=first.name, arguments={}),
                     ToolCallRequest(id="cap_2", name=second.name, arguments={}),
                 ]
-            )
+            ),
+            _finalize_options([first.name, second.name]),
         ]
     )
     loop, _ = _registry_loop(
@@ -1639,7 +1687,8 @@ async def test_capability_terminal_reaches_judge_with_capability_evidence() -> N
         [
             ModelTurnResult(
                 tool_calls=[ToolCallRequest(id="cap_1", name=capability.name, arguments={})]
-            )
+            ),
+            _finalize_options([capability.name]),
         ]
     )
     loop, _ = _registry_loop(
@@ -1678,7 +1727,8 @@ async def test_internal_capability_evidence_is_not_sent_to_the_ui() -> None:
         [
             ModelTurnResult(
                 tool_calls=[ToolCallRequest(id="cap_1", name=capability.name, arguments={})]
-            )
+            ),
+            _finalize_options([capability.name]),
         ]
     )
     loop, _ = _registry_loop(
@@ -1710,17 +1760,9 @@ async def test_capability_judge_rejection_retries_without_losing_ui_payload() ->
             ModelTurnResult(
                 tool_calls=[ToolCallRequest(id="cap_1", name=capability.name, arguments={})]
             ),
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="answer_1",
-                        name="answerWithText",
-                        arguments={
-                            "answer": "You can use this option to manage positions.",
-                            "evidence": [],
-                        },
-                    )
-                ]
+            _finalize_options([capability.name], "Use the displayed option.", "initial"),
+            _finalize_options(
+                [capability.name], "You can use this option to manage positions.", "repaired"
             ),
         ]
     )
@@ -1734,12 +1776,12 @@ async def test_capability_judge_rejection_retries_without_losing_ui_payload() ->
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
-    assert outcome.assistant_text.startswith("I wasn't able to fully answer your question")
-    # The general judge allowance is exhausted; a skipped review cannot approve the rewrite.
+    assert "manage positions" in outcome.assistant_text
     assert [card["tool_name"] for card in outcome.capability_cards or []] == [capability.name]
-    assert [brief.site for brief in judge.briefs] == ["exit_capability"]
+    assert [brief.site for brief in judge.briefs] == ["exit_capability", "exit_capability"]
     assert capability.calls == 1
-    assert await store.claim_finalization_block(SESSION_ID, 0, 1, "answer_judge") is False
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert doc.review_states["0"]["calls"] == 2
 
 
 async def test_help_center_answer_reaches_judge_without_sql_grounding_refusal() -> None:
@@ -1846,8 +1888,9 @@ async def test_help_center_grounding_rejection_preserves_general_judge_allowance
     assert outcome.status == "done"
     assert outcome.assistant_text == "The documented limit is 1,000."
     assert len(judge.briefs) == 2
-    assert await store.claim_finalization_block(SESSION_ID, 0, 1, "help_center_grounding") is False
-    assert await store.claim_finalization_block(SESSION_ID, 0, 1, "answer_judge") is True
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert doc.review_states["0"]["calls"] == 2
+    assert doc.review_states["0"]["approved_version"]
 
 
 async def test_capability_card_waits_for_required_answer_table() -> None:
@@ -1865,10 +1908,12 @@ async def test_capability_card_waits_for_required_answer_table() -> None:
                 tool_calls=[
                     ToolCallRequest(
                         id="answer_1",
-                        name="answerWithTable",
+                        name="finalizeAnswer",
                         arguments={
                             "answer": "Here are the results and the requested page.",
-                            "tables": [{"sql": sql}],
+                            "tables": [{"result_id": "query_1"}],
+                            "capability_refs": [capability.name],
+                            "evidence": ["query_1"],
                         },
                     )
                 ]
@@ -1887,7 +1932,7 @@ async def test_capability_card_waits_for_required_answer_table() -> None:
             ]
         }
     )
-    loop, _ = _registry_loop(
+    loop, store = _registry_loop(
         model_client=model,
         mcp_client=mcp,
         runtime_tools={
@@ -1896,6 +1941,9 @@ async def test_capability_card_waits_for_required_answer_table() -> None:
         },
     )
 
+    from tests._blueprint_gate import expand_blueprint
+
+    await expand_blueprint(store, SESSION_ID, "discovery-fixture")
     outcome = await loop.run(
         session_id=SESSION_ID,
         credentials=_credentials(),
@@ -1908,10 +1956,6 @@ async def test_capability_card_waits_for_required_answer_table() -> None:
     assert [card["tool_name"] for card in outcome.capability_cards or []] == [capability.name]
     assert capability.calls == 1
     assert len(model.calls) == 3
-    assert any(
-        "The options are prepared" in str(message.get("content") or "")
-        for message in model.calls[2].messages
-    )
 
 
 async def test_unwired_retrieval_tool_returns_unavailable_never_dispatched() -> None:
@@ -1922,7 +1966,7 @@ async def test_unwired_retrieval_tool_returns_unavailable_never_dispatched() -> 
                     ToolCallRequest(id="gb_1", name="getBlueprint", arguments={"id": "bp-x"})
                 ]
             ),
-            ModelTurnResult(assistant_text="ok"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     mcp = FakeMCPClient()
@@ -1931,7 +1975,7 @@ async def test_unwired_retrieval_tool_returns_unavailable_never_dispatched() -> 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
 
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 1
+    assert outcome.tool_calls_made == 2  # Includes the explicit final-answer call.
     assert mcp.calls == []  # a runtime tool is NEVER dispatched to the MCP
 
     trail = await store.load_trail(SESSION_ID)
@@ -1948,7 +1992,7 @@ async def test_unknown_tool_falls_through_to_mcp_dispatch_unchanged() -> None:
             ModelTurnResult(
                 tool_calls=[ToolCallRequest(id="ld_1", name="listDatabases", arguments={})]
             ),
-            ModelTurnResult(assistant_text="done"),
+            final_answer(evidence=["ld_1"], assistant_text="done"),
         ]
     )
     mcp = FakeMCPClient(scripted={"listDatabases": [["db1", "db2"]]})

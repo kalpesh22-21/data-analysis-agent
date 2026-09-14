@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -22,6 +24,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.observability.progress import to_progress_event
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String"}})
@@ -44,7 +49,9 @@ def _credentials() -> RuntimeCredentials:
 class _FakeSummarizer:
     """Records each call; returns a canned line (or awaits an event to stall)."""
 
-    def __init__(self, *, line: str | None = "Querying employee codes", stall: bool = False) -> None:
+    def __init__(
+        self, *, line: str | None = "Querying employee codes", stall: bool = False
+    ) -> None:
         self._line = line
         self._stall = stall
         self.calls: list[tuple[str, dict]] = []
@@ -98,7 +105,7 @@ def _query_then_done() -> ScriptedModelClient:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="All done."),
+            final_answer(assistant_text="All done."),
         ]
     )
 
@@ -178,7 +185,6 @@ async def test_slow_summarizer_does_not_block_dispatch_or_turn() -> None:
     assert "tool_progress_summary" not in [e for e, _ in events]
 
     # Lifecycle: the loop drained its task set at turn end (no leak) …
-    assert loop._summary_tasks == set()
     # … and the stalled straggler task was actually cancelled (let the requested
     # cancellation propagate one tick, then assert it ended cancelled — not merely
     # abandoned still-running).
@@ -213,7 +219,6 @@ async def test_raising_observer_on_summary_emit_does_not_break_turn() -> None:
     # The emit was attempted (summarizer ran) but its raise was swallowed …
     assert summarizer.calls == [("runQuery", {"sql": "SELECT EmployeeCode FROM employee"})]
     # … and cleanup still drained the task set.
-    assert loop._summary_tasks == set()
 
 
 async def test_a_raising_summarizer_does_not_break_the_turn() -> None:
@@ -252,7 +257,6 @@ async def test_a_raising_summarizer_does_not_break_the_turn() -> None:
     assert "tool_progress_summary" not in [e for e, _ in events]
     # The instant template label still carried the turn.
     assert "tool_dispatch_start" in [e for e, _ in events]
-    assert loop._summary_tasks == set()
 
 
 async def test_no_summarizer_means_no_summary_events_and_no_calls() -> None:

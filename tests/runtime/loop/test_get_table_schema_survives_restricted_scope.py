@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -35,6 +37,9 @@ from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 _E = "dbpcm_warehouse.employee"
 
@@ -120,8 +125,10 @@ class _FetchThenAnswerModel:
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
         if self._fetched:
-            return ModelTurnResult(
-                assistant_text="Here is the employee schema.", usage={"total_tokens": 1}
+            return final_answer(
+                evidence=["getTableSchema"],
+                assistant_text="Here is the employee schema.",
+                usage={"total_tokens": 1},
             )
         self._fetched = True
         return ModelTurnResult(

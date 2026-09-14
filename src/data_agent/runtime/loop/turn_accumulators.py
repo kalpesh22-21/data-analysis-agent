@@ -245,6 +245,9 @@ class TurnAccumulators:
         # read at every `TurnOutcome(...)` return site.
         self._assumptions: list[str] = list(assumptions) if assumptions else []
         self._capability_cards: list[dict[str, Any]] = []
+        self._selected_capabilities: set[str] = set()
+        self._excluded_capabilities: set[str] = set()
+        self._excluded_table_sql: set[str] = set()
         self._loaded_capability_names: set[str] = set()
         self._capability_evidence: dict[str, dict[str, Any]] = {}
         for card in capability_cards or ():
@@ -301,6 +304,22 @@ class TurnAccumulators:
         other. A `runQuery`'s query is the argument the model sent; a `runBlueprint`'s is
         the terminal node's, which only `result_full` knows.
         """
+        if tool_result.status == "ok":
+            captured = (
+                blueprint_run_from_result(
+                    tool_result.result_full, slots=(arguments or {}).get("slot_bindings")
+                )
+                if tool_name == "runBlueprint"
+                else None
+            )
+            if captured:
+                self._blueprint_runs[tool_call_id] = captured[1]
+            elif (
+                tool_name == "runQuery"
+                and isinstance(arguments, dict)
+                and isinstance(arguments.get("sql"), str)
+            ):
+                self._blueprint_runs[tool_call_id] = BlueprintRun(terminal_sql=arguments["sql"])
         if tool_result.status != "ok":
             return
         if tool_name == "runQuery" and isinstance(arguments, dict):
@@ -347,8 +366,32 @@ class TurnAccumulators:
         if resolved:
             self._answer_tables = list(resolved)
 
+    def exclude_components(self, components) -> None:
+        for component in components:
+            if component["kind"] == "capability":
+                self._excluded_capabilities.add(component["capability_ref"])
+            else:
+                sql = component.get("sql") or self.result_sql_by_call_id.get(component["result_id"])
+                if sql:
+                    self._excluded_table_sql.add(sql)
+        self._selected_capabilities -= self._excluded_capabilities
+        self._answer_tables = [
+            t for t in self._answer_tables if t.sql not in self._excluded_table_sql
+        ]
+
+    def select_answer_tables(self, tables: Sequence[AnswerTable]) -> None:
+        """A complete proposal replaces its table selection, including an empty list."""
+        self._answer_tables = list(tables)
+
     def note_capability_card(self, tool_result: ToolResult) -> str | None:
-        if not (tool_result.status == "ok" and tool_result.terminal):
+        if not (
+            tool_result.status == "ok"
+            and (
+                tool_result.terminal
+                or isinstance(tool_result.result_full, dict)
+                and tool_result.result_full.get("prepared")
+            )
+        ):
             return None
         payload = tool_result.result_full
         if not isinstance(payload, dict):
@@ -359,7 +402,9 @@ class TurnAccumulators:
 
     def _remember_capability(self, payload: Mapping[str, Any], tool_name: str) -> None:
         card = {
-            key: value for key, value in payload.items() if key not in {"answer", "_agent_evidence"}
+            key: value
+            for key, value in payload.items()
+            if key not in {"answer", "_agent_evidence", "prepared", "capability_ref"}
         }
         if card not in self._capability_cards:
             self._capability_cards.append(card)
@@ -401,12 +446,17 @@ class TurnAccumulators:
 
     @property
     def capability_cards(self) -> list[dict[str, Any]] | None:
-        return self._capability_cards or None
+        return [
+            c
+            for c in self._capability_cards
+            if c.get("name") in self._selected_capabilities
+            and c.get("name") not in self._excluded_capabilities
+        ] or None
 
     @property
     def capability_judge_context(self) -> tuple[dict[str, Any], ...]:
         contexts = []
-        for card in self._capability_cards:
+        for card in self.capability_cards or ():
             name = card.get("name", card.get("tool_name", ""))
             evidence = self._capability_evidence.get(name, {}) if isinstance(name, str) else {}
             kind = evidence.get("kind", card.get("kind"))
@@ -419,6 +469,9 @@ class TurnAccumulators:
                 {
                     "name": sanitize_text(name, 120) if isinstance(name, str) else "",
                     "kind": kind,
+                    "arguments": card.get("arguments", {}),
+                    "metadata": metadata,
+                    "description": evidence.get("description", ""),
                     "data": list(metadata_data_digest(kind, metadata)),
                     "presentation": widget_label(
                         kind,
@@ -434,6 +487,17 @@ class TurnAccumulators:
                 }
             )
         return tuple(contexts)
+
+    @property
+    def answer_tables(self):
+        return tuple(self._answer_tables)
+
+    @property
+    def prepared_capability_names(self):
+        return {c.get("name") for c in self._capability_cards}
+
+    def select_capabilities(self, refs):
+        self._selected_capabilities = set(refs) - self._excluded_capabilities
 
     def clear_capabilities(self) -> None:
         self._capability_cards.clear()

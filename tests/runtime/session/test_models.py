@@ -42,7 +42,9 @@ def test_result_preview_roundtrip() -> None:
 
 
 def test_turn_message_roundtrip() -> None:
-    msg = TurnMessage(turn_index=0, role="user", content="how many employees?", ts="2026-07-01T00:00:00+00:00")
+    msg = TurnMessage(
+        turn_index=0, role="user", content="how many employees?", ts="2026-07-01T00:00:00+00:00"
+    )
     restored = TurnMessage.from_doc(msg.to_doc())
     assert restored == msg
 
@@ -56,7 +58,10 @@ def test_trail_entry_roundtrip_with_provenance() -> None:
         status="ok",
         error_code=None,
         provenance=frozenset(
-            {("dbpcm_warehouse.payroll_fact", "GrossPay"), ("dbpcm_warehouse.payroll_fact", "PayPeriod")}
+            {
+                ("dbpcm_warehouse.payroll_fact", "GrossPay"),
+                ("dbpcm_warehouse.payroll_fact", "PayPeriod"),
+            }
         ),
         result_preview=_sample_preview(),
         result_full_ref="result::uuid-1",
@@ -235,7 +240,9 @@ def test_session_doc_roundtrip_full() -> None:
         session_id="sess-1",
         created_at="2026-07-01T00:00:00+00:00",
         last_activity="2026-07-01T00:03:41+00:00",
-        messages=[TurnMessage(turn_index=0, role="user", content="hi", ts="2026-07-01T00:00:00+00:00")],
+        messages=[
+            TurnMessage(turn_index=0, role="user", content="hi", ts="2026-07-01T00:00:00+00:00")
+        ],
         tool_trail=[
             TrailEntry(
                 turn_index=0,
@@ -335,9 +342,7 @@ def test_analysis_state_roundtrips_on_the_session_doc() -> None:
 def test_a_document_written_before_the_fields_existed_loads_unchanged() -> None:
     """Both fields are additive and read with `.get`, so a legacy doc round-trips
     byte-identically rather than raising."""
-    legacy = SessionDoc(
-        session_id="sess-1", created_at="t0", last_activity="t0"
-    ).to_doc()
+    legacy = SessionDoc(session_id="sess-1", created_at="t0", last_activity="t0").to_doc()
     del legacy["analysis_state"]
     del legacy["finalization_blocks"]
     restored = SessionDoc.from_doc(legacy)
@@ -355,20 +360,22 @@ def test_live_analysis_state_gates_on_the_turn_index() -> None:
         turn_index=4,
         intents=(TrackedIntent(intent_id="i1", description="d", status="pending"),),
     )
-    doc = SessionDoc(
-        session_id="s", created_at="t0", last_activity="t0", analysis_state=state
-    )
+    doc = SessionDoc(session_id="s", created_at="t0", last_activity="t0", analysis_state=state)
     assert live_analysis_state(doc, 4) is state
     assert live_analysis_state(doc, 5) is None
     assert live_analysis_state(doc, 3) is None
-    assert live_analysis_state(SessionDoc(session_id="s", created_at="t0",
-                                          last_activity="t0"), 4) is None
+    assert (
+        live_analysis_state(SessionDoc(session_id="s", created_at="t0", last_activity="t0"), 4)
+        is None
+    )
 
 
 def test_the_reason_code_split_is_structural() -> None:
     """03 §A.3: a comment would let the validator drift toward accepting runtime
     codes from the model. These are separate frozensets, and disjoint."""
-    assert MODEL_REASON_CODES == frozenset({"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE"})
+    assert MODEL_REASON_CODES == frozenset(
+        {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED"}
+    )
     assert RUNTIME_REASON_CODES == frozenset(
         {"BUDGET_EXHAUSTED", "USER_STOPPED", "ENFORCEMENT_EXHAUSTED"}
     )

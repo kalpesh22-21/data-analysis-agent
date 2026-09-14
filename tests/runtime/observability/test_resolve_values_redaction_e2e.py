@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -29,6 +30,9 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _T = "dbpcm_warehouse.accrual_events"
 CATALOG = CatalogHandle(
@@ -99,7 +103,7 @@ async def test_concept_absent_from_every_span_and_progress_event() -> None:
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="MAT is the maternity code."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop = AgentLoop(

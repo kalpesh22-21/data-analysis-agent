@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.answer_with_table import (
     AnswerWithTableTool,
@@ -30,6 +32,9 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TrailEntry, TurnMessage
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import final_answer
+
+pytestmark = pytest.mark.usefixtures("answer_tools")
 
 SESSION_ID = "sess-answer-with-table"
 CATALOG = CatalogHandle({"db.t": {"c": "String"}})
@@ -182,7 +187,7 @@ def _loop_over(store: InMemorySessionStore) -> AgentLoop:
     """An AgentLoop bound to an EXISTING store, for exercising the trail-reseed
     helpers directly against a hand-built trail."""
     return AgentLoop(
-        model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
+        model_client=ScriptedModelClient([final_answer(assistant_text="x")]),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
         context_assembler=ContextAssembler(store),
         session_store=store,
@@ -210,7 +215,7 @@ async def test_a_successful_call_ends_the_turn() -> None:
     model = ScriptedModelClient(
         [
             _answer("a1", answer="Three departments.", tables=[{"sql": _ANSWER_SQL}]),
-            ModelTurnResult(assistant_text="THIS MUST NOT BE REACHED."),
+            final_answer(assistant_text="THIS MUST NOT BE REACHED."),
         ]
     )
     loop, _ = _build_loop(model)
@@ -242,13 +247,16 @@ async def test_the_terminal_answer_is_persisted_like_an_ordinary_one() -> None:
     assert assistants[0].provenance is not None
 
 
-async def test_a_scalar_answer_still_ends_the_old_way() -> None:
-    """The safe default is untouched: a model that never calls the tool cannot hang
-    — it falls through to the no-tool-calls exit with no table."""
-    loop, _ = _build_loop(ScriptedModelClient([ModelTurnResult(assistant_text="There are 5.")]))
+async def test_a_decline_finishes_explicitly_without_a_table() -> None:
+    """An unsupported request can finish explicitly with a decline and no table."""
+    loop, _ = _build_loop(
+        ScriptedModelClient(
+            [final_answer(assistant_text="I don't have any information to answer your question.")]
+        )
+    )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="how many?")
     assert outcome.status == "done"
-    assert outcome.assistant_text == "There are 5."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     assert outcome.answer_sql is None
 
 
@@ -259,7 +267,7 @@ async def test_a_call_without_answer_text_does_not_end_the_turn() -> None:
     model = ScriptedModelClient(
         [
             _answer("a1", tables=[{"sql": _ANSWER_SQL}]),
-            ModelTurnResult(assistant_text="Recovered prose."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _ = _build_loop(model)
@@ -267,8 +275,8 @@ async def test_a_call_without_answer_text_does_not_end_the_turn() -> None:
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
 
     assert len(model.calls) == 2
-    assert outcome.assistant_text == "Recovered prose."
-    assert outcome.answer_sql == _ANSWER_SQL  # the designation still counted
+    assert outcome.assistant_text == "I don't have any information to answer your question."
+    assert outcome.answer_sql is None  # The final proposal explicitly clears tables.
 
 
 async def test_batched_assumptions_and_answer_both_land() -> None:
@@ -344,7 +352,7 @@ async def test_an_unrun_blueprint_id_nudges_instead_of_ending_the_turn() -> None
     model = ScriptedModelClient(
         [
             _answer("a1", answer="See table.", tables=[{"blueprint_id": "bp-never-ran"}]),
-            ModelTurnResult(assistant_text="Recovered without a table."),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, store = _build_loop(model)
@@ -353,7 +361,7 @@ async def test_an_unrun_blueprint_id_nudges_instead_of_ending_the_turn() -> None
 
     # It did NOT terminate on the designation — the model got another round-trip.
     assert len(model.calls) == 2
-    assert outcome.assistant_text == "Recovered without a table."
+    assert outcome.assistant_text == "I don't have any information to answer your question."
     assert outcome.answer_sql is None
 
     entry = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == "answerWithTable"][0]
@@ -370,7 +378,7 @@ async def test_the_nudge_is_visible_to_the_model_on_the_next_round_trip() -> Non
     model = ScriptedModelClient(
         [
             _answer("a1", answer="See table.", tables=[{"blueprint_id": "bp-never-ran"}]),
-            ModelTurnResult(assistant_text="ok"),
+            final_answer(assistant_text="I don't have any information to answer your question."),
         ]
     )
     loop, _ = _build_loop(model)

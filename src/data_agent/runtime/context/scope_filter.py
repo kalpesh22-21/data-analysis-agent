@@ -14,10 +14,13 @@ just the tool trail; USER messages carry no warehouse-derived data and are alway
 
 TURN-SCOPED CONTINUITY, STATUS-GATED: `filter_trail`'s optional `current_turn_index`
 exempts ONLY non-`"ok"` entries of the turn IN PROGRESS from the `None` drop — a
-denied/errored entry carries no result rows, so surfacing it leaks nothing and the model
-can self-correct. A SUCCESSFUL current-turn entry is NEVER exempt: it is data-bearing,
+denied/errored entry carries no result rows, so the model can use it to self-correct
+within the original scope. Model-response receipts are restricted to their original scope on
+failure: even without result rows, their arguments may copy previously observed values.
+A SUCCESSFUL current-turn entry is NEVER exempt: it is data-bearing,
 and `sampleRows` provenance is declaratively "all columns of the table", frequently not
-a subset of a narrow scope. Cross-turn behaviour is unchanged in every case.
+a subset of a narrow scope. Legacy receipts without scope metadata retain their
+existing provenance rules.
 """
 
 from __future__ import annotations
@@ -34,8 +37,8 @@ def is_provenance_in_scope(
     provenance: frozenset[tuple[str, str]] | None, column_scope: frozenset[str]
 ) -> bool:
     """The core D44 subset/`None` semantics, shared by `TrailEntry.provenance` AND
-        `TurnMessage.provenance` — the single source of truth for "is this provenance
-        replayable under this scope", never duplicated between the two filters.
+    `TurnMessage.provenance` — the single source of truth for "is this provenance
+    replayable under this scope", never duplicated between the two filters.
     """
     if provenance is None:
         return False
@@ -53,7 +56,18 @@ def is_provenance_in_scope(
 
 def is_entry_in_scope(entry: TrailEntry, column_scope: frozenset[str]) -> bool:
     """Return True iff *entry* may be replayed under *column_scope* (D44)."""
-    return is_provenance_in_scope(entry.provenance, column_scope)
+    return _failure_scope_matches(entry, column_scope) and is_provenance_in_scope(
+        entry.provenance, column_scope
+    )
+
+
+def _failure_scope_matches(entry: TrailEntry, column_scope: frozenset[str]) -> bool:
+    original_scope = (entry.model_response or {}).get("scope_hash")
+    return (
+        entry.status == "ok"
+        or not original_scope
+        or original_scope == compute_scope_hash(column_scope)
+    )
 
 
 def filter_trail(
@@ -63,28 +77,31 @@ def filter_trail(
 ) -> list[TrailEntry]:
     """Return the subsequence of *trail* whose provenance is in *column_scope*.
 
-        Order-preserving; pure, no I/O.
+    Order-preserving; pure, no I/O.
 
-        *current_turn_index*, when given, keeps an entry with that `turn_index` AND
-        `status != "ok"` regardless of its provenance (see module docstring). A SUCCESSFUL
-        current-turn entry is never exempt. `None` applies the strict check to every entry.
+    *current_turn_index*, when given, keeps an entry with that `turn_index` AND
+    `status != "ok"` regardless of its provenance (see module docstring). A SUCCESSFUL
+    current-turn entry is never exempt. `None` applies the strict check to every entry.
     """
     return [
         entry
         for entry in trail
-        if (
-            current_turn_index is not None
-            and entry.turn_index == current_turn_index
-            and entry.status != "ok"
+        if _failure_scope_matches(entry, column_scope)
+        and (
+            (
+                current_turn_index is not None
+                and entry.turn_index == current_turn_index
+                and entry.status != "ok"
+            )
+            or is_provenance_in_scope(entry.provenance, column_scope)
         )
-        or is_entry_in_scope(entry, column_scope)
     ]
 
 
 def is_message_in_scope(message: TurnMessage, column_scope: frozenset[str]) -> bool:
     """Return True iff *message* may be replayed under *column_scope*. User messages are
-        always kept (no warehouse-derived data); assistant messages use the identical
-        subset/`None` semantics as `is_entry_in_scope`.
+    always kept (no warehouse-derived data); assistant messages use the identical
+    subset/`None` semantics as `is_entry_in_scope`.
     """
     if message.role == "user":
         return True
@@ -95,7 +112,7 @@ def filter_messages(
     messages: Sequence[TurnMessage], column_scope: frozenset[str]
 ) -> list[TurnMessage]:
     """Return the subsequence of *messages* replayable under *column_scope* — the
-        conversational counterpart of `filter_trail`. Order-preserving; pure, no I/O.
+    conversational counterpart of `filter_trail`. Order-preserving; pure, no I/O.
     """
     return [message for message in messages if is_message_in_scope(message, column_scope)]
 

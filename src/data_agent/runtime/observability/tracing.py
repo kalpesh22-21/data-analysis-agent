@@ -425,26 +425,10 @@ def guardrail_span(tracer: Tracer, name: str, *, attributes: dict[str, Any] | No
 
 
 def answer_judge_span(tracer: Tracer, *, site: str) -> Any:
-    """The ANSWER JUDGE's own model call (`CHAIN`, doc 09).
+    """A named judge review nested in the current agent turn.
 
-    WHY A SPAN OF ITS OWN, when the auto-instrumentor already covers the call. The
-    judge goes through the same `AsyncOpenAI` client as the agent, so `instrument_openai`
-    emits an `LLM` span for it either way — and that is exactly the problem: in the turn
-    trace it is INDISTINGUISHABLE from the agent's own round-trips. A turn that made five
-    model calls and a turn that made four plus a judgement look the same, which is the
-    one thing an operator watching judge cost or judge latency needs to tell apart.
-
-    Opening this span makes the auto LLM span its CHILD (ambient context), so the trace
-    reads `agent.turn -> answer_judge -> LLM` and the judge's tokens and latency are
-    attributable without any new plumbing at the model seam.
-
-    SHAPE ONLY (D25). `site` here, and `approved`/`violation`/`tokens` set on the span
-    after the verdict is parsed — every one of them a runtime-authored closed vocabulary
-    or a count. `feedback` is model-composed prose about the user's question and MUST
-    NEVER be set on this span; nor is the brief, which carries the draft answer and
-    warehouse rows. This is the same rule `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` enforces
-    for the events, restated here because a span attribute bypasses that allowlist
-    entirely.
+    The instrumented model call is a child of this wrapper. Prompts and verdict
+    prose stay on that model span, subject to the configured redaction.
     """
     return span(tracer, "answer_judge", OpenInferenceSpanKindValues.CHAIN, {"site": site})
 
