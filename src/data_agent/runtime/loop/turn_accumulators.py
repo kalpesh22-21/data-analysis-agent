@@ -30,6 +30,7 @@ from data_agent.runtime.capabilities.digest import (
     metadata_data_digest,
     widget_label,
 )
+from data_agent.runtime.capabilities.preparation import presented_card_key
 from data_agent.runtime.composite.answer_with_table import TOOL_NAME as ANSWER_TABLE_TOOL_NAME
 from data_agent.runtime.composite.answer_with_table import (
     AnswerTable,
@@ -245,6 +246,8 @@ class TurnAccumulators:
         # read at every `TurnOutcome(...)` return site.
         self._assumptions: list[str] = list(assumptions) if assumptions else []
         self._capability_cards: list[dict[str, Any]] = []
+        self._capability_card_keys: set[tuple[str, str]] = set()
+        self.capability_cards_deduped = 0
         self._selected_capabilities: set[str] = set()
         self._excluded_capabilities: set[str] = set()
         self._excluded_table_sql: set[str] = set()
@@ -404,10 +407,23 @@ class TurnAccumulators:
         card = {
             key: value
             for key, value in payload.items()
-            if key not in {"answer", "_agent_evidence", "prepared", "capability_ref"}
+            if key
+            not in {
+                "answer",
+                "_agent_evidence",
+                "prepared",
+                "capability_ref",
+                "next_step",
+                "reused_from_result_id",
+            }
         }
-        if card not in self._capability_cards:
+        key = presented_card_key(card)
+        if key not in self._capability_card_keys:
+            self._capability_card_keys.add(key)
             self._capability_cards.append(card)
+        else:
+            self.capability_cards_deduped += 1
+            return  # Keep the evidence associated with the first retained card.
         evidence = payload.get("_agent_evidence")
         name = card.get("name", tool_name)
         if isinstance(name, str) and isinstance(evidence, dict):
@@ -501,6 +517,7 @@ class TurnAccumulators:
 
     def clear_capabilities(self) -> None:
         self._capability_cards.clear()
+        self._capability_card_keys.clear()
         self._capability_evidence.clear()
         self._loaded_capability_names.clear()
 

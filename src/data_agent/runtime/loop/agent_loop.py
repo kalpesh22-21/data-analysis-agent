@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_answer_prose
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.capabilities.preparation import PreparationCache
 from data_agent.runtime.composite.analysis_state import (
     MAX_STATE_CALLS,
     split_serves_intent,
@@ -87,10 +88,17 @@ from data_agent.runtime.hooks.answer_table import (
     AnswerTableHooks,
     references_scratch,
 )
+from data_agent.runtime.loop.reliability import (
+    MODEL_CALL_TIMEOUT_EVENT,
+    MODEL_CALL_TIMEOUT_TEXT,
+    cancellation_checkpoint,
+    observe_turn_abort,
+)
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 from data_agent.runtime.model.conversation import assign_unique_call_ids, restore_response_batches
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
+from data_agent.runtime.observability.tracing import mark_current_span_error
 from data_agent.runtime.sanitize import sanitize_text
 from data_agent.runtime.session.models import (
     AnalysisState,
@@ -872,6 +880,7 @@ class AgentLoop:
         max_loop_iterations: int,
         max_wall_clock_seconds: float,
         max_budget_windows: int,
+        model_call_timeout_seconds: float = 120.0,
         max_token_spend: int | None = None,
         request_token_budget: int | None = None,
         request_budget_pinned_recent_tool_pairs: int = 3,
@@ -937,6 +946,7 @@ class AgentLoop:
         self._blueprint_executor = blueprint_executor
         self._max_loop_iterations = max_loop_iterations
         self._max_wall_clock_seconds = max_wall_clock_seconds
+        self._model_call_timeout_seconds = model_call_timeout_seconds
         self._max_budget_windows = max_budget_windows
         # Per-window SPEND ceiling: Σ(prompt + completion) over this window's
         # round-trips, as the provider reports it. NOT an occupancy limit — see
@@ -976,6 +986,7 @@ class AgentLoop:
         self._progress_summarizer = progress_summarizer
         self._answer_table_hooks = answer_table_hooks or AnswerTableHooks()
 
+    @observe_turn_abort
     async def run(
         self, *, session_id: str, credentials: RuntimeCredentials, user_message: str
     ) -> TurnOutcome:
@@ -1002,6 +1013,7 @@ class AgentLoop:
             question=user_message,
         )
 
+    @observe_turn_abort
     async def resume(
         self, *, session_id: str, credentials: RuntimeCredentials, answer: str
     ) -> TurnOutcome:
@@ -2129,6 +2141,7 @@ class AgentLoop:
         capability_cards: list[dict[str, Any]] | None = None,
         ship_guard: JudgeShipGuard | None = None,
         judge_site: str = "exit_prose",
+        completion_notice: str | None = None,
     ) -> TurnOutcome:
         """THE ORDER every in-body `TurnOutcome` return performs its effects in, in one place:
         checkpoint write, assistant-message append, envelope read, observer event, return.
@@ -2194,6 +2207,7 @@ class AgentLoop:
         # decision): `sql_executed`, `answer_sql`, `blueprint_use`, `verification`
         # and `answer_tables` keep naming exactly what ran. Prose is the agent's
         # voice; those fields are the audit surface.
+        await cancellation_checkpoint("finish")
         ship_disposition = ship_guard.disposition(judge_site) if ship_guard is not None else None
         retained_assumption_count = None
         if assistant_text == HELP_UNAVAILABLE_TEXT:
@@ -2236,6 +2250,10 @@ class AgentLoop:
             # Runtime limitation text contains no warehouse facts. Unknown provenance
             # from failed work must not hide this message in scope-filtered history.
             provenance = frozenset()
+        if completion_notice:
+            assistant_text = "\n\n".join(
+                part for part in (assistant_text, completion_notice) if part
+            )
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance)
         if persist_text is not None or (status == "done" and assistant_text):
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
@@ -2947,6 +2965,13 @@ class AgentLoop:
         # same document, so this is that read — not an extra one.
         session_doc = await self._session_store.get_or_create_session(session_id)
         used_call_ids = {entry.tool_call_id for entry in session_doc.tool_trail}
+        preparation_cache = PreparationCache(
+            self._session_store,
+            session_id,
+            turn_index,
+            scope_filter.compute_scope_hash(credentials.column_scope),
+            session_doc.tool_trail,
+        )
         # FINALIZATION ENFORCEMENT reads from HERE (05 §E). The state changes
         # mid-turn, so a once-per-window read would be wrong — but a store read at
         # each terminal exit would cost a round-trip on EVERY turn, including the
@@ -3129,6 +3154,7 @@ class AgentLoop:
 
         discovery_rounds = 0
         while True:
+            await cancellation_checkpoint("context", guard.usage().iterations + 1)
             request = await self._build_canonical_messages(
                 session_id,
                 credentials.column_scope,
@@ -3194,7 +3220,51 @@ class AgentLoop:
             # here, beside `designated_answer_text`, for the same reason.
             finalization_gate.begin_round()
             self._observer("loop_model_call_start", {"window": window_count})
-            result = await model_client.send_turn(canonical_messages, tools)
+            await cancellation_checkpoint("model_call", guard.usage().iterations + 1)
+            limit = min(
+                self._model_call_timeout_seconds,
+                max(0.001, self._max_wall_clock_seconds - guard.usage().elapsed_seconds),
+            )
+            call_started = self._clock()
+            try:
+                async with asyncio.timeout(limit):
+                    result = await model_client.send_turn(canonical_messages, tools)
+            except TimeoutError:
+                mark_current_span_error("model_call_timeout")
+                self._observer(
+                    MODEL_CALL_TIMEOUT_EVENT,
+                    {
+                        "elapsed": round(self._clock() - call_started, 3),
+                        "limit": limit,
+                        "iteration": guard.usage().iterations + 1,
+                    },
+                )
+                await self._force_block_pending_intents(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    state=analysis_state,
+                    reason_code="ENFORCEMENT_EXHAUSTED",
+                )
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    status="done",
+                    exit_label="runtime_fallback",
+                    assistant_text=None,
+                    completion_notice=MODEL_CALL_TIMEOUT_TEXT,
+                    tool_calls_made=tool_calls_made,
+                    accum=accum,
+                    ship_guard=ship_guard,
+                    judge_site=(
+                        "exit_capability"
+                        if accum.capability_cards
+                        else "exit_table"
+                        if accum.has_answer_tables
+                        else "exit_prose"
+                    ),
+                    provenance=frozenset(),
+                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                )
             used_call_ids.update(
                 message["tool_call_id"]
                 for message in canonical_messages
@@ -3379,6 +3449,8 @@ class AgentLoop:
             blueprint_search_gate.observe_batch(capped_tool_calls)
             dispatched_ids = set()
             for tool_call in capped_tool_calls:
+                await cancellation_checkpoint("dispatch")
+                capability_reused = False
                 dispatched_ids.add(tool_call.id)
                 is_unified_finalizer = tool_call.name == "finalizeAnswer"
                 if is_unified_finalizer:
@@ -3768,13 +3840,23 @@ class AgentLoop:
                     else:  # pragma: no cover - always wired by app.py
                         tool_result = _runtime_tool_internal_error(tool_call.name)
                 elif handler is not None:
-                    tool_result = await self._run_runtime_tool(
-                        handler,
-                        tool_call.name,
-                        call_args,
-                        credentials,
-                        turn_context,
-                        tool_call.id,
+                    cached_preparation = (
+                        await preparation_cache.lookup(tool_call.name, call_args)
+                        if getattr(handler, "repeat_guard_eligible", False)
+                        else None
+                    )
+                    capability_reused = cached_preparation is not None
+                    tool_result = (
+                        cached_preparation
+                        if capability_reused
+                        else await self._run_runtime_tool(
+                            handler,
+                            tool_call.name,
+                            call_args,
+                            credentials,
+                            turn_context,
+                            tool_call.id,
+                        )
                     )
                 elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
                     tool_result = _runtime_tool_unavailable(
@@ -3960,6 +4042,18 @@ class AgentLoop:
                 )
                 await self._session_store.append_trail_entry(session_id, entry)
 
+                if getattr(handler, "repeat_guard_eligible", False):
+                    preparation_cache.record(tool_call.name, call_args, tool_result, tool_call.id)
+                if capability_reused:
+                    self._observer(
+                        "loop_repeated_capability_call_guarded",
+                        {
+                            "tool_name": tool_call.name,
+                            "tool_call_id": tool_call.id,
+                            "deduped": True,
+                        },
+                    )
+
                 # UI Slice 1 (§3.2): accumulate the enriched-result fields from
                 # this SUCCESSFUL tool call (runQuery arg SQL + preview; runBlueprint
                 # `result_full` SQL/blueprint_id/verify + preview). Shared with the
@@ -4013,7 +4107,10 @@ class AgentLoop:
                         and tool_result.result_full.get("prepared")
                     )
                 ):
+                    prior_deduped = accum.capability_cards_deduped
                     accum.note_capability_card(tool_result)
+                    if accum.capability_cards_deduped > prior_deduped:
+                        self._observer("loop_capability_card_deduped", {"dropped": 1})
                 # TERMINAL: a successful `answerWithTable` carries the final prose,
                 # so the turn ends on it. Recorded here and acted on AFTER the whole
                 # tool batch drains, so a model that batches recordAssumptions +

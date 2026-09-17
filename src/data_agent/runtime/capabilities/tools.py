@@ -187,6 +187,8 @@ class GetCapabilityTool(_CapabilityTool):
 
 
 class PresentCapabilityCardTool(_CapabilityTool):
+    # Prepares UI state only; never performs the represented navigation/action.
+    repeat_guard_eligible = True
     tool_name = "dynamicCapability"
     intent_taggable = True
 

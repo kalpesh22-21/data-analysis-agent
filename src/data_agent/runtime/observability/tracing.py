@@ -13,6 +13,7 @@ access-controlled like the session store.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable, Collection, Iterator, Sequence
@@ -35,7 +36,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExportResult,
 )
 from opentelemetry.sdk.trace.id_generator import IdGenerator
-from opentelemetry.trace import Span, Tracer
+from opentelemetry.trace import Span, Status, StatusCode, Tracer
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 _TRACER_NAME = "data-agent-runtime"
@@ -290,7 +291,18 @@ def span(
         for key, value in (attributes or {}).items():
             if value is not None:
                 current_span.set_attribute(key, value)
-        yield current_span
+        try:
+            yield current_span
+        except asyncio.CancelledError:
+            mark_current_span_error("cancelled")
+            raise
+
+
+def mark_current_span_error(reason: str) -> None:
+    """Record a runtime-authored failure reason without exception or request text."""
+    current = trace.get_current_span()
+    current.set_attribute("reason", reason)
+    current.set_status(Status(StatusCode.ERROR, reason))
 
 
 # --- W3C trace-context propagation (cross-process span chaining) --------------
@@ -537,6 +549,11 @@ def recall_span(
 # and it is never placed on any of these payloads in the first place, so this list
 # is the second of two independent guards, not the only one.
 _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
+    "dropped",
+    "elapsed",
+    "limit",
+    "iteration",
+    "phase",
     "window",
     "tool_calls_made",
     "tool_name",

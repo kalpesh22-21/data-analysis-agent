@@ -762,6 +762,12 @@ class RuntimeSettings(BaseSettings):
     # longer than the 60s this was set to before any traffic existed: the
     # blueprint-definition gate (finding 22) costs a getBlueprint round-trip per
     # blueprint, and intent tracking adds declare/close rounds around the work.
+    model_call_timeout_seconds: float = Field(
+        120.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Per-call model timeout, capped by the remaining turn-window time.",
+    )
     max_loop_iterations: int = Field(
         25,
         ge=1,

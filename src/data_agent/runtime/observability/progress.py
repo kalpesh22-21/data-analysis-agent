@@ -19,6 +19,11 @@ from typing import Any
 # `shape` — an explicit allowlist, not a denylist, so a new observer event
 # added later never accidentally leaks a sensitive field by default.
 _SHAPE_ALLOWLIST = (
+    "dropped",
+    "elapsed",
+    "limit",
+    "iteration",
+    "phase",
     "tool_name",
     "tool_call_id",
     "error_code",
@@ -56,6 +61,10 @@ _STEP_LABELS: dict[str, str] = {
     "tool_dispatch_denied": "step denied: {tool_name}",
     "tool_dispatch_error": "step failed: {tool_name}",
     "loop_model_call_start": "thinking…",
+    "loop_repeated_capability_call_guarded": "reusing an earlier option preparation outcome",
+    "loop_capability_card_deduped": "equivalent options combined",
+    "loop_model_call_timeout": "answer preparation timed out",
+    "loop_turn_aborted": "request cancelled",
     "loop_turn_done": "done",
     "loop_paused_ask_user": "waiting for your answer…",
     "loop_paused_budget_cap": "this is taking a while — continue, refine, or stop?",

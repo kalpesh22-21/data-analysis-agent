@@ -958,6 +958,7 @@ def create_app(
             tools_provider=_tools_provider,
             max_loop_iterations=settings.max_loop_iterations,
             max_wall_clock_seconds=settings.max_wall_clock_seconds,
+            model_call_timeout_seconds=settings.model_call_timeout_seconds,
             max_budget_windows=settings.max_budget_windows,
             # Per-window SPEND ceiling (2026-08-12 fix): Σ(prompt + completion)
             # across the window's round-trips. This used to be
