@@ -414,7 +414,12 @@ async def test_a_resolves_column_outside_uses_does_not_survive_a_narrowing() -> 
     )
 
 
-async def test_a_prior_turns_empty_designation_refusal_does_not_replay_its_draft() -> None:
+@pytest.mark.parametrize(
+    "error_code", ["ANSWER_TABLE_NO_TABLE_DESIGNATED", "ANSWER_TABLE_RESULT_INVALID"]
+)
+async def test_a_prior_turns_empty_designation_refusal_does_not_replay_its_draft(
+    error_code: str,
+) -> None:
     """The FOURTH instance of the same class (08 §O), pinned the day it was added
     rather than after it leaked.
 
@@ -431,10 +436,6 @@ async def test_a_prior_turns_empty_designation_refusal_does_not_replay_its_draft
     ALLOW-ALL scope, because `frozenset()` provenance is unconditionally in scope
     and an assertion made only under a narrowed one would pass for the wrong reason.
     """
-    from data_agent.runtime.dispatch.denial_mapping import (
-        ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
-    )
-
     draft = "Radiology has 41 people earning above 100000."
     store = InMemorySessionStore()
     await store.get_or_create_session(SESSION_ID)
@@ -446,7 +447,7 @@ async def test_a_prior_turns_empty_designation_refusal_does_not_replay_its_draft
             tool_name=ANSWER,
             args={"answer": draft, "tables": []},
             status="error",
-            error_code=ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
+            error_code=error_code,
             provenance=frozenset(),
             result_preview=None,
             result_full_ref=None,
@@ -460,10 +461,10 @@ async def test_a_prior_turns_empty_designation_refusal_does_not_replay_its_draft
 
     # Its OWN turn still sees it — that is what makes the nudge work at all.
     own_turn = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=0)
-    assert ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE in json.dumps(own_turn.messages, default=str)
+    assert error_code in json.dumps(own_turn.messages, default=str)
 
     # A LATER turn does not, draft prose included.
     later = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=1)
     blob = json.dumps(later.messages, default=str)
-    assert ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE not in blob
+    assert error_code not in blob
     assert draft not in blob

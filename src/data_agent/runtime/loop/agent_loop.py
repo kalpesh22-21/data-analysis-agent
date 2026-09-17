@@ -539,6 +539,30 @@ class _CanonicalRequest:
 ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE = "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
 
 
+def _answer_table_result_invalid(result_id: str, available: Sequence[str]) -> ToolResult:
+    detail = (
+        f"Table result_id '{result_id}' does not identify an accessible, successful "
+        "warehouse execution from this turn. Discovery and capability preparation "
+        "results cannot be displayed as warehouse tables. Select an existing runQuery "
+        "or verified runBlueprint result_id; put prepared UI options in capability_refs. "
+        "This is a presentation repair: do not rerun completed analysis or pass a "
+        "result_id to runBlueprint. Available table result IDs: "
+        + json.dumps(list(available))
+        + ". Correct the table and evidence references, then call finalizeAnswer again."
+    )
+    return ToolResult(
+        status="error",
+        tool_name=ANSWER_TABLE_TOOL_NAME,
+        error_code="ANSWER_TABLE_RESULT_INVALID",
+        retryable=True,
+        user_message=detail,
+        denial_detail=detail,
+        provenance=frozenset(),
+        result_preview=None,
+        result_full=None,
+    )
+
+
 def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
     """The nudge for `answerWithTable(blueprint_id=X)` where X never ran this turn.
 
@@ -2656,10 +2680,10 @@ class AgentLoop:
         credentials: RuntimeCredentials,
         session_id: str,
         turn_index: int,
-    ) -> tuple[list[AnswerTable], str | None, bool]:
+    ) -> tuple[list[AnswerTable], ToolResult | None, bool]:
         """Resolve ONE `answerWithTable` call into its designated answer tables.
 
-        Returns `(tables, unresolved_blueprint_id, carried_designation)`.
+        Returns `(tables, refusal, carried_designation)`.
 
         THE THIRD VALUE IS NOT DERIVABLE FROM THE FIRST TWO, which is why it is returned
         rather than inferred. An empty `tables` list has two completely different causes
@@ -2679,8 +2703,7 @@ class AgentLoop:
              second resolution path, which is why multi-table costs no new resolver and
              cannot drift from the single-table one.
           3. An item naming a blueprint that did not run this turn REFUSES THE WHOLE CALL
-             (the caller turns the returned id into the retryable
-             `_answer_table_blueprint_not_run` nudge), after the dormant
+             with a retryable `_answer_table_blueprint_not_run` nudge, after the dormant
              ON_ANSWER_TABLE_UNRESOLVED seam has had first refusal. Dropping it instead
              would silently lose a deliverable's table.
           4. Dedupe on resolved SQL, then cap at `MAX_ANSWER_TABLES`.
@@ -2698,6 +2721,7 @@ class AgentLoop:
             "turn_index": turn_index,
         }
         blueprint_runs = dict(blueprint_runs)
+        result_runs: dict[str, BlueprintRun] = {}
         trail = await self._session_store.load_trail(session_id)
         for entry in scope_filter.filter_trail(
             trail, credentials.column_scope, current_turn_index=None
@@ -2705,14 +2729,24 @@ class AgentLoop:
             if entry.turn_index != turn_index or entry.status != "ok":
                 continue
             if entry.tool_name == "runQuery" and isinstance(entry.args.get("sql"), str):
-                blueprint_runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
+                result_runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
             elif (
                 entry.tool_name == "runBlueprint" and entry.authoritative and entry.result_full_ref
             ):
                 full = await self._session_store.read_full_result(session_id, entry.result_full_ref)
                 captured = blueprint_run_from_result(full, slots=entry.args.get("slot_bindings"))
                 if captured:
-                    blueprint_runs[entry.tool_call_id] = captured[1]
+                    result_runs[entry.tool_call_id] = captured[1]
+        # Execution IDs and legacy blueprint IDs are different namespaces. Validate
+        # before merging for the shared resolver, and never invoke blueprint hooks
+        # or suggest execution to repair an invalid result selection.
+        table_items = arguments.get("tables")
+        for item in table_items if isinstance(table_items, list) else []:
+            if isinstance(item, dict) and item.get("result_id"):
+                ref = item["result_id"]
+                if not isinstance(ref, str) or ref.strip() not in result_runs:
+                    return [], _answer_table_result_invalid(str(ref), list(result_runs)), True
+        blueprint_runs.update(result_runs)
         designation = resolve_designations(arguments, terminal_sql_by_id(blueprint_runs))
         # Read BEFORE anything is dropped. `designation.items` holds every entry that
         # carried a designation at all, resolved or not — so this is "did the model
@@ -2752,7 +2786,7 @@ class AgentLoop:
         if unresolved_blueprint_id is not None:
             # The whole call is refused; nothing below would be surfaced anyway, and
             # computing provenance for tables that will not ship is pure cost.
-            return [], unresolved_blueprint_id, carried_designation
+            return [], _answer_table_blueprint_not_run(unresolved_blueprint_id), carried_designation
 
         finalized = finalize_designations(resolved_items)
         for _ in range(designation.dropped_unresolvable):
@@ -3894,15 +3928,15 @@ class AgentLoop:
                         analysis_state = refreshed
                 resolved_answer_tables = []
                 if tool_call.name == ANSWER_TABLE_TOOL_NAME and tool_result.status == "ok":
-                    resolved_answer_tables, unresolved, _ = await self._resolve_answer_tables(
+                    resolved_answer_tables, table_refusal, _ = await self._resolve_answer_tables(
                         call_args,
                         blueprint_runs=accum.blueprint_runs,
                         credentials=credentials,
                         session_id=session_id,
                         turn_index=turn_index,
                     )
-                    if unresolved:
-                        tool_result = _answer_table_blueprint_not_run(unresolved)
+                    if table_refusal:
+                        tool_result = table_refusal
                 if (
                     tool_call.name in {ANSWER_TABLE_TOOL_NAME, ANSWER_TEXT_TOOL_NAME}
                     and tool_result.status == "ok"

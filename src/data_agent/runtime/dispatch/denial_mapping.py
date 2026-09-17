@@ -171,6 +171,17 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     # `error_code` on every later rebuild. An unregistered code renders as the
     # generic "Something went wrong processing that request.", which would strand
     # the model with no idea what to do differently.
+    "ANSWER_TABLE_RESULT_INVALID": DenialInfo(
+        code="ANSWER_TABLE_RESULT_INVALID",
+        retryable=True,
+        kind=DenialKind.GATE,
+        user_message=(
+            "The table reference is not an accessible successful warehouse result from this turn. "
+            "Use an existing runQuery or verified runBlueprint result_id in tables, and "
+            "put prepared UI options in capability_refs. Correct the evidence references too. "
+            "Do not rerun completed analysis or pass result IDs to runBlueprint; retry finalizeAnswer."
+        ),
+    ),
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN": DenialInfo(
         code="ANSWER_TABLE_BLUEPRINT_NOT_RUN",
         retryable=True,

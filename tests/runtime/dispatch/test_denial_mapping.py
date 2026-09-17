@@ -71,6 +71,7 @@ _EXPECTED_RETRYABLE = {
     # RETRYABLE on purpose: the fix is one runBlueprint call away and the model can
     # make it inside the same turn.
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN": True,
+    "ANSWER_TABLE_RESULT_INVALID": True,
     "COLUMN_SCOPE_VIOLATION": False,
     "SCRATCH_SESSION_VIOLATION": False,
     "PARSE_FAILED_CLOSED": True,
@@ -139,6 +140,7 @@ _EXPECTED_RETRYABLE = {
 # rest, though its live refusal always carries a specific `denial_detail` — the judge's
 # own sentence — so the table entry is the replay fallback only.
 _ANSWER_TABLE_CODES = {
+    "ANSWER_TABLE_RESULT_INVALID",
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN",
     "ANSWER_TABLE_NO_TABLE_DESIGNATED",
     "ANSWER_JUDGE_REJECTED",
@@ -239,6 +241,7 @@ _EXPECTED_KIND = {
     "BLUEPRINT_DEFINITION_NOT_READ": DenialKind.GATE,
     # Answer SHAPE: a blueprint named in the answer that was never run this turn.
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN": DenialKind.GATE,
+    "ANSWER_TABLE_RESULT_INVALID": DenialKind.GATE,
     # Answer SHAPE: no table designated at all (08 §O).
     "ANSWER_TABLE_NO_TABLE_DESIGNATED": DenialKind.GATE,
     # Finalization: the turn's WORK may be perfect. What the judge refused is

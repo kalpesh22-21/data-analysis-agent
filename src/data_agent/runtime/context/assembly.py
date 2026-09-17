@@ -737,6 +737,7 @@ _STALE_CROSS_TURN_ERROR_CODES = frozenset(
         # narrowed. It only ever needs to survive its OWN turn: the whole point is
         # that the model reads it on the next round-trip and sends the table.
         ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
+        "ANSWER_TABLE_RESULT_INVALID",
         # The FIFTH and SIXTH, added with the answer judge (09 §G.2). Both are
         # persisted under `answerWithTable` and both carry the refused draft answer
         # in `args`, so both belong here for the reason the two above do.

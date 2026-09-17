@@ -1595,3 +1595,88 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
     paged = build_page_sql(turn["answer_sql"], limit=50, offset=0)
     assert HEADCOUNT_SQL in paged
     assert "LIMIT 50" in paged.upper()
+
+
+@pytest.mark.parametrize(
+    "invalid_ref",
+    ["syn_databases", "prepared_widget", "bp-active", "missing", "old", "denied", "hidden"],
+)
+async def test_result_table_repair_reuses_scoped_execution(invalid_ref: str) -> None:
+    loop, store, _ = _build([])
+    for ref, name, turn, status, provenance in [
+        ("syn_databases", "listDatabases", 1, "ok", frozenset()),
+        ("prepared_widget", "get_hr_head_count", 1, "ok", frozenset()),
+        ("old", "runQuery", 0, "ok", frozenset()),
+        ("denied", "runQuery", 1, "error", frozenset()),
+        ("hidden", "runQuery", 1, "ok", frozenset({(_P, "annual_salary")})),
+        ("headcount_result", "runBlueprint", 1, "ok", frozenset({(_E, "department_name")})),
+    ]:
+        full_ref = None
+        if name == "runBlueprint":
+            full_ref = await store.write_full_result(
+                SESSION_ID,
+                ref,
+                {
+                    "blueprint_id": "bp-active",
+                    "terminal_sql": HEADCOUNT_SQL,
+                    "status": "verified",
+                    "verify": {"grain_checked": True},
+                },
+            )
+        await store.append_trail_entry(
+            SESSION_ID,
+            TrailEntry(
+                turn_index=turn,
+                tool_call_id=ref,
+                tool_name=name,
+                args={"sql": HEADCOUNT_SQL} if name == "runQuery" else {},
+                status=status,
+                error_code=None,
+                provenance=provenance,
+                result_preview=None,
+                result_full_ref=full_ref,
+                ts="t",
+                authoritative=name == "runBlueprint",
+            ),
+        )
+    kwargs = dict(
+        blueprint_runs={"bp-active": BlueprintRun(terminal_sql=HEADCOUNT_SQL)},
+        credentials=_creds(frozenset({f"{_E}.department_name"})),
+        session_id=SESSION_ID,
+        turn_index=1,
+    )
+    tables, refusal, carried = await loop._resolve_answer_tables(
+        {"tables": [{"result_id": invalid_ref}]},
+        **kwargs,
+    )
+    assert tables == [] and carried
+    assert refusal.error_code == "ANSWER_TABLE_RESULT_INVALID"
+    assert 'Available table result IDs: ["headcount_result"]' in refusal.denial_detail
+    assert "do not rerun completed analysis" in refusal.denial_detail
+    tables, refusal, carried = await loop._resolve_answer_tables(
+        {"tables": [{"result_id": "headcount_result", "caption": "Active employees"}]},
+        **kwargs,
+    )
+    assert refusal is None and carried
+    assert len(tables) == 1
+    assert tables[0].sql == HEADCOUNT_SQL
+
+
+async def test_invalid_result_reference_returns_presentation_repair_in_live_loop() -> None:
+    loop, store, _ = _build(
+        [
+            final_answer(
+                assistant_text="See the breakdown.", tables=[{"result_id": "syn_databases"}]
+            ),
+            final_answer(assistant_text="I don't have any information to answer your question."),
+        ]
+    )
+    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
+    refused = [
+        e
+        for e in await store.load_trail(SESSION_ID)
+        if e.error_code == "ANSWER_TABLE_RESULT_INVALID"
+    ]
+    assert len(refused) == 1
+    assert "syn_databases" in refused[0].denial_detail
+    assert "presentation repair" in refused[0].denial_detail
