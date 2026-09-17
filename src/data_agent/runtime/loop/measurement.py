@@ -296,6 +296,8 @@ def execution_review_scope(messages, analysis_state, intent_ids, turn_index):
                         "description": evidence.get("description"),
                         "kind": evidence.get("kind"),
                         "activation": evidence.get("activation"),
+                        "parameters": evidence.get("parameters", []),
+                        "arguments": card.get("arguments", {}),
                     }
                 )
     return {
@@ -322,6 +324,13 @@ class MeasurementReviewer:
             "When unbound, identify the requested part from the proposed analysis and original request; "
             "do not assume one execution must answer the entire request. If alignment cannot be established, "
             "report request_alignment=uncertain. A genuinely unrelated query is unrelated. "
+            "A narrowly scoped prerequisite lookup can also align with the requested part: for example, "
+            "finding the employee identifier and display name for the person whose paystub was requested. "
+            "Inspect received_capabilities and their unresolved arguments to establish that dependency. "
+            "Do not reject an employee-identification query merely because it does not return paystub amounts. "
+            "The lookup must preserve the requested person/filter and return only information needed for resolution; "
+            "it does not itself fulfill the paystub request or support claims about pay amounts. "
+            "A capability description alone does not authorize unrelated or broad employee lookups. "
             "Compare THIS part's metric, population/exclusions, period/anchor, units, grain and joins "
             "against catalog evidence. For a blueprint inspect its actual definition and bound slots. "
             "Check requested entity uniqueness and tie preservation even in non-aggregate window/CTE joins: joining back to repeated salary levels duplicates employees. "

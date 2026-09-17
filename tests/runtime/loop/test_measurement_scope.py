@@ -96,7 +96,9 @@ def receipt(*, turn=2, status="ok", prepared=True):
                             {
                                 "prepared": prepared,
                                 "capability_ref": "identifier_card",
+                                "arguments": {"unresolved_entities": {"employees": ["Smith"]}},
                                 "_agent_evidence": {
+                                    "parameters": [{"name": "employees", "type": "employee"}],
                                     "description": "Employee SSN",
                                     "kind": "data_widget",
                                     "activation": "user_interaction_required",
@@ -138,6 +140,12 @@ def test_scope_includes_only_received_current_successful_capabilities():
     ]
     assert len(scope["received_capabilities"]) == 1
     assert scope["received_capabilities"][0]["activation"] == "user_interaction_required"
+    assert scope["received_capabilities"][0]["arguments"] == {
+        "unresolved_entities": {"employees": ["Smith"]}
+    }
+    assert scope["received_capabilities"][0]["parameters"] == [
+        {"name": "employees", "type": "employee"}
+    ]
     assert execution_review_scope([], state, ["invented"], 2)["binding_status"] == "unbound"
 
 

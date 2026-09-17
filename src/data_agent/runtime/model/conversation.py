@@ -2,7 +2,35 @@
 
 from __future__ import annotations
 
+import uuid
+from dataclasses import replace
 from typing import Any
+
+from .client import ModelTurnResult
+
+
+def assign_unique_call_ids(result: ModelTurnResult, used_ids: set[str]) -> ModelTurnResult:
+    """Give every execution a unique receipt ID, even when a provider reuses IDs.
+
+    Reserve IDs from this whole batch before generating replacements. References
+    in arguments still name previously received receipts and must not be rewritten.
+    """
+    reserved = used_ids | {call.id for call in result.tool_calls}
+    calls = []
+    changed = False
+    for call in result.tool_calls:
+        if not call.id or call.id in used_ids:
+            ident = "call_" + uuid.uuid4().hex
+            while ident in reserved:
+                ident = "call_" + uuid.uuid4().hex
+            reserved.add(ident)
+            call = replace(call, id=ident)
+            changed = True
+        used_ids.add(call.id)
+        calls.append(call)
+    # Opaque provider metadata may refer to original IDs; don't replay it with
+    # renamed calls. Ordinary responses retain their original metadata.
+    return replace(result, tool_calls=calls, reasoning_metadata={}) if changed else result
 
 
 def restore_response_batches(

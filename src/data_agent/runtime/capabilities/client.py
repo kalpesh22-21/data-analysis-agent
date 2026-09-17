@@ -285,6 +285,11 @@ class CapabilityDefinition:
         return {
             "type": "function",
             "name": self.name,
+            # Preserve omission of optional UI filters. Responses can normalize
+            # an unspecified strict mode into required fields, forcing invented
+            # values for e.g. a paystub date the user never supplied. Arguments
+            # still pass our local JSON-schema validator before hydration.
+            "strict": False,
             "description": self.description
             + " Prepare this option; include its capability_ref in finalizeAnswer to display it.",
             "parameters": parameters,

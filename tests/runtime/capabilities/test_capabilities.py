@@ -8,6 +8,8 @@ import pytest
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.capabilities.client import (
     CapabilityDefinition,
+    CapabilityError,
+    CapabilityServiceError,
     HttpCapabilityClient,
     ToolParam,
 )
@@ -20,6 +22,7 @@ from data_agent.runtime.capabilities.router import PrefetchRouter
 from data_agent.runtime.capabilities.tools import (
     GetCapabilityTool,
     PresentCapabilityCardTool,
+    SearchCapabilityToolsTool,
 )
 from data_agent.runtime.config import RuntimeSettings
 from data_agent.runtime.loop.agent_loop import TurnContext
@@ -303,11 +306,15 @@ async def test_hydrate_then_prepare_nonterminal_widget_card_without_invocation()
         "ready": True,
         "presented": False,
         "next_step": (
-            "Call show_employee_profile to present this option; definition lookup alone does "
-            "not present it. Omit optional arguments the user did not supply."
+            "Call show_employee_profile to prepare this option only if it has not already been prepared "
+            "with the required arguments. Loading this definition does not display it. "
+            "Reuse a previously prepared result when its arguments still fit; include its "
+            "capability_ref in finalizeAnswer to display it. Omit optional arguments the "
+            "user did not supply; do not substitute today's date for an unspecified date."
         ),
     }
     assert result.terminal is False
+    assert schema["strict"] is False  # Optional UI filters must remain omittable at the API.
     assert "serves_intents" in schema["parameters"]["properties"]
     assert "answer" not in schema["parameters"]["properties"]
     assert schema["parameters"]["properties"]["employees"] == {
@@ -352,6 +359,90 @@ async def test_hydrate_then_prepare_nonterminal_widget_card_without_invocation()
             "metadata": {"preamble_url": "ember:EmployeeCard"},
         },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "get_definition", "hydrate"])
+@pytest.mark.parametrize(
+    "failure", ["unavailable", "service", "unexpected", "access", "invalid", "missing"]
+)
+async def test_capability_failure_routes_data_to_warehouse_without_bypassing_denials(
+    monkeypatch, operation, failure
+) -> None:
+    client = _client()
+    definitions = []
+    credentials = RuntimeCredentials(jwt="jwt", session_id="session", column_scope=frozenset())
+    loader = GetCapabilityTool(client=client, hydrate=definitions.append, visible_names=set())
+    await loader.run({"tool_name": "show_employee_profile"}, credentials)
+
+    async def fail(*args, **kwargs):
+        if failure == "missing":
+            return None
+        if failure == "service":
+            raise CapabilityServiceError(status_code=503, code="SERVICE_UNAVAILABLE")
+        if failure == "access":
+            raise CapabilityServiceError(status_code=403, code="FORBIDDEN")
+        if failure == "invalid":
+            raise CapabilityServiceError(status_code=422, code="INVALID_ARGUMENTS")
+        if failure == "unexpected":
+            raise RuntimeError("provider internals must not leak")
+        raise CapabilityError("provider internals must not leak")
+
+    monkeypatch.setattr(client, operation, fail)
+    tool, args = {
+        "search": (SearchCapabilityToolsTool(client=client), {"query": "paystub"}),
+        "get_definition": (loader, {"tool_name": "show_employee_profile"}),
+        "hydrate": (
+            PresentCapabilityCardTool(client=client, definition=definitions[0]),
+            {"employees": ["Venkat"]},
+        ),
+    }[operation]
+    result = await tool.run(args, credentials)
+    message = result.user_message or (result.result_full or {}).get("note", "")
+    assert "provider internals" not in message
+    if failure == "access":
+        assert result.error_code == "CAPABILITY_FORBIDDEN"
+        assert "bypass" in message
+        assert "searchBlueprints" not in message
+    elif failure == "invalid":
+        assert "corrected" in message
+        assert "searchBlueprints" not in message
+    else:
+        assert "searchBlueprints" in message
+        assert "runQuery" in message
+        assert "navigation/actions" in message
+        assert "actual paystub document" in message
+
+
+@pytest.mark.asyncio
+async def test_unresolved_employee_prepares_ui_selection_handoff(monkeypatch) -> None:
+    client = _client()
+    definitions = []
+    credentials = RuntimeCredentials(jwt="jwt", session_id="session", column_scope=frozenset())
+    loader = GetCapabilityTool(client=client, hydrate=definitions.append, visible_names=set())
+    await loader.run({"tool_name": "show_employee_profile"}, credentials)
+    arguments = {
+        "filters": {"employees": []},
+        "unresolved_entities": {"employees": ["Venkat"]},
+        "has_unresolved_entities": True,
+    }
+    calls = []
+
+    async def hydrate(*args, **kwargs):
+        calls.append(kwargs["raw_arguments"])
+        return {"name": "show_employee_profile", "arguments": arguments}
+
+    monkeypatch.setattr(client, "hydrate", hydrate)
+    tool = PresentCapabilityCardTool(client=client, definition=definitions[0])
+    result = await tool.run({"employees": ["Venkat"]}, credentials)
+    assert result.status == "ok"
+    assert result.terminal is False
+    assert result.result_full["prepared"] is True
+    assert result.result_full["capability_ref"] == "show_employee_profile"
+    assert result.result_full["arguments"] == arguments
+    assert calls == [{"employees": ["Venkat"]}]
+    assert "finalizeAnswer" in result.result_full["next_step"]
+    assert "user must select the employee there" in result.result_full["next_step"]
 
 
 @pytest.mark.asyncio

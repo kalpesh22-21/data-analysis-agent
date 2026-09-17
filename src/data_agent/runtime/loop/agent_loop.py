@@ -88,7 +88,7 @@ from data_agent.runtime.hooks.answer_table import (
     references_scratch,
 )
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
-from data_agent.runtime.model.conversation import restore_response_batches
+from data_agent.runtime.model.conversation import assign_unique_call_ids, restore_response_batches
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.sanitize import sanitize_text
@@ -2946,6 +2946,7 @@ class AgentLoop:
         # session doc carries both, and `load_trail` is itself just a read of this
         # same document, so this is that read — not an extra one.
         session_doc = await self._session_store.get_or_create_session(session_id)
+        used_call_ids = {entry.tool_call_id for entry in session_doc.tool_trail}
         # FINALIZATION ENFORCEMENT reads from HERE (05 §E). The state changes
         # mid-turn, so a once-per-window read would be wrong — but a store read at
         # each terminal exit would cost a round-trip on EVERY turn, including the
@@ -3194,6 +3195,12 @@ class AgentLoop:
             finalization_gate.begin_round()
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)
+            used_call_ids.update(
+                message["tool_call_id"]
+                for message in canonical_messages
+                if message.get("role") == "tool" and "tool_call_id" in message
+            )
+            result = assign_unique_call_ids(result, used_call_ids)
             last_assistant_text = result.assistant_text
             model_response = {
                 "id": str(uuid.uuid4()),

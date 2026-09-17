@@ -314,12 +314,12 @@ async def test_duplicate_tool_call_ids_both_execute_and_trail() -> None:
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_creds(frozenset({_A})), user_message="hi"
     )
-    # PIN: the loop does not de-duplicate ids — both run, both are trailed under
-    # the same tool_call_id. (Replay would synthesize two assistant/tool pairs
-    # with a colliding id — see the report's ambiguity note for runBlueprint.)
+    # Both executions survive, with distinct receipt identities for safe replay.
     assert outcome.tool_calls_made == 3  # Includes the explicit final-answer call.
     trail = await work_trail(store, SESSION_ID)
-    assert [e.tool_call_id for e in trail] == ["dup", "dup"]
+    assert len(trail) == 2
+    assert trail[0].tool_call_id == "dup"
+    assert trail[1].tool_call_id != "dup"
 
 
 # ---------------------------------------------------------------------------

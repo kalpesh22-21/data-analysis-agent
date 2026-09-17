@@ -34,6 +34,18 @@ if TYPE_CHECKING:
 INVALID_ARGS = "CAPABILITY_INVALID_ARGS"
 UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
 INTERNAL_ERROR = "CAPABILITY_INTERNAL_ERROR"
+WAREHOUSE_FALLBACK_NUDGE = (
+    "For employee or payroll data that the warehouse can answer, continue with the "
+    "blueprint-first data path: inspect suitable offered blueprints or searchBlueprints, "
+    "then use schema/knowledge discovery and runQuery if no blueprint fits. Do not repeat "
+    "unchanged capability calls or treat this failure as proof that data is absent. "
+    "Use only authorized warehouse evidence and disclose any missing coverage. "
+    "Warehouse data cannot perform navigation/actions or substitute for an actual paystub "
+    "document; explain those unavailable parts honestly."
+)
+CAPABILITY_UNAVAILABLE_MESSAGE = (
+    "UI capabilities are temporarily unavailable. " + WAREHOUSE_FALLBACK_NUDGE
+)
 
 
 def _ok(name: str, value: dict[str, Any], *, terminal: bool = False) -> ToolResult:
@@ -52,7 +64,7 @@ def _ok(name: str, value: dict[str, Any], *, terminal: bool = False) -> ToolResu
 
 class _CapabilityTool(RuntimeToolBase):
     _INTERNAL_ERROR_CODE = INTERNAL_ERROR
-    _INTERNAL_ERROR_MESSAGE = "UI capabilities are temporarily unavailable."
+    _INTERNAL_ERROR_MESSAGE = CAPABILITY_UNAVAILABLE_MESSAGE
     _GUARDED_EXCEPTIONS = (CapabilityError,)
 
     def __init__(
@@ -76,18 +88,25 @@ class _CapabilityTool(RuntimeToolBase):
                 "ENTITY_LIMIT_EXCEEDED",
                 "PAYLOAD_TOO_LARGE",
             }
+            access_denied = exc.status_code in {401, 403} or exc.code in {
+                "UNAUTHORIZED",
+                "FORBIDDEN",
+            }
             return self._error(
                 f"CAPABILITY_{safe_provider_code(exc.code)}",
                 (
                     "The capability arguments need to be corrected."
                     if invalid
-                    else "UI capabilities are temporarily unavailable."
+                    else (
+                        "Access to this UI option was denied. Do not use another route to bypass "
+                        "this denial; explain the access limitation."
+                        if access_denied
+                        else CAPABILITY_UNAVAILABLE_MESSAGE
+                    )
                 ),
                 retryable=invalid or exc.status_code == 503,
             )
-        return self._error(
-            UNAVAILABLE, "UI capabilities are temporarily unavailable.", retryable=True
-        )
+        return self._error(UNAVAILABLE, CAPABILITY_UNAVAILABLE_MESSAGE, retryable=True)
 
 
 class SearchCapabilityToolsTool(_CapabilityTool):
@@ -133,7 +152,8 @@ class GetCapabilityTool(_CapabilityTool):
                 {
                     "found": False,
                     "tool_name": name,
-                    "note": "No UI option exists with this exact name. It was not loaded and must not be called. Use searchCapabilityTools to find an available option.",
+                    "note": "No UI option exists with this exact name. It was not loaded and must not be called. "
+                    + WAREHOUSE_FALLBACK_NUDGE,
                 },
             )
         ready = self._hydrate(definition) is not False
@@ -154,8 +174,11 @@ class GetCapabilityTool(_CapabilityTool):
                 ),
                 "presented": False,
                 "next_step": (
-                    f"Call {name} to present this option; definition lookup alone does not "
-                    "present it. Omit optional arguments the user did not supply."
+                    f"Call {name} to prepare this option only if it has not already been prepared "
+                    "with the required arguments. Loading this definition does not display it. "
+                    "Reuse a previously prepared result when its arguments still fit; include its "
+                    "capability_ref in finalizeAnswer to display it. Omit optional arguments the "
+                    "user did not supply; do not substitute today's date for an unspecified date."
                     if ready
                     else "This UI option was not loaded as a callable tool. Do not call its name; use searchCapabilityTools to choose another option, or answer from the data tools."
                 ),
@@ -207,7 +230,7 @@ class PresentCapabilityCardTool(_CapabilityTool):
         if result is None:
             return self._error(
                 "CAPABILITY_NOT_FOUND",
-                "That capability is no longer available.",
+                "That capability is no longer available. " + WAREHOUSE_FALLBACK_NUDGE,
                 retryable=False,
             )
         result = {
@@ -234,6 +257,22 @@ class PresentCapabilityCardTool(_CapabilityTool):
                 "metadata": self._definition.metadata,
             },
         }
+        hydrated_arguments = result.get("arguments")
+        if (
+            isinstance(hydrated_arguments, dict)
+            and hydrated_arguments.get("has_unresolved_entities") is True
+        ):
+            result["next_step"] = (
+                "The UI handles unresolved employee selection. Include this capability_ref in "
+                "finalizeAnswer and explain that the user must select the employee there. "
+                "Do not query employee identities, ask a clarification, reload the definition, "
+                "or repeat preparation solely to resolve this selection. Do not claim the "
+                "employee was identified or their paystub or pay values were retrieved."
+                " Describe only what the loaded option supports. If the request asks for "
+                "the latest record and the definition does not establish latest-record "
+                "selection, explicitly say that the latest record has not been determined; "
+                "do not promise that selecting the employee will identify it automatically."
+            )
         if isinstance(answer, str) and answer.strip():
             result = {**result, "answer": answer.strip()}
         return _ok(
