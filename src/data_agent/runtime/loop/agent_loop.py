@@ -4755,6 +4755,14 @@ class AgentLoop:
                                 finalization_nudge += " The omission target was invalid or ambiguous; no component was automatically removed. Correct the answer using accessible evidence."
                             if verdict.repair_type in {"prose", "presentation"}:
                                 finalization_nudge += " Preserve the existing results. No additional warehouse query is needed."
+                                if accum.capability_cards:
+                                    finalization_nudge += (
+                                        " The selected UI options are already prepared. Repair "
+                                        "finalizeAnswer using the existing capability_refs and "
+                                        "evidence result IDs; do not reload or prepare them again, "
+                                        "or add filters to repair prose. Unresolved selection "
+                                        "does not establish how many employees matched."
+                                    )
                     await self._session_store.write_review_state(
                         session_id, turn_index, review_state.to_doc()
                     )

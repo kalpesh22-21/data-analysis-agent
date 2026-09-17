@@ -5,11 +5,108 @@ from types import SimpleNamespace
 
 import pytest
 
+from data_agent.runtime.capabilities.client import CapabilityDefinition, ToolParam
 from data_agent.runtime.capabilities.preparation import PreparationCache
-from data_agent.runtime.capabilities.tools import PresentCapabilityCardTool
+from data_agent.runtime.capabilities.tools import GetCapabilityTool, PresentCapabilityCardTool
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult, _build_preview
+from data_agent.runtime.loop.answer_judge import JudgeVerdict
 from data_agent.runtime.loop.turn_accumulators import TurnAccumulators
-from tests.runtime.test_harness_improvements import CREDS, batch, build, call, run
+from tests.runtime.test_harness_improvements import CREDS, Judge, batch, build, call, run
+
+
+async def test_real_handler_reload_and_prose_repair_reuse_preparation():
+    name = "get_employee_payroll_totals"
+    definition = CapabilityDefinition(
+        name,
+        "1",
+        "data_widget",
+        "View employee paystubs",
+        (ToolParam("employees", "Employee", "employee", True, None, None, None, "all"),),
+        {"preamble_url": "ember:PayrollTotalsCl"},
+    )
+
+    class Client:
+        hydrates = 0
+
+        async def get_definition(self, *args, **kwargs):
+            return definition
+
+        async def hydrate(self, *args, **kwargs):
+            self.hydrates += 1
+            return {
+                "name": name,
+                "arguments": {
+                    "filters": {"employees": []},
+                    "unresolved_entities": {"employees": ["Venkat"]},
+                    "has_unresolved_entities": True,
+                },
+            }
+
+    client = Client()
+
+    def load(ident):
+        return call("getCapabilityTool", ident, tool_name=name)
+
+    def prep(ident):
+        return call(name, ident, employees=["Venkat"])
+
+    def answer(ident, text):
+        return call(
+            "finalizeAnswer", ident, answer=text, tables=[], capability_refs=[name], evidence=["p1"]
+        )
+
+    judge = Judge(
+        [
+            JudgeVerdict(
+                False,
+                "unsupported_environment_claim",
+                "Do not invent multiple matches.",
+                True,
+                repair_type="prose",
+            ),
+            JudgeVerdict(True, reviewed=True),
+        ]
+    )
+    loop, store, model, _, events = build(
+        [
+            batch(load("l1")),
+            batch(prep("p1")),
+            batch(load("l2"), prep("p2")),
+            batch(answer("f1", "Select the employee; there are multiple matches.")),
+            batch(load("l3"), prep("p3")),
+            batch(
+                answer(
+                    "f2",
+                    "Select the employee in the paystub view. I have not determined the latest paystub.",
+                )
+            ),
+        ],
+        judge=judge,
+    )
+
+    def register(definition):
+        # Exercise handler replacement on reload, a stronger case than app.py's
+        # existing-name fast path; the guard must belong to the turn, not handler.
+        loop._runtime_tools[name] = PresentCapabilityCardTool(client=client, definition=definition)
+        return True
+
+    loop._runtime_tools["getCapabilityTool"] = GetCapabilityTool(
+        client=client,
+        hydrate=register,
+        visible_names=set(),
+    )
+    out = await run(loop, "Venkat's last paystub")
+    assert out.status == "done"
+    assert client.hydrates == 1
+    assert len(out.capability_cards) == 1
+    assert len(judge.briefs) == 2
+    assert sum(e == "loop_repeated_capability_call_guarded" for e, _ in events) == 2
+    assert any("do not reload or prepare them again" in str(c.messages) for c in model.calls)
+    trail = await store.load_trail(CREDS.session_id)
+    for entry in [e for e in trail if e.tool_name == name][1:]:
+        payload = await store.read_full_result(CREDS.session_id, entry.result_full_ref)
+        assert payload["reused_from_result_id"] == "p1"
+        assert "does not establish zero, one, or multiple matches" in payload["next_step"]
 
 
 class Preparation:

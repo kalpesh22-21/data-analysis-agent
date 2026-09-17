@@ -270,6 +270,8 @@ class PresentCapabilityCardTool(_CapabilityTool):
                 "Do not query employee identities, ask a clarification, reload the definition, "
                 "or repeat preparation solely to resolve this selection. Do not claim the "
                 "employee was identified or their paystub or pay values were retrieved."
+                " Unresolved selection does not establish zero, one, or multiple matches; "
+                "do not invent a reason for the unresolved selection."
                 " Describe only what the loaded option supports. If the request asks for "
                 "the latest record and the definition does not establish latest-record "
                 "selection, explicitly say that the latest record has not been determined; "
