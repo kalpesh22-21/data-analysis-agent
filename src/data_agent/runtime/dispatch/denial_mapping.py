@@ -130,6 +130,18 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         kind=DenialKind.GATE,
         user_message="That tool is not available. Call only an advertised tool by its exact name; never use a tool-call ID as a tool name.",
     ),
+    "READ_REFETCH_LIMIT": DenialInfo(
+        code="READ_REFETCH_LIMIT",
+        retryable=False,
+        kind=DenialKind.GATE,
+        user_message="The read allowance for this tool is exhausted for this window. Reuse earlier results or disclose the missing coverage; changing arguments will not fetch more data.",
+    ),
+    "HELP_CENTER_CIRCUIT_OPEN": DenialInfo(
+        code="HELP_CENTER_CIRCUIT_OPEN",
+        retryable=False,
+        kind=DenialKind.GATE,
+        user_message="Help Center is unavailable for the rest of this turn. Do not retry it. Preserve other supported work and disclose unverified product guidance.",
+    ),
     BLUEPRINT_NOT_SEARCHED_CODE: DenialInfo(
         code=BLUEPRINT_NOT_SEARCHED_CODE,
         retryable=True,

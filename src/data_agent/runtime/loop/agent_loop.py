@@ -69,6 +69,7 @@ from data_agent.runtime.composite.answer_with_text import TOOL_NAME as ANSWER_TE
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
+    _REPEATED_IDEMPOTENT_READ_NUDGE,
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
     ContextAssembler,
     turn_date_anchor_day,
@@ -95,7 +96,11 @@ from data_agent.runtime.loop.reliability import (
     observe_turn_abort,
 )
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
-from data_agent.runtime.model.conversation import assign_unique_call_ids, restore_response_batches
+from data_agent.runtime.model.conversation import (
+    assign_unique_call_ids,
+    conversation_call_ids,
+    restore_response_batches,
+)
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.observability.tracing import mark_current_span_error
@@ -156,6 +161,12 @@ from .judge_ship_guard import (
     coherent_capability_ship_text,
     ship_decline_text,
     table_hedge_text,
+)
+from .loop_safety import (
+    HELP_BREAKER_TEXT,
+    NO_PROGRESS_COACH,
+    NO_PROGRESS_TEXT,
+    LoopSafety,
 )
 from .proposal import ReviewState, deliverable_evidence, fingerprint
 from .read_guard import ReadGuard, idempotent_read_signature, repeated_read_guard_event
@@ -349,7 +360,9 @@ _RUNTIME_TOOL_UNAVAILABLE_MESSAGE: dict[str, str] = {
     ),
 }
 
-TurnStatus = Literal["done", "paused_ask_user", "paused_budget_cap", "stopped_hard_ceiling"]
+TurnStatus = Literal[
+    "done", "paused_ask_user", "paused_budget_cap", "stopped_hard_ceiling", "stopped_no_progress"
+]
 
 # WHICH EXIT produced the prose the answer scrub inspected (ISSUES I1) — the
 # `exit` label on `loop_answer_prose_redacted`, and nothing else. It is a
@@ -369,6 +382,7 @@ AnswerExitLabel = Literal[
     "ask_user_question",
     "declined_clarification",
     "runtime_fallback",
+    "no_progress",
 ]
 
 _BUDGET_CAP_QUESTION = "This is taking a while — continue, refine, or stop?"
@@ -905,6 +919,9 @@ class AgentLoop:
         max_wall_clock_seconds: float,
         max_budget_windows: int,
         model_call_timeout_seconds: float = 120.0,
+        max_read_calls_per_tool: int = 3,
+        max_no_progress_rounds: int = 4,
+        help_center_failure_limit: int = 2,
         max_token_spend: int | None = None,
         request_token_budget: int | None = None,
         request_budget_pinned_recent_tool_pairs: int = 3,
@@ -971,6 +988,9 @@ class AgentLoop:
         self._max_loop_iterations = max_loop_iterations
         self._max_wall_clock_seconds = max_wall_clock_seconds
         self._model_call_timeout_seconds = model_call_timeout_seconds
+        self._max_read_calls_per_tool = max_read_calls_per_tool
+        self._max_no_progress_rounds = max_no_progress_rounds
+        self._help_center_failure_limit = help_center_failure_limit
         self._max_budget_windows = max_budget_windows
         # Per-window SPEND ceiling: Σ(prompt + completion) over this window's
         # round-trips, as the provider reports it. NOT an occupancy limit — see
@@ -2983,6 +3003,12 @@ class AgentLoop:
         # prior `ok` idempotent-read entry of this turn is what lets it recognize a
         # repeat it did not itself serve in the current window.
         read_guard = ReadGuard(self._observer)
+        loop_safety = LoopSafety(
+            read_limit=self._max_read_calls_per_tool,
+            no_progress_limit=self._max_no_progress_rounds,
+            help_failure_limit=self._help_center_failure_limit,
+            observer=self._observer,
+        )
         # The blueprint-definition gate, `loop/blueprint_gate.py`: it holds every
         # blueprint id this turn has already EXPANDED with a successful
         # `getBlueprint`, and `runBlueprint` for an id that is NOT in it is refused
@@ -2999,6 +3025,12 @@ class AgentLoop:
         # same document, so this is that read — not an extra one.
         session_doc = await self._session_store.get_or_create_session(session_id)
         used_call_ids = {entry.tool_call_id for entry in session_doc.tool_trail}
+        used_call_ids.update(conversation_call_ids(discovery_canonical))
+        for prior in scope_filter.filter_trail(session_doc.tool_trail, credentials.column_scope):
+            if prior.turn_index == turn_index:
+                loop_safety.observe_help(
+                    prior.tool_name, prior.error_code, emit=False
+                )
         preparation_cache = PreparationCache(
             self._session_store,
             session_id,
@@ -3083,6 +3115,7 @@ class AgentLoop:
                 prior_entry.args,
                 prior_entry.tool_call_id,
                 data_free=prior_entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+                served_round=(prior_entry.model_response or {}).get("round"),
             )
             # NOT an `elif`: `getBlueprint` is BOTH a guarded idempotent read and the
             # thing the blueprint-definition gate is keyed on, so it seeds both.
@@ -3188,6 +3221,7 @@ class AgentLoop:
 
         discovery_rounds = 0
         while True:
+            loop_safety.begin_round()
             await cancellation_checkpoint("context", guard.usage().iterations + 1)
             request = await self._build_canonical_messages(
                 session_id,
@@ -3204,6 +3238,13 @@ class AgentLoop:
                 user_jwt=credentials.jwt,
             )
             canonical_messages = request.messages
+            if loop_safety.help_open:
+                tools = [
+                    t
+                    for t in tools
+                    if (t.get("name") or t.get("function", {}).get("name")) not in HELP_TOOLS
+                ]
+                canonical_messages.append({"role": "system", "content": HELP_BREAKER_TEXT})
             blueprint_search_gate.observe_context(canonical_messages)
             if request.prefetched_blueprints:
                 blueprint_search_gate.observe_prefetch()
@@ -3299,15 +3340,13 @@ class AgentLoop:
                     provenance=frozenset(),
                     event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
                 )
-            used_call_ids.update(
-                message["tool_call_id"]
-                for message in canonical_messages
-                if message.get("role") == "tool" and "tool_call_id" in message
-            )
-            result = assign_unique_call_ids(result, used_call_ids)
+            used_call_ids.update(conversation_call_ids(canonical_messages))
+            result = assign_unique_call_ids(result, used_call_ids, self._observer)
             last_assistant_text = result.assistant_text
             model_response = {
                 "id": str(uuid.uuid4()),
+                "round": guard.usage().iterations + 1,
+                "window": window_count,
                 "scope_hash": scope_filter.compute_scope_hash(credentials.column_scope),
                 "content": result.assistant_text,
                 "reasoning_metadata": result.reasoning_metadata
@@ -3479,6 +3518,20 @@ class AgentLoop:
             capped_tool_calls = (
                 list(state_calls) if ask_user_call is not None else [*state_calls, *other_calls]
             )
+            if ask_user_call is not None:
+                kept_ids = {c.id for c in capped_tool_calls} | {ask_user_call.id}
+                dropped = [c for c in result.tool_calls if c.id not in kept_ids]
+                if dropped:
+                    self._observer(
+                        "loop_ask_user_batch_calls_dropped",
+                        {
+                            "dropped_count": len(dropped),
+                            "dropped_tool_names": json.dumps([c.name for c in dropped]),
+                            "dropped_tool_call_ids": json.dumps([c.id for c in dropped]),
+                            "iteration": guard.usage().iterations + 1,
+                            "reason": "ask_user_batch_pause",
+                        },
+                    )
             state_calls_dispatched = 0
             blueprint_search_gate.observe_batch(capped_tool_calls)
             dispatched_ids = set()
@@ -3643,6 +3696,14 @@ class AgentLoop:
                         serves_intents=serves_intents,
                         status="ok",
                         error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+                        denial_detail=(
+                            (
+                                _REPEATED_IDEMPOTENT_READ_NUDGE + " "
+                                if read_decision.source_readable
+                                else ""
+                            )
+                            + read_decision.nudge()
+                        ),
                         # `None` (undetermined) is deliberate: it routes this
                         # data-free entry through the D94 stranded-sentinel path.
                         # `_compute_turn_provenance_union` excludes it by marker so
@@ -3662,7 +3723,16 @@ class AgentLoop:
                     await self._session_store.append_trail_entry(session_id, guard_entry)
                     self._observer(
                         "loop_repeated_idempotent_read_guarded",
-                        repeated_read_guard_event(tool_call.name, tool_call.id, call_args),
+                        {
+                            **repeated_read_guard_event(
+                                tool_call.name,
+                                tool_call.id,
+                                call_args,
+                                source_readable=read_decision.source_readable,
+                            ),
+                            "serving_tool_call_id": read_decision.served_call_id,
+                            "serving_round": read_decision.served_round,
+                        },
                     )
                     if guard.exceeded:
                         break
@@ -3706,7 +3776,7 @@ class AgentLoop:
                 # after a tool that cannot help it, replacing the honest
                 # `RUN_BLUEPRINT_UNAVAILABLE` → raw-loop fallback (§6) with a loop.
                 handler = self._runtime_tools.get(tool_call.name)
-                gate_refusal: ToolResult | None = None
+                gate_refusal: ToolResult | None = loop_safety.check(tool_call.name)
                 if tool_call.argument_error:
                     gate_refusal = ToolResult(
                         status="error",
@@ -3719,7 +3789,7 @@ class AgentLoop:
                         result_preview=None,
                         result_full=None,
                     )
-                if tool_call.name not in advertised_names(
+                if gate_refusal is None and tool_call.name not in advertised_names(
                     tools,
                     self._runtime_tools,
                     {"askUser", UPDATE_ANALYSIS_STATE_TOOL_NAME, *_RUNTIME_TOOL_UNAVAILABLE_CODE},
@@ -3761,6 +3831,8 @@ class AgentLoop:
                         )
                         self._observer("loop_sql_repair_exhausted", {"tool_call_id": tool_call.id})
 
+                if gate_refusal is None:
+                    loop_safety.record_attempt(tool_call.name)
                 measurement_review = None
                 if gate_refusal is None and tool_call.name in {"runQuery", "runBlueprint"}:
                     definition = dict(call_args)
@@ -3921,6 +3993,14 @@ class AgentLoop:
                             "error_code": tool_result.error_code,
                         },
                     )
+
+                if gate_refusal is None:
+                    loop_safety.observe_help(
+                        tool_call.name, tool_result.error_code
+                    )
+                loop_safety.observe_result(
+                    tool_call.name, call_args, tool_result, reused=capability_reused
+                )
 
                 if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
                     refreshed = refreshed_analysis_state(tool_result, turn_index)
@@ -4876,6 +4956,43 @@ class AgentLoop:
             # `fit_request_to_budget` above. Cached prompt tokens are counted at
             # full weight on purpose (loop/budget_guard.py module docstring).
             guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
+
+            if loop_safety.end_round():
+                await self._force_block_pending_intents(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    state=analysis_state,
+                    reason_code="ENFORCEMENT_EXHAUSTED",
+                )
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    status="stopped_no_progress",
+                    exit_label="no_progress",
+                    assistant_text=None,
+                    persist_text=NO_PROGRESS_TEXT,
+                    completion_notice=NO_PROGRESS_TEXT,
+                    tool_calls_made=tool_calls_made,
+                    accum=accum,
+                    ship_guard=ship_guard,
+                    judge_site="exit_capability"
+                    if accum.capability_cards
+                    else "exit_table"
+                    if accum.has_answer_tables
+                    else "exit_prose",
+                    provenance=frozenset(),
+                    event=(
+                        "loop_no_new_evidence_stop",
+                        {
+                            "iteration": guard.usage().iterations,
+                            "window": window_count,
+                            "stagnant_rounds": loop_safety.stagnant_rounds,
+                            "exit": "no_progress",
+                        },
+                    ),
+                )
+            if loop_safety.stagnant_rounds == self._max_no_progress_rounds - 1:
+                finalization_nudge = (finalization_nudge or "") + "\n" + NO_PROGRESS_COACH
 
             if guard.exceeded:
                 if window_count >= self._max_budget_windows:

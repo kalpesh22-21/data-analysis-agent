@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -341,6 +341,14 @@ class RuntimeSettings(BaseSettings):
     )
     use_reasoning_metadata: bool = Field(
         False, description="Preserve provider reasoning metadata in internal conversation history."
+    )
+    model_api: Literal["auto", "chat"] = Field(
+        "auto",
+        description="Model protocol: auto keeps Responses-first fallback; chat directly uses Chat Completions for compatible servers such as vLLM.",
+    )
+    model_tool_choice: Literal["required", "auto"] = Field(
+        "required",
+        description="Provider tool-choice mode. Use auto for thinking endpoints that reject required; runtime finalization remains enforced.",
     )
     openai_model: str = Field("gpt-4.1", description="Model name for Responses/Chat Completions.")
     openai_base_url: str = Field("", description="Optional OpenAI-compatible base URL override.")
@@ -767,6 +775,21 @@ class RuntimeSettings(BaseSettings):
         gt=0,
         allow_inf_nan=False,
         description="Per-call model timeout, capped by the remaining turn-window time.",
+    )
+    max_read_calls_per_tool: int = Field(
+        3,
+        ge=1,
+        description="Actual read executions per tool name per budget window, independent of arguments.",
+    )
+    max_no_progress_rounds: int = Field(
+        4,
+        ge=2,
+        description="Consecutive rounds without new evidence before an honest runtime stop.",
+    )
+    help_center_failure_limit: int = Field(
+        2,
+        ge=1,
+        description="Consecutive Help Center availability failures before disabling it for this turn.",
     )
     max_loop_iterations: int = Field(
         25,

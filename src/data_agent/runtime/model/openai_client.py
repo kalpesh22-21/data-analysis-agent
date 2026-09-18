@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 import openai
 
@@ -289,7 +289,7 @@ _AsyncSleep = Callable[[float], Awaitable[None]]
 
 
 class OpenAIModelClient:
-    """`ModelClient` over the real OpenAI SDK — Responses primary, Chat fallback."""
+    """OpenAI-compatible transport with automatic fallback or explicit Chat mode."""
 
     def __init__(
         self,
@@ -300,8 +300,12 @@ class OpenAIModelClient:
         backoff_base_seconds: float = 0.5,
         sleep: _AsyncSleep = asyncio.sleep,
         use_reasoning_metadata: bool = False,
+        tool_choice: Literal["required", "auto"] = "required",
+        api_mode: Literal["auto", "chat"] = "auto",
     ) -> None:
         self._use_reasoning_metadata = use_reasoning_metadata
+        self._tool_choice = tool_choice
+        self._api_mode = api_mode
         self._client = client
         self._model = model
         self._max_retries = max_retries
@@ -323,12 +327,14 @@ class OpenAIModelClient:
             backoff_base_seconds=self._backoff_base_seconds,
             sleep=self._sleep,
             use_reasoning_metadata=self._use_reasoning_metadata,
+            tool_choice=self._tool_choice,
+            api_mode=self._api_mode,
         )
 
     async def send_turn(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurnResult:
-        if self._use_reasoning_metadata:
+        if self._api_mode == "chat" or self._use_reasoning_metadata:
             return await self._call_chat_with_retry(messages, tools)
         if not self._fell_back_this_turn:
             try:
@@ -346,7 +352,7 @@ class OpenAIModelClient:
             model=self._model,
             input=_messages_to_responses_input(messages),
             tools=list(tools),
-            **({"tool_choice": "required"} if tools else {}),
+            **({"tool_choice": self._tool_choice} if tools else {}),
         )
         return _responses_result_to_turn(response)
 
@@ -371,7 +377,7 @@ class OpenAIModelClient:
                     model=self._model,
                     messages=chat_messages,
                     tools=chat_tools,
-                    **({"tool_choice": "required"} if chat_tools else {}),
+                    **({"tool_choice": self._tool_choice} if chat_tools else {}),
                 )
                 return _chat_result_to_turn(response)
             except Exception as exc:
@@ -382,7 +388,13 @@ class OpenAIModelClient:
 
 
 def build_openai_model_client(
-    *, api_key: str, model: str, base_url: str = "", use_reasoning_metadata: bool = False
+    *,
+    api_key: str,
+    model: str,
+    base_url: str = "",
+    use_reasoning_metadata: bool = False,
+    tool_choice: Literal["required", "auto"] = "required",
+    api_mode: Literal["auto", "chat"] = "auto",
 ) -> OpenAIModelClient:
     """Construct an `OpenAIModelClient` wired to a real `AsyncOpenAI` client.
 
@@ -390,7 +402,13 @@ def build_openai_model_client(
     constructing a real `AsyncOpenAI` (which validates `api_key` eagerly).
     """
     client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None)
-    return OpenAIModelClient(client, model=model, use_reasoning_metadata=use_reasoning_metadata)
+    return OpenAIModelClient(
+        client,
+        model=model,
+        use_reasoning_metadata=use_reasoning_metadata,
+        tool_choice=tool_choice,
+        api_mode=api_mode,
+    )
 
 
 __all__ = [

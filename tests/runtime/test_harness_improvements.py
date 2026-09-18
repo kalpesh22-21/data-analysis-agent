@@ -1040,6 +1040,8 @@ async def test_discovery_streak_prompts_delivery_without_discarding_evidence():
         steps,
         extra={"getTableSchema": Tool("getTableSchema", {"description": "Employee information"})},
     )
+    loop._max_read_calls_per_tool = 6  # Isolate the existing discovery coach.
+    loop._max_no_progress_rounds = 8
     outcome = await run(loop, "What employee information is available?")
     assert outcome.status == "done"
     assert any("six consecutive rounds" in str(m.get("content")) for m in model.calls[-1].messages)

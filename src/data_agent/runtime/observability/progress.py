@@ -19,6 +19,15 @@ from typing import Any
 # `shape` — an explicit allowlist, not a denylist, so a new observer event
 # added later never accidentally leaks a sensitive field by default.
 _SHAPE_ALLOWLIST = (
+    "old_id",
+    "new_id",
+    "serving_tool_call_id",
+    "serving_round",
+    "attempts",
+    "failures",
+    "stagnant_rounds",
+    "dropped_tool_names",
+    "dropped_tool_call_ids",
     "dropped",
     "elapsed",
     "limit",
@@ -51,6 +60,11 @@ _SHAPE_ALLOWLIST = (
 # human-readable progress step labels (design §7 "same stage boundaries...
 # coarser"). `{}`-style placeholders are filled from the allowlisted shape.
 _STEP_LABELS: dict[str, str] = {
+    "loop_tool_call_id_reminted": "tracking the next step",
+    "loop_read_refetch_limit": "using information already received",
+    "loop_help_center_circuit_opened": "product guidance is temporarily unavailable",
+    "loop_no_new_evidence_stop": "stopping — no additional information was found",
+    "loop_ask_user_batch_calls_dropped": "deferring other work until your answer",
     # Retrieval fires TWO shape-only steps (design §3.5): a start signal while it
     # searches, and a completion step carrying the (blueprints, knowledge) counts.
     "retrieval_start": "searching for a matching blueprint…",

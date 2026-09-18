@@ -811,7 +811,7 @@ def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:
     the "you already fetched this, proceed" nudge as its verbatim content.
     """
     content = (
-        _REPEATED_IDEMPOTENT_READ_NUDGE
+        entry.denial_detail or _REPEATED_IDEMPOTENT_READ_NUDGE
         if entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
         else _WITHHELD_PROVENANCE_SENTINEL
     )

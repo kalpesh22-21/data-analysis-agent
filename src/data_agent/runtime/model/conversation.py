@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
 from .client import ModelTurnResult
 
 
-def assign_unique_call_ids(result: ModelTurnResult, used_ids: set[str]) -> ModelTurnResult:
+def assign_unique_call_ids(
+    result: ModelTurnResult,
+    used_ids: set[str],
+    observer: Callable[[str, dict[str, Any]], None] | None = None,
+) -> ModelTurnResult:
     """Give every execution a unique receipt ID, even when a provider reuses IDs.
 
     Reserve IDs from this whole batch before generating replacements. References
@@ -20,17 +24,43 @@ def assign_unique_call_ids(result: ModelTurnResult, used_ids: set[str]) -> Model
     changed = False
     for call in result.tool_calls:
         if not call.id or call.id in used_ids:
-            ident = "call_" + uuid.uuid4().hex
+            original = call.id
+            base = original or "call"
+            suffix = 1
+            ident = f"{base}#{suffix}"
             while ident in reserved:
-                ident = "call_" + uuid.uuid4().hex
+                suffix += 1
+                ident = f"{base}#{suffix}"
             reserved.add(ident)
             call = replace(call, id=ident)
             changed = True
+            if observer is not None:
+                observer(
+                    "loop_tool_call_id_reminted",
+                    {
+                        "old_id": original,
+                        "new_id": ident,
+                        "tool_name": call.name,
+                        "reason": "collision" if original else "empty_id",
+                    },
+                )
         used_ids.add(call.id)
         calls.append(call)
-    # Opaque provider metadata may refer to original IDs; don't replay it with
-    # renamed calls. Ordinary responses retain their original metadata.
-    return replace(result, tool_calls=calls, reasoning_metadata={}) if changed else result
+    # Preserve opaque reasoning verbatim. Evidence arguments continue to reference
+    # original receipts; neither opaque text nor arguments are safe to rewrite.
+    return replace(result, tool_calls=calls) if changed else result
+
+
+def conversation_call_ids(messages: list[dict[str, Any]]) -> set[str]:
+    """Reserve synthetic, assistant-side and tool-side IDs, including withheld pairs."""
+    ids = set()
+    for message in messages:
+        if isinstance(message.get("tool_call_id"), str):
+            ids.add(message["tool_call_id"])
+        for call in message.get("tool_calls", []) or []:
+            if isinstance(call.get("id"), str):
+                ids.add(call["id"])
+    return ids
 
 
 def restore_response_batches(

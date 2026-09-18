@@ -33,3 +33,4 @@ deploy/helm/*/charts/*.tgz
 deploy/helm/*/Chart.lock
 
 remote-developer.md
+kimi_api_key.txt

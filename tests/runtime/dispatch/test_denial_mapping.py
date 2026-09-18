@@ -28,6 +28,8 @@ _ALL_SEVEN_CODES = {
 # of the original seven): the cartesian-join block. Retryable — the model can
 # self-correct by adding an ON/USING condition or wrapping a constant side.
 _GUARDRAIL_CODES = {
+    "READ_REFETCH_LIMIT",
+    "HELP_CENTER_CIRCUIT_OPEN",
     "SQL_REPAIR_EXHAUSTED",
     "CARTESIAN_JOIN_FORBIDDEN",
 }
@@ -65,6 +67,8 @@ _RUN_BLUEPRINT_CODES = {
 _TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR"}
 
 _EXPECTED_RETRYABLE = {
+    "READ_REFETCH_LIMIT": False,
+    "HELP_CENTER_CIRCUIT_OPEN": False,
     "SQL_REPAIR_EXHAUSTED": False,
     "UNKNOWN_TOOL": True,
     "BLUEPRINT_NOT_SEARCHED": True,
@@ -232,6 +236,8 @@ def test_none_code_is_handled() -> None:
 # calls, the shape of the envelope)". The WORK_JUDGED/INFRA_FAILED line is the H8 one:
 # did anything actually form a verdict on the work, or did the floor give way under it.
 _EXPECTED_KIND = {
+    "READ_REFETCH_LIMIT": DenialKind.GATE,
+    "HELP_CENTER_CIRCUIT_OPEN": DenialKind.GATE,
     "SQL_REPAIR_EXHAUSTED": DenialKind.GATE,
     "UNKNOWN_TOOL": DenialKind.GATE,
     "BLUEPRINT_NOT_SEARCHED": DenialKind.GATE,

@@ -394,6 +394,7 @@ async def test_the_cap_is_per_signature_not_global() -> None:
     recorder = _Recorder()
     loop, _store = _trimming_loop(model=model, mcp=mcp, observer=recorder)
 
+    loop._max_read_calls_per_tool = 6  # Test trim exemptions independently of RC2.
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="schemas?")
 
     tables = [c.args.get("table") for c in mcp.calls if c.tool_name == "getTableSchema"]

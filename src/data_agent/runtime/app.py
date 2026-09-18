@@ -351,6 +351,8 @@ def create_app(
         api_key=settings.openai_api_key,
         model=settings.openai_model,
         use_reasoning_metadata=settings.use_reasoning_metadata,
+        tool_choice=settings.model_tool_choice,
+        api_mode=settings.model_api,
         base_url=settings.openai_base_url,
     )
 
@@ -394,6 +396,8 @@ def create_app(
             api_key=settings.openai_summary_api_key or settings.openai_api_key,
             model=settings.openai_summary_model,
             base_url=settings.openai_summary_base_url or settings.openai_base_url,
+            tool_choice=settings.model_tool_choice,
+            api_mode=settings.model_api,
         )
         progress_summarizer = ProgressSummarizer(
             summary_model_client,
@@ -430,6 +434,9 @@ def create_app(
                 api_key=settings.openai_api_key,
                 model=settings.answer_judge_model,
                 base_url=settings.openai_base_url,
+                use_reasoning_metadata=settings.use_reasoning_metadata,
+                tool_choice=settings.model_tool_choice,
+                api_mode=settings.model_api,
             )
             if settings.answer_judge_model
             else model_client
@@ -959,6 +966,9 @@ def create_app(
             max_loop_iterations=settings.max_loop_iterations,
             max_wall_clock_seconds=settings.max_wall_clock_seconds,
             model_call_timeout_seconds=settings.model_call_timeout_seconds,
+            max_read_calls_per_tool=settings.max_read_calls_per_tool,
+            max_no_progress_rounds=settings.max_no_progress_rounds,
+            help_center_failure_limit=settings.help_center_failure_limit,
             max_budget_windows=settings.max_budget_windows,
             # Per-window SPEND ceiling (2026-08-12 fix): Σ(prompt + completion)
             # across the window's round-trips. This used to be

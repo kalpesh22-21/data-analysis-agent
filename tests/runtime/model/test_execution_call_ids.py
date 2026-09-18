@@ -34,7 +34,7 @@ def test_reused_and_duplicate_ids_are_unique_without_rewriting_evidence():
     assert "functions.runQuery:0" not in ids
     assert ids[1] == "fresh"
     assert normalized.tool_calls[1].arguments == {"evidence": ["functions.runQuery:0"]}
-    assert normalized.reasoning_metadata == {}
+    assert normalized.reasoning_metadata == result.reasoning_metadata
     assert result.tool_calls[0].id == "functions.runQuery:0"
 
 
@@ -49,7 +49,13 @@ def test_unique_response_preserves_provider_metadata():
 @pytest.mark.parametrize("pause", [False, True])
 async def test_reused_provider_id_keeps_both_query_results_in_model_history(pause):
     pause_steps = (
-        [batch(call("askUser", "clarify", question="Which period?", options=["Current", "Previous"]))]
+        [
+            batch(
+                call(
+                    "askUser", "clarify", question="Which period?", options=["Current", "Previous"]
+                )
+            )
+        ]
         if pause
         else []
     )
@@ -94,3 +100,39 @@ async def test_reused_provider_id_keeps_both_query_results_in_model_history(paus
     ]
     assert len(results) == 2
     assert [r["result_preview"]["preview_rows"] for r in results] == [[[120]], [[125]]]
+
+
+def test_lineage_observer_prefetch_seed_and_reasoning_survive_collision():
+    from data_agent.runtime.model.conversation import conversation_call_ids
+
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": "syn_prefetch"}]},
+        {"role": "tool", "tool_call_id": "functions.read:0"},
+    ]
+    used = conversation_call_ids(messages)
+    events = []
+    metadata = {
+        "reasoning_content": "opaque",
+        "reasoning_details": [{"id": "functions.read:0", "data": "unchanged"}],
+    }
+    result = ModelTurnResult(
+        tool_calls=[
+            ToolCallRequest("syn_prefetch", "listTables", {}),
+            ToolCallRequest("functions.read:0", "getTableSchema", {}),
+            ToolCallRequest("functions.read:0#1", "getBlueprint", {}),
+            ToolCallRequest("", "listDatabases", {}),
+        ],
+        reasoning_metadata=metadata,
+    )
+    normalized = assign_unique_call_ids(result, used, lambda e, p: events.append((e, p)))
+    assert [c.id for c in normalized.tool_calls] == [
+        "syn_prefetch#1",
+        "functions.read:0#2",
+        "functions.read:0#1",
+        "call#1",
+    ]
+    assert len(events) == 3
+    assert all(e == "loop_tool_call_id_reminted" for e, _ in events)
+    assert events[1][1]["old_id"] == "functions.read:0"
+    assert events[1][1]["new_id"] == "functions.read:0#2"
+    assert normalized.reasoning_metadata is metadata

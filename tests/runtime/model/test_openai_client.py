@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -39,7 +40,9 @@ def _responses_message_result(text: str) -> SimpleNamespace:
 
 def _responses_tool_call_result(call_id: str, name: str, arguments: str) -> SimpleNamespace:
     return SimpleNamespace(
-        output=[SimpleNamespace(type="function_call", call_id=call_id, name=name, arguments=arguments)],
+        output=[
+            SimpleNamespace(type="function_call", call_id=call_id, name=name, arguments=arguments)
+        ],
         usage=SimpleNamespace(input_tokens=20, output_tokens=8, total_tokens=28),
     )
 
@@ -81,9 +84,7 @@ class _FakeChatCompletions:
 
 
 class _FakeOpenAIClient:
-    def __init__(
-        self, responses_effects: list[Any], chat_effects: list[Any] | None = None
-    ) -> None:
+    def __init__(self, responses_effects: list[Any], chat_effects: list[Any] | None = None) -> None:
         self.responses = _FakeResponses(responses_effects)
         self.chat = SimpleNamespace(completions=_FakeChatCompletions(chat_effects or []))
 
@@ -105,9 +106,7 @@ async def test_send_turn_happy_path_uses_responses_api() -> None:
     fake_client = _FakeOpenAIClient(responses_effects=[_responses_message_result("hello")])
     model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
 
-    result = await model_client.send_turn(
-        [{"role": "user", "content": "hi"}], RESPONSES_TOOLS
-    )
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
 
     assert result.assistant_text == "hello"
     assert result.tool_calls == []
@@ -140,9 +139,7 @@ async def test_5xx_falls_back_to_chat_completions_with_shape_translation() -> No
     )
     model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
 
-    result = await model_client.send_turn(
-        [{"role": "user", "content": "hi"}], RESPONSES_TOOLS
-    )
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
 
     assert result.assistant_text == "fallback answer"
     assert len(fake_client.responses.calls) == 1
@@ -340,7 +337,9 @@ async def test_a_completed_response_reports_no_incomplete_reason() -> None:
     two events that carry it stop meaning anything."""
     response = SimpleNamespace(
         output=[
-            SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="hi")])
+            SimpleNamespace(
+                type="message", content=[SimpleNamespace(type="output_text", text="hi")]
+            )
         ],
         usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
         status="completed",
@@ -421,3 +420,97 @@ async def test_output_text_is_not_consulted_when_there_are_tool_calls() -> None:
 
     assert result.assistant_text is None
     assert len(result.tool_calls) == 1
+
+
+@pytest.mark.parametrize("choice", ["required", "auto"])
+async def test_configured_tool_choice_survives_begin_turn_and_keeps_reasoning(choice):
+    response = _chat_message_result(None)
+    response.choices[0].message.reasoning_content = "opaque provider reasoning"
+    client = _FakeOpenAIClient([], [response])
+    model = OpenAIModelClient(
+        client, model="compatible", tool_choice=choice, use_reasoning_metadata=True
+    )
+    result = await model.begin_turn().send_turn(
+        [{"role": "user", "content": "count"}], RESPONSES_TOOLS
+    )
+    assert client.chat.completions.calls[0]["tool_choice"] == choice
+    assert result.reasoning_metadata == {"reasoning_content": "opaque provider reasoning"}
+    assert client.responses.calls == []
+
+
+@pytest.mark.parametrize("keep_reasoning", [False, True])
+async def test_chat_mode_sdk_tool_round_trip_without_responses_probe(keep_reasoning):
+    requests = []
+
+    def handle(request):
+        assert request.url.path == "/v1/chat/completions"
+        payload = json.loads(request.content)
+        requests.append(payload)
+        assert payload["model"] == "served-model"
+        if len(requests) == 1:
+            assert payload["tools"][0]["function"]["name"] == "runQuery"
+            assert payload["tool_choice"] == "auto"
+            message = {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "provider reasoning",
+                "tool_calls": [
+                    {
+                        "id": "call1",
+                        "type": "function",
+                        "function": {"name": "runQuery", "arguments": '{"sql":"SELECT 1"}'},
+                    }
+                ],
+            }
+        else:
+            assert "tool_choice" not in payload
+            assistant = payload["messages"][1]
+            assert ("reasoning_content" in assistant) is keep_reasoning
+            assert payload["messages"][2]["tool_call_id"] == "call1"
+            message = {"role": "assistant", "content": "Done."}
+        return httpx.Response(
+            200,
+            json={
+                "id": "completion1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "served-model",
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        sdk = openai.AsyncOpenAI(
+            api_key="test-only",
+            base_url="http://vllm.test/v1",
+            http_client=http,
+        )
+        client = OpenAIModelClient(
+            sdk,
+            model="served-model",
+            api_mode="chat",
+            tool_choice="auto",
+            use_reasoning_metadata=keep_reasoning,
+        ).begin_turn()
+        messages = [{"role": "user", "content": "Count"}]
+        result = await client.send_turn(messages, RESPONSES_TOOLS)
+        assert result.tool_calls[0].arguments == {"sql": "SELECT 1"}
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "provider reasoning",
+                    "tool_calls": [
+                        {
+                            "id": "call1",
+                            "type": "function",
+                            "function": {"name": "runQuery", "arguments": '{"sql":"SELECT 1"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call1", "content": "1"},
+            ]
+        )
+        assert (await client.send_turn(messages, [])).assistant_text == "Done."
+        assert len(requests) == 2

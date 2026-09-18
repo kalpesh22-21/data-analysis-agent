@@ -39,7 +39,15 @@ from dataclasses import dataclass
 from typing import Any
 
 IDEMPOTENT_READ_TOOLS = frozenset(
-    {"getTableSchema", "listTables", "listDatabases", "explainQuery", "getBlueprint"}
+    {
+        "getTableSchema",
+        "listTables",
+        "listDatabases",
+        "explainQuery",
+        "getBlueprint",
+        "searchBlueprints",
+        "searchKnowledge",
+    }
 )
 
 __all__ = [
@@ -109,7 +117,7 @@ def _read_target_attrs(tool_name: str, arguments: Mapping[str, Any]) -> tuple[st
 
 
 def repeated_read_guard_event(
-    tool_name: str, tool_call_id: str, arguments: Mapping[str, Any]
+    tool_name: str, tool_call_id: str, arguments: Mapping[str, Any], *, source_readable: bool = True,
 ) -> dict[str, Any]:
     """Build the self-describing `loop_repeated_idempotent_read_guarded` observer payload,
         so the exported GUARDRAIL span reads unambiguously as a SECOND, duplicate read that
@@ -136,6 +144,9 @@ def repeated_read_guard_event(
         ),
     }
     payload.update(attrs)
+    if not source_readable:
+        payload["guard_reason"] = "trimmed_refetch_allowance_exhausted"
+        payload["note"] = "The serving result is no longer readable and the refetch allowance is exhausted; not re-dispatched."
     return payload
 
 
@@ -209,6 +220,24 @@ class ReadDecision:
 
     signature: ReadSignature | None
     declined: bool
+    served_call_id: str | None = None
+    served_round: int | None = None
+    source_readable: bool = False
+
+    def nudge(self) -> str:
+        location = (
+            f"Serving result_id: {self.served_call_id}; serving round: "
+            f"{self.served_round if self.served_round is not None else 'prior window'}. "
+            if self.served_call_id
+            else "No serving result is currently readable. "
+        )
+        if self.source_readable:
+            return location + "Reuse that result; do not repeat or rephrase this read."
+        return location + (
+            "The result is no longer readable and the bounded refetch allowance is exhausted. "
+            "Use other available evidence or disclose the missing information; do not claim "
+            "this marker contains data."
+        )
 
     @property
     def is_idempotent_read(self) -> bool:
@@ -245,6 +274,8 @@ class ReadGuard:
         self._refetch_exemptions: dict[ReadSignature, int] = {}
         self._served_this_round: set[ReadSignature] = set()
         self._readable_tool_call_ids: frozenset[str] = frozenset()
+        self._round = 0
+        self._served_rounds: dict[ReadSignature, int | None] = {}
 
     def observe_prior_read(
         self,
@@ -253,6 +284,7 @@ class ReadGuard:
         tool_call_id: str,
         *,
         data_free: bool,
+        served_round: int | None = None,
     ) -> None:
         """Seed from ONE persisted trail entry of this turn (the caller's walk is already
                 filtered to `turn_index` + `status == "ok"`). Non-read entries are ignored here
@@ -269,6 +301,7 @@ class ReadGuard:
         self._seen.add(signature)
         if not data_free:
             self._served_call_ids[signature] = tool_call_id
+            self._served_rounds[signature] = served_round
 
     def seed_emulation(
         self,
@@ -288,6 +321,7 @@ class ReadGuard:
         """
         self._seen.update(signatures)
         self._served_call_ids.update(served_call_ids)
+        self._served_rounds.update({signature: 0 for signature in served_call_ids})
 
     def begin_round(self, readable_tool_call_ids: frozenset[str]) -> None:
         """Start a response batch: adopt the tool results the model can actually READ this
@@ -302,6 +336,7 @@ class ReadGuard:
                 this round" means "will be readable next round".
         """
         self._readable_tool_call_ids = readable_tool_call_ids
+        self._round += 1
         self._served_this_round = set()
 
     def classify(self, tool_name: str, arguments: Mapping[str, Any]) -> ReadDecision:
@@ -358,7 +393,15 @@ class ReadGuard:
                         ),
                     ),
                 )
-        return ReadDecision(signature=signature, declined=declined)
+        served_by = self._served_call_ids.get(signature)
+        return ReadDecision(
+            signature=signature,
+            declined=declined,
+            served_call_id=served_by,
+            served_round=self._served_rounds.get(signature),
+            source_readable=signature in self._served_this_round
+            or served_by in self._readable_tool_call_ids,
+        )
 
     def record_served(self, decision: ReadDecision, tool_call_id: str) -> None:
         """Record a SUCCESSFUL idempotent read so an identical repeat later this turn is
@@ -378,4 +421,5 @@ class ReadGuard:
             return
         self._seen.add(signature)
         self._served_call_ids[signature] = tool_call_id
+        self._served_rounds[signature] = self._round
         self._served_this_round.add(signature)
