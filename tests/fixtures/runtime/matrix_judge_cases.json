@@ -1,0 +1,224 @@
+[
+  {
+    "name": "unsupported_create_seats",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Take me to Manage Position Seats.",
+      "draft": "Use the option to open Manage Position Seats and create new seats.",
+      "capability_presented": [
+        {
+          "tool_name": "navigate_to_manage_position_seats",
+          "kind": "navigation",
+          "description": "Open the Manage Position Seats page.",
+          "parameters": [],
+          "metadata": {
+            "preamble_url": "ember:ManagePositionSeats"
+          },
+          "result_ids": [
+            "nav1"
+          ]
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "unsupported_by_evidence"
+    ]
+  },
+  {
+    "name": "grounded_navigation",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Take me to Manage Position Seats.",
+      "draft": "Use the option to open Manage Position Seats.",
+      "capability_presented": [
+        {
+          "tool_name": "navigate_to_manage_position_seats",
+          "kind": "navigation",
+          "description": "Open the Manage Position Seats page.",
+          "parameters": [],
+          "metadata": {
+            "preamble_url": "ember:ManagePositionSeats"
+          },
+          "result_ids": [
+            "nav1"
+          ]
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": []
+  },
+  {
+    "name": "unsupported_position_prompt",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Give me an option to start a PAF draft.",
+      "draft": "Use this option to start a draft; it will prompt you to select the new position.",
+      "capability_presented": [
+        {
+          "tool_name": "submit_paf_transaction",
+          "kind": "data_widget",
+          "description": "Create a saved Personnel Action Form draft for an employee.",
+          "parameters": [
+            {
+              "name": "employees",
+              "type": "employee"
+            },
+            {
+              "name": "department",
+              "type": "department"
+            }
+          ],
+          "result_ids": [
+            "paf1"
+          ]
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "unsupported_by_evidence"
+    ]
+  },
+  {
+    "name": "grounded_draft",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Give me an option to start a PAF draft.",
+      "draft": "Use the option to start a Personnel Action Form draft.",
+      "capability_presented": [
+        {
+          "tool_name": "submit_paf_transaction",
+          "kind": "data_widget",
+          "description": "Create a saved Personnel Action Form draft for an employee.",
+          "parameters": [
+            {
+              "name": "employees",
+              "type": "employee"
+            },
+            {
+              "name": "department",
+              "type": "department"
+            }
+          ],
+          "result_ids": [
+            "paf1"
+          ]
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": []
+  },
+  {
+    "name": "unrelated_profile_beside_table",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Show employee headcount by department.",
+      "draft": "Employee headcount by department is in the table.",
+      "capability_presented": [
+        {
+          "tool_name": "show_employee_profile",
+          "kind": "data_widget",
+          "description": "Display a profile for one employee.",
+          "parameters": [
+            {
+              "name": "employees",
+              "type": "employee"
+            }
+          ],
+          "result_ids": [
+            "profile1"
+          ]
+        }
+      ],
+      "sql_executed": [
+        "SELECT department_name, count() AS headcount FROM employee GROUP BY department_name"
+      ],
+      "designated_tables": [
+        [
+          "Employee headcount by department",
+          "q1"
+        ]
+      ],
+      "results": [
+        {
+          "tool_name": "runQuery",
+          "status": "ok",
+          "result_id": "q1",
+          "result_preview": {
+            "columns": [
+              "Department",
+              "Headcount"
+            ],
+            "row_count": 1,
+            "preview_rows": [
+              [
+                "Example",
+                3
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "capability_intent_mismatch"
+    ]
+  },
+  {
+    "name": "requested_navigation_beside_table",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Show employee headcount by department and give me an option to open Manage Position Seats.",
+      "draft": "Employee headcount by department is in the table. Use the option to open Manage Position Seats.",
+      "capability_presented": [
+        {
+          "tool_name": "navigate_to_manage_position_seats",
+          "kind": "navigation",
+          "description": "Open the Manage Position Seats page.",
+          "parameters": [],
+          "metadata": {
+            "preamble_url": "ember:ManagePositionSeats"
+          },
+          "result_ids": [
+            "nav1"
+          ]
+        }
+      ],
+      "sql_executed": [
+        "SELECT department_name, count() AS headcount FROM employee GROUP BY department_name"
+      ],
+      "designated_tables": [
+        [
+          "Employee headcount by department",
+          "q1"
+        ]
+      ],
+      "results": [
+        {
+          "tool_name": "runQuery",
+          "status": "ok",
+          "result_id": "q1",
+          "result_preview": {
+            "columns": [
+              "Department",
+              "Headcount"
+            ],
+            "row_count": 1,
+            "preview_rows": [
+              [
+                "Example",
+                3
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": []
+  }
+]
