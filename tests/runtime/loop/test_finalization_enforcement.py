@@ -473,7 +473,7 @@ async def test_exit_one_refuses_without_persisting_and_nudges_with_the_draft() -
 
 
 async def test_the_nudge_is_never_persisted_and_lives_exactly_one_round_trip() -> None:
-    """05 §D. Copying `discovery_canonical`'s once-per-window lifetime would repeat
+    """05 §D. Reusing the nudge for a whole budget window would repeat
     the nudge forever — including after the intents were closed — and, being
     ephemeral and tail-anchored, would migrate it to be the newest message on every
     rebuild, appearing after tool results it predates."""

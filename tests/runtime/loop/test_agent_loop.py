@@ -16,18 +16,11 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.composite.answer_with_text import AnswerWithTextTool
 from data_agent.runtime.context.assembly import (
-    IDEMPOTENT_READ_ALREADY_SERVED_CODE,
     ContextAssembler,
-)
-from data_agent.runtime.context.discovery_emulation import (
-    EmulatedDiscovery,
-    _opaque_discovery_call_id,
-    build_emulated_discovery,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult, _build_preview
 from data_agent.runtime.loop.agent_loop import (
     AgentLoop,
-    _assembled_to_canonical,
     _declines_clarification,
     _tool_trail_entry_to_canonical,
 )
@@ -78,7 +71,6 @@ def _build_loop(
     max_loop_iterations: int = 15,
     max_wall_clock_seconds: float = 60,
     max_budget_windows: int = 3,
-    discovery_emulation_provider=None,
     base_system_prompt: str | None = None,
     runtime_tools: dict | None = None,
 ) -> tuple[AgentLoop, InMemorySessionStore]:
@@ -94,7 +86,6 @@ def _build_loop(
         max_loop_iterations=max_loop_iterations,
         max_wall_clock_seconds=max_wall_clock_seconds,
         max_budget_windows=max_budget_windows,
-        discovery_emulation_provider=discovery_emulation_provider,
         runtime_tools={"answerWithText": AnswerWithTextTool(), **(runtime_tools or {})},
     )
     return loop, store
@@ -554,449 +545,6 @@ async def test_dispatched_tool_call_persists_trail_entry_and_full_result() -> No
 
 
 # ---------------------------------------------------------------------------
-# Emulated-discovery injection (context/discovery_emulation.py)
-# ---------------------------------------------------------------------------
-
-_DB = "dbpcm_warehouse"
-
-
-class _StubDiscoveryDispatcher:
-    """A dispatcher double for `build_emulated_discovery` — scripts listDatabases +
-    listTables `ToolResult`s so the loop's provider produces real emulated pairs."""
-
-    def __init__(self, responses: dict[tuple[str, str | None], ToolResult]) -> None:
-        self._responses = responses
-
-    async def dispatch(
-        self,
-        tool_name: str,
-        model_args: dict,
-        credentials: RuntimeCredentials,
-        *,
-        emit_progress: bool = True,
-    ) -> ToolResult:
-        # The emulated sweep is synthetic context replay, never user-visible work
-        # (tests/runtime/context/test_discovery_emulation.py).
-        assert emit_progress is False, "the discovery sweep leaked UI progress"
-        return self._responses[(tool_name, model_args.get("database"))]
-
-
-def _ok_list(tool_name: str, payload: list[dict]) -> ToolResult:
-    from data_agent.runtime.session.models import ResultPreview
-
-    return ToolResult(
-        status="ok",
-        tool_name=tool_name,
-        error_code=None,
-        retryable=None,
-        user_message=None,
-        provenance=frozenset(),
-        result_preview=ResultPreview(
-            columns=[],
-            row_count=len(payload),
-            truncated=False,
-            preview_rows=[[item] for item in payload],
-        ),
-        result_full=payload,
-    )
-
-
-def _discovery_provider():
-    """A provider closure returning a real `EmulatedDiscovery` for one db+table."""
-    dispatcher = _StubDiscoveryDispatcher(
-        {
-            ("listDatabases", None): _ok_list("listDatabases", [{"name": _DB}]),
-            ("listTables", _DB): _ok_list(
-                "listTables", [{"database": _DB, "name": "employee", "engine": "MergeTree"}]
-            ),
-        }
-    )
-
-    async def _provider(creds: RuntimeCredentials) -> EmulatedDiscovery:
-        return await build_emulated_discovery(dispatcher, creds)
-
-    return _provider
-
-
-def _real_discovery_provider(discovery_mcp: FakeMCPClient):
-    """A provider closure that runs the REAL `build_emulated_discovery` over the REAL
-    `ToolDispatcher` wrapping *discovery_mcp* — so the sweep exercises the genuine
-    dispatch/denial-mapping path (not a stub) for degrade + edge-case coverage."""
-    dispatcher = ToolDispatcher(discovery_mcp, CATALOG)
-
-    async def _provider(creds: RuntimeCredentials) -> EmulatedDiscovery:
-        return await build_emulated_discovery(dispatcher, creds)
-
-    return _provider
-
-
-async def test_emulated_discovery_pairs_injected_after_the_current_question() -> None:
-    # SEQUENTIAL TURN LAYOUT: a wired provider splices the synthetic
-    # listDatabases+listTables assistant/tool pairs in immediately AFTER the current
-    # turn's question, so the turn reads system -> question -> emulated discovery ->
-    # the model's own work.
-    #
-    # This previously spliced after the leading `system` run, hoisting every emulated
-    # pair ABOVE turn-0's question — a block of tool calls before the user had asked
-    # anything. The sweep is re-run per budget window against the CURRENT turn, so it
-    # was never prior-session history; prepending it broke the sequential layout
-    # `context/assembly.py`'s interleave otherwise maintains.
-    model = ScriptedModelClient([final_answer(evidence=["listDatabases"], assistant_text="Done.")])
-    mcp = FakeMCPClient()
-    loop, _store = _build_loop(
-        model_client=model,
-        mcp_client=mcp,
-        discovery_emulation_provider=_discovery_provider(),
-        base_system_prompt="BASE PROMPT",
-    )
-
-    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="How many?")
-
-    messages = model.calls[0].messages
-    # The base prompt stays the sole pinned head.
-    assert messages[0] == {"role": "system", "content": "BASE PROMPT"}
-
-    assistant_calls = [
-        (m["tool_calls"][0]["function"]["name"], m["tool_calls"][0]["id"])
-        for m in messages
-        if m["role"] == "assistant" and m.get("tool_calls")
-    ]
-    assert assistant_calls == [
-        ("listDatabases", _opaque_discovery_call_id(SESSION_ID, "databases")),
-        ("listTables", _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}")),
-    ]
-    tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-    assert tool_ids == [
-        _opaque_discovery_call_id(SESSION_ID, "databases"),
-        _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}"),
-    ]
-
-    # THE POINT: every emulated pair FOLLOWS the real user question, and the
-    # question immediately precedes the first of them — nothing sits between.
-    # The question is the LAST `user` message, not the first: the date anchor
-    # (`context/assembly.py::_turn_date_anchor`) is inserted immediately before it
-    # and is itself `role:"user"`.
-    user_index = max(i for i, m in enumerate(messages) if m.get("role") == "user")
-    assert messages[user_index]["content"] == "How many?"
-    first_emulated = min(
-        i for i, m in enumerate(messages) if m["role"] == "assistant" and m.get("tool_calls")
-    )
-    assert first_emulated == user_index + 1
-
-    # Full expected order, so a future reordering cannot pass by accident.
-    assert [m["role"] for m in messages] == [
-        "system",
-        "user",  # the date anchor
-        "user",  # the question
-        "assistant",
-        "tool",
-        "assistant",
-        "tool",
-    ]
-    assert messages[1]["content"].startswith("Today's date is ")
-
-
-async def test_emulated_discovery_stays_anchored_at_the_first_question_on_later_turns() -> None:
-    # The pairs are ephemeral and re-spliced on every rebuild, so the anchor decides
-    # where they LAND each time. Anchored on the LAST user message they migrated to
-    # whatever the newest question was — mid-session the model saw a fresh block of
-    # listDatabases/listTables appear AFTER it had already fetched schemas. Anchored
-    # at the session's FIRST question they stay put, which is what "emulated once, at
-    # the beginning" has to mean in a rebuilt-every-round-trip context.
-    model = ScriptedModelClient(
-        [
-            final_answer(assistant_text="A0.", evidence=["listTables"]),
-            final_answer(
-                assistant_text="I cannot answer this follow-up from the available evidence."
-            ),
-        ]
-    )
-    loop, _store = _build_loop(
-        model_client=model,
-        mcp_client=FakeMCPClient(),
-        discovery_emulation_provider=_discovery_provider(),
-        base_system_prompt="BASE PROMPT",
-    )
-
-    creds = _credentials()
-    await loop.run(session_id=SESSION_ID, credentials=creds, user_message="Q0?")
-    await loop.run(session_id=SESSION_ID, credentials=creds, user_message="Q1?")
-
-    messages = model.calls[1].messages
-    # Turn 1's request: the emulated pairs sit between Q0 and turn-0's answer — at
-    # the START of the session — NOT after Q1.
-    assert [m["role"] for m in messages] == [
-        "system",
-        "user",  # Q0
-        "assistant",  # emulated listDatabases
-        "tool",
-        "assistant",  # emulated listTables
-        "tool",
-        "assistant",  # A0
-        "user",  # the date anchor, immediately before the current question
-        "user",  # Q1
-    ]
-    assert messages[1]["content"] == "Q0?"
-    assert messages[-2]["content"].startswith("Today's date is ")
-    assert messages[-1]["content"] == "Q1?"
-    # Nothing emulated trails the current question.
-    assert not any(m.get("tool_calls") for m in messages[7:])
-
-
-async def test_emulated_discovery_seeds_guard_model_recall_not_dispatched() -> None:
-    # The model re-issues listTables with the SAME args the emulation served. The
-    # repeated-idempotent-read guard must fire: NO MCP dispatch, and a guard trail
-    # entry + nudge is produced instead. `FakeMCPClient` has no scripted listTables,
-    # so any dispatch would raise `AssertionError` — proving the guard short-circuited.
-    model = ScriptedModelClient(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(id="call_lt", name="listTables", arguments={"database": _DB})
-                ]
-            ),
-            final_answer(evidence=["listDatabases"], assistant_text="Done."),
-        ]
-    )
-    mcp = FakeMCPClient()
-    loop, store = _build_loop(
-        model_client=model, mcp_client=mcp, discovery_emulation_provider=_discovery_provider()
-    )
-
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="List tables."
-    )
-
-    assert outcome.status == "done"
-    # The MCP was never asked for listTables (guard short-circuited the re-call).
-    assert all(c.tool_name != "listTables" for c in mcp.calls)
-    # A data-free guard trail entry was persisted with the already-served marker.
-    trail = await store.load_trail(SESSION_ID)
-    guard_entries = [
-        e
-        for e in trail
-        if e.tool_name == "listTables" and e.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
-    ]
-    assert len(guard_entries) == 1
-    assert guard_entries[0].tool_call_id == "call_lt"
-    assert guard_entries[0].result_preview is None
-
-
-async def test_emulated_discovery_provider_none_leaves_messages_unchanged() -> None:
-    # provider None ⇒ byte-identical: no emulated assistant/tool pairs anywhere.
-    model = ScriptedModelClient(
-        [final_answer(assistant_text="I don't have any information to answer your question.")]
-    )
-    mcp = FakeMCPClient()
-    loop, _store = _build_loop(model_client=model, mcp_client=mcp)
-
-    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Hello?")
-
-    for recorded_turn in model.calls:
-        assert all(
-            not str(m.get("tool_call_id", "")).startswith("emulated-")
-            for m in recorded_turn.messages
-        )
-
-
-async def test_emulated_discovery_provider_exception_degrades_not_fails() -> None:
-    # A provider that raises must not crash the turn — the loop swallows it and
-    # proceeds with no injected pairs.
-    async def _provider(_creds: RuntimeCredentials) -> EmulatedDiscovery:
-        raise RuntimeError("sweep exploded")
-
-    model = ScriptedModelClient(
-        [final_answer(assistant_text="I don't have any information to answer your question.")]
-    )
-    mcp = FakeMCPClient()
-    loop, _store = _build_loop(
-        model_client=model, mcp_client=mcp, discovery_emulation_provider=_provider
-    )
-
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="Hello?"
-    )
-
-    assert outcome.status == "done"
-    assert outcome.assistant_text == "I don't have any information to answer your question."
-    for recorded_turn in model.calls:
-        assert all(
-            not str(m.get("tool_call_id", "")).startswith("emulated-")
-            for m in recorded_turn.messages
-        )
-
-
-async def test_emulated_pair_deduped_against_colliding_real_trail_id() -> None:
-    # Item 5: an emulated pair whose tool_call_id collides with a (pathological)
-    # persisted trail entry must NOT emit two `tool` messages with one id (an API
-    # 400). The emulated pair is dropped; the real trail entry is kept.
-    from data_agent.runtime.session.models import ResultPreview, TrailEntry
-
-    store = InMemorySessionStore()
-    colliding_id = _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}")
-    await store.append_trail_entry(
-        SESSION_ID,
-        TrailEntry(
-            turn_index=0,
-            tool_call_id=colliding_id,
-            tool_name="listTables",
-            args={"database": _DB},
-            status="ok",
-            error_code=None,
-            provenance=frozenset(),
-            result_preview=ResultPreview(
-                columns=[], row_count=1, truncated=False, preview_rows=[["real"]]
-            ),
-            result_full_ref=None,
-            ts="2026-07-01T00:00:00+00:00",
-        ),
-    )
-
-    model = ScriptedModelClient([final_answer(evidence=["listDatabases"], assistant_text="Done.")])
-    mcp = FakeMCPClient()
-    loop, _store = _build_loop(
-        model_client=model,
-        mcp_client=mcp,
-        store=store,
-        discovery_emulation_provider=_discovery_provider(),
-    )
-
-    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="How many?")
-
-    messages = model.calls[0].messages
-    tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-    # The colliding id appears EXACTLY once (real kept, emulated pair dropped) — the
-    # message list stays API-valid (unique tool_call_id per tool message).
-    assert tool_ids.count(colliding_id) == 1
-    # The non-colliding emulated listDatabases pair is still injected.
-    assert _opaque_discovery_call_id(SESSION_ID, "databases") in tool_ids
-
-
-async def test_emulated_discovery_real_dispatcher_degrades_when_listdatabases_denied() -> None:
-    # Degrade-not-fail through the GENUINE dispatch path: a `listDatabases` denial
-    # (MCPToolError -> status="denied") makes the sweep inject nothing, the turn
-    # still completes, and `listTables` is never even attempted after the denial.
-    discovery_mcp = FakeMCPClient(
-        scripted={"listDatabases": [MCPToolError("PERMISSION_DENIED", "no access")]}
-    )
-    model = ScriptedModelClient(
-        [final_answer(assistant_text="I don't have any information to answer your question.")]
-    )
-    loop, _store = _build_loop(
-        model_client=model,
-        mcp_client=FakeMCPClient(),
-        discovery_emulation_provider=_real_discovery_provider(discovery_mcp),
-    )
-
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="How many?"
-    )
-
-    assert outcome.status == "done"
-    assert outcome.assistant_text == "I don't have any information to answer your question."
-    # Nothing discovery-shaped reached the model.
-    for recorded_turn in model.calls:
-        assert all(
-            not str(m.get("tool_call_id", "")).startswith("emulated-")
-            for m in recorded_turn.messages
-        )
-    # listTables was never attempted once discovery was denied.
-    assert [c.tool_name for c in discovery_mcp.calls] == ["listDatabases"]
-
-
-async def test_emulated_discovery_zero_table_db_still_injected_and_guarded() -> None:
-    # A database whose `listTables` returns `ok` with an EMPTY list still yields an
-    # emulated pair AND a guard signature — so the (empty) listing is visible to the
-    # model and a same-args re-call is served locally, never re-dispatched.
-    discovery_mcp = FakeMCPClient(scripted={"listDatabases": [[{"name": _DB}]], "listTables": [[]]})
-    model = ScriptedModelClient(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(id="call_lt", name="listTables", arguments={"database": _DB})
-                ]
-            ),
-            final_answer(evidence=["listTables"], assistant_text="No tables."),
-        ]
-    )
-    # No scripted listTables on the loop's MCP — any dispatch would raise, proving
-    # the guard short-circuited the re-call.
-    mcp = FakeMCPClient()
-    loop, store = _build_loop(
-        model_client=model,
-        mcp_client=mcp,
-        discovery_emulation_provider=_real_discovery_provider(discovery_mcp),
-    )
-
-    outcome = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(), user_message="List tables."
-    )
-
-    assert outcome.status == "done"
-    # The empty-listing emulated pair is present in the model payload.
-    tool_ids = [m["tool_call_id"] for m in model.calls[0].messages if m["role"] == "tool"]
-    assert _opaque_discovery_call_id(SESSION_ID, f"tables:{_DB}") in tool_ids
-    # The re-call was guarded (never dispatched to the MCP).
-    assert all(c.tool_name != "listTables" for c in mcp.calls)
-    trail = await store.load_trail(SESSION_ID)
-    guard_entries = [e for e in trail if e.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE]
-    assert len(guard_entries) == 1
-    assert guard_entries[0].tool_call_id == "call_lt"
-
-
-async def test_emulated_listtables_canonical_is_byte_identical_to_a_real_replay() -> None:
-    # Shape fidelity (load-bearing): the emulated listTables assistant/tool pair the
-    # model sees must be byte-identical to a REAL replayed listTables (same db/args)
-    # except for the tool_call_id — otherwise the model could tell an emulated read
-    # from a genuine one. Build both through their real code paths and compare.
-    from data_agent.runtime.context.budget import _render_entry
-    from data_agent.runtime.session.models import TrailEntry
-
-    payload = [{"database": _DB, "name": "employee", "engine": "MergeTree"}]
-
-    # Emulated: real sweep -> rendered entry -> canonical pair.
-    discovery_mcp = FakeMCPClient(
-        scripted={"listDatabases": [[{"name": _DB}]], "listTables": [payload]}
-    )
-    emulated = await build_emulated_discovery(
-        ToolDispatcher(discovery_mcp, CATALOG), _credentials()
-    )
-    emulated_entry = next(e for e in emulated.entries if e["tool_name"] == "listTables")
-    emulated_pair = _tool_trail_entry_to_canonical(emulated_entry)
-
-    # Real: dispatch the same call, render through the assembler path, canonicalize.
-    real_dispatcher = ToolDispatcher(FakeMCPClient(scripted={"listTables": [payload]}), CATALOG)
-    real_result = await real_dispatcher.dispatch("listTables", {"database": _DB}, _credentials())
-    real_entry = _render_entry(
-        TrailEntry(
-            turn_index=0,
-            tool_call_id="call_real",
-            tool_name="listTables",
-            args={"database": _DB},
-            status=real_result.status,
-            error_code=real_result.error_code,
-            provenance=real_result.provenance,
-            result_preview=real_result.result_preview,
-            result_full_ref=None,
-            ts="2026-07-01T00:00:00+00:00",
-        ),
-        20,
-    )
-    real_pair = _assembled_to_canonical([real_entry])
-
-    def _blank_ids(pair: list[dict]) -> list[dict]:
-        assistant, tool = json.loads(json.dumps(pair))  # deep copy
-        assistant["tool_calls"][0]["id"] = "ID"
-        tool["tool_call_id"] = "ID"
-        content = json.loads(tool["content"])
-        content["result_id"] = "ID"
-        tool["content"] = json.dumps(content)
-        return [assistant, tool]
-
-    assert _blank_ids(emulated_pair) == _blank_ids(real_pair)
-
-
-# ---------------------------------------------------------------------------
 # S3 — tool-calls-per-model-response are capped, never unbounded
 # ---------------------------------------------------------------------------
 
@@ -1081,7 +629,6 @@ async def test_tool_calls_are_capped_per_iteration_never_unbounded() -> None:
 
 
 def test_tool_trail_entry_to_canonical_includes_static_denial_user_message() -> None:
-    from data_agent.runtime.loop.agent_loop import _tool_trail_entry_to_canonical
 
     rendered_entry = {
         "tool_call_id": "call_1",
@@ -1103,7 +650,6 @@ def test_tool_trail_entry_to_canonical_includes_static_denial_user_message() -> 
 
 
 def test_verified_blueprint_tool_message_carries_authoritative_marker() -> None:
-    from data_agent.runtime.loop.agent_loop import _tool_trail_entry_to_canonical
 
     rendered_entry = {
         "tool_call_id": "bp_1",
@@ -1133,7 +679,6 @@ def test_verified_blueprint_tool_message_carries_authoritative_marker() -> None:
 def test_non_authoritative_tool_messages_carry_no_marker() -> None:
     # A runQuery, a denied blueprint, and an errored blueprint all lack the flag —
     # their canonical tool message is byte-identical to before (no marker, no note).
-    from data_agent.runtime.loop.agent_loop import _tool_trail_entry_to_canonical
 
     run_query = {
         "tool_call_id": "q_1",
@@ -1186,7 +731,6 @@ async def test_current_turn_denial_is_visible_to_model_within_same_turn() -> Non
     of a turn must be visible — status/error_code/S4 user_message, no result
     rows — to the model's NEXT `send_turn` call in that SAME turn, so it can
     self-correct (design §3.4)."""
-    from data_agent.runtime.mcp.client import MCPToolError
 
     model = ScriptedModelClient(
         [
@@ -1229,7 +773,6 @@ async def test_prior_turn_denial_is_dropped_from_next_turns_context() -> None:
     """Cross-turn D44 is unchanged by the exemption: once the turn a denial
     happened in has ENDED, a LATER external turn's context assembly must not
     resurrect it."""
-    from data_agent.runtime.mcp.client import MCPToolError
 
     model = ScriptedModelClient(
         [

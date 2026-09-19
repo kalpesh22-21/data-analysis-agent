@@ -180,30 +180,8 @@ def test_non_read_trail_entries_are_ignored_by_the_seed() -> None:
 # --- emulation seeding ------------------------------------------------------
 
 
-def test_emulation_seeding_dedupes_a_model_recall_of_the_swept_listing() -> None:
-    """The whole point of the discovery sweep: a model re-call of
-    `listDatabases`/`listTables` is served locally instead of re-dispatched."""
-    signature = idempotent_read_signature("listTables", {"database": _DB})
-    guard, recorder = _guard(readable=frozenset({"emulated-1"}))
-    guard.seed_emulation({signature}, {signature: "emulated-1"})
-
-    assert guard.classify("listTables", {"database": _DB}).declined is True
-    assert recorder.events == []
 
 
-def test_emulation_signature_without_a_readable_pointer_is_exempted() -> None:
-    """If the synthetic pair is not readable (it was not pinned, or the sweep seeded
-    no pointer), the exemption re-dispatches rather than nudging about something
-    absent — the same rule as any other read."""
-    signature = idempotent_read_signature("listDatabases", {})
-    guard, recorder = _guard(readable=frozenset())
-    guard.seed_emulation({signature}, {signature: "emulated-1"})
-
-    decision = guard.classify("listDatabases", {})
-    assert decision.declined is False
-    assert recorder.payloads("loop_trimmed_read_refetch_allowed")[0]["reason"] == (
-        "result_not_readable_in_window"
-    )
 
 
 # --- per-round reset --------------------------------------------------------

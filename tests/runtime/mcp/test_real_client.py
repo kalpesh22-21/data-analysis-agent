@@ -39,10 +39,8 @@ async def _mint(column_scope: list[str] | None = None) -> str:
 
 
 # `_unwrap_fastmcp_result` — the FastMCP `{"result": ...}` envelope strip. The
-# wrapped payloads below are the REAL shapes captured off the live l2-mcp; before
-# the unwrap they reached `discovery_emulation._database_names` as a dict, failed
-# its `isinstance(payload, list)` check, and degraded the emulated-discovery sweep
-# to empty on EVERY turn (and made `_build_preview` miss its bare-list branch).
+# wrapped payloads below are shapes captured from the live MCP. Unwrap the
+# envelope so preview construction recognizes the underlying list.
 @pytest.mark.parametrize(
     ("structured", "expected"),
     [

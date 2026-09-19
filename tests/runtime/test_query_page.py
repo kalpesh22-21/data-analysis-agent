@@ -137,7 +137,7 @@ def _client(monkeypatch, *, scripted: dict | None = None) -> tuple[TestClient, F
         },
     )
     app = create_app(
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=InMemorySessionStore(),
         mcp_client=mcp,
         model_client=ScriptedModelClient([ModelTurnResult(assistant_text="hi")]),

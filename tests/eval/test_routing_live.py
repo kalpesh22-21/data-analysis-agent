@@ -139,11 +139,7 @@ class LiveEvalMCPClient:
         )
 
     # `listDatabases`/`listTables` return BARE LISTS of dicts, matching
-    # `clickhouse-api/app/service.py`. The emulated-discovery sweep parses exactly
-    # that shape (`discovery_emulation._database_names`), and a `{"databases": […]}`
-    # wrapper would make it inject `listDatabases` alone and silently skip the
-    # `listTables` half — the model would then spend a real round-trip on
-    # discovery on every A2 run, which is not the composition being graded.
+    # `clickhouse-api/app/service.py`.
     def _listDatabases(self, _args: dict[str, Any]) -> list[dict[str, str]]:  # noqa: N802
         return [{"name": _BASE_DATABASE}]
 

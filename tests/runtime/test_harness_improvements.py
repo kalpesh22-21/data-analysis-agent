@@ -689,7 +689,6 @@ async def test_capability_registry_is_reloaded_on_http_resume(monkeypatch, avail
             capability_tools_enabled=True,
             capability_prefetch_enabled=False,
             measurement_review_enabled=False,
-            discovery_emulation_enabled=False,
             otlp_endpoint="",
         ),
         session_store=store,
@@ -988,35 +987,6 @@ def test_measurement_input_does_not_reuse_previous_refusals_as_catalog():
     ]
     evidence = catalog_evidence(messages)
     assert len(evidence) == 1 and evidence[0]["tool_name"] == "getBlueprint"
-
-
-def test_emulated_catalogue_can_ground_metadata_answer():
-    from data_agent.runtime.loop.proposal import context_catalog_entries, deliverable_evidence
-
-    message = {
-        "role": "tool",
-        "tool_call_id": "emulated-tables",
-        "content": json.dumps(
-            {
-                "tool_name": "listTables",
-                "status": "ok",
-                "result_preview": {
-                    "columns": ["table"],
-                    "row_count": 1,
-                    "truncated": False,
-                    "preview_rows": [["employee"]],
-                },
-            }
-        ),
-    }
-    entries = context_catalog_entries([message], {"emulated-tables"}, 0)
-    parts, error = deliverable_evidence(
-        None,
-        {"answer": "Employee information is available.", "evidence": ["emulated-tables"]},
-        entries,
-    )
-    assert error is None and parts[0]["evidence"][0]["kind"] == "catalog"
-    assert context_catalog_entries([message], set(), 0) == []
 
 
 async def test_discovery_streak_prompts_delivery_without_discarding_evidence():

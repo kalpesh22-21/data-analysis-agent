@@ -19,7 +19,6 @@ from fastapi.testclient import TestClient
 from data_agent.runtime import app as app_module
 from data_agent.runtime.app import create_app
 from data_agent.runtime.config import RuntimeSettings
-from data_agent.runtime.context.discovery_emulation import _opaque_discovery_call_id
 from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -158,7 +157,6 @@ def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch)
         settings=RuntimeSettings(
             _env_file=None,
             catalog_source="fixture",
-            discovery_emulation_enabled=False,
         ),
         session_store=InMemorySessionStore(),
         mcp_client=mcp_client,
@@ -175,84 +173,47 @@ def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch)
     assert data["provenance"] == ["dbpcm_warehouse.employee.employee_code"]
 
 
-def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> None:
-    # Positive proof that the create_app -> AgentLoop wiring actually INJECTS the
-    # emulated discovery (not just the degrade path): with the feature enabled and a
-    # FakeMCPClient scripted for listDatabases/listTables, the synthetic
-    # emulated-listDatabases + emulated-listTables-<db> assistant/tool pairs must
-    # reach the model payload, spliced in sequentially AFTER the user question.
+@pytest.mark.parametrize("legacy_enabled", [False, True])
+def test_turn_endpoint_does_not_inject_discovery(monkeypatch, legacy_enabled) -> None:
     monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
-
-    db = "dbpcm_warehouse"
     mcp_client = FakeMCPClient(
         tools=[
             MCPToolSpec(
-                name="listDatabases",
-                description="",
-                input_schema={"type": "object", "properties": {}},
+                name=name, description="", input_schema={"type": "object", "properties": {}}
             )
+            for name in ("listDatabases", "listTables")
         ],
-        scripted={
-            "listDatabases": [[{"name": db}]],
-            "listTables": [[{"database": db, "name": "employee", "engine": "MergeTree"}]],
-        },
+        scripted={},
     )
     model_client = ScriptedModelClient(
         [
-            final_answer(assistant_text="Here is your answer."),
+            final_answer(assistant_text="First answer."),
             final_answer(assistant_text="Second answer."),
         ]
     )
     app = create_app(
-        settings=RuntimeSettings(
-            max_loop_iterations=15,
-            max_wall_clock_seconds=60,
-            max_budget_windows=3,
-            discovery_emulation_enabled=True,
-        ),
+        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=legacy_enabled),
         session_store=InMemorySessionStore(),
         mcp_client=mcp_client,
         model_client=model_client,
         catalog=CatalogHandle({}),
     )
-    client = TestClient(app)
-
-    response = client.post("/turn", json={"message": "How many employees?"}, headers=HEADERS)
-    assert response.status_code == 200
-
-    messages = model_client.calls[0].messages
-    tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-    assert _opaque_discovery_call_id(SESSION_ID, "databases") in tool_ids
-    assert _opaque_discovery_call_id(SESSION_ID, f"tables:{db}") in tool_ids
-    # SEQUENTIAL TURN LAYOUT: every emulated pair FOLLOWS the real user question,
-    # which immediately precedes the first of them.
-    first_emulated = min(i for i, m in enumerate(messages) if m.get("role") == "tool") - 1
-    # The question is the last `user` message BEFORE the emulated pairs, not the
-    # first: the date anchor (`context/assembly.py::_turn_date_anchor`) is inserted
-    # immediately before it and is itself `role:"user"`.
-    user_index = max(
-        i for i, m in enumerate(messages) if m.get("role") == "user" and i < first_emulated
-    )
-    assert first_emulated == user_index + 1
-    assert messages[user_index]["content"] == "How many employees?"
-    assert messages[user_index - 1]["content"].startswith("Today's date is ")
-    # The sweep dispatched exactly the two discovery tools through the real MCP —
-    # ONE listTables, for the base database only.
-    assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
-
-    # ONCE PER SESSION: a SECOND turn on the SAME session must be served from
-    # `EmulatedDiscoveryCache` — no further MCP round-trips. `_run_loop_body` is
-    # re-entered by run()/resume()/the blueprint approval-resume, so before the cache
-    # every budget window re-swept, and the ephemeral pairs re-appeared mid-session
-    # after the model had already fetched schemas.
-    response2 = client.post("/turn", json={"message": "And by department?"}, headers=HEADERS)
-    assert response2.status_code == 200
-    assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
-
-    # The pairs still reach the second turn's payload — served from cache, not re-swept.
-    tool_ids2 = [m["tool_call_id"] for m in model_client.calls[1].messages if m["role"] == "tool"]
-    assert _opaque_discovery_call_id(SESSION_ID, "databases") in tool_ids2
-    assert _opaque_discovery_call_id(SESSION_ID, f"tables:{db}") in tool_ids2
+    with TestClient(app) as client:
+        for question in ("What can you help with?", "What information is available?"):
+            response = client.post("/turn", json={"message": question}, headers=HEADERS)
+            assert response.status_code == 200
+    assert not mcp_client.calls
+    for call in model_client.calls:
+        assert {"listDatabases", "listTables"} <= {tool["name"] for tool in call.tools}
+        assert not any(
+            m.get("role") == "tool" and m.get("name") in {"listDatabases", "listTables"}
+            for m in call.messages
+        )
+        assert not any(
+            c.get("function", {}).get("name") in {"listDatabases", "listTables"}
+            for m in call.messages
+            for c in m.get("tool_calls", [])
+        )
 
 
 def test_turn_endpoint_missing_auth_header_returns_401(monkeypatch) -> None:
@@ -431,11 +392,7 @@ def _read_tools_app(
             top_k_knowledge=3,
         )
     app = create_app(
-        # Disable the emulated-discovery sweep here: this smoke test asserts the
-        # EXACT MCP-dispatch sequence for the read-tool wiring, and the sweep's
-        # listDatabases/listTables probe would add unrelated calls. The sweep is
-        # covered directly in tests/runtime/context/test_discovery_emulation.py.
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -596,11 +553,7 @@ def _run_blueprint_app(
         }
     )
     app = create_app(
-        # Disable the emulated-discovery sweep here: this smoke test asserts the
-        # EXACT MCP-dispatch sequence for the runBlueprint wiring, and the sweep's
-        # listDatabases/listTables probe would add unrelated calls. The sweep is
-        # covered directly in tests/runtime/context/test_discovery_emulation.py.
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -1137,7 +1090,7 @@ def test_history_survives_an_unreadable_blueprint_result(monkeypatch) -> None:
     monkeypatch.setattr(store, "read_full_result", _boom, raising=False)
 
     app = create_app(
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=store,
         mcp_client=FakeMCPClient(),
         model_client=ScriptedModelClient([final_answer(assistant_text="hi")]),
@@ -1228,7 +1181,7 @@ def test_update_analysis_state_is_wired_and_gets_the_loops_own_turn_index(
     )
     mcp_client = FakeMCPClient(tools=[], scripted={})
     app = create_app(
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -1290,7 +1243,7 @@ def test_extra_observers_receive_loop_events_on_both_endpoints(monkeypatch) -> N
         ]
     )
     app = create_app(
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=InMemorySessionStore(),
         mcp_client=FakeMCPClient(tools=[], scripted={}),
         model_client=model_client,

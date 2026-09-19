@@ -950,44 +950,6 @@ class RuntimeSettings(BaseSettings):
         ),
     )
 
-    # --- Emulated-discovery injection (context/discovery_emulation.py) ---
-    # Emulate `listDatabases`+`listTables` once per budget window (through the
-    # ToolDispatcher, so credentials/scope/denial-mapping/telemetry stay
-    # consistent) and inject synthetic assistant/tool pairs as if the model had
-    # already made those calls, so it need not spend completion round-trips on
-    # pure discovery. Also seeds the repeated-idempotent-read guard so a re-call is
-    # served locally. Degrade-not-fail: a sweep failure injects nothing and the
-    # model falls back to the tools. `getTableSchema` stays model-driven.
-    discovery_emulation_enabled: bool = Field(
-        True,
-        description=(
-            "When True (default) emulate listDatabases+listTables once per turn "
-            "and inject synthetic assistant/tool pairs as if the model had already "
-            "called them so it need not call those two discovery tools."
-        ),
-    )
-    # The ONE database the agent actually answers questions from. The emulated
-    # discovery sweep lists tables for THIS database only — not for every database
-    # `listDatabases` returns. The others on a live warehouse are not analysis
-    # surface (`dbpcm_warehouse_security` is the access-control side, `scratch` is
-    # the D93 per-session materialization area), so sweeping them spent an MCP
-    # round-trip each per turn to inject listings the model should never query.
-    #
-    # `listDatabases` itself is still emulated in full (it is one round-trip, and
-    # its injected pair is what seeds the read guard so the model does not spend a
-    # live call rediscovering the same list).
-    #
-    # Matches the two long-standing hardcoded defaults for the same name —
-    # `catalog/loader.py::DEFAULT_DATABASE` and `sqlparse/provenance.py::_DEFAULT_DB`
-    # — which is why the default is the literal below rather than a required field.
-    base_database: str = Field(
-        "dbpcm_warehouse",
-        min_length=1,
-        description=(
-            "The database the agent answers from; the emulated discovery sweep "
-            "lists tables for this database only."
-        ),
-    )
     retrieval_recall_k: int = Field(
         30,
         ge=1,

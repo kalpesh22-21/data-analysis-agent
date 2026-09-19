@@ -295,7 +295,6 @@ def fit_request_to_budget(
     *,
     token_budget: int,
     pinned_recent_tool_pairs: int = _DEFAULT_PINNED_RECENT_TOOL_PAIRS,
-    pinned_tool_call_ids: frozenset[str] | None = None,
 ) -> RequestFitResult:
     """Fit the FULL canonical request to `token_budget` while honoring the send-seam
     invariants:
@@ -317,17 +316,11 @@ def fit_request_to_budget(
          PINNED — K protects the D94 withheld/idempotent-read self-correct loop, and
          making the pairs older than K droppable is what keeps a single non-terminating
          turn bounded by the budget;
-      7. any unit whose `tool_call_id` is in *pinned_tool_call_ids* is PINNED regardless
-         of tier or age. This carries the emulated-discovery pairs, which are anchored
-         at the SESSION'S FIRST question and so classify as prior-turn trail, tier 0.
-         Dropping them is uniquely harmful: the loop seeds its repeated-idempotent-read
-         guard from the same sweep, so the model would be unable to see the tables AND
-         unable to re-fetch them. `None`/empty behaves as if the parameter did not exist.
+
 
     Invariants 1/3/6/7 take precedence over 2, so in the pathological corner where the
     pinned material ALONE exceeds `token_budget` the result may still exceed it.
     """
-    pinned_ids = pinned_tool_call_ids or frozenset()
     sizes = [estimate_message_tokens(m) for m in messages]
     total = sum(sizes)
     n = len(messages)
@@ -367,12 +360,10 @@ def fit_request_to_budget(
     pinned: list[bool] = [False] * len(units)
     tiers: list[int] = [0] * len(units)
     droppable: list[int] = []
-    for u, (s, e) in enumerate(units):
+    for u, (s, _e) in enumerate(units):
         is_current = s >= turn_start
         is_tool_pair = messages[s].get("role") == "assistant" and messages[s].get("tool_calls")
-        if pinned_ids and any(messages[k].get("tool_call_id") in pinned_ids for k in range(s, e)):
-            pinned[u] = True  # invariant 7 — emulated discovery, never dropped.
-        elif kinds[u] == _UNIT_KIND_RETRIEVAL:
+        if kinds[u] == _UNIT_KIND_RETRIEVAL:
             # The current question's prefetch pair replaces the formerly pinned
             # retrieval user block. Its marker makes that pin independent of
             # positional/current-turn heuristics.

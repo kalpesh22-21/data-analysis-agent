@@ -431,11 +431,6 @@ def eval_settings(**overrides: Any) -> RuntimeSettings:
     """The settings A1 runs under.
 
     `_env_file=None` so a developer's local `.env` cannot change what CI measures.
-    `discovery_emulation_enabled=False` because the sweep would add
-    `listDatabases`/`listTables` MCP dispatches the per-tool scripted queues do
-    not carry — it is covered directly in
-    `tests/runtime/context/test_discovery_emulation.py`.
-
     THE BASE PROMPT IS NOT OVERRIDDEN. `agent_system_prompt_enabled` stays at its
     shipped default, so `ContextAssembler` gets the real prompt. A1 cannot FAIL on
     a bad prompt (see README), but it must not run without one either.
@@ -451,7 +446,6 @@ def eval_settings(**overrides: Any) -> RuntimeSettings:
     """
     defaults: dict[str, Any] = {
         "_env_file": None,
-        "discovery_emulation_enabled": False,
         "max_loop_iterations": 25,
         "max_wall_clock_seconds": 180,
         "max_budget_windows": 3,

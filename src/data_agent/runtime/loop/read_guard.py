@@ -1,9 +1,7 @@
 """The repeated-idempotent-read guard — its primitives AND the window-scoped `ReadGuard`
 that owns the decision.
 
-A dependency-free leaf, so `loop/agent_loop.py` and `context/discovery_emulation.py`
-both depend on it in ONE direction and neither reaches into the other's namespace. Keep
-it a leaf: `ReadGuard` deliberately neither builds the data-free guard `TrailEntry`
+A dependency-free leaf used by `loop/agent_loop.py`. Keep it a leaf: `ReadGuard` deliberately neither builds the data-free guard `TrailEntry`
 (that would need `session/models.py` + the store) nor emits the guarded event (the loop
 must append THEN emit). It owns the STATE and the DECISION; the loop owns the effects.
 
@@ -34,7 +32,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any
 
@@ -303,25 +300,6 @@ class ReadGuard:
             self._served_call_ids[signature] = tool_call_id
             self._served_rounds[signature] = served_round
 
-    def seed_emulation(
-        self,
-        signatures: AbstractSet[ReadSignature],
-        served_call_ids: Mapping[ReadSignature, str],
-    ) -> None:
-        """Seed the emulated-discovery sweep so a model re-call of
-                `listDatabases`/`listTables` is served locally instead of re-dispatched to the MCP.
-
-                The pointers matter as much as the signatures: without them the trim-aware
-                exemption would read "no readable source" and re-dispatch the very calls the
-                sweep exists to avoid. `fit_request_to_budget` pins the emulated pairs by id, so
-                they stay readable for the whole window.
-
-                *signatures* is an `AbstractSet` because this method only READS it — the caller
-                keeps ownership of its own collection, and nothing here mutates or retains it.
-        """
-        self._seen.update(signatures)
-        self._served_call_ids.update(served_call_ids)
-        self._served_rounds.update({signature: 0 for signature in served_call_ids})
 
     def begin_round(self, readable_tool_call_ids: frozenset[str]) -> None:
         """Start a response batch: adopt the tool results the model can actually READ this

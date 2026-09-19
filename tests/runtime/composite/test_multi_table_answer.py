@@ -683,7 +683,7 @@ async def test_answer_tables_reaches_the_sse_result_frame(monkeypatch) -> None:
     monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: frozenset())
     store = InMemorySessionStore()
     app = create_app(
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=store,
         mcp_client=FakeMCPClient(),
         model_client=ScriptedModelClient(
@@ -982,7 +982,7 @@ def _history_app(monkeypatch, model: ScriptedModelClient, scope: frozenset[str])
 
     monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: scope)
     app = create_app(
-        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        settings=RuntimeSettings(_env_file=None),
         session_store=InMemorySessionStore(),
         mcp_client=FakeMCPClient(),
         model_client=model,

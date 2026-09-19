@@ -32,7 +32,6 @@ def test_locked_defaults() -> None:
     assert settings.max_budget_windows == 3
     assert settings.max_window_token_spend == 1_000_000
     assert settings.max_tool_calls_per_iteration == 8  # S3 hardening default
-    assert settings.discovery_emulation_enabled is True
 
 
 def test_window_token_spend_ceiling_is_independent_of_the_context_window() -> None:

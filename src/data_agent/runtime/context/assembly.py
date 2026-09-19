@@ -312,9 +312,7 @@ class ContextAssembler:
             #
             # READ FRESH EVERY ROUND-TRIP, from the `doc` this method already
             # loaded: zero extra store reads, and correct by construction. It is
-            # deliberately NOT threaded like `discovery_canonical`, which is
-            # computed ONCE PER BUDGET WINDOW and reused unchanged; the state
-            # changes WITHIN the window (every `updateAnalysisState` mutates it),
+            # refreshed within the window: every `updateAnalysisState` mutates it,
             # so copying that lifetime would mean the model never sees the ids it
             # was just assigned — the entire point of the initialize result.
             #

@@ -202,40 +202,6 @@ def validate_proposal_args(args: Any) -> str | None:
     return ("Invalid finalizeAnswer arguments: " + error.message[:400]) if error else None
 
 
-def context_catalog_entries(messages, allowed_ids, turn_index):
-    """Scoped emulated discovery is valid catalogue evidence even without a trail write."""
-    from data_agent.runtime.session.models import ResultPreview, TrailEntry
-
-    entries = []
-    for message in messages:
-        if message.get("role") != "tool" or message.get("tool_call_id") not in allowed_ids:
-            continue
-        try:
-            payload = json.loads(message.get("content", ""))
-            if payload.get("status") != "ok" or payload.get("tool_name") not in {
-                "listDatabases",
-                "listTables",
-            }:
-                continue
-            entries.append(
-                TrailEntry(
-                    turn_index=turn_index,
-                    tool_call_id=message["tool_call_id"],
-                    tool_name=payload["tool_name"],
-                    args={},
-                    status="ok",
-                    error_code=None,
-                    provenance=frozenset(),
-                    result_preview=ResultPreview.from_doc(payload["result_preview"]),
-                    result_full_ref=None,
-                    ts="",
-                )
-            )
-        except (TypeError, ValueError, KeyError, AttributeError):
-            continue
-    return entries
-
-
 def selected_components(args, trail, result_sql_by_call_id=None):
     """Only successful current-scope executions selected in this exact proposal."""
     result_sql_by_call_id = result_sql_by_call_id or {}

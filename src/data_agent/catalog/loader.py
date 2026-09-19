@@ -24,8 +24,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# The single warehouse database name — the NAMED ANCHOR for that convention, cited by
-# `runtime/config.py` (the default-database setting) and `context/discovery_emulation.py`.
+# The conventional warehouse database name.
 # No code here reads it: the dir-based loader that applied it as a per-file fallback is
 # gone (D75 Wave 1b), and every catalog entry from the MCP export carries `database`.
 DEFAULT_DATABASE = "dbpcm_warehouse"

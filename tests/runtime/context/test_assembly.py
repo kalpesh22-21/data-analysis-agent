@@ -246,8 +246,7 @@ async def test_analysis_state_renders_as_user_before_the_current_question() -> N
 
 
 async def test_the_state_block_is_re_read_every_round_trip() -> None:
-    """NOT threaded like `discovery_canonical`, which is computed once per BUDGET
-    WINDOW and reused unchanged. The state changes WITHIN the window — every
+    """The state changes WITHIN the window — every
     `updateAnalysisState` mutates it — so a once-per-window read would mean the
     model never sees the ids it was just assigned, which is the entire point of
     the initialize result."""

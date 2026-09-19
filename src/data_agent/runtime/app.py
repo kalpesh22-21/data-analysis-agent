@@ -60,11 +60,6 @@ from data_agent.runtime.config import (
     get_runtime_settings,
 )
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.context.discovery_emulation import (
-    EmulatedDiscovery,
-    EmulatedDiscoveryCache,
-    build_emulated_discovery,
-)
 from data_agent.runtime.dispatch.tool_dispatcher import (
     CatalogProvider,
     ToolDispatcher,
@@ -656,12 +651,6 @@ def create_app(
     # `loop_paused_ask_user`'s `question` payload specifically).
     _tracing_observer = tracing.guardrail_observer(tracer)
 
-    # Emulated-discovery sweep cache — built ONCE per app, NOT per request, so it
-    # actually spans a session. `_build_agent_loop` runs per request, so a cache
-    # created in there would memoize nothing across turns and the sweep would still
-    # re-dispatch on every budget window.
-    discovery_emulation_cache = EmulatedDiscoveryCache()
-
     async def _base_tools_provider(credentials: RuntimeCredentials) -> list[dict[str, Any]]:
         # The live MCP authenticates tools/list too (no anonymous
         # introspection) — thread this turn's credentials through, but the
@@ -700,35 +689,6 @@ def create_app(
 
     def _build_agent_loop(observer: ToolObserver) -> AgentLoop:
         dispatcher = _build_dispatcher(observer)
-        # Emulated-discovery injection (context/discovery_emulation.py): a per-
-        # window closure that sweeps listDatabases+listTables through the SAME
-        # per-request `dispatcher` (so D5/D57/denial-mapping/telemetry are the
-        # free path) and returns the synthetic rendered entries + guard signatures.
-        # Gated on the setting; `None` (disabled) → AgentLoop runs byte-identically
-        # to before this feature.
-        discovery_emulation_provider = None
-        if settings.discovery_emulation_enabled:
-
-            async def _discovery_emulation_provider(
-                creds: RuntimeCredentials,
-            ) -> EmulatedDiscovery:
-                # ONCE PER SESSION: `_run_loop_body` is re-entered by run()/resume()/the
-                # blueprint approval-resume, so without this the sweep re-dispatched
-                # to the MCP on every budget window. The cache serves the first
-                # non-empty sweep for the rest of the session; a degraded one is not
-                # memoized, so a transient MCP blip retries next window.
-                return await discovery_emulation_cache.get_or_build(
-                    creds.session_id,
-                    lambda: build_emulated_discovery(
-                        dispatcher,
-                        creds,
-                        base_database=settings.base_database,
-                        preview_row_count=settings.preview_row_count,
-                        observer=observer,
-                    ),
-                )
-
-            discovery_emulation_provider = _discovery_emulation_provider
         # D77: the composite wraps the SAME dispatcher (so its inner runQuery
         # shares the per-request observer/tracer and the free D5/D57/provenance
         # path); an injected `resolve_values` (Layer-1 smoke test) overrides it.
@@ -989,7 +949,6 @@ def create_app(
             tracer=tracer,
             runtime_tools=runtime_tools,
             blueprint_executor=blueprint_executor,
-            discovery_emulation_provider=discovery_emulation_provider,
             progress_summarizer=progress_summarizer,
             # 09: `None` unless `answer_judge_enabled` AND a key is present, in which
             # case every terminal exit is byte-identical to before the feature existed.
