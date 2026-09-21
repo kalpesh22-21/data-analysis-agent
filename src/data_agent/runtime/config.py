@@ -236,6 +236,10 @@ class RuntimeSettings(BaseSettings):
     )
 
     # --- Adopted MCP (clickhouse-api, D75) ---
+    mcp_max_response_bytes: int = Field(
+        16 * 1024 * 1024, ge=1,
+        description="Maximum bytes received per MCP HTTP response, before JSON/SSE parsing.",
+    )
     mcp_url: str = Field(
         "http://localhost:18090/mcp",
         description="Streamable-HTTP endpoint of the adopted clickhouse-api MCP.",

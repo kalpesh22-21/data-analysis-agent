@@ -65,8 +65,11 @@ _RUN_BLUEPRINT_CODES = {
 }
 
 _TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR"}
+_RECEIVE_LIMIT_CODES = {"RESULT_TOO_LARGE", "MCP_RESPONSE_UNSUPPORTED_ENCODING"}
 
 _EXPECTED_RETRYABLE = {
+    "RESULT_TOO_LARGE": True,
+    "MCP_RESPONSE_UNSUPPORTED_ENCODING": False,
     "READ_REFETCH_LIMIT": False,
     "HELP_CENTER_CIRCUIT_OPEN": False,
     "SQL_REPAIR_EXHAUSTED": False,
@@ -180,6 +183,7 @@ _ALL_KNOWN_CODES = (
     | _BLUEPRINT_DEFINITION_CODES
     | _RUN_BLUEPRINT_CODES
     | _TRANSPORT_CODES
+    | _RECEIVE_LIMIT_CODES
 )
 
 
@@ -236,6 +240,8 @@ def test_none_code_is_handled() -> None:
 # calls, the shape of the envelope)". The WORK_JUDGED/INFRA_FAILED line is the H8 one:
 # did anything actually form a verdict on the work, or did the floor give way under it.
 _EXPECTED_KIND = {
+    "RESULT_TOO_LARGE": DenialKind.GATE,
+    "MCP_RESPONSE_UNSUPPORTED_ENCODING": DenialKind.INFRA_FAILED,
     "READ_REFETCH_LIMIT": DenialKind.GATE,
     "HELP_CENTER_CIRCUIT_OPEN": DenialKind.GATE,
     "SQL_REPAIR_EXHAUSTED": DenialKind.GATE,

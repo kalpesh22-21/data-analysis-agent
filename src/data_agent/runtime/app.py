@@ -336,7 +336,9 @@ def create_app(
     embedder it stays `None`, which is byte-identical Phase-0 parity (D86).
     """
     settings = settings or get_runtime_settings()
-    mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
+    mcp_client = mcp_client or RealMCPClient(
+        settings.mcp_url, max_response_bytes=settings.mcp_max_response_bytes
+    )
     # The scratch side-channel client is a singleton shared by every per-request
     # BlueprintExecutor (it holds no per-request state — creds ride each call).
     if scratch_client is None and settings.scratch_enabled:

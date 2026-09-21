@@ -106,6 +106,7 @@ config:
   # --- runtime / agent core ---
   # -- URL of the MCP (clickhouse-api) service. EXTERNAL.
   MCP_URL: "http://clickhouse-api:8000/mcp"
+  MCP_MAX_RESPONSE_BYTES: "16777216"
   # -- Where the semantic catalog is sourced from: "mcp" (live GET
   #    /catalog/export off the MCP host) or "fixture" (offline JSON on disk).
   CATALOG_SOURCE: "mcp"

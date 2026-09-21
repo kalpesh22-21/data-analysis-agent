@@ -9,14 +9,17 @@ runtime. Layer-2 only: its tests skip unless `MCP_TEST_URL` is set.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from ._transport import side_channel_headers
+from .bounded_http import DEFAULT_MAX_RESPONSE_BYTES, ResponseGuard
 from .client import MCPToolError, MCPToolSpec
 
 # Matches the `[{CODE}] message` marker that `clickhouse-api`'s
@@ -68,8 +71,35 @@ def _unwrap_fastmcp_result(structured: Any) -> Any:
 class RealMCPClient:
     """`MCPClient` over the live `clickhouse-api` MCP (streamable-HTTP)."""
 
-    def __init__(self, mcp_url: str) -> None:
+    def __init__(
+        self, mcp_url: str, *, max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
+    ) -> None:
+        if max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be positive")
         self._mcp_url = mcp_url
+        self._max_response_bytes = max_response_bytes
+
+    @asynccontextmanager
+    async def _session(self, headers: dict[str, str]):
+        guard = ResponseGuard(self._max_response_bytes)
+        try:
+            # SDK readers may swallow stream errors and leave a request pending.
+            # The watcher cancels that operation as soon as the receive guard fires.
+            async with asyncio.TaskGroup() as tasks:
+                watcher = tasks.create_task(guard.watch())
+                try:
+                    async with streamablehttp_client(
+                        self._mcp_url, headers=headers, httpx_client_factory=guard.client_factory
+                    ) as (read, write, _):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            yield session
+                finally:
+                    watcher.cancel()
+        except Exception:
+            guard.raise_if_failed()
+            raise
+        guard.raise_if_failed()
 
     def _headers(self, jwt: str, session_id: str) -> dict[str, str]:
         # The D5 binding, shared with every HTTP side channel (`_transport.py`). The
@@ -86,10 +116,8 @@ class RealMCPClient:
         session_id: str,
     ) -> dict[str, Any] | list[Any]:
         headers = self._headers(jwt, session_id)
-        async with streamablehttp_client(self._mcp_url, headers=headers) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, args)
+        async with self._session(headers) as session:
+            result = await session.call_tool(tool_name, args)
 
         if result.isError:
             text = result.content[0].text if result.content else "unknown MCP tool error"
@@ -106,10 +134,8 @@ class RealMCPClient:
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
         headers = self._headers(jwt, session_id)
-        async with streamablehttp_client(self._mcp_url, headers=headers) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.list_tools()
+        async with self._session(headers) as session:
+            result = await session.list_tools()
 
         return [
             MCPToolSpec(

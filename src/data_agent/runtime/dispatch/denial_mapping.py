@@ -124,6 +124,15 @@ BLUEPRINT_NOT_SEARCHED_MESSAGE = (
 )
 
 _DENIAL_TABLE: dict[str, DenialInfo] = {
+    "RESULT_TOO_LARGE": DenialInfo(
+        code="RESULT_TOO_LARGE", retryable=True, kind=DenialKind.GATE,
+        user_message="The response exceeded the size limit and was not retained. Narrow the requested scope or aggregate the data without dropping required records.",
+    ),
+    "MCP_RESPONSE_UNSUPPORTED_ENCODING": DenialInfo(
+        code="MCP_RESPONSE_UNSUPPORTED_ENCODING", retryable=False, kind=DenialKind.INFRA_FAILED,
+        user_message="The data service returned an unsupported response encoding. Its response could not be read safely.",
+    ),
+
     UNKNOWN_TOOL_CODE: DenialInfo(
         code=UNKNOWN_TOOL_CODE,
         retryable=True,
