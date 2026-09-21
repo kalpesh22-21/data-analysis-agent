@@ -19,6 +19,8 @@ from typing import Any
 # `shape` — an explicit allowlist, not a denylist, so a new observer event
 # added later never accidentally leaks a sensitive field by default.
 _SHAPE_ALLOWLIST = (
+    "rule",
+    "site",
     "old_id",
     "new_id",
     "serving_tool_call_id",
@@ -60,6 +62,7 @@ _SHAPE_ALLOWLIST = (
 # human-readable progress step labels (design §7 "same stage boundaries...
 # coarser"). `{}`-style placeholders are filled from the allowlisted shape.
 _STEP_LABELS: dict[str, str] = {
+    "loop_answer_rule_refused": "checking what this assistant can answer",
     "loop_tool_call_id_reminted": "tracking the next step",
     "loop_read_refetch_limit": "using information already received",
     "loop_help_center_circuit_opened": "product guidance is temporarily unavailable",

@@ -28,6 +28,7 @@ _ALL_SEVEN_CODES = {
 # of the original seven): the cartesian-join block. Retryable — the model can
 # self-correct by adding an ON/USING condition or wrapping a constant side.
 _GUARDRAIL_CODES = {
+    "OUT_OF_SCOPE_REQUEST",
     "READ_REFETCH_LIMIT",
     "HELP_CENTER_CIRCUIT_OPEN",
     "SQL_REPAIR_EXHAUSTED",
@@ -70,6 +71,7 @@ _RECEIVE_LIMIT_CODES = {"RESULT_TOO_LARGE", "MCP_RESPONSE_UNSUPPORTED_ENCODING"}
 _EXPECTED_RETRYABLE = {
     "RESULT_TOO_LARGE": True,
     "MCP_RESPONSE_UNSUPPORTED_ENCODING": False,
+    "OUT_OF_SCOPE_REQUEST": True,
     "READ_REFETCH_LIMIT": False,
     "HELP_CENTER_CIRCUIT_OPEN": False,
     "SQL_REPAIR_EXHAUSTED": False,
@@ -242,6 +244,7 @@ def test_none_code_is_handled() -> None:
 _EXPECTED_KIND = {
     "RESULT_TOO_LARGE": DenialKind.GATE,
     "MCP_RESPONSE_UNSUPPORTED_ENCODING": DenialKind.INFRA_FAILED,
+    "OUT_OF_SCOPE_REQUEST": DenialKind.GATE,
     "READ_REFETCH_LIMIT": DenialKind.GATE,
     "HELP_CENTER_CIRCUIT_OPEN": DenialKind.GATE,
     "SQL_REPAIR_EXHAUSTED": DenialKind.GATE,

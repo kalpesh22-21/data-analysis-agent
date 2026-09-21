@@ -692,7 +692,13 @@ class BlueprintExecutor:
 
         # 5. Verify the FINAL node result (D56) + build the verified answer.
         return await self._finalize(
-            blueprint, terminal, node_sqls, provenances, credentials, bound_slots=bound_slots
+            blueprint,
+            terminal,
+            node_sqls,
+            provenances,
+            credentials,
+            bound_slots=bound_slots,
+            resolved_rule_bindings=rule_bindings,
         )
 
     async def _resolve_all_slots(
@@ -842,6 +848,7 @@ class BlueprintExecutor:
         credentials: RuntimeCredentials,
         *,
         bound_slots: dict[str, Any] | None = None,
+        resolved_rule_bindings: dict[str, Any] | None = None,
     ) -> ExecOutcome:
         """Run the D56 gate over the FINAL node result and build the verified
         answer (§2.2 step 5 / §5.2). Identical teeth to the single-node path."""
@@ -882,6 +889,9 @@ class BlueprintExecutor:
             # `composite/answer_with_table.py`).
             "terminal_sql": terminal_sql,
             "bound_slots": dict(bound_slots or {}),
+            "uses_rules": list(blueprint.uses_rules),
+            "resolved_rule_bindings": dict(resolved_rule_bindings or {}),
+            "omitted_slots": [s.name for s in blueprint.slots if s.name not in (bound_slots or {})],
             "verify": _verify_block(verify_out, row_count),
         }
         _stamp_window_anchor(

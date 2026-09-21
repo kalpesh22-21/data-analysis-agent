@@ -115,7 +115,7 @@ COMPLETION_EVIDENCE_TOOLS = frozenset(
 # on a fourth tool could never resolve to anything, so advertising one would be a
 # path to nowhere. The same three are also the ones whose FAILED calls 04 §B.1
 # accepts as block evidence, so blocking resolves through the identical mechanism.
-INTENT_TAGGABLE_TOOLS = COMPLETION_EVIDENCE_TOOLS
+INTENT_TAGGABLE_TOOLS = COMPLETION_EVIDENCE_TOOLS | {"declineOutOfScope"}
 SERVES_INTENT_ARG = "serves_intent"
 # How an intent's evidence binding was ESTABLISHED (06). A closed, shape-only enum
 # on `loop_intent_completed` / `loop_intent_blocked`, so route derivation knows its
@@ -419,6 +419,15 @@ def validate_block_evidence(
     entry = _find_entry(tool_call_id, trail, turn_index)
     if entry is None:
         return _missing_entry_reason(tool_call_id, trail, turn_index)
+
+    if reason_code == "OUT_OF_SCOPE_REQUEST":
+        if (
+            entry.status != "ok"
+            and entry.error_code == "OUT_OF_SCOPE_REQUEST"
+            and entry.tool_name == "declineOutOfScope"
+        ):
+            return None
+        return "OUT_OF_SCOPE_REQUEST requires a declineOutOfScope receipt for the refused part."
 
     if reason_code == "NO_ACCESS":
         # `status != "ok"` — NOT `== "denied"`. See NO_ACCESS_ERROR_CODES above:
@@ -1053,7 +1062,7 @@ def _bind_evidence_against_trail(
                 if reason_code is None:
                     raise _reject(
                         "unresolved_evidence",
-                        "This result does not establish a blocked intent. Permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
+                        "This result does not establish a blocked intent. Scope refusal receipts support OUT_OF_SCOPE_REQUEST; permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
                     )
             tool_call_id, binding = explicit, EVIDENCE_BINDING_TAGGED
         else:

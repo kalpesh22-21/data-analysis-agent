@@ -54,6 +54,7 @@ from data_agent.runtime.composite.answer_with_table import (
 from data_agent.runtime.composite.answer_with_text import AnswerWithTextTool
 from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
+from data_agent.runtime.composite.scope_refusal import DeclineOutOfScopeTool
 from data_agent.runtime.config import (
     RuntimeSettings,
     effective_llm_hide,
@@ -72,7 +73,6 @@ from data_agent.runtime.help_center.tools import (
 )
 from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
 from data_agent.runtime.loop.answer_judge import AnswerJudge
-from data_agent.runtime.loop.measurement import MeasurementReviewer
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
@@ -764,6 +764,7 @@ def create_app(
         # assumptions into the turn result), so it is never subject to the
         # advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path.
         runtime_tools["recordAssumptions"] = RecordAssumptionsTool(observer=observer)
+        runtime_tools["declineOutOfScope"] = DeclineOutOfScopeTool(observer=observer)
         # `answerWithTable` (composite/answer_with_table.py): ALWAYS wired, same
         # reasoning — it only echoes the model's final prose + designated query into
         # the turn result and has no backing stack. It is TERMINAL: a successful call
@@ -970,11 +971,7 @@ def create_app(
                 if judge_model_client is not None
                 else None
             ),
-            measurement_reviewer=(
-                MeasurementReviewer(model_client)
-                if settings.measurement_review_enabled and settings.openai_api_key
-                else None
-            ),
+            judge_catalog=catalog_provider,
             answer_judge_min_headroom_seconds=settings.answer_judge_min_headroom_seconds,
             # 09 §D.3: the SAME number the assembler renders the model's context with,
             # so the judge's view of a result is byte-identical to the model's.

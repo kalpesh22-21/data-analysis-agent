@@ -220,7 +220,7 @@ def test_only_evidence_backed_codes_are_model_declarable() -> None:
     """Structural, not a comment: the split is what stops a FUTURE runtime code
     becoming model-declarable the day it lands."""
     assert MODEL_REASON_CODES == frozenset(
-        {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED"}
+        {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED", "OUT_OF_SCOPE_REQUEST"}
     )
     assert len(RUNTIME_REASON_CODES) == 3
     assert not (MODEL_REASON_CODES & RUNTIME_REASON_CODES)

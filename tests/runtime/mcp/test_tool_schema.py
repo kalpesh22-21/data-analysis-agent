@@ -14,6 +14,7 @@ from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.tool_schema import (
     ANSWER_WITH_TABLE_TOOL_SCHEMA,
     ASK_USER_TOOL_SCHEMA,
+    DECLINE_OUT_OF_SCOPE_SCHEMA,
     FINALIZE_ANSWER_SCHEMA,
     GET_BLUEPRINT_TOOL_SCHEMA,
     RECORD_ASSUMPTIONS_TOOL_SCHEMA,
@@ -135,8 +136,9 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
         "recordAssumptions",
         "finalizeAnswer",
         "updateAnalysisState",
+        "declineOutOfScope",
     }
-    assert len(schemas) == 15
+    assert len(schemas) == 16
     ask_user = next(s for s in schemas if s["name"] == "askUser")
     assert ask_user == ASK_USER_TOOL_SCHEMA
     assert ask_user["parameters"]["properties"]["options"]["maxItems"] == 5
@@ -188,7 +190,7 @@ async def test_serves_intent_is_advertised_on_exactly_the_taggable_tools() -> No
     """
     client = FakeMCPClient(tools=_FAKE_TOOLS)
     schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
-    assert len(schemas) == 15, "the augmentation must not add or drop a tool"
+    assert len(schemas) == 16, "the augmentation must not add or drop a tool"
 
     advertised = {
         schema["name"]
@@ -332,7 +334,7 @@ async def test_name_collision_guard_allows_disjoint_names() -> None:
     # The real 6 MCP tools are disjoint from the 9 local names — no collision.
     client = FakeMCPClient(tools=_FAKE_TOOLS)
     schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
-    assert len(schemas) == 15
+    assert len(schemas) == 16
 
 
 async def test_no_credential_params_leak_in_any_schema() -> None:
@@ -349,7 +351,7 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
     cache = ToolSchemaCache(client)
 
     first = await cache.get_schemas(jwt="tok", session_id="s1")
-    assert len(first) == 15
+    assert len(first) == 16
 
     # Mutate the underlying client's tool list; without force_reload the cache
     # must not reflect the change.
@@ -364,6 +366,7 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
 
     reloaded = await cache.get_schemas(jwt="tok", session_id="s1", force_reload=True)
     assert reloaded == [
+        DECLINE_OUT_OF_SCOPE_SCHEMA,
         FINALIZE_ANSWER_SCHEMA,
         ASK_USER_TOOL_SCHEMA,
         RESOLVE_VALUES_TOOL_SCHEMA,

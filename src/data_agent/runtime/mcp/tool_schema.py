@@ -686,7 +686,30 @@ FINALIZE_ANSWER_SCHEMA = {
     },
 }
 
+DECLINE_OUT_OF_SCOPE_SCHEMA = {
+    "type": "function",
+    "name": "declineOutOfScope",
+    "description": (
+        "Record a refusal for a request outside HR, payroll, and product usage. "
+        "Use only for an out-of-domain part of the original ask, never for missing data, "
+        "disabled features, unavailable services, access denials, or failed execution. "
+        "Supply that part verbatim as request. Tag only its matching declared intents. "
+        "The result is a scope refusal receipt, not data or an execution failure. "
+        "Do not retry this refusal; finish supported parts and explain the scope in finalizeAnswer."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "request": {"type": "string", "minLength": 1},
+            "serves_intents": SERVES_INTENTS_PARAM,
+        },
+        "required": ["request"],
+        "additionalProperties": False,
+    },
+}
+
 _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
+    DECLINE_OUT_OF_SCOPE_SCHEMA,
     FINALIZE_ANSWER_SCHEMA,
     ASK_USER_TOOL_SCHEMA,
     RESOLVE_VALUES_TOOL_SCHEMA,

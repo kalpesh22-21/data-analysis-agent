@@ -9,6 +9,7 @@ never mutated, never a mutable global.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -27,7 +28,9 @@ class CatalogHandle:
         self,
         schema: dict[str, dict[str, str]],
         description_cols: dict[str, dict[str, str]] | None = None,
+        documentation: dict[str, Any] | None = None,
     ) -> None:
+        self._documentation = deepcopy(documentation or {})
         # Deep-freeze one level down (per-table column dicts) so callers cannot
         # mutate the shared catalog through the handle.
         self._schema: Mapping[str, Mapping[str, str]] = MappingProxyType(
@@ -42,6 +45,10 @@ class CatalogHandle:
                 for table, links in (description_cols or {}).items()
             }
         )
+
+    def documentation_for(self, table: str) -> dict[str, Any]:
+        """Return an isolated copy; callers must apply column scope before disclosure."""
+        return deepcopy(self._documentation.get(table, {}))
 
     @property
     def schema(self) -> Mapping[str, Mapping[str, str]]:
@@ -75,6 +82,7 @@ def load_catalog_handle_from_catalog(catalog: dict[str, Any]) -> CatalogHandle:
     return CatalogHandle(
         build_sqlglot_schema_from_catalog(catalog),
         load_description_cols_from_catalog(catalog),
+        documentation=catalog,
     )
 
 

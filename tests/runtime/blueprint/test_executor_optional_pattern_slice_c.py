@@ -127,6 +127,9 @@ async def test_single_node_omitted_optional_applies_pattern_and_verifies() -> No
     assert len(mcp.calls) == 2
     node_sql = mcp.calls[0].args["sql"]
     assert "WHERE TRUE" in node_sql
+    assert outcome.result_full["omitted_slots"] == ["department"]
+    assert outcome.result_full["bound_slots"] == {}
+    assert outcome.result_full["terminal_sql"] == node_sql
     assert "{department}" not in node_sql
     assert "Department = " not in node_sql  # NOT a value substitution
 

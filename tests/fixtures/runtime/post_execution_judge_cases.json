@@ -1,0 +1,1167 @@
+[
+  {
+    "name": "optional_filter_correct",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in each department?",
+      "draft": "Active employee counts in the records you can access are shown by department.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runBlueprint",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND TRUE GROUP BY department",
+            "omitted_slots": [
+              "department"
+            ],
+            "bound_slots": {}
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        },
+        "blueprint_definitions": [
+          {
+            "sql_template": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND department={department} GROUP BY department",
+            "slots": [
+              {
+                "name": "department",
+                "required": false,
+                "optional_pattern": "TRUE"
+              }
+            ]
+          }
+        ]
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND TRUE GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND TRUE GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": [
+      "measurement_mismatch"
+    ]
+  },
+  {
+    "name": "optional_filter_incorrect",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in each department?",
+      "draft": "Active employee counts in the records you can access are shown by department.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runBlueprint",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND department='Sales' GROUP BY department",
+            "omitted_slots": [
+              "department"
+            ],
+            "bound_slots": {}
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        },
+        "blueprint_definitions": [
+          {
+            "sql_template": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND department={department} GROUP BY department",
+            "slots": [
+              {
+                "name": "department",
+                "required": false,
+                "optional_pattern": "TRUE"
+              }
+            ]
+          }
+        ]
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND department='Sales' GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' AND department='Sales' GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "measurement_mismatch"
+    ]
+  },
+  {
+    "name": "population_correct",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in each department?",
+      "draft": "Active employee counts in the records you can access are shown by department.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": [
+      "measurement_mismatch"
+    ]
+  },
+  {
+    "name": "population_incorrect",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in each department?",
+      "draft": "Active employee counts in the records you can access are shown by department.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='I' GROUP BY department"
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='I' GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='I' GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "measurement_mismatch"
+    ]
+  },
+  {
+    "name": "swapped_values_correct",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in each department?",
+      "draft": "Among accessible records, Sales has 3 active employees and Engineering has 2.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": [
+      "contradicts_result"
+    ]
+  },
+  {
+    "name": "swapped_values_incorrect",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in each department?",
+      "draft": "Among accessible records, Sales has 2 active employees and Engineering has 3.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "contradicts_result"
+    ]
+  },
+  {
+    "name": "empty_population_correct",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in Sales?",
+      "draft": "No active Sales employees were found in the records you can access.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT id FROM hr.employee WHERE status='A' AND department='Sales'"
+          },
+          "result_preview": {
+            "columns": [
+              "id"
+            ],
+            "row_count": 0,
+            "preview_rows": [],
+            "truncated": false
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT id FROM hr.employee WHERE status='A' AND department='Sales'"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT id FROM hr.employee WHERE status='A' AND department='Sales'"
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": [
+      "measurement_mismatch",
+      "unsupported_by_evidence",
+      "contradicts_result"
+    ]
+  },
+  {
+    "name": "empty_population_incorrect",
+    "brief": {
+      "site": "exit_table",
+      "question": "How many active employees are in Sales?",
+      "draft": "There are no employees anywhere in your company.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT id FROM hr.employee WHERE status='A' AND department='Sales'"
+          },
+          "result_preview": {
+            "columns": [
+              "id"
+            ],
+            "row_count": 0,
+            "preview_rows": [],
+            "truncated": false
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT id FROM hr.employee WHERE status='A' AND department='Sales'"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT id FROM hr.employee WHERE status='A' AND department='Sales'"
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "measurement_mismatch",
+      "unsupported_by_evidence",
+      "contradicts_result"
+    ]
+  },
+  {
+    "name": "join_multiplication_correct",
+    "brief": {
+      "site": "exit_table",
+      "question": "What is the total annual salary of active employees with a payroll record?",
+      "draft": "The annual salary total for matching accessible employees is $200,000.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT sum(e.salary) FROM hr.employee e WHERE e.status='A' AND e.id IN (SELECT employee_id FROM hr.payroll)"
+          },
+          "result_preview": {
+            "columns": [
+              "annual_salary"
+            ],
+            "row_count": 1,
+            "preview_rows": [
+              [
+                200000
+              ]
+            ],
+            "truncated": false
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                },
+                "salary": {
+                  "type": "Float64",
+                  "units": "USD/year"
+                }
+              }
+            },
+            {
+              "table": "hr.payroll",
+              "grain": [
+                "payroll_id"
+              ],
+              "description": "Multiple payroll records can belong to one employee."
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT sum(e.salary) FROM hr.employee e WHERE e.status='A' AND e.id IN (SELECT employee_id FROM hr.payroll)"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT sum(e.salary) FROM hr.employee e WHERE e.status='A' AND e.id IN (SELECT employee_id FROM hr.payroll)"
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": [
+      "aggregation_risk",
+      "measurement_mismatch"
+    ]
+  },
+  {
+    "name": "join_multiplication_incorrect",
+    "brief": {
+      "site": "exit_table",
+      "question": "What is the total annual salary of active employees with a payroll record?",
+      "draft": "The annual salary total for matching accessible employees is $200,000.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT sum(e.salary) FROM hr.employee e JOIN hr.payroll p ON e.id=p.employee_id WHERE e.status='A'"
+          },
+          "result_preview": {
+            "columns": [
+              "annual_salary"
+            ],
+            "row_count": 1,
+            "preview_rows": [
+              [
+                200000
+              ]
+            ],
+            "truncated": false
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                },
+                "salary": {
+                  "type": "Float64",
+                  "units": "USD/year"
+                }
+              }
+            },
+            {
+              "table": "hr.payroll",
+              "grain": [
+                "payroll_id"
+              ],
+              "description": "Multiple payroll records can belong to one employee."
+            }
+          ]
+        }
+      },
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT sum(e.salary) FROM hr.employee e JOIN hr.payroll p ON e.id=p.employee_id WHERE e.status='A'"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT sum(e.salary) FROM hr.employee e JOIN hr.payroll p ON e.id=p.employee_id WHERE e.status='A'"
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "aggregation_risk",
+      "measurement_mismatch"
+    ]
+  },
+  {
+    "name": "ui_claim_correct",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Show Jane Doe\u2019s department.",
+      "draft": "Use the option to view the employee\u2019s department; select Jane Doe there.",
+      "capability_presented": [
+        {
+          "tool_name": "get_employee_department",
+          "description": "Displays department name for an employee selected in the UI.",
+          "presentation_columns": [
+            "Employee Name",
+            "Department Name"
+          ],
+          "has_unresolved_entities": true,
+          "result_ids": [
+            "ui"
+          ]
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": [
+      "unsupported_by_evidence",
+      "capability_coverage_gap"
+    ]
+  },
+  {
+    "name": "ui_claim_incorrect",
+    "brief": {
+      "site": "exit_capability",
+      "question": "Show Jane Doe\u2019s department.",
+      "draft": "Jane Doe is in Sales.",
+      "capability_presented": [
+        {
+          "tool_name": "get_employee_department",
+          "description": "Displays department name for an employee selected in the UI.",
+          "presentation_columns": [
+            "Employee Name",
+            "Department Name"
+          ],
+          "has_unresolved_entities": true,
+          "result_ids": [
+            "ui"
+          ]
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "unsupported_by_evidence",
+      "capability_coverage_gap"
+    ]
+  },
+  {
+    "name": "missing_deliverable_correct",
+    "brief": {
+      "site": "exit_table",
+      "question": "Give active headcount by department and explain how to request time off.",
+      "draft": "Active employee counts for accessible records are shown by department. I could not verify the time-off instructions from the available documentation.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "intents": [
+        [
+          "i1",
+          "Active headcount by department",
+          "completed",
+          null
+        ],
+        [
+          "i2",
+          "How to request time off",
+          "blocked",
+          "UNAVAILABLE"
+        ]
+      ],
+      "deliverables": [
+        {
+          "intent_id": "i1",
+          "answer": "See department counts.",
+          "evidence": [
+            "q"
+          ]
+        },
+        {
+          "intent_id": "i2",
+          "answer": "Time-off instructions could not be verified.",
+          "evidence": []
+        }
+      ],
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": true,
+    "acceptable_violations": [
+      "unexplained_gap"
+    ]
+  },
+  {
+    "name": "missing_deliverable_incorrect",
+    "brief": {
+      "site": "exit_table",
+      "question": "Give active headcount by department and explain how to request time off.",
+      "draft": "Active employee counts in the records you can access are shown by department.",
+      "designated_tool_call_ids": [
+        "q"
+      ],
+      "results": [
+        {
+          "tool_call_id": "q",
+          "tool_name": "runQuery",
+          "status": "ok",
+          "execution": {
+            "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+          },
+          "result_preview": {
+            "columns": [
+              "department",
+              "headcount"
+            ],
+            "row_count": 2,
+            "truncated": false,
+            "preview_rows": [
+              [
+                "Sales",
+                3
+              ],
+              [
+                "Engineering",
+                2
+              ]
+            ]
+          }
+        }
+      ],
+      "evidence_package": {
+        "caller_access": {
+          "company_wide_completeness": "unknown"
+        },
+        "catalog": {
+          "tables": [
+            {
+              "table": "hr.employee",
+              "grain": [
+                "id"
+              ],
+              "rules": [
+                {
+                  "id": "active",
+                  "predicate": "status='A'",
+                  "applies_when": "active employee counts"
+                }
+              ],
+              "columns": {
+                "id": {
+                  "type": "String"
+                },
+                "status": {
+                  "description": "A=active, I=inactive"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "intents": [
+        [
+          "i1",
+          "Active headcount by department",
+          "completed",
+          null
+        ],
+        [
+          "i2",
+          "How to request time off",
+          "blocked",
+          "UNAVAILABLE"
+        ]
+      ],
+      "deliverables": [
+        {
+          "intent_id": "i1",
+          "answer": "See department counts.",
+          "evidence": [
+            "q"
+          ]
+        }
+      ],
+      "designated_tables": [
+        [
+          "Requested breakdown",
+          "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        ]
+      ],
+      "selected_components": [
+        {
+          "kind": "table",
+          "result_id": "q",
+          "sql": "SELECT department, count(DISTINCT id) FROM hr.employee WHERE status='A' GROUP BY department"
+        }
+      ]
+    },
+    "expected_approved": false,
+    "acceptable_violations": [
+      "unexplained_gap"
+    ]
+  }
+]

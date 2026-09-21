@@ -486,6 +486,8 @@ class TurnAccumulators:
                     "name": sanitize_text(name, 120) if isinstance(name, str) else "",
                     "kind": kind,
                     "arguments": card.get("arguments", {}),
+                    "definition": dict(evidence),
+                    "unresolved_entities": card.get("unresolved_entities", {}),
                     "metadata": metadata,
                     "description": evidence.get("description", ""),
                     "data": list(metadata_data_digest(kind, metadata)),

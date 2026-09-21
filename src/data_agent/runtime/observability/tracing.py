@@ -671,6 +671,8 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "site",
     # `loop_answer_judge_called.tokens` — the judge call's own spend, telemetry only.
     "tokens",
+    "reviewed",
+    "outcome",
     # --- the finish-time answer rules (05 §L) ---
     # `loop_answer_rule_refused.rule` / `loop_answer_rule_exhausted.rule` — WHICH rule
     # the finishing prose tripped (`ungrounded_quantity`, `markdown_table`). A closed

@@ -67,6 +67,7 @@ from data_agent.runtime.composite.answer_with_table import (
 )
 from data_agent.runtime.composite.answer_with_text import TOOL_NAME as ANSWER_TEXT_TOOL_NAME
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
+from data_agent.runtime.composite.scope_refusal import scope_request_refused
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
     _REPEATED_IDEMPOTENT_READ_NUDGE,
@@ -135,7 +136,6 @@ from .answer_rules import (
     ANSWER_RULE_EXHAUSTED_EVENT,
     ANSWER_RULE_REFUSED_EVENT,
     first_match,
-    reported_figures,
 )
 from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
@@ -658,13 +658,6 @@ ANSWER_TABLE_EMPTY_DESIGNATION_EVENT = "loop_answer_table_empty_designation"
 # left the rejection WRITES unbounded).
 _MAX_SURPLUS_STATE_REJECTIONS = 2
 
-# How many of a turn's full results the figure-corroboration pass (09 §D.4) may read
-# back from the KV before giving up. A CAP, not a budget: the pass short-circuits on
-# the first match, so this only bounds the miss case — a long turn holding a dozen
-# results, where reading all of them would put a dozen store round-trips on the
-# terminal path to establish a fact that is optional by construction.
-_MAX_CORROBORATION_READS = 4
-
 
 class _NoLiveStateToForceError(Exception):
     """Raised from inside the force-block merge when the live state vanished between the
@@ -935,7 +928,7 @@ class AgentLoop:
         # would also approve everything, but it would still be an object on the
         # terminal path; `None` is the stronger statement and the cheaper one.
         answer_judge: AnswerJudge | None = None,
-        measurement_reviewer: Any = None,
+        judge_catalog: Any = None,
         # Seconds of wall clock a judge rejection needs to be worth making (09 §H).
         # Below this the judge is SKIPPED and the answer ships: a rejection issued at
         # 168s of a 180s window buys a regeneration the guard cuts off mid-round, and
@@ -996,7 +989,7 @@ class AgentLoop:
         # while K protects the D94 re-fetch/self-correct loop. Default 3.
         self._request_budget_pinned_recent_tool_pairs = request_budget_pinned_recent_tool_pairs
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
-        self._measurement_reviewer = measurement_reviewer
+        self._judge_catalog = judge_catalog
         self._answer_judge = answer_judge
         self._answer_judge_min_headroom_seconds = answer_judge_min_headroom_seconds
         self._preview_row_count = preview_row_count
@@ -1804,7 +1797,7 @@ class AgentLoop:
         separated from `_judge` so it can be answered BEFORE the brief is built.
 
         THE SEPARATION IS THE POINT, not a refactor. Building a brief costs a session
-        load plus up to `_MAX_CORROBORATION_READS` KV reads; doing that first and
+        load plus execution-metadata reads; doing that first and
         deciding afterwards put real store I/O on every terminal exit of every turn —
         INCLUDING with the feature switched off, which is the shipped default. Both
         halves of the cost have to sit behind the same test.
@@ -1883,29 +1876,13 @@ class AgentLoop:
         include_all_successful: bool = False,
         exclude_result_ids: frozenset[str] = frozenset(),
     ) -> tuple[tuple[Mapping[str, Any], ...], str | None, tuple[TrailEntry, ...]]:
-        """This turn's data-bearing results as the MODEL saw them, plus the date anchor —
-        the two brief fields that cannot be read off a window-local (09 §D).
+        """Read authorized evidence before rendering bounded previews for review.
 
-        SCOPE-FILTERED FIRST, RENDERED SECOND, and the order is the contract
-        `context/budget.py` states for the model-request path: `render_entry` has no
-        scope information of its own and performs no filtering, so handing it a raw
-        trail would put warehouse rows the caller is not entitled to in front of the
-        judge. `filter_trail` is called with `current_turn_index=None` — the
-        current-turn exemption exists to let the MODEL see its own denials and
-        self-correct, and a judge has nothing to self-correct; a `None`-provenance
-        entry is undetermined and must stay dropped.
-
-        `DATA_ANSWER_TOOLS` ONLY, successful ones. Those are the results the answer was
-        written FROM; a `getTableSchema` grounds the model, not the answer, and a wide
-        one is ~4k tokens of column documentation the judge has no criterion for. The
-        set is imported rather than re-spelled so it cannot drift from the answer-shape
-        gate's.
-
-        ⚠ ONE EXTRA `load_trail` PER JUDGED EXIT (issues-stack A3 already counts three
-        per window). It is paid ONLY when the judge is enabled AND reached a terminal
-        exit AND passed both skips — at most once per window — and the alternative is
-        threading a growing trail snapshot through `_run_loop_body` for a feature that
-        is off by default.
+        Scope-filter first, without the current-turn denial exemption. Unknown or
+        excluded provenance must not inform a judgment. Successful warehouse, Help
+        Center and prepared UI results are included; catalog documentation is added
+        separately by the post-execution evidence builder. The authorized trail is
+        returned for that builder so it does not need a second session read.
         """
         doc = await self._session_store.get_or_create_session(session_id)
         in_scope = [
@@ -1929,82 +1906,12 @@ class AgentLoop:
                 or entry.capability_terminal
             )
         )
-        # The IN-SCOPE entries ride along so `_corroborated_figures` can reuse this one
-        # read (issues-stack A3 counts three per window already) — it needs
-        # `result_full_ref`, which the rendered view deliberately does not carry.
-        #
-        # `in_scope`, NEVER `doc.tool_trail`. Corroboration only ever ADDS a `True`, so a
-        # raw-trail scan could not leak content — but it could derive that `True` from a
-        # result the scope filter dropped, i.e. state a fact about data the model's own
-        # context no longer holds. The judge would then weigh a figure against evidence
-        # neither it nor the model was entitled to see.
+        # Reuse this authorized trail to build the final evidence package.
         return (
             rendered,
             turn_date_anchor_day(doc.messages, turn_index),
             tuple(in_scope),
         )
-
-    async def _corroborated_figures(
-        self, session_id: str, turn_index: int, prose: str, trail: Sequence[TrailEntry]
-    ) -> bool | None:
-        """`True` when a figure the prose reports is FOUND in what this turn's queries
-        actually returned; `None` when nothing was established. **Never `False`.**
-
-        THIS IS 05 §L.7's ESCAPE HATCH, BUILT AS AN ESCAPE HATCH. That section works
-        through why corroboration cannot be a TRIGGER and the reasoning is unchanged: a
-        derived figure never matches literally ("rose 12% year over year"), rounding
-        breaks it (`9184` reported as "about 9,200"), and formatting diverges. Every one
-        of those produces a NON-match on a perfectly good answer.
-
-        So the absence of a match is not evidence and is never reported as any. A `False`
-        would be read by the judge as "this figure was looked for and is not in the
-        data", which is a finding the runtime cannot support and which would push it
-        toward `contradicts_result` on exactly the answers §L.7 lists. `True` is the only
-        thing this can honestly say, and it says it so a judge weighing a figure it
-        cannot verify from 20 preview rows has one fact it can trust.
-
-        IT READS `result_full`, the one place in this feature that does — and 09 §D.3's
-        rule survives it, because the judge never SEES the full result. It sees a
-        boolean derived from it. The full result is where a corroborating row lives when
-        the preview cap cut it, which is the entire reason for the read.
-
-        COSTS ONE `read_full_result` PER DATA CALL, capped, and short-circuits on the
-        first match. Skipped entirely when the prose reports no figure — most answers.
-        """
-        figures = reported_figures(prose)
-        if not figures:
-            return None
-        refs = [
-            entry.result_full_ref
-            for entry in trail
-            if entry.turn_index == turn_index
-            and entry.status == "ok"
-            and entry.tool_name in DATA_ANSWER_TOOLS
-            and entry.result_full_ref is not None
-        ][:_MAX_CORROBORATION_READS]
-        for ref in refs:
-            try:
-                full = await self._session_store.read_full_result(session_id, ref)
-            except Exception:
-                # DEGRADE-NEVER-FAIL, and here the degradation is already the honest
-                # answer: a failed read establishes nothing, which is what `None` means.
-                _logger.warning(
-                    "could not read a full result for figure corroboration "
-                    "(session=%s, turn=%d) — reporting 'not checked'",
-                    session_id,
-                    turn_index,
-                )
-                continue
-            if full is None:
-                continue
-            haystack = json.dumps(full, default=str)
-            # Digits-only on BOTH sides: a result cell serialises as `9184` while the
-            # prose writes `9,184`, and the separator is a presentation choice made on
-            # one side only.
-            stripped = haystack.replace(",", "")
-            if any(figure in stripped for figure in figures):
-                return True
-        return None
 
     def _judge_brief(
         self,
@@ -2019,7 +1926,6 @@ class AgentLoop:
         pending_options: tuple[str, ...] = (),
         results: tuple[Mapping[str, Any], ...] = (),
         designated_tables: tuple[tuple[str | None, str], ...] = (),
-        figure_corroborated: bool | None = None,
         ship_guard: JudgeShipGuard | None = None,
     ) -> JudgeBrief:
         """Assemble the judge's brief from what the loop already holds (09 §D.2).
@@ -2052,7 +1958,6 @@ class AgentLoop:
             results=results,
             draft=draft,
             designated_tables=designated_tables,
-            figure_corroborated=figure_corroborated,
             pending_question=pending_question,
             pending_options=pending_options,
             designated_tool_call_ids=tuple(
@@ -2306,7 +2211,7 @@ class AgentLoop:
                             pending_options=tuple(pending_question["options"] or ()),
                         )
                     ),
-                    timeout=getattr(self._answer_judge, "timeout_seconds", 20.0),
+                    timeout=getattr(self._answer_judge, "timeout_seconds", 30.0),
                 )
             except Exception:
                 verdict = APPROVED
@@ -3674,60 +3579,49 @@ class AgentLoop:
                         )
                         self._observer("loop_sql_repair_exhausted", {"tool_call_id": tool_call.id})
 
+                if gate_refusal is None and tool_call.name in {
+                    ANSWER_TABLE_TOOL_NAME,
+                    ANSWER_TEXT_TOOL_NAME,
+                }:
+                    scope_rule = first_match(
+                        clean_answer_text(call_args.get("answer")) or "",
+                        accum.sql_executed,
+                        question,
+                        has_alternative_evidence=bool(
+                            accum.capability_cards
+                            or accum.has_answer_tables
+                            or successful_text_evidence_tools
+                        ),
+                    )
+                    if (
+                        scope_rule
+                        and scope_rule.name == "out_of_scope_request"
+                        and await finalization_gate.may_refuse(scope_rule.charges_to)
+                    ):
+                        gate_refusal = scope_request_refused(
+                            tool_call.name, self._observer, site="answer_scope_rule"
+                        )
+
                 if gate_refusal is None:
                     loop_safety.record_attempt(tool_call.name)
-                measurement_review = None
-                if gate_refusal is None and tool_call.name in {"runQuery", "runBlueprint"}:
-                    definition = dict(call_args)
-                    if self._measurement_reviewer is not None:
-                        from .measurement import catalog_evidence, execution_review_scope
+                if gate_refusal is None and tool_call.name == "runQuery":
+                    from .measurement import validate_join_cardinality
 
-                        schema_evidence = catalog_evidence(canonical_messages)
-                        measurement_review = await self._measurement_reviewer.review(
-                            question,
-                            definition,
-                            schema_evidence,
-                            review_scope=execution_review_scope(
-                                canonical_messages,
-                                analysis_state,
-                                (*serves_intents, serves_intent),
-                                turn_index,
-                            ),
+                    detail = await validate_join_cardinality(
+                        call_args.get("sql", ""), self._tool_dispatcher, credentials
+                    )
+                    if detail:
+                        gate_refusal = ToolResult(
+                            status="error",
+                            tool_name=tool_call.name,
+                            error_code="AGGREGATION_RISK",
+                            retryable=True,
+                            user_message=detail,
+                            denial_detail=detail,
+                            provenance=frozenset(),
+                            result_preview=None,
+                            result_full=None,
                         )
-                        if not measurement_review.get("approved"):
-                            detail = (
-                                measurement_review.get("feedback")
-                                or "The proposed measurement does not match the requested outcome."
-                            )
-                            gate_refusal = ToolResult(
-                                status="error",
-                                tool_name=tool_call.name,
-                                error_code="MEASUREMENT_MISMATCH",
-                                retryable=True,
-                                user_message=detail,
-                                denial_detail=detail,
-                                provenance=frozenset(),
-                                result_preview=None,
-                                result_full=None,
-                            )
-                    if gate_refusal is None and tool_call.name == "runQuery":
-                        from .measurement import validate_join_cardinality
-
-                        detail = await validate_join_cardinality(
-                            call_args.get("sql", ""), self._tool_dispatcher, credentials
-                        )
-                        if detail:
-                            gate_refusal = ToolResult(
-                                status="error",
-                                tool_name=tool_call.name,
-                                error_code="AGGREGATION_RISK",
-                                retryable=True,
-                                user_message=detail,
-                                denial_detail=detail,
-                                provenance=frozenset(),
-                                result_preview=None,
-                                result_full=None,
-                            )
                 # A gated call does not run. Otherwise summarize before its start event.
                 if gate_refusal is None and tool_call.name not in {
                     ANSWER_TABLE_TOOL_NAME,
@@ -3926,15 +3820,6 @@ class AgentLoop:
                         serves_intents=serves_intents,
                     )
                 tool_calls_made += 1
-                if measurement_review and isinstance(tool_result.result_full, dict):
-                    tool_result = replace(
-                        tool_result,
-                        result_full={
-                            **tool_result.result_full,
-                            "measurement_review": measurement_review,
-                        },
-                    )
-
                 result_full_ref: str | None = None
                 # Final-answer arguments contain derived prose. Give their trail
                 # entries the same evidence scope as the persisted answer, rather
@@ -3957,7 +3842,6 @@ class AgentLoop:
                     tool_name=tool_call.name,
                     args=dict(call_args),
                     model_response=model_response,
-                    measurement_review=measurement_review,
                     serves_intents=serves_intents,
                     status=tool_result.status,
                     error_code=tool_result.error_code,
@@ -4609,9 +4493,6 @@ class AgentLoop:
                                 analysis_state=analysis_state,
                                 date_anchor=anchor,
                                 draft=final_text,
-                                figure_corroborated=await self._corroborated_figures(
-                                    session_id, turn_index, final_text, in_scope
-                                ),
                                 results=results,
                                 ship_guard=ship_guard,
                                 designated_tables=tuple(
@@ -4622,6 +4503,7 @@ class AgentLoop:
                                 brief,
                                 deliverables=tuple(deliverables),
                                 selected_components=tuple(component_catalog),
+                                referenced_result_ids=tuple(proposal_args.get("evidence", ())),
                                 capability_presented=tuple(
                                     {
                                         **card,
@@ -4645,11 +4527,30 @@ class AgentLoop:
                                     if isinstance(t, dict) and isinstance(t.get("result_id"), str)
                                 ),
                             )
+                            from .judge_evidence import enrich_brief
+
+                            brief = await enrich_brief(
+                                brief,
+                                trail=in_scope,
+                                turn_index=turn_index,
+                                session_id=session_id,
+                                store=self._session_store,
+                                catalog_provider=self._judge_catalog,
+                                credentials=credentials,
+                                analysis_state=analysis_state,
+                            )
                             brief_ready = True
                             verdict = await asyncio.wait_for(
                                 self._answer_judge.review(brief),
-                                timeout=min(
-                                    remaining, getattr(self._answer_judge, "timeout_seconds", 20.0)
+                                # The real judge owns its 30s timeout and records the
+                                # outcome. The outer bound is only the turn deadline.
+                                timeout=(
+                                    remaining
+                                    if isinstance(self._answer_judge, AnswerJudge)
+                                    else min(
+                                        remaining,
+                                        getattr(self._answer_judge, "timeout_seconds", 30.0),
+                                    )
                                 ),
                             )
                         except Exception as exc:

@@ -88,7 +88,12 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         if bp.id not in department_seeds:
             continue
         # result_grain round-trips as a JSON list; sql_template stored verbatim.
-        assert json.loads(props["result_grain_json"]) == ["Department"]
+        expected_grain = (
+            ["department_code"]
+            if bp.id == "bp-active-headcount-by-department"
+            else ["Department"]
+        )
+        assert json.loads(props["result_grain_json"]) == expected_grain
         # Single-node seeds carry a top-level {department}-parameterized template;
         # the Slice-C multi-node seed stores its SQL per-node in composes instead.
         if bp.sql_template is not None:

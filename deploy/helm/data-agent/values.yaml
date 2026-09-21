@@ -147,7 +147,7 @@ config:
   # -- Per-call timeout for the judge (seconds). On timeout the answer is
   #    APPROVED and shipped: the judge may only ever ADD a round-trip on positive
   #    evidence, never withhold an answer because it could not be reached.
-  ANSWER_JUDGE_TIMEOUT_SECONDS: "20"
+  ANSWER_JUDGE_TIMEOUT_SECONDS: "30"
   # -- Wall-clock seconds that must REMAIN in the budget window for the judge to
   #    run at all (09 §H). Below this it is skipped and the answer ships. A
   #    rejection issued near the cap buys a regeneration the budget guard cuts off

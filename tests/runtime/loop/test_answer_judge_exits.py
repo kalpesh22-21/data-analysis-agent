@@ -216,7 +216,7 @@ async def test_a_disabled_judge_does_no_store_io_at_a_terminal_exit() -> None:
     model = ScriptedModelClient(
         [
             ModelTurnResult(tool_calls=[_query("q1")]),
-            # A 3-digit figure, so corroboration WOULD run if it were reached.
+            # A numerical claim must still be supported by the supplied evidence.
             final_answer(assistant_text="There are 412 active employees."),
         ]
     )
@@ -570,10 +570,10 @@ async def test_the_brief_previews_are_capped_exactly_as_the_models_are() -> None
     assert len(entry["result_preview"]["preview_rows"]) == 20
 
 
-# --- corroboration (09 §D.4) -------------------------------------------------
+# --- numerical claims remain the judge's responsibility -------------------------------------------------
 
 
-async def test_a_figure_present_in_the_full_result_is_reported_as_corroborated() -> None:
+async def test_a_matching_number_does_not_create_a_global_verification_flag() -> None:
     judge = _ScriptedJudge()
     loop, _store, _ev, _model = _build(
         [
@@ -587,7 +587,7 @@ async def test_a_figure_present_in_the_full_result_is_reported_as_corroborated()
         session_id=SESSION_ID, credentials=_credentials(), user_message="largest department?"
     )
     (brief,) = judge.briefs
-    assert brief.figure_corroborated is True
+    assert "figures_found_in_results" not in brief.payload()
 
 
 async def test_a_figure_absent_from_the_results_is_not_reported_as_false() -> None:
@@ -605,8 +605,7 @@ async def test_a_figure_absent_from_the_results_is_not_reported_as_false() -> No
     )
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="growth?")
     (brief,) = judge.briefs
-    assert brief.figure_corroborated is None
-    assert brief.figure_corroborated is not False
+    assert "figures_found_in_results" not in brief.payload()
 
 
 async def test_prose_with_no_figure_is_not_checked_at_all() -> None:
@@ -621,7 +620,7 @@ async def test_prose_with_no_figure_is_not_checked_at_all() -> None:
     )
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="anyone?")
     (brief,) = judge.briefs
-    assert brief.figure_corroborated is None
+    assert "figures_found_in_results" not in brief.payload()
 
 
 # --- exit #2 -----------------------------------------------------------------

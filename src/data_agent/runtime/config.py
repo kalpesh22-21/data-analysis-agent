@@ -339,10 +339,6 @@ class RuntimeSettings(BaseSettings):
 
     # --- OpenAI model provider (D71) ---
     openai_api_key: str = Field("", description="OpenAI API key (secret).")
-    measurement_review_enabled: bool = Field(
-        True,
-        description="Review measurement meaning before warehouse execution when a model endpoint is configured.",
-    )
     use_reasoning_metadata: bool = Field(
         False, description="Preserve provider reasoning metadata in internal conversation history."
     )
@@ -476,11 +472,11 @@ class RuntimeSettings(BaseSettings):
         ),
     )
     answer_judge_timeout_seconds: float = Field(
-        20.0,
+        30.0,
         gt=0,
         description=(
-            "Per-call timeout for the judge. On timeout the answer is APPROVED and "
-            "shipped (fail-open) — the judge may only ever ADD a round-trip on positive "
+            "Per-call timeout for the judge. Unavailable review fails open for otherwise valid "
+            "answers but cannot clear a prior rejection. The judge adds a repair on positive "
             "evidence, never withhold an answer because it could not be reached. Sized "
             "against the wall-clock window rather than against typical latency: a judge "
             "still running at this point has already eaten the headroom a rejection "

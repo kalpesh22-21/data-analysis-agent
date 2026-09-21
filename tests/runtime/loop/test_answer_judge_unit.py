@@ -386,20 +386,6 @@ def test_a_brief_that_fits_is_passed_through_untouched() -> None:
     assert payload["results"][0]["result_preview"]["truncated"] is False
 
 
-def test_figure_corroborated_is_three_valued() -> None:
-    """`None` means NOT CHECKED — no figure in the prose, no `result_full_ref`, or a failed
-    read. Collapsing it into `False` asserts a figure was looked for and not found, which is
-    a fabricated finding the judge would then act on."""
-    import json
-
-    judge = AnswerJudge(model_client=ScriptedModelClient([]), token_budget=_ROOMY)
-    absent = json.loads(judge.messages_for(_brief())[1]["content"])
-    assert "figures_found_in_results" not in absent
-    for value in (True, False):
-        payload = json.loads(judge.messages_for(_brief(figure_corroborated=value))[1]["content"])
-        assert payload["figures_found_in_results"] is value
-
-
 # --- AnswerJudge.review -----------------------------------------------------
 
 
@@ -432,7 +418,9 @@ async def test_review_returns_a_valid_rejection() -> None:
     assert verdict.approved is False
     assert verdict.violation == "unrecorded_assumption"
     called = [p for e, p in events if e == "loop_answer_judge_called"]
-    assert called == [{"site": "exit_prose", "tokens": 3120}]
+    assert called == [
+        {"site": "exit_prose", "tokens": 3120, "reviewed": True, "outcome": "rejected"}
+    ]
 
 
 @pytest.mark.asyncio

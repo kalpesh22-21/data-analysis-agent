@@ -688,7 +688,6 @@ async def test_capability_registry_is_reloaded_on_http_resume(monkeypatch, avail
             openai_api_key="",
             capability_tools_enabled=True,
             capability_prefetch_enabled=False,
-            measurement_review_enabled=False,
             otlp_endpoint="",
         ),
         session_store=store,
@@ -829,36 +828,6 @@ async def test_discovery_unavailable_allows_honest_subsequent_sql_fallback():
     )
 
 
-async def test_measurement_review_is_about_one_execution_not_whole_answer():
-    from data_agent.runtime.loop.measurement import MeasurementReviewer
-
-    model = ScriptedModelClient(
-        [
-            batch(
-                call(
-                    "record_measurement_review",
-                    "r",
-                    request_alignment="matches_requested_part",
-                    findings=[],
-                    contract={
-                        "metric": "headcount",
-                        "population": "Sales",
-                        "period": "current",
-                        "units": "people",
-                        "grain": "department",
-                        "join_cardinality": "none",
-                    },
-                )
-            )
-        ]
-    )
-    result = await MeasurementReviewer(model).review(
-        "Sales and Engineering counts", {"department": "Sales"}, []
-    )
-    assert result["approved"] and result["reviewed"]
-    assert "Whole-answer coverage" in model.calls[0].messages[0]["content"]
-
-
 async def test_raw_result_reference_reconstructs_same_query_in_history():
     from data_agent.runtime.session_history import project_history
 
@@ -958,35 +927,6 @@ def test_semi_join_is_a_valid_cardinality_preserving_repair():
         )
         == []
     )
-
-
-def test_measurement_input_does_not_reuse_previous_refusals_as_catalog():
-    from data_agent.runtime.loop.measurement import catalog_evidence
-
-    messages = [
-        {
-            "role": "tool",
-            "content": json.dumps(
-                {
-                    "tool_name": "getBlueprint",
-                    "status": "ok",
-                    "result_preview": {"definition": "valid"},
-                }
-            ),
-        },
-        {
-            "role": "tool",
-            "content": json.dumps(
-                {
-                    "tool_name": "runBlueprint",
-                    "status": "error",
-                    "user_message": "Wrong previous feedback",
-                }
-            ),
-        },
-    ]
-    evidence = catalog_evidence(messages)
-    assert len(evidence) == 1 and evidence[0]["tool_name"] == "getBlueprint"
 
 
 async def test_discovery_streak_prompts_delivery_without_discarding_evidence():

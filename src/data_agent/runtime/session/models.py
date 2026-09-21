@@ -322,7 +322,9 @@ INTENT_STATUSES = frozenset({"pending", "completed", "blocked"})
 # review — they are `retryable=True` in `denial_mapping.py` (the codebase's own
 # "the model got the name wrong" bucket) and `TABLE_NOT_FOUND` is also how a
 # column-scope denial surfaces from `sampleRows`.
-MODEL_REASON_CODES = frozenset({"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED"})
+MODEL_REASON_CODES = frozenset(
+    {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED", "OUT_OF_SCOPE_REQUEST"}
+)
 # Written ONLY by the runtime's forced-block paths (05 §F), never by the model.
 # `ENFORCEMENT_EXHAUSTED` means "enforcement could not establish a disposition" —
 # NOT that the system proved the intent impossible.

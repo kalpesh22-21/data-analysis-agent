@@ -113,10 +113,6 @@ async def test_omitted_results_cannot_corroborate_the_repaired_answer():
     )
     assert rendered == ()
     assert usable == ()
-    assert (
-        await loop._corroborated_figures(CREDS.session_id, 0, "There are 9,184 people.", usable)
-        is None
-    )
 
 
 @pytest.mark.parametrize("code", ["TOOL_NOT_EXECUTED", "INVALID_TOOL_ARGUMENTS"])

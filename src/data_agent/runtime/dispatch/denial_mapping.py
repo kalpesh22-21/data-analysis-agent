@@ -123,6 +123,8 @@ BLUEPRINT_NOT_SEARCHED_MESSAGE = (
     "fits or the corpus is unavailable, re-issue runQuery and it will proceed."
 )
 
+OUT_OF_SCOPE_REQUEST_CODE = "OUT_OF_SCOPE_REQUEST"
+
 _DENIAL_TABLE: dict[str, DenialInfo] = {
     "RESULT_TOO_LARGE": DenialInfo(
         code="RESULT_TOO_LARGE", retryable=True, kind=DenialKind.GATE,
@@ -133,6 +135,12 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         user_message="The data service returned an unsupported response encoding. Its response could not be read safely.",
     ),
 
+    OUT_OF_SCOPE_REQUEST_CODE: DenialInfo(
+        code=OUT_OF_SCOPE_REQUEST_CODE,
+        retryable=True,
+        kind=DenialKind.GATE,
+        user_message="That request is outside HR, payroll, and product-usage scope. I can help with those topics instead.",
+    ),
     UNKNOWN_TOOL_CODE: DenialInfo(
         code=UNKNOWN_TOOL_CODE,
         retryable=True,

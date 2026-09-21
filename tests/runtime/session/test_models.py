@@ -374,7 +374,7 @@ def test_the_reason_code_split_is_structural() -> None:
     """03 §A.3: a comment would let the validator drift toward accepting runtime
     codes from the model. These are separate frozensets, and disjoint."""
     assert MODEL_REASON_CODES == frozenset(
-        {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED"}
+        {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED", "OUT_OF_SCOPE_REQUEST"}
     )
     assert RUNTIME_REASON_CODES == frozenset(
         {"BUDGET_EXHAUSTED", "USER_STOPPED", "ENFORCEMENT_EXHAUSTED"}

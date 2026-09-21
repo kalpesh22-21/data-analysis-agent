@@ -54,7 +54,7 @@ config:
   # spend have been accepted for this environment.
   ANSWER_JUDGE_ENABLED: "false"
   ANSWER_JUDGE_MODEL: ""
-  ANSWER_JUDGE_TIMEOUT_SECONDS: "20"
+  ANSWER_JUDGE_TIMEOUT_SECONDS: "30"
   ANSWER_JUDGE_MIN_HEADROOM_SECONDS: "25"
 
   # Help Center is invisible to the agent while disabled. Set both endpoints

@@ -175,6 +175,10 @@ async def test_the_judge_opens_a_chain_span_carrying_shape_only() -> None:
     assert attributes["approved"] is False
     assert attributes["violation"] == "unrecorded_assumption"
     assert attributes["tokens"] == 1234
+    assert attributes["outcome"] == "rejected"
+    assert attributes["reviewed"] is True
+    assert attributes["duration_ms"] >= 0
+    assert attributes["model"] == "unknown"
 
     dumped = _all_attribute_text(exporter)
     assert SECRET_FEEDBACK not in dumped, "the judge's own prose must never be exported"

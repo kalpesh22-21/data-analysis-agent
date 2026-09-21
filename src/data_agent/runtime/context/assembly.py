@@ -705,6 +705,7 @@ def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:
 # requires to contain the full state, descriptions included.
 _STALE_CROSS_TURN_TOOLS = frozenset(
     {
+        "declineOutOfScope",
         "recordAssumptions",
         "updateAnalysisState",
         "answerWithText",
@@ -726,6 +727,7 @@ _STALE_CROSS_TURN_TOOLS = frozenset(
 # two sets — do not add a third predicate.
 _STALE_CROSS_TURN_ERROR_CODES = frozenset(
     {
+        "OUT_OF_SCOPE_REQUEST",
         FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
         # The FOURTH instance, and the set was extended rather than a third
         # predicate added, exactly as the paragraph above instructs. The

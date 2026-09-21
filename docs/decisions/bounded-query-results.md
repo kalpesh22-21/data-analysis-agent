@@ -78,3 +78,11 @@ service was redeployed by this task.
   source/receive safeguards above are the implemented prerequisite; storing
   arbitrarily large results was not approved.
 - Improvements #4–#7 remain to be discussed/finalized in sequence.
+
+### 2026-09-20 follow-up
+
+The agreed post-execution judge and catalog-evidence work is now implemented; see
+[Single post-execution semantic review](post-execution-judge.md). The separate
+pre-execution model reviewer and global numeric-substring flag were removed. No
+per-number verification subsystem was added. These changes do not relax either
+result-size safeguard above.

@@ -53,27 +53,43 @@
     GROUP BY e.department_name
 
 - id: bp-active-headcount-by-department
-  intent: Active employee headcount by department
+  intent: Active employee headcount by department, including departments with no active employees
   slots_summary: department
   status: validated
   drift_status: clean
-  catalog_sha: ""
+  catalog_sha: ''
   uses:
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.department_name
-    - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_code
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.department.department_code
+  - dbpcm_warehouse.department.department_name
   slots:
-    - { name: department, type: string, required: false, binds_to: dbpcm_warehouse.employee.department_name, optional_pattern: 'TRUE' }
+  # Omitting `department` includes all accessible departments, including zero counts.
+  # Apply the optional name filter to the directory, not to joined employee rows.
+  - name: department
+    type: string
+    required: false
+    binds_to: dbpcm_warehouse.department.department_name
+    optional_pattern: 'TRUE'
   uses_rules:
-    - active_employee
-  result_grain: [ Department ]
+  - active_employee
+  result_grain:
+  - department_code
   sql_template: |
-    SELECT department_name AS department, COUNT(DISTINCT employee_code) AS headcount
-    FROM dbpcm_warehouse.employee
-    WHERE employee_status = 'A' AND department_name = {department}
-    GROUP BY department_name
-    ORDER BY headcount
-
+    SELECT
+        d.department_code AS department_code,
+        d.department_name AS department,
+        coalesce(e.active_count, 0) AS headcount
+    FROM dbpcm_warehouse.department AS d
+    LEFT JOIN (
+        SELECT department_code, uniqExact(employee_code) AS active_count
+        FROM dbpcm_warehouse.employee
+        WHERE employee_status = 'A'
+        GROUP BY department_code
+    ) AS e ON d.department_code = e.department_code
+    WHERE d.department_name = {department}
+    ORDER BY headcount, department, department_code
 - id: bp-average-salary-by-department
   intent: Average annual salary by department
   slots_summary: department
