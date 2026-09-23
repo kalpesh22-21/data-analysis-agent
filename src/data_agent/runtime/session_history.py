@@ -213,6 +213,16 @@ def project_history(
                 "turn_index": turn_index,
                 "question": questions[turn_index],
                 "answer": assistant.content if assistant is not None else None,
+                **(
+                    {"review": assistant.review}
+                    if assistant and assistant.review is not None
+                    else {}
+                ),
+                **(
+                    {"failure": assistant.failure}
+                    if assistant and assistant.failure is not None
+                    else {}
+                ),
                 "provenance_union": (
                     _project_provenance(assistant.provenance) if assistant is not None else None
                 ),

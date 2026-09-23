@@ -226,6 +226,8 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
         # ignores the unknown key.
         "assumptions": outcome.assumptions,
         "capability_cards": outcome.capability_cards,
+        **({"review": outcome.review} if outcome.review is not None else {}),
+        **({"failure": outcome.failure} if outcome.failure is not None else {}),
     }
 
 

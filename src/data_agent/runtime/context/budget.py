@@ -48,6 +48,18 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     preview: dict[str, Any] | None = None
     if entry.result_preview is not None:
         rows = entry.result_preview.preview_rows[:preview_row_count]
+        if entry.capability_terminal:
+            from data_agent.runtime.capabilities.preview import capability_preview
+
+            rows = [
+                [
+                    capability_preview(value)
+                    if isinstance(value, dict) and "metadata" in value
+                    else value
+                    for value in row
+                ]
+                for row in rows
+            ]
         preview = {
             "columns": entry.result_preview.columns,
             "row_count": entry.result_preview.row_count,

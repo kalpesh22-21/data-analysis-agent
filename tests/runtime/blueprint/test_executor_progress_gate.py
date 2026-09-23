@@ -248,3 +248,26 @@ async def test_the_outer_run_blueprint_dispatch_still_shows_progress() -> None:
 
     assert observer.names == ["tool_dispatch_start", "tool_dispatch_ok"]
     assert [to_progress_event(name, payload) for name, payload in observer.events] != [None, None]
+
+
+async def test_join_cardinality_probes_also_suppress_inner_progress():
+    detail = _detail(
+        sql_template=(
+            "SELECT e.Department AS department, avg(e.AnnualSalary) AS avg_salary "
+            "FROM dbpcm_warehouse.employee e JOIN dbpcm_warehouse.employee d "
+            "ON e.EmployeeCode = d.EmployeeCode GROUP BY e.Department"
+        ),
+        result_grain=["department"],
+    )
+    dispatcher = _StubDispatcher(
+        [
+            _rq(["n", "d"], [[2, 2]]),
+            _rq(["department", "avg_salary"], [["Sales", 55000.0]]),
+            _rq(["__bp_n", "__bp_d"], [[1, 1]]),
+        ]
+    )
+    executor = BlueprintExecutor(tool_dispatcher=dispatcher, vector_index=_index(detail))
+    outcome = await executor.execute(blueprint_id=detail.id, slot_bindings={}, credentials=_creds())
+    assert isinstance(outcome, ExecCompleted)
+    assert len(dispatcher.dispatches) == 3
+    assert all(not enabled for _, enabled in dispatcher.dispatches)

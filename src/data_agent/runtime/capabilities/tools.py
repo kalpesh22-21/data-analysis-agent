@@ -24,6 +24,7 @@ from .client import (
 )
 from .digest import definition_data_digest, presentation_label
 from .hydrate_trace import record_hydrate_event
+from .preview import capability_preview
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -56,7 +57,9 @@ def _ok(name: str, value: dict[str, Any], *, terminal: bool = False) -> ToolResu
         retryable=None,
         user_message=None,
         provenance=frozenset(),
-        result_preview=_build_preview(value, 20, 4_000),
+        result_preview=_build_preview(
+            capability_preview(value) if value.get("prepared") else value, 20, 4_000
+        ),
         result_full=value,
         terminal=terminal,
     )

@@ -507,7 +507,7 @@ def test_malformed_persisted_disposition_cannot_crash_history_decode():
 
 
 @pytest.mark.parametrize(
-    "violation,keeps_table", [("contradicts_result", True), ("capability_intent_mismatch", False)]
+    "violation,keeps_table", [("contradicts_result", False), ("capability_intent_mismatch", False)]
 )
 async def test_table_ship_guard_and_history_agree(violation, keeps_table):
     judge = Judge([JudgeVerdict(False, violation, "The answer needs a correction.", reviewed=True)])
@@ -763,7 +763,7 @@ def test_resumed_cards_retain_judge_kind_without_exposing_internal_evidence():
 @pytest.mark.parametrize(
     "verdict,visible",
     [
-        (APPROVED, False),
+        (APPROVED, True),
         (replace(APPROVED, reviewed=True), True),
         (
             JudgeVerdict(
@@ -773,9 +773,7 @@ def test_resumed_cards_retain_judge_kind_without_exposing_internal_evidence():
         ),
     ],
 )
-async def test_data_widget_needs_actual_approval_even_when_a_hedge_would_keep_navigation(
-    verdict, visible
-):
+async def test_data_widget_opens_on_no_verdict_but_preserves_explicit_refusal(verdict, visible):
     judge = Judge([verdict])
     script = [turn(call("show_profile", "c1")), finalize_options("show_profile", ident="a1")]
     if not verdict.approved:

@@ -276,3 +276,89 @@ async def test_no_summarizer_means_no_summary_events_and_no_calls() -> None:
     assert outcome.status == "done"
     assert "tool_dispatch_start" in [e for e, _ in events]
     assert "tool_progress_summary" not in [e for e, _ in events]
+
+
+@pytest.mark.parametrize("tool_name", ["answerWithText", "answerWithTable", "finalizeAnswer"])
+@pytest.mark.parametrize(
+    "event",
+    ["tool_dispatch_start", "tool_dispatch_ok", "tool_dispatch_error", "tool_progress_summary"],
+)
+def test_finalization_progress_requires_explicit_judge_approval(tool_name, event):
+    payload = {"tool_name": tool_name, "tool_call_id": "answer", "summary": "Preparing the answer"}
+    assert to_progress_event(event, payload) is None
+    assert to_progress_event(event, {**payload, "judge_approved": True}) is not None
+
+
+@pytest.mark.parametrize("review", ["approved", "unavailable", "disabled", "repair", "rejected"])
+async def test_finalization_summary_and_progress_follow_review(review):
+    from data_agent.runtime.loop.answer_judge import JudgeVerdict
+    from tests.runtime.test_harness_improvements import (
+        Judge,
+        batch,
+        build,
+        discovery,
+        finish,
+        query,
+        run,
+    )
+
+    events = []
+
+    class RecordingJudge(Judge):
+        async def review(self, brief):
+            events.append(("review", {}))
+            return await super().review(brief)
+
+    verdicts = {
+        "approved": [JudgeVerdict(True, reviewed=True)],
+        "unavailable": [JudgeVerdict(True)],
+        "repair": [
+            JudgeVerdict(
+                False,
+                "contradicts_result",
+                "Correct the explanation.",
+                reviewed=True,
+                repair_type="prose",
+            ),
+            JudgeVerdict(True, reviewed=True),
+        ],
+    }
+    verdicts["rejected"] = [verdicts["repair"][0]] * 2
+    judge = None if review == "disabled" else RecordingJudge(verdicts[review])
+    steps = [discovery(), query(), batch(finish())]
+    if review in {"repair", "rejected"}:
+        steps.append(batch(finish()))
+    loop, _, _, _, _ = build(steps, judge=judge)
+    loop._observer = lambda e, p: events.append((e, p))
+    # Observe actual staging events as well as the loop's approved events.
+    for tool in loop._runtime_tools.values():
+        if hasattr(tool, "_observer"):
+            tool._observer = loop._observer
+    summarizer = _FakeSummarizer(line="Preparing the answer")
+    loop._progress_summarizer = summarizer
+    result = await run(loop)
+    assert result.status == "done"
+    visible = [
+        (e, p)
+        for e, p in events
+        if to_progress_event(e, p)
+        and p.get("tool_name") in {"answerWithText", "answerWithTable", "finalizeAnswer"}
+    ]
+    final_summaries = [
+        name
+        for name, _ in summarizer.calls
+        if name in {"answerWithText", "answerWithTable", "finalizeAnswer"}
+    ]
+    if review in {"approved", "repair"}:
+        assert [e for e, _ in visible] == [
+            "tool_progress_summary",
+            "tool_dispatch_start",
+            "tool_dispatch_ok",
+        ]
+        assert final_summaries == ["finalizeAnswer"]
+        assert all(p["judge_approved"] for _, p in visible)
+        last_review = max(i for i, (e, _) in enumerate(events) if e == "review")
+        assert all(i > last_review for i, (_, p) in enumerate(events) if p.get("judge_approved"))
+    else:
+        assert visible == []
+        assert final_summaries == []

@@ -150,7 +150,7 @@ def build_real_app():
         "yes",
         "on",
     )
-    answer_judge_on = os.environ.get("ANSWER_JUDGE_ENABLED", "").strip().lower() in (
+    answer_judge_on = os.environ.get("ANSWER_JUDGE_ENABLED", "true").strip().lower() in (
         "1",
         "true",
         "yes",

@@ -128,6 +128,10 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
     Returns `None` for observer events that have no user-facing progress label; callers
     simply drop those.
     """
+    # Answer tools stage proposals; their dispatch success is not judge approval.
+    if payload.get("tool_name") in {"answerWithText", "answerWithTable", "finalizeAnswer"}:
+        if payload.get("judge_approved") is not True:
+            return None
     if event == _PROGRESS_SUMMARY_EVENT:
         # Value-rich, LLM-authored line → straight into `step` (verbatim, never
         # templated so a `{` in the text cannot raise). D25-relaxed channel; see

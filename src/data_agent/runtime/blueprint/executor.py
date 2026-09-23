@@ -620,7 +620,7 @@ class BlueprintExecutor:
             from data_agent.runtime.loop.measurement import validate_join_cardinality
 
             aggregation_error = await validate_join_cardinality(
-                node_sql, self._tool_dispatcher, credentials
+                node_sql, self._tool_dispatcher, credentials, emit_progress=False
             )
             if aggregation_error:
                 return ExecFailed("AGGREGATION_RISK", aggregation_error, retryable=True)

@@ -9,7 +9,10 @@ _PREFIX = "capability.hydrate."
 
 
 def hydrate_response_attributes(card: dict[str, Any] | None) -> dict[str, Any]:
-    facts: dict[str, Any] = {"status": "ok" if card is not None else "not_found"}
+    facts: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "ok" if card is not None else "not_found",
+    }
     if card is not None:
         metadata = card.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
@@ -17,7 +20,7 @@ def hydrate_response_attributes(card: dict[str, Any] | None) -> dict[str, Any]:
             value = card.get(key)
             facts[key + "_count"] = len(value) if isinstance(value, (list, dict)) else -1
         for key in ("gql", "preamble_url", "ui_parameters", "widgetName"):
-            facts["has_" + key] = key in metadata
+            facts["has_" + ("widget_name" if key == "widgetName" else key)] = key in metadata
         arguments = card.get("arguments")
         if isinstance(arguments, dict) and isinstance(
             arguments.get("has_unresolved_entities"), bool

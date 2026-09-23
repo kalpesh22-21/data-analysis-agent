@@ -67,12 +67,16 @@ class TurnMessage:
 
     ship_disposition: str | None = None
     retained_assumption_count: int | None = None
+    review: dict[str, Any] | None = None
+    failure: dict[str, Any] | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
             "turn_index": self.turn_index,
             "role": self.role,
             "content": self.content,
+            **({"review": self.review} if self.review is not None else {}),
+            **({"failure": self.failure} if self.failure is not None else {}),
             "ts": self.ts,
             "provenance": _provenance_to_doc(self.provenance),
             **(
@@ -91,6 +95,8 @@ class TurnMessage:
             turn_index=int(doc["turn_index"]),
             role=doc["role"],
             content=doc["content"],
+            review=doc.get("review"),
+            failure=doc.get("failure"),
             ts=doc["ts"],
             provenance=_provenance_from_doc(doc.get("provenance")),
             ship_disposition=doc.get("ship_disposition")

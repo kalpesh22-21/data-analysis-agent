@@ -281,22 +281,15 @@ async def test_the_stop_exit_still_emits_nothing_and_makes_no_extra_round_trip()
     assert [name for name, _p in events[before:]] == []
 
 
-async def test_the_rebuild_does_not_persist_a_second_assistant_message() -> None:
-    """The stop exit does not route through `_finish` and must not start: it appends
-    NO assistant `TurnMessage`, so the rebuilt table is a live-outcome enrichment
-    only and history is left to reconstruct itself from the same trail.
-
-    Pinned because the natural way to "make stop match continue" is to reach for the
-    shared finisher, which persists — and a persisted canned "Stopping here" line
-    would then replay into every later turn's model context.
-    """
+async def test_stop_persists_the_reviewed_terminal_message() -> None:
+    """The common finisher records the delivered stop outcome for history parity."""
     loop, store, _events = _build([_designating_round(), _probe_round("q1")])
     await _pause_at_the_budget_cap_with_a_designated_table(loop)
 
     await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     doc = await store.get_or_create_session(SESSION_ID)
-    assert [m.role for m in doc.messages] == ["user", "user", "user"], (
+    assert [m.role for m in doc.messages] == ["user", "user", "user", "assistant"], (
         "the question and the two resume answers ('EMEA', 'stop') — the resume "
         "consumes a checkpoint by appending the answer as a user message — and NO "
         "assistant message"

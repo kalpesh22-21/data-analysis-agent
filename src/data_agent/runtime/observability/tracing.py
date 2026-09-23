@@ -549,6 +549,10 @@ def recall_span(
 # and it is never placed on any of these payloads in the first place, so this list
 # is the second of two independent guards, not the only one.
 _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
+    "dependency",
+    "retryable",
+    "calls",
+    "status",
     "old_id",
     "new_id",
     "serving_tool_call_id",

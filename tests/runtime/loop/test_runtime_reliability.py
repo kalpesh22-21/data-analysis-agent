@@ -92,7 +92,7 @@ async def test_timeout_is_capped_by_remaining_window():
     assert 0 < payload["limit"] <= 0.03
 
 
-async def test_timeout_retains_selected_table_after_prose_refusal():
+async def test_timeout_withholds_selected_table_after_unresolved_refusal():
     loop, store, *_ = hanging_loop(
         [
             discovery(),
@@ -112,7 +112,7 @@ async def test_timeout_retains_selected_table_after_prose_refusal():
     loop._answer_judge = Judge([JudgeVerdict(False, "contradicts_result", "Use 120.", True)])
     out = await run(loop)
     assert MODEL_CALL_TIMEOUT_TEXT in out.assistant_text
-    assert out.answer_tables and len(out.answer_tables) == 1
+    assert out.answer_tables is None
     assert "999" not in out.assistant_text
     doc = await store.get_or_create_session(CREDS.session_id)
     assert doc.messages[-1].content == out.assistant_text

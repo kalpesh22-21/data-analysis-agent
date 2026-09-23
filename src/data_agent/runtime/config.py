@@ -237,7 +237,8 @@ class RuntimeSettings(BaseSettings):
 
     # --- Adopted MCP (clickhouse-api, D75) ---
     mcp_max_response_bytes: int = Field(
-        16 * 1024 * 1024, ge=1,
+        16 * 1024 * 1024,
+        ge=1,
         description="Maximum bytes received per MCP HTTP response, before JSON/SSE parsing.",
     )
     mcp_url: str = Field(
@@ -451,16 +452,8 @@ class RuntimeSettings(BaseSettings):
         description="Result evidence budget for the answer judge; subject fields remain pinned.",
     )
     answer_judge_enabled: bool = Field(
-        False,
-        description=(
-            "Enable the LLM answer judge at the terminal exits and the askUser pause "
-            "(doc 09). OFF BY DEFAULT, and the default is a design position rather "
-            "than caution: the loop is byte-deterministic by construction (D45) and "
-            "this is a NON-DETERMINISTIC gate on the terminal path, so the "
-            "scripted-mechanics suite and every replay run with it off unless they are "
-            "driving the judge on purpose. When False no judge object is constructed "
-            "at all and every exit is byte-identical to before the feature existed."
-        ),
+        True,
+        description="Review terminal answers and clarification questions. No-verdict exhaustion may deliver; explicit rejections remain binding.",
     )
     answer_judge_model: str = Field(
         "",

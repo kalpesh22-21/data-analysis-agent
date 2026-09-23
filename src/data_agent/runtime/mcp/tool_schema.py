@@ -60,7 +60,7 @@ RESOLVE_VALUES_TOOL_SCHEMA: dict[str, Any] = {
         "code/category column, ranked by how well each value matches the concept and how "
         "frequently it occurs for THIS client. Use this for client-defined or time-varying "
         "code spaces (e.g. earn_code, type_code, department codes) where the exact codes differ "
-        "per client and drift over time — never hardcode such codes. Prefer this over sampleRows "
+        "per client and drift over time — never hardcode such codes. This also covers stored department names, positions, work locations, and earn/type-code descriptions. Follow configured resolution targets. Preserve established exact values; never use popularity or fuzzy similarity alone to identify an employee. Prefer this over sampleRows "
         "when you need the values that mean a concept (e.g. 'PTO earn codes'), not a raw sample. "
         "Each result has a `score` (0-1); if the top scores are low or clustered (no clear "
         "winner), ask the user to confirm with askUser before filtering on a guessed value. "

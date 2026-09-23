@@ -314,6 +314,9 @@ def test_capability_review_retains_parameter_meaning_and_unresolved_selection():
             "name": "show_department",
             "arguments": {"has_unresolved_entities": True},
             "unresolved_entities": {"employee": "Jane Doe"},
+            "resolved_entities": {"department": ["Sales"]},
+            "additional_arguments": {"status": "active"},
+            "metadata": {"ui_parameters": [{"name": "department", "values": ["Sales"]}]},
             "_agent_evidence": definition,
         },
         "show_department",
@@ -323,3 +326,7 @@ def test_capability_review_retains_parameter_meaning_and_unresolved_selection():
     assert context["definition"] == definition
     assert context["unresolved_entities"] == {"employee": "Jane Doe"}
     assert context["arguments"]["has_unresolved_entities"] is True
+    assert context["resolved_entities"] == {"department": ["Sales"]}
+    assert context["additional_arguments"] == {"status": "active"}
+    assert context["parameters"] == definition["parameters"]
+    assert context["filter_definitions"] == [{"name": "department", "values": ["Sales"]}]

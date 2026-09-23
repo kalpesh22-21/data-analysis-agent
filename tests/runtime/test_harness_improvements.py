@@ -1029,14 +1029,14 @@ async def test_repair_can_remove_a_table_from_live_answer_and_history():
 
 
 @pytest.mark.parametrize("reviewed", [False, True])
-async def test_data_display_requires_actual_approval_when_judge_is_enabled(reviewed):
+async def test_data_display_allows_no_verdict_exhaustion_without_claiming_approval(reviewed):
     payload = {
         "prepared": True,
         "capability_ref": "show_profile",
         "name": "show_profile",
         "_agent_evidence": {"kind": "data_widget"},
     }
-    judge = Judge([JudgeVerdict(True, reviewed=reviewed)])
+    judge = Judge([JudgeVerdict(True, reviewed=reviewed)] * 3)
     loop, _, _, _, _ = build(
         [
             batch(call("show_profile", "prepare")),
@@ -1056,4 +1056,5 @@ async def test_data_display_requires_actual_approval_when_judge_is_enabled(revie
     )
     outcome = await run(loop, "Show the employee profile.")
     assert outcome.status == "done"
-    assert bool(outcome.capability_cards) is reviewed
+    assert outcome.capability_cards
+    assert outcome.review["status"] == ("approved" if reviewed else "exhausted")

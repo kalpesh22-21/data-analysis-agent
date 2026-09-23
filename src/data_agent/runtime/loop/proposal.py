@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .answer_judge import JudgeVerdict
@@ -16,6 +16,9 @@ def fingerprint(value: Any) -> str:
 
 @dataclass
 class ReviewState:
+    question_refusals: dict[str, str] = field(default_factory=dict)
+    delivery_version: str = ""
+    delivery_status: str = ""
     calls: int = 0
     repaired: bool = False
     answer_version: str = ""
@@ -47,6 +50,8 @@ class ReviewState:
         if state.scope_hash != scope_hash:
             state.excluded_components = ()
             state.approved_version = ""
+            state.delivery_version = ""
+            state.delivery_status = ""
             state.feedback = ""
             state.result_ids = ()
             state.assumptions_before_refusal = ()
@@ -55,7 +60,7 @@ class ReviewState:
 
     def reject(self, verdict: JudgeVerdict, version: str, assumptions=()) -> None:
         if not self.violation:
-            self.assumptions_before_refusal = tuple(assumptions)
+            self.assumptions_before_refusal = tuple(assumptions or ())
         self.violation, self.feedback = verdict.violation, verdict.feedback
         self.intent_id, self.result_ids = verdict.intent_id, verdict.result_ids
         self.repair_type = verdict.repair_type

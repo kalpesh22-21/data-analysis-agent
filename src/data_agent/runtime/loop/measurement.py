@@ -239,11 +239,15 @@ def cardinality_probes(sql: str) -> list[str]:
     return list(dict.fromkeys(probes))
 
 
-async def validate_join_cardinality(sql, dispatcher, credentials) -> str | None:
+async def validate_join_cardinality(
+    sql, dispatcher, credentials, *, emit_progress=True
+) -> str | None:
     try:
         probes = cardinality_probes(sql)
         for statement in probes:
-            result = await dispatcher.dispatch("runQuery", {"sql": statement}, credentials)
+            result = await dispatcher.dispatch(
+                "runQuery", {"sql": statement}, credentials, emit_progress=emit_progress
+            )
             rows = (
                 result.result_full.get("rows", []) if isinstance(result.result_full, dict) else []
             )

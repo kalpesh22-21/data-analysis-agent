@@ -66,7 +66,10 @@ def _build_client(monkeypatch, model_client: ScriptedModelClient) -> TestClient:
         scripted={},
     )
     settings = RuntimeSettings(
-        max_loop_iterations=15, max_wall_clock_seconds=60, max_budget_windows=3
+        answer_judge_enabled=False,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
     )
     app = create_app(
         settings=settings,

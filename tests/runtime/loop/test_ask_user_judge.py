@@ -29,7 +29,6 @@ from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.loop.answer_judge import (
     ANSWER_JUDGE_SKIPPED_EVENT,
-    APPROVED,
     ASK_USER_JUDGE_EXHAUSTED_EVENT,
     ASK_USER_JUDGE_REFUSED_EVENT,
     JudgeBrief,
@@ -63,6 +62,9 @@ async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
 
 def _credentials() -> RuntimeCredentials:
     return RuntimeCredentials(session_id=SESSION_ID, jwt="jwt", column_scope=frozenset())
+
+
+APPROVED = JudgeVerdict(True, reviewed=True)
 
 
 class _ScriptedJudge:
@@ -137,9 +139,7 @@ def _build(
     return loop, store, events, model
 
 
-def _ask(
-    question: str, call_id: str = "a1", options: list[str] | None = None
-) -> ToolCallRequest:
+def _ask(question: str, call_id: str = "a1", options: list[str] | None = None) -> ToolCallRequest:
     arguments: dict[str, Any] = {"question": question}
     if options is not None:
         arguments["options"] = options
@@ -164,9 +164,7 @@ def _nudge(model: ScriptedModelClient) -> str:
 
 
 def _reject() -> JudgeVerdict:
-    return JudgeVerdict(
-        approved=False, violation="non_contextual_question", feedback=_FEEDBACK
-    )
+    return JudgeVerdict(approved=False, violation="non_contextual_question", feedback=_FEEDBACK)
 
 
 # --- the feature absent ------------------------------------------------------
@@ -264,7 +262,7 @@ async def test_the_judge_sees_the_raw_question_not_the_scrubbed_one() -> None:
     await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="average salary in Sales"
     )
-    (brief,) = judge.briefs
+    brief = judge.briefs[0]
     assert brief.site == "ask_user"
     assert brief.pending_question == _SCHEMA_QUESTION
     assert "withheld" not in brief.pending_question
@@ -279,7 +277,7 @@ async def test_the_judge_sees_structured_options_for_code_and_placement_checks()
     await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="show employee payroll"
     )
-    (brief,) = judge.briefs
+    brief = judge.briefs[0]
     assert brief.pending_question == "Which employee?"
     assert brief.pending_options == tuple(choices)
 
@@ -316,7 +314,7 @@ async def test_a_batched_state_call_survives_the_rejection() -> None:
     doc = await _loop_doc(loop)
     assert doc.analysis_state is not None
     assert len(doc.analysis_state.intents) == 2
-    (brief,) = judge.briefs
+    brief = judge.briefs[0]
     assert [i[1] for i in brief.intents] == [
         "average salary in Sales",
         "headcount in Sales",
@@ -357,11 +355,11 @@ async def test_a_denied_claim_exhausts_and_the_pause_proceeds() -> None:
         {"violation": "non_contextual_question"}
     ]
     assert store.claims == ["ask_user_judge"], "it asked, and was refused"
-    assert judge.calls_made == 1
+    assert judge.calls_made == 2
     assert model.calls_made == 1
 
 
-async def test_the_second_call_is_skipped_when_the_allowance_is_already_gone() -> None:
+async def test_spent_repair_allowance_still_reviews_the_revised_question() -> None:
     """09 §F.1. Once the grant is spent a rejection cannot act, so buying the verdict is
     buying something nothing is permitted to use — and unlike every other gate's
     predicate, this one costs a MODEL CALL. The skip is what makes the judge affordable on
@@ -379,7 +377,7 @@ async def test_the_second_call_is_skipped_when_the_allowance_is_already_gone() -
         session_id=SESSION_ID, credentials=_credentials(), user_message="average salary in Sales"
     )
     assert outcome.status == "paused_ask_user"
-    assert judge.calls_made == 1, "the second finish never reached the model"
+    assert judge.calls_made == 2, "the revised question is reviewed before delivery"
     assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == [{"reason": "allowance_spent"}]
     assert store.claims == ["ask_user_judge"], "no second claim attempt"
 
@@ -401,7 +399,7 @@ async def test_the_ask_user_judge_never_spends_the_answer_judges_grant() -> None
 # --- the wall clock ----------------------------------------------------------
 
 
-async def test_no_wall_clock_headroom_skips_the_judge_entirely() -> None:
+async def test_no_repair_headroom_still_reviews_delivery() -> None:
     """09 §H, the failure mode most likely to make this feature net-negative. A rejection
     issued near the cap buys a regeneration the guard cuts off mid-round, and the turn
     then pauses with nothing to show. Below the headroom the judge does not run AT ALL —
@@ -416,9 +414,9 @@ async def test_no_wall_clock_headroom_skips_the_judge_entirely() -> None:
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="average salary in Sales"
     )
-    assert outcome.status == "paused_ask_user"
-    assert outcome.pending_question == {"question": _SCHEMA_QUESTION, "options": None}
-    assert judge.calls_made == 0
+    assert outcome.status == "done"
+    assert outcome.pending_question is None
+    assert judge.calls_made == 1
     assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == [{"reason": "wall_clock"}]
     assert store.claims == []
     assert model.calls_made == 1

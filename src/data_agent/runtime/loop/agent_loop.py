@@ -140,6 +140,16 @@ from .answer_rules import (
 from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
 from .clarification import normalize_clarification
+from .delivery import (
+    CURRENT_DELIVERY,
+    DependencyFailureError,
+    delivery_boundary,
+    delivery_version,
+    dependency_failure,
+    partial_delivery_text,
+    review_delivery,
+    review_once,
+)
 from .dispatch_gates import BlueprintSearchGate, advertised_names, refusal
 from .finalization import (
     DATA_ANSWER_TOOLS,
@@ -481,6 +491,8 @@ class TurnOutcome:
     assistant_text: str | None
     pending_question: dict[str, Any] | None
     tool_calls_made: int
+    review: dict[str, Any] | None = None
+    failure: dict[str, Any] | None = None
     # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §1):
     # additive, nullable enrichment for the SSE `result` event — the loop
     # populates these best-effort at every return site (never load-bearing for
@@ -1006,6 +1018,7 @@ class AgentLoop:
         self._answer_table_hooks = answer_table_hooks or AnswerTableHooks()
 
     @observe_turn_abort
+    @delivery_boundary
     async def run(
         self, *, session_id: str, credentials: RuntimeCredentials, user_message: str
     ) -> TurnOutcome:
@@ -1016,6 +1029,8 @@ class AgentLoop:
             session_id,
             TurnMessage(turn_index=turn_index, role="user", content=user_message, ts=_now_iso()),
         )
+        if CURRENT_DELIVERY.get():
+            CURRENT_DELIVERY.get().turn_index = turn_index
         # B3: ONE per-turn-scoped `ModelClient` handle, used for every `send_turn`
         # of this external turn (across all budget-window resumes) — never
         # `self._model_client` directly, whose Responses/Chat fallback stickiness
@@ -1033,6 +1048,7 @@ class AgentLoop:
         )
 
     @observe_turn_abort
+    @delivery_boundary
     async def resume(
         self, *, session_id: str, credentials: RuntimeCredentials, answer: str
     ) -> TurnOutcome:
@@ -1047,6 +1063,8 @@ class AgentLoop:
         updated_doc = await self._session_store.resume_checkpoint(session_id, cas, answer)
         turn_index = updated_doc.messages[-1].turn_index if updated_doc.messages else 0
 
+        if CURRENT_DELIVERY.get():
+            CURRENT_DELIVERY.get().turn_index = turn_index
         prior_window_count = checkpoint.budget_window_count if checkpoint else 1
         pause_reason = checkpoint.reason if checkpoint else "askUser"
         declined_question = (
@@ -1069,6 +1087,9 @@ class AgentLoop:
                 pause_reason=pause_reason,
                 declined_question=declined_question,
             )
+        except DependencyFailureError:
+            # The boundary persists a terminal failure; do not reopen this consumed pause.
+            raise
         except BaseException:
             try:
                 reopened = await asyncio.shield(
@@ -1170,21 +1191,15 @@ class AgentLoop:
                     answer_tables=stop_tables,
                     capability_cards=stop_capability_cards,
                 )
-                stop_envelope = stop_accum.envelope()
-                return TurnOutcome(
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
                     status="done",
-                    assistant_text=("Stopping here — here is what I found before the budget cap."),
-                    pending_question=None,
+                    exit_label="runtime_fallback",
                     tool_calls_made=0,
-                    # UI Slice 1: a `done` return — surface the turn's lineage from
-                    # the trail (the fail-closed source of truth).
+                    accum=stop_accum,
+                    assistant_text="Stopping here — here is what I found before the budget cap.",
                     provenance=await self._compute_turn_provenance_union(session_id, turn_index),
-                    answer_sql=stop_envelope.answer_sql,
-                    blueprint_use=stop_envelope.blueprint_use,
-                    verification=stop_envelope.verification,
-                    answer_tables=stop_envelope.answer_tables,
-                    assumptions=stop_accum.assumptions,
-                    capability_cards=stop_accum.capability_cards,
                 )
             window_count = prior_window_count + 1  # D55: "continue"/"refine" grants a fresh window
         else:
@@ -1587,14 +1602,16 @@ class AgentLoop:
         return cards
 
     async def _maybe_start_summary(
-        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
+        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any], *, judge_approved=False
     ) -> None:
         """Emit the optional summary before dispatch so a late start cannot reopen a spinner."""
         if self._progress_summarizer is not None:
             try:
                 await asyncio.wait_for(
                     asyncio.create_task(
-                        self._summarize_and_emit(tool_name, tool_call_id, dict(arguments))
+                        self._summarize_and_emit(
+                            tool_name, tool_call_id, dict(arguments), judge_approved=judge_approved
+                        )
                     ),
                     timeout=1.0,
                 )
@@ -1602,7 +1619,7 @@ class AgentLoop:
                 pass
 
     async def _summarize_and_emit(
-        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
+        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any], *, judge_approved=False
     ) -> None:
         """Await the summarizer and emit the value-rich progress line — fail-soft: an error or
         timeout yields `None` (dropped), and observer failures are contained.
@@ -1622,7 +1639,12 @@ class AgentLoop:
             # in depth so no observer wiring can ever break the turn from here.
             self._observer(
                 "tool_progress_summary",
-                {"summary": summary, "tool_name": tool_name, "tool_call_id": tool_call_id},
+                {
+                    "summary": summary,
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    **({"judge_approved": True} if judge_approved else {}),
+                },
             )
         except Exception:
             _logger.debug("progress-summary emit failed for %s (ignored)", tool_name)
@@ -1865,7 +1887,10 @@ class AgentLoop:
             self._observer(ANSWER_JUDGE_FAILED_EVENT, {"reason": "brief_failed"})
             return APPROVED
         assert self._answer_judge is not None  # `_judge_would_run` established it
-        return await self._answer_judge.review(brief)
+        try:
+            return await review_once(self, brief)
+        except Exception:
+            return APPROVED
 
     async def _judge_results(
         self,
@@ -1996,6 +2021,7 @@ class AgentLoop:
         ship_guard: JudgeShipGuard | None = None,
         judge_site: str = "exit_prose",
         completion_notice: str | None = None,
+        failure: dict[str, Any] | None = None,
     ) -> TurnOutcome:
         """THE ORDER every in-body `TurnOutcome` return performs its effects in, in one place:
         checkpoint write, assistant-message append, envelope read, observer event, return.
@@ -2042,11 +2068,8 @@ class AgentLoop:
         for a refused round at the budget cap), the provenance union, and the
         `PauseCheckpoint` construction.
 
-        TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately: `resume()`'s budget-cap "stop"
-        return, which happens before `_run_loop_body` is entered and builds its own
-        accumulators from the trail rebuild, so everything here is a no-op for it; and
-        `_pause_from_runtime_tool`, which is already a single-purpose finisher and receives
-        its `AnswerEnvelope` as a parameter.
+        Stop-on-resume and runtime-tool pauses also use this boundary, so their
+        exact delivered contents are reviewed before persistence and emission.
         """
         # THE ANSWER-PROSE SCRUB (ISSUES I1) — FIRST, above every effect, so there
         # is exactly ONE scrubbed string and it is the one that reaches BOTH the
@@ -2062,6 +2085,17 @@ class AgentLoop:
         # and `answer_tables` keep naming exactly what ran. Prose is the agent's
         # voice; those fields are the audit surface.
         await cancellation_checkpoint("finish")
+        if CURRENT_DELIVERY.get():
+            saved_doc = await self._session_store.get_or_create_session(session_id)
+            saved_review = saved_doc.review_states.get(str(turn_index), {})
+            if saved_review.get("violation"):
+                accum.apply_ship_disposition("decline_only", ())
+                capability_cards = None
+                if ship_guard is None:
+                    ship_guard = JudgeShipGuard()
+                    ship_guard.note_refusal(
+                        saved_review.get("site", "exit_prose"), saved_review["violation"]
+                    )
         ship_disposition = ship_guard.disposition(judge_site) if ship_guard is not None else None
         retained_assumption_count = None
         if assistant_text == HELP_UNAVAILABLE_TEXT:
@@ -2104,11 +2138,42 @@ class AgentLoop:
             # Runtime limitation text contains no warehouse facts. Unknown provenance
             # from failed work must not hide this message in scope-filtered history.
             provenance = frozenset()
+        if (
+            CURRENT_DELIVERY.get()
+            and self._answer_judge is not None
+            and getattr(self._answer_judge, "enabled", True)
+            and (
+                completion_notice
+                or assistant_text
+                == "I could not verify every requested part from the available evidence."
+            )
+        ):
+            parts = partial_delivery_text(saved_doc, turn_index, accum)
+            if parts:
+                assistant_text = (
+                    "\n\n".join(p for p in (assistant_text, parts) if p) if failure else parts
+                )
         if completion_notice:
             assistant_text = "\n\n".join(
                 part for part in (assistant_text, completion_notice) if part
             )
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance)
+        review, withheld = await review_delivery(
+            self, session_id, turn_index, assistant_text, accum, checkpoint
+        )
+        if withheld:
+            accum.apply_ship_disposition("decline_only", ())
+            capability_cards = None
+            ship_disposition = "decline_only"
+            retained_assumption_count = 0
+            assistant_text = "I don't have enough verified information to answer your question."
+            if completion_notice:
+                assistant_text += "\n\n" + completion_notice
+            provenance = frozenset()
+            if checkpoint is not None:
+                # Do not publish or leave resumable an explicitly rejected question.
+                checkpoint = replace(checkpoint, consumed=True)
+                status = "done"
         if persist_text is not None or (status == "done" and assistant_text):
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
             # that persist pass the same string they pass as *assistant_text*, so
@@ -2128,6 +2193,8 @@ class AgentLoop:
                     provenance=provenance,
                     ship_disposition=ship_disposition,
                     retained_assumption_count=retained_assumption_count,
+                    review=review,
+                    failure=failure,
                 ),
             )
         # AFTER every fold and `commit_round` of the round — this is called at the
@@ -2152,7 +2219,9 @@ class AgentLoop:
             assistant_text=assistant_text,
             # From the checkpoint OBJECT, not re-derived from the question text —
             # the outcome and the persisted checkpoint hand the client the same dict.
-            pending_question=checkpoint.pending_question if checkpoint is not None else None,
+            pending_question=checkpoint.pending_question
+            if checkpoint is not None and not checkpoint.consumed
+            else None,
             tool_calls_made=tool_calls_made,
             # `[]` (no successful query this turn) -> `None`, so the UI treats
             # "no SQL panel" and "empty SQL" identically (§1 fork 1).
@@ -2166,6 +2235,8 @@ class AgentLoop:
             # `sql_executed`: the UI treats "no assumptions" and "empty" identically.
             assumptions=accum.assumptions,
             capability_cards=capability_cards or accum.capability_cards,
+            review=review,
+            failure=failure,
         )
 
     async def _pause_from_runtime_tool(
@@ -2193,34 +2264,6 @@ class AgentLoop:
         pending_question = normalize_clarification(
             pause.pending_question.get("question"), pause.pending_question.get("options")
         )
-        if self._answer_judge is not None and getattr(self._answer_judge, "enabled", True):
-            doc = await self._session_store.get_or_create_session(session_id)
-            active_turn = doc.messages[-1].turn_index if doc.messages else -1
-            user_answers = [
-                m.content for m in doc.messages if m.role == "user" and m.turn_index == active_turn
-            ]
-            original = user_answers[0] if user_answers else ""
-            try:
-                verdict = await asyncio.wait_for(
-                    self._answer_judge.review(
-                        JudgeBrief(
-                            site="ask_user",
-                            question=original,
-                            clarification_answers=tuple(user_answers[1:]),
-                            pending_question=pending_question["question"],
-                            pending_options=tuple(pending_question["options"] or ()),
-                        )
-                    ),
-                    timeout=getattr(self._answer_judge, "timeout_seconds", 30.0),
-                )
-            except Exception:
-                verdict = APPROVED
-            if not verdict.approved:
-                pending_question = {
-                    "question": "Please clarify the person, group, or period you mean using its full name or description.",
-                    "options": None,
-                }
-
         checkpoint = PauseCheckpoint(
             reason=pause.reason,
             pending_question=pending_question,
@@ -2239,39 +2282,29 @@ class AgentLoop:
             serves_intent=serves_intent,
             serves_intents=serves_intents,
         )
-        await self._session_store.write_pause_checkpoint(session_id, checkpoint)
-        # ISSUES I1, the same scrub `_finish` applies — this exit does not route
-        # through it (see `_finish`'s "TWO EXITS DO NOT ROUTE THROUGH THIS"), and a
-        # pause is still model prose on a user's screen. `provenance=None`: a pause
-        # has no determined turn provenance (there is no persisted assistant
-        # message to tag), which costs only the quoted-value arm — the corpus-id,
-        # qualified and snake_case rules need no knowledge of the turn.
-        #
-        # The checkpoint's `pending_question` is NOT scrubbed here: it is authored
-        # by the pausing runtime tool (a blueprint slot prompt), not by the model,
-        # and it never reaches the observer payload's published attributes
-        # (`question` is not on the D25 allowlist).
-        assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=None)
-        if redaction_count:
-            self._observer(
-                ANSWER_PROSE_REDACTED_EVENT,
-                {"redaction_count": redaction_count, "exit": "pause"},
-            )
-        self._observer(
-            "loop_paused_ask_user",
-            {"question": pending_question.get("question", "")},
-        )
-        return TurnOutcome(
-            status="paused_ask_user",
-            assistant_text=assistant_text,
-            pending_question=checkpoint.pending_question,
-            tool_calls_made=tool_calls_made,
-            sql_executed=sql_executed,
-            answer_sql=envelope.answer_sql if envelope else None,
+        doc = await self._session_store.get_or_create_session(session_id)
+        turn_index = doc.messages[-1].turn_index if doc.messages else 0
+        from data_agent.runtime.composite.answer_with_table import AnswerTable
+
+        accum = TurnAccumulators(
+            assumptions=assumptions,
+            sql=sql_executed,
+            answer_tables=[AnswerTable(**t) for t in (envelope.answer_tables or ())]
+            if envelope
+            else (),
             blueprint_use=envelope.blueprint_use if envelope else None,
             verification=envelope.verification if envelope else None,
-            answer_tables=envelope.answer_tables if envelope else None,
-            assumptions=assumptions,
+        )
+        return await self._finish(
+            session_id=session_id,
+            turn_index=turn_index,
+            status="paused_ask_user",
+            exit_label="pause",
+            assistant_text=assistant_text,
+            tool_calls_made=tool_calls_made,
+            accum=accum,
+            checkpoint=checkpoint,
+            event=("loop_paused_ask_user", {"question": pending_question.get("question", "")}),
         )
 
     async def _resume_blueprint(
@@ -2728,7 +2761,13 @@ class AgentLoop:
         # catalogue itself (see mcp/tool_schema.py::ToolSchemaCache) since the
         # catalogue is scope-independent; this is not a live MCP round-trip
         # on every call in practice, just a credentialed one the first time.
-        tools = await self._tools_provider(credentials)
+        try:
+            tools = await self._tools_provider(credentials)
+        except Exception as exc:
+            failure = dependency_failure(exc, "tool_schema")
+            if failure:
+                raise failure from exc
+            raise
 
         # The loop's OWN turn index, handed to every runtime tool (03 §C.1). It is
         # built here, from the parameter `run`/`resume` computed, so no tool ever
@@ -2790,9 +2829,7 @@ class AgentLoop:
         used_call_ids = {entry.tool_call_id for entry in session_doc.tool_trail}
         for prior in scope_filter.filter_trail(session_doc.tool_trail, credentials.column_scope):
             if prior.turn_index == turn_index:
-                loop_safety.observe_help(
-                    prior.tool_name, prior.error_code, emit=False
-                )
+                loop_safety.observe_help(prior.tool_name, prior.error_code, emit=False)
         preparation_cache = PreparationCache(
             self._session_store,
             session_id,
@@ -3020,6 +3057,7 @@ class AgentLoop:
             # terminal exit #2 below. Reset per iteration — a designation only ends
             # the turn it was made in.
             proposal_args = None
+            proposal_call_id = None
             # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
             # BATCH. Reset per iteration beside `designated_answer_text`, and for the
             # same reason: it describes one response, not one turn.
@@ -3088,6 +3126,11 @@ class AgentLoop:
                     provenance=frozenset(),
                     event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
                 )
+            except Exception as exc:
+                failure = dependency_failure(exc, "model")
+                if failure:
+                    raise failure from exc
+                raise
             used_call_ids.update(conversation_call_ids(canonical_messages))
             result = assign_unique_call_ids(result, used_call_ids, self._observer)
             last_assistant_text = result.assistant_text
@@ -3177,8 +3220,11 @@ class AgentLoop:
                         if empty_refused
                         else ""
                     )
-                    + "Finish by calling finalizeAnswer with answer, tables, capability_refs and "
-                    "evidence. Use empty lists when none apply, including for an honest decline. "
+                    + "Your assistant message has not completed this turn. If you can answer now, "
+                    "call finalizeAnswer with your complete text in answer. For a simple "
+                    "conversational reply, use empty tables, capability_refs, and evidence lists; "
+                    "no lookup is needed. If the request still needs work, continue with the "
+                    "appropriate capability or data tools, then call finalizeAnswer. "
                     "For supported claims, evidence contains successful result IDs, not tool names."
                 )
                 last_assistant_text = None
@@ -3732,9 +3778,7 @@ class AgentLoop:
                     )
 
                 if gate_refusal is None:
-                    loop_safety.observe_help(
-                        tool_call.name, tool_result.error_code
-                    )
+                    loop_safety.observe_help(tool_call.name, tool_result.error_code)
                 loop_safety.observe_result(
                     tool_call.name, call_args, tool_result, reused=capability_reused
                 )
@@ -3759,6 +3803,7 @@ class AgentLoop:
                     and tool_result.status == "ok"
                 ):
                     proposal_args = dict(call_args)
+                    proposal_call_id = tool_call.id
                 # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
                 # pause (today only `runBlueprint`, on a slot-resolution
                 # `askUser`). This GENERALIZES the terminal `askUser` branch
@@ -4187,6 +4232,17 @@ class AgentLoop:
                     kind="ask_user_judge",
                 )
                 if not ask_verdict.approved:
+                    review_state.question_refusals[
+                        fingerprint(
+                            {
+                                "question": raw_question,
+                                "options": ask_user_call.arguments.get("options") or [],
+                            }
+                        )
+                    ] = ask_verdict.violation
+                    await self._session_store.write_review_state(
+                        session_id, turn_index, review_state.to_doc()
+                    )
                     # ITS OWN ALLOWANCE (`ask_user_judge`), never the answer
                     # judge's: a rejected ANSWER earlier in this window must not
                     # silence the check that keeps a schema-worded question off
@@ -4262,6 +4318,15 @@ class AgentLoop:
                     question, ask_user_call.arguments.get("options")
                 )
                 question, options = normalized["question"], normalized["options"]
+                if ask_verdict.approved and ask_verdict.reviewed:
+                    review_state.question_refusals.clear()
+                    review_state.delivery_version = delivery_version(
+                        result.assistant_text, accum, normalized
+                    )
+                    review_state.delivery_status = "approved"
+                    await self._session_store.write_review_state(
+                        session_id, turn_index, review_state.to_doc()
+                    )
                 checkpoint = PauseCheckpoint(
                     reason="askUser",
                     pending_question={"question": question, "options": options},
@@ -4380,6 +4445,15 @@ class AgentLoop:
                     ),
                     declined_clarification=declined_question,
                 )
+                if (
+                    rule
+                    and rule.name == "no_evidence"
+                    and self._answer_judge is not None
+                    and getattr(self._answer_judge, "enabled", True)
+                ):
+                    # Conversational text needs no warehouse receipt. The judge checks
+                    # whether an evidence-free answer makes unsupported substantive claims.
+                    rule = None
                 feedback = evidence_error
                 kind = "ungrounded_answer"
                 if not final_text:
@@ -4540,19 +4614,7 @@ class AgentLoop:
                                 analysis_state=analysis_state,
                             )
                             brief_ready = True
-                            verdict = await asyncio.wait_for(
-                                self._answer_judge.review(brief),
-                                # The real judge owns its 30s timeout and records the
-                                # outcome. The outer bound is only the turn deadline.
-                                timeout=(
-                                    remaining
-                                    if isinstance(self._answer_judge, AnswerJudge)
-                                    else min(
-                                        remaining,
-                                        getattr(self._answer_judge, "timeout_seconds", 30.0),
-                                    )
-                                ),
-                            )
+                            verdict = await review_once(self, brief)
                         except Exception as exc:
                             self._observer(
                                 ANSWER_JUDGE_FAILED_EVENT,
@@ -4569,6 +4631,8 @@ class AgentLoop:
                         review_state.approved_version = version
                         review_state.violation = ""
                         ship_guard.note_approval()
+                        review_state.delivery_version = delivery_version(final_text, accum)
+                        review_state.delivery_status = "approved"
                     elif not verdict.approved:
                         self._observer(
                             ANSWER_JUDGE_REFUSED_EVENT,
@@ -4613,15 +4677,19 @@ class AgentLoop:
                         session_id, turn_index, review_state.to_doc()
                     )
                 if not feedback or finalization_nudge is None:
-                    if (
-                        self._answer_judge is not None
-                        and getattr(self._answer_judge, "enabled", True)
-                        and review_state.approved_version != version
-                        and any(
-                            card["kind"] != "navigation" for card in accum.capability_judge_context
+                    if review_state.approved_version == version:
+                        await self._maybe_start_summary(
+                            "finalizeAnswer", proposal_call_id, proposal_args, judge_approved=True
                         )
-                    ):
-                        ship_guard.refuse_unreviewed_data_card(assumptions=accum.assumptions)
+                        for event in ("tool_dispatch_start", "tool_dispatch_ok"):
+                            self._observer(
+                                event,
+                                {
+                                    "tool_name": "finalizeAnswer",
+                                    "tool_call_id": proposal_call_id,
+                                    "judge_approved": True,
+                                },
+                            )
                     if pending_intents(analysis_state):
                         self._observer(
                             "loop_enforcement_exhausted",

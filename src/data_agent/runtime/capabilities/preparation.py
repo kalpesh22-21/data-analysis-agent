@@ -6,6 +6,8 @@ from dataclasses import replace
 
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult, _build_preview
 
+from .preview import capability_preview
+
 
 def preparation_key(name, arguments):
     # Intent tags describe attribution, not the UI binding. Array order, case,
@@ -78,7 +80,11 @@ class PreparationCache:
                     None,
                     None,
                     entry.provenance,
-                    _build_preview(payload, 20, 4000),
+                    _build_preview(
+                        capability_preview(payload) if payload.get("prepared") else payload,
+                        20,
+                        4000,
+                    ),
                     payload,
                 )
             else:
@@ -114,7 +120,9 @@ class PreparationCache:
                 retryable=False,
                 user_message=message,
                 result_full=payload,
-                result_preview=_build_preview(payload, 20, 4000),
+                result_preview=_build_preview(
+                    capability_preview(payload) if payload.get("prepared") else payload, 20, 4000
+                ),
             )
         payload["next_step"] = (
             "This is the earlier successful preparation, not a new provider call. "
@@ -123,5 +131,9 @@ class PreparationCache:
             + str(payload.get("next_step", ""))
         )
         return replace(
-            original, result_full=payload, result_preview=_build_preview(payload, 20, 4000)
+            original,
+            result_full=payload,
+            result_preview=_build_preview(
+                capability_preview(payload) if payload.get("prepared") else payload, 20, 4000
+            ),
         )
