@@ -3,7 +3,7 @@
 The production-shaped sibling of `scripts/run_ui_runtime.py` (which wires Layer-1
 fakes): SAME `create_app` structure, SAME port (:8000), SAME real JWT-vs-l2-token
 verification, but with the REAL components — an OpenAI model client (key from `.env`,
-model from `DEMO_MODEL` or a startup preflight), a `RealMCPClient` against the live
+model from `OPENAI_MODEL`, `DEMO_MODEL`, or a startup preflight), a `RealMCPClient` against the live
 l2-mcp, the real `CouchbaseSessionStore` (`REAL_SESSION_STORE=memory` falls back to the
 in-memory store), and the real `CatalogHandle` rebuilt from the frozen catalog-export
 snapshot (`CATALOG_FIXTURE_PATH` points at a live `/catalog/export` dump to refresh).
@@ -21,7 +21,9 @@ like the audit store when the flag is on. TELEMETRY-ONLY: it never weakens the
 MCP-enforced scope/PII posture (D5/D57).
 
 Prerequisites (this launcher does NOT start/stop any container):
-    - `.env` with `OPENAI_API_KEY=...` at the repo root.
+    - `OPENAI_API_KEY` in the environment, or in `.env` at the repo root.
+      For compatible providers, also set `OPENAI_BASE_URL`, `OPENAI_MODEL`, and
+      provider-appropriate `MODEL_TOOL_CHOICE` / `USE_REASONING_METADATA` settings.
     - The l2 integration stack UP: l2-mcp (:18090), l2-token (:19000),
       l2-cb (:8091/:11210), l2-phoenix (:6006). (l2-neo4j/l2-embedding only if
       `REAL_RETRIEVAL=1`.)
@@ -109,8 +111,8 @@ def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:
 
 
 def build_real_app():
-    api_key = load_openai_key()
-    model = pick_openai_model(api_key, label=_PREFLIGHT_LABEL)
+    api_key = os.environ.get("OPENAI_API_KEY") or load_openai_key()
+    model = os.environ.get("OPENAI_MODEL") or pick_openai_model(api_key, label=_PREFLIGHT_LABEL)
 
     retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
     retrieval_prefetch_tool_on = os.environ.get(
@@ -162,7 +164,7 @@ def build_real_app():
         mcp_url=_MCP_URL,
         openai_api_key=api_key,
         openai_model=model,
-        openai_base_url="",
+        openai_base_url=os.environ.get("OPENAI_BASE_URL", ""),
         use_reasoning_metadata=os.environ.get("USE_REASONING_METADATA", "").lower()
         in {"1", "true", "yes"},
         # Real JWT verification against the live l2-token JWKS (NOT bypassed).
@@ -265,6 +267,7 @@ def build_real_app():
             model=settings.openai_model,
             base_url=settings.openai_base_url,
             use_reasoning_metadata=settings.use_reasoning_metadata,
+            tool_choice=settings.model_tool_choice,
         ),
         catalog=catalog_handle(),
     )
