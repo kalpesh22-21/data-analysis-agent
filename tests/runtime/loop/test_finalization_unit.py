@@ -339,14 +339,21 @@ async def test_begin_round_reopens_the_claim() -> None:
     ]
 
 
-async def test_a_spent_allowance_denies_without_an_event() -> None:
-    """The store says the window's allowance for this kind is gone. No event of its
-    own: the caller emits `loop_enforcement_exhausted` / the answer-shape exhausted
-    event, which is where the disposition being recorded is visible."""
+async def test_a_spent_allowance_emits_exhaustion_event() -> None:
+    """A denied claim is visible even when the caller has no specialized event."""
     gate, store, recorder = _gate(_CountingStore(granted=[False]))
     assert await gate.may_refuse("intents") is False
     assert len(store.calls) == 1
-    assert recorder.events == []
+    assert recorder.events == [
+        (
+            "loop_finalization_block_exhausted",
+            {
+                "window": 2,
+                "turn_index": 3,
+                "guard_reason": "intents",
+            },
+        )
+    ]
     assert gate.refused_this_round is False
 
 

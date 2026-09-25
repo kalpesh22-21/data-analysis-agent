@@ -128,7 +128,19 @@ def partial_delivery_text(doc, turn_index, accum):
     from data_agent.runtime.session.models import live_analysis_state
 
     state = live_analysis_state(doc, turn_index)
-    if not state or len(state.intents) < 2:
+    if not state:
+        # Component labels describe what is actually included, not invented intent
+        # bindings or a claim that a prepared widget has verified its data.
+        lines = []
+        for index, card in enumerate(accum.capability_judge_context, 1):
+            label = card.get("description") or f"Requested view {index}"
+            lines.append(f"{label}: The prepared view is included.")
+        for index, table in enumerate(accum.answer_tables, 1):
+            lines.append(f"{table.caption or f'Requested table {index}'}: The result is shown.")
+        if lines:
+            lines.append("Other requested parts could not be verified for this answer.")
+        return "\n".join(lines)
+    if len(state.intents) < 2:
         return ""
     trail = {e.tool_call_id: e for e in doc.tool_trail if e.turn_index == turn_index}
     lines = []
@@ -215,7 +227,27 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
                 pending_question=(pending or {}).get("question", ""),
                 pending_options=tuple((pending or {}).get("options") or ()),
             )
-            brief = replace(brief, clarification_answers=tuple(questions[1:]))
+            from .proposal import selected_components
+
+            current_trail = [e for e in trail if e.turn_index == turn_index]
+            table_ids = [
+                ident
+                for ident, sql in accum.result_sql_by_call_id.items()
+                if any(t.sql == sql for t in accum.answer_tables)
+            ]
+            components = selected_components(
+                {
+                    "capability_refs": [c.get("name") for c in accum.capability_cards or ()],
+                    "tables": [{"result_id": ident} for ident in table_ids],
+                },
+                current_trail,
+                accum.result_sql_by_call_id,
+            )
+            brief = replace(
+                brief,
+                clarification_answers=tuple(questions[1:]),
+                selected_components=tuple(components),
+            )
             from .judge_evidence import enrich_brief
 
             brief = await enrich_brief(

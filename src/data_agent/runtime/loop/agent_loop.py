@@ -4386,16 +4386,19 @@ class AgentLoop:
                 deliverables, evidence_error = deliverable_evidence(
                     analysis_state, proposal_args, evidence_trail
                 )
+                evidence_complaints = [evidence_error] if evidence_error else []
                 refs = proposal_args.get("capability_refs", [])
                 if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
-                    evidence_error = "capability_refs must contain prepared option IDs."
+                    evidence_complaints.append("capability_refs must contain prepared option IDs.")
                     refs = []
                 if refs:
                     missing = set(refs) - (
                         accum.prepared_capability_names & self._runtime_tools.keys()
                     )
                     if missing:
-                        evidence_error = "A requested UI option is not prepared. Load and prepare it before finalizing."
+                        evidence_complaints.append(
+                            "A requested UI option is not prepared. Load and prepare it before finalizing."
+                        )
                 # Explicit selection; preparation alone is never user-visible finalization.
                 if "capability_refs" in proposal_args:
                     accum.select_capabilities(refs)
@@ -4454,6 +4457,7 @@ class AgentLoop:
                     # Conversational text needs no warehouse receipt. The judge checks
                     # whether an evidence-free answer makes unsupported substantive claims.
                     rule = None
+                evidence_error = "\n\n".join(evidence_complaints)
                 feedback = evidence_error
                 kind = "ungrounded_answer"
                 if not final_text:
@@ -4488,6 +4492,11 @@ class AgentLoop:
                         f"You drafted: {echo}\n\nThe turn is NOT over. Use finalizeAnswer.tables with the result IDs for the requested breakdown. Disclose any missing part and include the complete answer in finalizeAnswer.answer.",
                         "answer_shape",
                     )
+                rule_feedback = rule is not None and feedback == rule.nudge(final_text)
+                # Preserve the existing gate precedence, but show all evidence/prep
+                # complaints with its nudge so one repair can address them together.
+                if evidence_error and feedback != evidence_error:
+                    feedback = evidence_error + "\n\n" + feedback
                 if feedback:
                     if await finalization_gate.may_refuse(kind):
                         if kind == "empty_answer":
@@ -4495,7 +4504,7 @@ class AgentLoop:
                                 EMPTY_ANSWER_REFUSED_EVENT,
                                 {"incomplete_reason": result.incomplete_reason or ""},
                             )
-                        if rule and feedback == rule.nudge(final_text):
+                        if rule_feedback:
                             self._observer(ANSWER_RULE_REFUSED_EVENT, {"rule": rule.name})
                         if kind == "answer_shape":
                             self._observer(
@@ -4519,7 +4528,7 @@ class AgentLoop:
                                 EMPTY_ANSWER_EXHAUSTED_EVENT,
                                 {"incomplete_reason": result.incomplete_reason or ""},
                             )
-                        if rule and feedback == rule.nudge(final_text):
+                        if rule_feedback:
                             self._observer(ANSWER_RULE_EXHAUSTED_EVENT, {"rule": rule.name})
                         if kind == "answer_shape":
                             self._observer("loop_answer_shape_exhausted", {})
@@ -4532,10 +4541,17 @@ class AgentLoop:
                                 else "I could not verify every requested part from the available evidence."
                             )
                         )
-                        accum.apply_ship_disposition(
-                            "ship_tables_with_hedge" if accum.has_answer_tables else "decline_only",
-                            (),
+                        # Invalid prose/evidence bindings do not invalidate successful
+                        # selected executions. Keep them for the final delivery review;
+                        # _finish still enforces every persisted explicit rejection.
+                        accum.select_capabilities(
+                            [
+                                c["capability_ref"]
+                                for c in component_catalog
+                                if c["kind"] == "capability"
+                            ]
                         )
+                        accum.apply_ship_disposition(accum.hedged_disposition, ())
                 else:
                     enabled = self._answer_judge is not None and getattr(
                         self._answer_judge, "enabled", True

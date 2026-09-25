@@ -774,4 +774,13 @@ class FinalizationGate:
             # SECOND kind in one batch without claiming anything, so recording there
             # would make `has_spent` report an allowance that is still available.
             self._granted_kinds.add(kind)
+        else:
+            self._observer(
+                "loop_finalization_block_exhausted",
+                {
+                    "window": self._window_count,
+                    "turn_index": self._turn_index,
+                    "guard_reason": kind,
+                },
+            )
         return granted

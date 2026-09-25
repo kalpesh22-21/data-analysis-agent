@@ -527,11 +527,20 @@ class TurnAccumulators:
         self._capability_evidence.clear()
         self._loaded_capability_names.clear()
 
+    @property
+    def hedged_disposition(self) -> str:
+        """Preserve selected components, never promote merely prepared work."""
+        if self.capability_cards and self.has_answer_tables:
+            return "ship_components_with_hedge"
+        if self.capability_cards:
+            return "ship_cards_with_hedge"
+        return "ship_tables_with_hedge" if self.has_answer_tables else "decline_only"
+
     def apply_ship_disposition(self, disposition: str, assumptions: tuple[str, ...]) -> None:
         self._assumptions = [item for item in self._assumptions if item in assumptions]
-        if disposition != "ship_cards_with_hedge":
+        if disposition not in {"ship_cards_with_hedge", "ship_components_with_hedge"}:
             self.clear_capabilities()
-        if disposition != "ship_tables_with_hedge":
+        if disposition not in {"ship_tables_with_hedge", "ship_components_with_hedge"}:
             self._sql.clear()
             self._answer_tables.clear()
             self._blueprint_use = None
