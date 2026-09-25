@@ -81,9 +81,12 @@ async def test_summarize_strips_wrapping_quotes() -> None:
     ],
 )
 async def test_summarize_replaces_mechanical_language(produced: str) -> None:
-    assert await ProgressSummarizer(_FakeModelClient(produced)).summarize(
-        "searchBlueprints", {"query": "employee positions"}
-    ) == "finding the best way to answer"
+    assert (
+        await ProgressSummarizer(_FakeModelClient(produced)).summarize(
+            "searchBlueprints", {"query": "employee positions"}
+        )
+        == "finding a suitable way to calculate the measures you requested"
+    )
 
 
 async def test_summarize_passes_tool_name_and_allowlisted_args_to_prompt() -> None:
@@ -303,7 +306,7 @@ async def test_the_post_filter_catches_a_bare_table_name_from_a_withheld_arg() -
         "getTableSchema", {"database": "dbpcm_warehouse", "table": "EmployeeMaster"}
     )
 
-    assert line == "checking what information is available"
+    assert line == "checking which details can answer your question"
 
 
 async def test_the_post_filter_catches_a_bare_table_name_from_the_withheld_sql() -> None:
@@ -417,7 +420,7 @@ async def test_a_dotted_identifier_in_a_slot_value_or_search_query_is_replaced()
             "searchBlueprints",
             {"query": "overtime from payroll_detail table"},
             "Searching blueprints over payroll_detail",
-            "finding the best way to answer",
+            "finding a suitable way to calculate the measures you requested",
         ),
         (
             "recordAssumptions",
@@ -442,7 +445,7 @@ async def test_a_backtick_quoted_identifier_is_replaced() -> None:
         line = await ProgressSummarizer(_FakeModelClient(produced)).summarize(
             "searchBlueprints", {"query": "headcount"}
         )
-        assert line == "finding the best way to answer", produced
+        assert line == "finding a suitable way to calculate the measures you requested", produced
 
 
 async def test_a_sql_fragment_in_the_line_is_replaced() -> None:
@@ -454,7 +457,7 @@ async def test_a_sql_fragment_in_the_line_is_replaced() -> None:
         line = await ProgressSummarizer(_FakeModelClient(produced)).summarize(
             "searchBlueprints", {"query": "headcount"}
         )
-        assert line == "finding the best way to answer", produced
+        assert line == "finding a suitable way to calculate the measures you requested", produced
 
 
 async def test_the_shape_check_leaves_ordinary_business_prose_alone() -> None:
@@ -481,7 +484,7 @@ def test_the_system_prompt_forbids_internal_identifiers() -> None:
     assert "databases, schemas, tables, columns, blueprints, tools" in _SYSTEM_PROMPT
     assert "plain business English" in _SYSTEM_PROMPT
     # The bounds the feature depends on are still stated.
-    assert "max ~12 words" in _SYSTEM_PROMPT
+    assert "about 12–22 words" in _SYSTEM_PROMPT
     assert "No preamble" in _SYSTEM_PROMPT
 
 
@@ -503,3 +506,45 @@ def test_no_physical_identifier_argument_is_ever_allowlisted() -> None:
     for tool, allowed in _ARG_ALLOWLIST.items():
         for key in ("sql", "database", "table", "column", "columns", "tables"):
             assert key not in allowed, f"{tool} allowlists {key!r}"
+
+
+async def test_summary_has_request_context_without_sql_or_results():
+    fake = _FakeModelClient("Comparing overtime totals across departments for September")
+    line = await ProgressSummarizer(fake).summarize(
+        "runQuery",
+        {"sql": "SELECT sum(HiddenAmount) FROM internal_payroll"},
+        user_request="Compare overtime by department for September",
+    )
+    prompt = fake.calls[0][0][-1]["content"]
+    assert "Compare overtime by department for September" in prompt
+    assert "HiddenAmount" not in prompt
+    assert "internal_payroll" not in prompt
+    assert line == "Comparing overtime totals across departments for September"
+
+
+async def test_multi_part_search_context_projects_only_business_queries():
+    fake = _FakeModelClient("Checking how to compare department headcounts and overtime totals")
+    await ProgressSummarizer(fake).summarize(
+        "searchBlueprints",
+        {
+            "deliverables": [
+                {
+                    "intent_id": "private_intent_id",
+                    "query": "department headcounts",
+                    "sql": "PRIVATE_SQL",
+                },
+                {"intent_id": "other", "query": "overtime totals"},
+            ]
+        },
+        user_request="Compare headcount and overtime",
+    )
+    prompt = fake.calls[0][0][-1]["content"]
+    assert "department headcounts" in prompt and "overtime totals" in prompt
+    assert "PRIVATE_SQL" not in prompt and "private_intent_id" not in prompt
+
+
+async def test_request_context_is_bounded_and_cannot_license_internal_progress():
+    fake = _FakeModelClient("Searching blueprints in internal_payroll")
+    line = await ProgressSummarizer(fake).summarize("runQuery", {}, user_request="x" * 10000)
+    assert len(fake.calls[0][0][-1]["content"]) < 1400
+    assert line == "finding the requested information"

@@ -187,13 +187,13 @@ def build_real_app():
         # Use RuntimeSettings production budgets; do not pin obsolete launcher values.
         answer_judge_enabled=answer_judge_on,
         # Value-rich progress lines via a cheap side LLM (openai_summary_model);
-        # ordered before dispatch, bounded by the summary timeout. Explicitly wired (this launcher
+        # generated concurrently; progress delivery is ordered and bounded. Explicitly wired (this launcher
         # sets _env_file=None, so the flag must not rely on `.env`).
         progress_summary_enabled=progress_summaries_on,
         openai_summary_base_url=os.environ.get("OPENAI_SUMMARY_BASE_URL") or None,
         openai_summary_api_key=os.environ.get("OPENAI_SUMMARY_API_KEY") or None,
         progress_summary_timeout_seconds=float(
-            os.environ.get("PROGRESS_SUMMARY_TIMEOUT_SECONDS", "") or 10.0
+            os.environ.get("PROGRESS_SUMMARY_TIMEOUT_SECONDS", "") or 5.0
         ),
         # Retrieval / scratch: both off unless REAL_RETRIEVAL=1.
         #

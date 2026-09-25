@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .progress_summarizer import _static_line
+
 # Only these payload keys are ever allowed to flow into a progress event's
 # `shape` — an explicit allowlist, not a denylist, so a new observer event
 # added later never accidentally leaks a sensitive field by default.
@@ -70,22 +72,22 @@ _STEP_LABELS: dict[str, str] = {
     "loop_ask_user_batch_calls_dropped": "deferring other work until your answer",
     # Retrieval fires TWO shape-only steps (design §3.5): a start signal while it
     # searches, and a completion step carrying the (blueprints, knowledge) counts.
-    "retrieval_start": "searching for a matching blueprint…",
-    "retrieval": "found matching context",
-    "blueprint_rule_resolved": "resolved the filter set",
-    "tool_dispatch_start": "running {tool_name}…",
-    "tool_dispatch_ok": "step complete: {tool_name}",
-    "tool_dispatch_denied": "step denied: {tool_name}",
-    "tool_dispatch_error": "step failed: {tool_name}",
-    "loop_model_call_start": "thinking…",
-    "loop_repeated_capability_call_guarded": "reusing an earlier option preparation outcome",
-    "loop_capability_card_deduped": "equivalent options combined",
+    "retrieval_start": "looking for information relevant to your question…",
+    "retrieval": "reviewing the information available for your question",
+    "blueprint_rule_resolved": "identified the requested group to include",
+    "tool_dispatch_start": "working on the next part of your question…",
+    "tool_dispatch_ok": "finished this step; continuing with your answer",
+    "tool_dispatch_denied": "this step could not proceed; checking what can still be answered",
+    "tool_dispatch_error": "this step did not finish; checking how to continue",
+    "loop_model_call_start": "working out the next step for your answer…",
+    "loop_repeated_capability_call_guarded": "using the previously prepared information",
+    "loop_capability_card_deduped": "combining duplicate views",
     "loop_model_call_timeout": "answer preparation timed out",
     "loop_turn_aborted": "request cancelled",
     "loop_turn_done": "done",
     "loop_paused_ask_user": "waiting for your answer…",
     "loop_paused_budget_cap": "this is taking a while — continue, refine, or stop?",
-    "loop_hard_ceiling_stop": "stopping — budget exhausted",
+    "loop_hard_ceiling_stop": "stopping here because this request has reached its time or work limit",
 }
 
 _TOOL_PROGRESS_LABELS: dict[tuple[str, str], str] = {
@@ -143,6 +145,8 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
         return ProgressEvent(step=summary.strip(), shape=shape)
     tool_name = payload.get("tool_name")
     label = _TOOL_PROGRESS_LABELS.get((event, tool_name)) if isinstance(tool_name, str) else None
+    if label is None and event == "tool_dispatch_start" and isinstance(tool_name, str):
+        label = _static_line(tool_name) + "…"
     if label is None:
         label = _STEP_LABELS.get(event)
     if label is None:
@@ -155,25 +159,48 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
     return ProgressEvent(step=step, shape=shape)
 
 
+@dataclass(frozen=True)
+class _PendingSummary:
+    task: asyncio.Task[str]
+    payload: dict[str, Any]
+
+
 class ProgressEmitter:
     """Renders observer calls into `ProgressEvent`s on an asyncio queue —
     one instance per in-flight turn, consumed by `app.py`'s SSE endpoint."""
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[ProgressEvent | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[ProgressEvent | _PendingSummary | None] = asyncio.Queue()
         self._closed = False
+        self._reserved_summaries: set[str] = set()
 
     def observe(self, event: str, payload: dict[str, Any]) -> None:
         """The `(event, payload) -> None` callback — wire directly into
         `ToolDispatcher(observer=...)` / `AgentLoop(observer=...)`."""
         if self._closed:
             return
+        call_id = payload.get("tool_call_id")
+        if event == "tool_progress_summary_pending":
+            task = payload.get("summary_task")
+            # Finalization proposals must still wait for review before any UI progress.
+            visible = to_progress_event(_PROGRESS_SUMMARY_EVENT, {**payload, "summary": "pending"})
+            if visible is not None and isinstance(task, asyncio.Task) and isinstance(call_id, str):
+                self._reserved_summaries.add(call_id)
+                self._queue.put_nowait(
+                    _PendingSummary(
+                        task,
+                        {key: value for key, value in payload.items() if key != "summary_task"},
+                    )
+                )
+            return
+        if event == _PROGRESS_SUMMARY_EVENT and call_id in self._reserved_summaries:
+            return  # Its reserved slot delivers it, never append it after completion.
         progress_event = to_progress_event(event, payload)
         if progress_event is not None:
             self._queue.put_nowait(progress_event)
 
     def close(self) -> None:
-        """Signal end-of-stream — call once the turn completes."""
+        """Seal the queue after producers finish; the sentinel follows every reserved slot."""
         if self._closed:
             return
         self._closed = True
@@ -185,6 +212,20 @@ class ProgressEmitter:
             event = await self._queue.get()
             if event is None:
                 return
+            if isinstance(event, _PendingSummary):
+                try:
+                    summary = await asyncio.shield(event.task)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise
+                    summary = _static_line(event.payload["tool_name"])
+                except Exception:
+                    summary = _static_line(event.payload["tool_name"])
+                event = to_progress_event(
+                    _PROGRESS_SUMMARY_EVENT, {**event.payload, "summary": summary}
+                )
+                if event is None:
+                    continue
             yield event
 
 

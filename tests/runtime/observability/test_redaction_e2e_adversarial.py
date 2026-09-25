@@ -187,7 +187,7 @@ async def test_progress_emitter_wired_into_a_real_turn_never_carries_pii() -> No
     # Sanity: real progress events were actually produced (not a vacuous
     # "empty stream trivially has no PII" pass).
     assert len(progress_events) >= 3
-    assert any(e.step.startswith("running") for e in progress_events)
+    assert any(e.step == "finding the requested information…" for e in progress_events)
 
 
 async def test_mask_sql_applied_before_any_span_write_strips_the_exact_pii_used_here() -> None:

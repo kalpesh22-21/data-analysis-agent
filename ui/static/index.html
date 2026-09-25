@@ -865,7 +865,7 @@
     els.errorMessage.textContent = message || "Something went wrong.";
   }
 
-  function addProgressItem(step, shape) {
+  function addProgressItem(step) {
     var li = document.createElement("li");
     li.className = "progress-item";
     li.setAttribute("data-testid", "progress-item");
@@ -874,14 +874,6 @@
     stepSpan.className = "step";
     stepSpan.textContent = step;
     li.appendChild(stepSpan);
-
-    var shapeKeys = shape ? Object.keys(shape) : [];
-    if (shapeKeys.length > 0) {
-      var shapeSpan = document.createElement("span");
-      shapeSpan.className = "shape";
-      shapeSpan.textContent = JSON.stringify(shape);
-      li.appendChild(shapeSpan);
-    }
 
     els.progressList.appendChild(li);
     els.progressList.scrollTop = els.progressList.scrollHeight;
@@ -1686,7 +1678,7 @@
 
   function handleSSEEvent(eventName, data) {
     if (eventName === "progress" && data) {
-      addProgressItem(data.step, data.shape);
+      addProgressItem(data.step);
     } else if (eventName === "result" && data) {
       // Populate the in-progress turn block (no clearing — prior blocks stay).
       if (inProgressBlock) {

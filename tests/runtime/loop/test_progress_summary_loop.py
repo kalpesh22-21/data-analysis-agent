@@ -3,7 +3,7 @@
 With a summarizer wired, a tool dispatch emits BOTH the instant
 `tool_dispatch_start` template label AND an additive, value-rich
 `tool_progress_summary` event (fired concurrently, never awaited before
-dispatch). A SLOW summarizer never blocks the tool or the turn result. With no
+dispatch). A slow summarizer never blocks execution; the turn drains producers before returning. With no
 summarizer (the default), the loop emits neither the extra event nor calls the
 summarizer — byte-identical to before the feature.
 """
@@ -55,16 +55,23 @@ class _FakeSummarizer:
         self._line = line
         self._stall = stall
         self.calls: list[tuple[str, dict]] = []
+        self.requests: list[str] = []
         # Captured (from inside the fire-and-forget task) so a test can assert the
         # straggler was actually cancelled at turn end.
         self.task: asyncio.Task | None = None
+        self.was_cancelled = False
 
-    async def summarize(self, tool_name: str, arguments: dict) -> str | None:
+    async def summarize(self, tool_name: str, arguments: dict, *, user_request="") -> str | None:
         self.task = asyncio.current_task()
         self.calls.append((tool_name, dict(arguments)))
+        self.requests.append(user_request)
         if self._stall:
             # Never resolves within the turn — proves dispatch is not awaited on it.
-            await asyncio.sleep(3600)
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.was_cancelled = True
+                raise
         return self._line
 
 
@@ -139,6 +146,7 @@ async def test_dispatch_emits_both_template_label_and_summary() -> None:
     assert outcome.status == "done"
     # The summarizer saw the CALL (name + args), not the result.
     assert summarizer.calls == [("runQuery", {"sql": "SELECT EmployeeCode FROM employee"})]
+    assert summarizer.requests == ["show codes"]
 
     names = [e for e, _ in events]
     # The instant template label still fires (unchanged).
@@ -158,7 +166,8 @@ async def test_dispatch_emits_both_template_label_and_summary() -> None:
     assert progress.shape == {"tool_name": "runQuery", "tool_call_id": "call_1"}
 
 
-async def test_slow_summarizer_does_not_block_dispatch_or_turn() -> None:
+async def test_slow_summarizer_does_not_block_dispatch_or_turn(monkeypatch) -> None:
+    monkeypatch.setattr("data_agent.runtime.loop.agent_loop.SUMMARY_DEADLINE_SECONDS", 0.03)
     events: list[tuple[str, dict]] = []
     mcp = _run_query_mcp()
     summarizer = _FakeSummarizer(stall=True)
@@ -170,7 +179,7 @@ async def test_slow_summarizer_does_not_block_dispatch_or_turn() -> None:
     )
 
     # A stalling summarizer must NOT prevent the tool from dispatching or the turn
-    # from completing — the whole run resolves promptly despite the 3600s stall.
+    # from completing within the summary deadline despite the 3600s stall.
     outcome = await asyncio.wait_for(
         loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="show codes"),
         timeout=5.0,
@@ -179,10 +188,14 @@ async def test_slow_summarizer_does_not_block_dispatch_or_turn() -> None:
     assert outcome.status == "done"
     # The tool DID dispatch (not gated on the summary).
     assert [c.tool_name for c in mcp.calls] == ["runQuery"]
-    # The summarizer was invoked, but its (cancelled) stall produced no summary event.
+    # The summarizer was invoked; its expired deadline produces a fallback.
     assert summarizer.calls == [("runQuery", {"sql": "SELECT EmployeeCode FROM employee"})]
+    assert summarizer.requests == ["show codes"]
     assert "tool_dispatch_start" in [e for e, _ in events]
-    assert "tool_progress_summary" not in [e for e, _ in events]
+    assert (
+        next(p["summary"] for e, p in events if e == "tool_progress_summary")
+        == "finding the requested information"
+    )
 
     # Lifecycle: the loop drained its task set at turn end (no leak) …
     # … and the stalled straggler task was actually cancelled (let the requested
@@ -190,7 +203,7 @@ async def test_slow_summarizer_does_not_block_dispatch_or_turn() -> None:
     # abandoned still-running).
     await asyncio.sleep(0)
     assert summarizer.task is not None
-    assert summarizer.task.cancelled()
+    assert summarizer.was_cancelled
 
 
 async def test_raising_observer_on_summary_emit_does_not_break_turn() -> None:
@@ -218,6 +231,7 @@ async def test_raising_observer_on_summary_emit_does_not_break_turn() -> None:
     assert outcome.assistant_text == "All done."
     # The emit was attempted (summarizer ran) but its raise was swallowed …
     assert summarizer.calls == [("runQuery", {"sql": "SELECT EmployeeCode FROM employee"})]
+    assert summarizer.requests == ["show codes"]
     # … and cleanup still drained the task set.
 
 
@@ -232,7 +246,9 @@ async def test_a_raising_summarizer_does_not_break_the_turn() -> None:
         def __init__(self) -> None:
             self.calls: list[str] = []
 
-        async def summarize(self, tool_name: str, arguments: dict) -> str | None:
+        async def summarize(
+            self, tool_name: str, arguments: dict, *, user_request=""
+        ) -> str | None:
             self.calls.append(tool_name)
             raise RuntimeError("summarizer exploded")
 
@@ -253,8 +269,11 @@ async def test_a_raising_summarizer_does_not_break_the_turn() -> None:
     assert outcome.status == "done"
     assert outcome.assistant_text == "All done."
     assert summarizer.calls == ["runQuery"]
-    # Nothing was emitted — not even a fallback line (the failure is silent).
-    assert "tool_progress_summary" not in [e for e, _ in events]
+    # Failures still resolve the reserved slot with a business-language fallback.
+    assert (
+        next(p["summary"] for e, p in events if e == "tool_progress_summary")
+        == "finding the requested information"
+    )
     # The instant template label still carried the turn.
     assert "tool_dispatch_start" in [e for e, _ in events]
 
@@ -350,10 +369,11 @@ async def test_finalization_summary_and_progress_follow_review(review):
         if name in {"answerWithText", "answerWithTable", "finalizeAnswer"}
     ]
     if review in {"approved", "repair"}:
+        # Observer order reflects real execution; the emitter reorders UI delivery.
         assert [e for e, _ in visible] == [
-            "tool_progress_summary",
             "tool_dispatch_start",
             "tool_dispatch_ok",
+            "tool_progress_summary",
         ]
         assert final_summaries == ["finalizeAnswer"]
         assert all(p["judge_approved"] for _, p in visible)

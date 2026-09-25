@@ -436,12 +436,12 @@ class RuntimeSettings(BaseSettings):
         ),
     )
     progress_summary_timeout_seconds: float = Field(
-        10.0,
+        5.0,
         gt=0,
         description=(
             "Per-call timeout for the progress-line summarization LLM call. On timeout "
-            "the summary is dropped (fail-soft) and the instant template label stands. "
-            "This timeout bounds the extra latency before dispatch when summaries are enabled."
+            "a business-language fallback fills its ordered progress slot. Summary generation "
+            "runs concurrently with execution; the loop enforces a five-second maximum."
         ),
     )
 

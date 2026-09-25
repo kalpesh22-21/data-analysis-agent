@@ -139,7 +139,7 @@ async def test_progress_events_are_shape_only_start_then_counts() -> None:
 
     # The public progress translation renders shape-only, question-free steps.
     assert to_progress_event("retrieval_start", start_payload).step == (  # type: ignore[union-attr]
-        "searching for a matching blueprint…"
+        "looking for information relevant to your question…"
     )
     progress = to_progress_event("retrieval", payload)
     assert progress is not None

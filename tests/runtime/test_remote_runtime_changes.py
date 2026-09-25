@@ -194,9 +194,9 @@ async def test_unknown_tool_is_local_and_has_no_progress_start():
     assert not any(name.startswith("tool_dispatch_") for name, _ in events)
 
 
-async def test_ordered_summary_precedes_one_matching_dispatch_pair():
+async def test_summary_reservation_precedes_one_matching_dispatch_pair():
     class Summarizer:
-        async def summarize(self, name, args):
+        async def summarize(self, name, args, *, user_request=""):
             await asyncio.sleep(0)
             return "Preparing the option."
 
@@ -212,10 +212,12 @@ async def test_ordered_summary_precedes_one_matching_dispatch_pair():
         if p.get("tool_call_id") == "card-7"
         and (name.startswith("tool_dispatch_") or name == "tool_progress_summary")
     ]
+    names = [name for name, payload in events if payload.get("tool_call_id") == "card-7"]
+    assert names.index("tool_progress_summary_pending") < names.index("tool_dispatch_start")
     assert progress == [
-        ("tool_progress_summary", "card-7"),
         ("tool_dispatch_start", "card-7"),
         ("tool_dispatch_ok", "card-7"),
+        ("tool_progress_summary", "card-7"),
     ]
 
 
@@ -571,9 +573,9 @@ async def test_ship_guard_strips_only_assumptions_added_after_refusal():
     assert outcome.blueprint_use is outcome.verification is None
 
 
-async def test_failed_summary_does_not_prevent_dispatch_or_emit_a_late_summary():
+async def test_failed_summary_does_not_prevent_dispatch_and_produces_fallback():
     class Summarizer:
-        async def summarize(self, name, args):
+        async def summarize(self, name, args, *, user_request=""):
             raise TimeoutError("private input")
 
     loop, _, events, _, _ = build(
@@ -588,7 +590,7 @@ async def test_failed_summary_does_not_prevent_dispatch_or_emit_a_late_summary()
         "tool_dispatch_start",
         "tool_dispatch_ok",
     ]
-    assert not any(n == "tool_progress_summary" for n, _ in events)
+    assert any(n == "tool_progress_summary" and p.get("summary") for n, p in events)
 
 
 async def test_runtime_exception_keeps_the_pair_and_canned_error():

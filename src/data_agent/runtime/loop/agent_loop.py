@@ -102,7 +102,13 @@ from data_agent.runtime.model.conversation import (
     conversation_call_ids,
     restore_response_batches,
 )
-from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
+from data_agent.runtime.observability.progress_summarizer import (
+    CURRENT_SUMMARY_TASKS,
+    SUMMARY_DEADLINE_SECONDS,
+    ProgressSummarizer,
+    _static_line,
+    progress_summary_boundary,
+)
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.observability.tracing import mark_current_span_error
 from data_agent.runtime.sanitize import sanitize_text
@@ -1013,11 +1019,12 @@ class AgentLoop:
         # every other tracer seam (`ToolDispatcher`, `RuntimeToolBase`): `None`
         # (Layer-1 loop tests, no Phoenix) means the span is simply never created.
         self._tracer = tracer
-        # Summaries complete before dispatch; the summarizer owns its timeout.
+        # Each call gets an independent summary task; the turn owns their lifetime.
         self._progress_summarizer = progress_summarizer
         self._answer_table_hooks = answer_table_hooks or AnswerTableHooks()
 
     @observe_turn_abort
+    @progress_summary_boundary
     @delivery_boundary
     async def run(
         self, *, session_id: str, credentials: RuntimeCredentials, user_message: str
@@ -1048,6 +1055,7 @@ class AgentLoop:
         )
 
     @observe_turn_abort
+    @progress_summary_boundary
     @delivery_boundary
     async def resume(
         self, *, session_id: str, credentials: RuntimeCredentials, answer: str
@@ -1604,36 +1612,66 @@ class AgentLoop:
         return cards
 
     async def _maybe_start_summary(
-        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any], *, judge_approved=False
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        *,
+        judge_approved=False,
+        user_request: str = "",
     ) -> None:
-        """Emit the optional summary before dispatch so a late start cannot reopen a spinner."""
-        if self._progress_summarizer is not None:
-            try:
-                await asyncio.wait_for(
-                    asyncio.create_task(
-                        self._summarize_and_emit(
-                            tool_name, tool_call_id, dict(arguments), judge_approved=judge_approved
-                        )
-                    ),
-                    timeout=1.0,
-                )
-            except TimeoutError:
-                pass
+        """Reserve an ordered progress slot and start a summary without delaying execution."""
+        if self._progress_summarizer is None:
+            return
+        task = asyncio.create_task(
+            self._summarize_and_emit(
+                tool_name,
+                tool_call_id,
+                dict(arguments),
+                judge_approved=judge_approved,
+                user_request=user_request,
+            )
+        )
+        tasks = CURRENT_SUMMARY_TASKS.get()
+        if tasks is not None:
+            tasks.add(task)
+        try:
+            self._observer(
+                "tool_progress_summary_pending",
+                {
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "summary_task": task,
+                    **({"judge_approved": True} if judge_approved else {}),
+                },
+            )
+        except Exception:
+            _logger.debug("progress-summary reservation failed (ignored)", exc_info=True)
 
     async def _summarize_and_emit(
-        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any], *, judge_approved=False
-    ) -> None:
-        """Await the summarizer and emit the value-rich progress line — fail-soft: an error or
-        timeout yields `None` (dropped), and observer failures are contained.
-        """
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        *,
+        judge_approved=False,
+        user_request: str = "",
+    ) -> str:
+        """Resolve every slot with a summary or safe fallback within five seconds."""
+        summary = _static_line(tool_name)
         try:
-            summary = await self._progress_summarizer.summarize(tool_name, arguments)
+            produced = await asyncio.wait_for(
+                self._progress_summarizer.summarize(
+                    tool_name, arguments, **({"user_request": user_request} if user_request else {})
+                ),
+                timeout=SUMMARY_DEADLINE_SECONDS,
+            )
+            if isinstance(produced, str) and produced.strip():
+                summary = produced.strip()
         except asyncio.CancelledError:
             raise
         except Exception:
-            return
-        if not summary:
-            return
+            pass
         try:
             # The ProgressEmitter drops a post-close emit (its `_closed` guard), and
             # the tracing guardrail observer ignores non-`loop_` events — so this is
@@ -1650,6 +1688,7 @@ class AgentLoop:
             )
         except Exception:
             _logger.debug("progress-summary emit failed for %s (ignored)", tool_name)
+        return summary
 
     async def _run_runtime_tool(
         self,
@@ -3677,7 +3716,9 @@ class AgentLoop:
                     ANSWER_TABLE_TOOL_NAME,
                     ANSWER_TEXT_TOOL_NAME,
                 }:
-                    await self._maybe_start_summary(tool_call.name, tool_call.id, call_args)
+                    await self._maybe_start_summary(
+                        tool_call.name, tool_call.id, call_args, user_request=question
+                    )
 
                 # Runtime-tool registry (read-tools-design §2): a runtime tool
                 # (`resolveValues` + the three read tools) is intercepted here —

@@ -12,7 +12,7 @@ from data_agent.runtime.observability.progress import (
 def test_to_progress_event_renders_known_events() -> None:
     event = to_progress_event("tool_dispatch_start", {"tool_name": "runQuery"})
     assert event is not None
-    assert event.step == "running runQuery…"
+    assert event.step == "finding the requested information…"
     assert event.shape == {"tool_name": "runQuery"}
 
 
@@ -42,7 +42,7 @@ def test_to_progress_event_never_carries_sql_or_credentials() -> None:
 def test_to_progress_event_falls_back_to_bare_label_on_missing_placeholder() -> None:
     event = to_progress_event("tool_dispatch_start", {})
     assert event is not None
-    assert event.step == "running {tool_name}…"  # no KeyError raised
+    assert event.step == "working on the next part of your question…"  # no KeyError raised
 
 
 def test_tool_progress_summary_uses_summary_verbatim_bypassing_labels() -> None:
@@ -95,7 +95,7 @@ async def test_progress_emitter_streams_events_until_closed() -> None:
     emitter.close()
 
     events = [e async for e in emitter.stream()]
-    assert [e.step for e in events] == ["running listDatabases…", "done"]
+    assert [e.step for e in events] == ["checking what information is available…", "done"]
 
 
 async def test_progress_emitter_drops_unknown_events_silently() -> None:
@@ -127,3 +127,49 @@ def test_combine_observers_fans_out_to_all() -> None:
 
     assert seen_a == [("tool_dispatch_start", {"tool_name": "runQuery"})]
     assert seen_b == seen_a
+
+
+def test_all_dispatch_stages_hide_internal_names_even_without_summary_model() -> None:
+    for tool in (
+        "searchBlueprints",
+        "getBlueprint",
+        "runBlueprint",
+        "runQuery",
+        "getTableSchema",
+        "unknownInternalTool",
+    ):
+        for stage in ("start", "ok", "denied", "error"):
+            event = to_progress_event(f"tool_dispatch_{stage}", {"tool_name": tool})
+            assert event is not None
+            assert tool not in event.step
+            assert "blueprint" not in event.step.lower()
+            assert event.shape["tool_name"] == tool
+
+
+async def test_summary_start_and_completion_remain_distinct_events():
+    emitter = ProgressEmitter()
+    emitter.observe(
+        "tool_progress_summary",
+        {
+            "tool_name": "runBlueprint",
+            "tool_call_id": "headcount",
+            "summary": "Counting active staff by department for September",
+        },
+    )
+    emitter.observe(
+        "tool_dispatch_start", {"tool_name": "runBlueprint", "tool_call_id": "headcount"}
+    )
+    # An independent call still gets its start, and completion/failure stays visible.
+    emitter.observe(
+        "tool_dispatch_start", {"tool_name": "getTableSchema", "tool_call_id": "salary"}
+    )
+    emitter.observe(
+        "tool_dispatch_error", {"tool_name": "runBlueprint", "tool_call_id": "headcount"}
+    )
+    emitter.close()
+    events = [event async for event in emitter.stream()]
+    assert len(events) == 4
+    assert events[0].step == "Counting active staff by department for September"
+    assert events[1].shape["tool_call_id"] == "headcount"
+    assert events[2].shape["tool_call_id"] == "salary"
+    assert "did not finish" in events[3].step
