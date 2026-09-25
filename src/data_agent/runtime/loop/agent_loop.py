@@ -1575,6 +1575,8 @@ class AgentLoop:
     async def _compute_turn_capability_cards(
         self, session_id: str, turn_index: int, column_scope: frozenset[str] | None = None
     ) -> list[dict[str, Any]]:
+        if not self._context_assembler.capability_tools_enabled:
+            return []
         trail = await self._session_store.load_trail(session_id)
         cards: list[dict[str, Any]] = []
         doc = await self._session_store.get_or_create_session(session_id)
@@ -1912,7 +1914,9 @@ class AgentLoop:
         doc = await self._session_store.get_or_create_session(session_id)
         in_scope = [
             e
-            for e in scope_filter.filter_trail(doc.tool_trail, column_scope)
+            for e in scope_filter.filter_trail(
+                self._context_assembler.available_tool_trail(doc.tool_trail), column_scope
+            )
             if e.tool_call_id not in exclude_result_ids
         ]
         rendered = tuple(

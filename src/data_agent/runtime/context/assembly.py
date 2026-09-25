@@ -137,6 +137,7 @@ class ContextAssembler:
         preview_row_count: int = 20,
         retrieval: RetrievalPipeline | None = None,
         retrieval_prefetch_tool_enabled: bool = False,
+        capability_tools_enabled: bool = True,
         capability_prefetch_provider: Callable[[str, str | None], Any] | None = None,
         base_system_prompt: str | None = None,
         tracer: Tracer | None = None,
@@ -165,12 +166,36 @@ class ContextAssembler:
         # Feature-flagged representation only; retrieval behavior and lifetime are
         # unchanged. False preserves the established byte-for-byte user-message path.
         self._retrieval_prefetch_tool_enabled = retrieval_prefetch_tool_enabled
-        self._capability_prefetch_provider = capability_prefetch_provider
+        self.capability_tools_enabled = capability_tools_enabled
+        self._capability_prefetch_provider = (
+            capability_prefetch_provider if capability_tools_enabled else None
+        )
         # B5: optional — when wired (app.py's composition root), assemble()
         # emits one CHAIN span per call recording only non-sensitive shape
         # counters (trail entries loaded, dropped-by-scope count — design §7's
         # CHAIN row); `None` (Layer-1 tests) means no span is ever created.
         self._tracer = tracer
+
+    def available_tool_trail(self, trail: Sequence[TrailEntry]) -> Sequence[TrailEntry]:
+        """Do not replay retired capability tools after disabling them on a reused session.
+
+        Preserve conversation text and warehouse evidence. Filter before rendering so
+        batch restoration cannot resurrect removed calls or their opaque reasoning.
+        """
+        if self.capability_tools_enabled:
+            return trail
+        capability_names = {
+            entry.args.get("tool_name")
+            for entry in trail
+            if entry.tool_name == "getCapabilityTool"
+            and isinstance(entry.args.get("tool_name"), str)
+        }
+        capability_names.update({"searchCapabilityTools", "getCapabilityTool"})
+        return [
+            entry
+            for entry in trail
+            if not entry.capability_terminal and entry.tool_name not in capability_names
+        ]
 
     async def assemble(
         self,
@@ -221,7 +246,7 @@ class ContextAssembler:
             # 1. load BOTH streams from the SAME doc (single get_or_create_session):
             # the tool pairs AND the user/assistant dialogue that interleave by turn.
             doc = await self._session_store.get_or_create_session(session_id)
-            raw_trail = doc.tool_trail
+            raw_trail = self.available_tool_trail(doc.tool_trail)
             raw_messages = doc.messages
 
             # 2. D44 filter EACH stream independently, order-preserving.

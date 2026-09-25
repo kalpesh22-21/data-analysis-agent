@@ -642,6 +642,7 @@ def create_app(
         preview_row_count=settings.preview_row_count,
         retrieval=active_retrieval,
         retrieval_prefetch_tool_enabled=settings.retrieval_prefetch_tool_enabled,
+        capability_tools_enabled=settings.capability_tools_enabled,
         capability_prefetch_provider=capability_prefetch_provider,
         base_system_prompt=settings.effective_agent_system_prompt(),
         tracer=tracer,
@@ -961,6 +962,7 @@ def create_app(
                 AnswerJudge(
                     model_client=judge_model_client,
                     token_budget=settings.answer_judge_evidence_token_budget,
+                    capabilities_enabled=settings.capability_tools_enabled,
                     timeout_seconds=settings.answer_judge_timeout_seconds,
                     observer=observer,
                     # The judge opens its OWN `answer_judge` CHAIN span, so the
