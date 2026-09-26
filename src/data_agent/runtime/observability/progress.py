@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .progress_summarizer import _static_line
@@ -39,6 +39,7 @@ _SHAPE_ALLOWLIST = (
     "phase",
     "tool_name",
     "tool_call_id",
+    "lifecycle",  # Derived from the dispatch event, never copied from payload text.
     "error_code",
     "window",
     "tool_calls_made",
@@ -124,6 +125,21 @@ class ProgressEvent:
 _PROGRESS_SUMMARY_EVENT = "tool_progress_summary"
 
 
+_DISPATCH_LIFECYCLES = {
+    "tool_dispatch_start": "start",
+    "tool_dispatch_ok": "ok",
+    "tool_dispatch_denied": "denied",
+    "tool_dispatch_error": "error",
+}
+
+
+def _progress_shape(event: str, payload: dict[str, Any]) -> dict[str, Any]:
+    shape = {key: payload[key] for key in _SHAPE_ALLOWLIST if key != "lifecycle" and key in payload}
+    if lifecycle := _DISPATCH_LIFECYCLES.get(event):
+        shape["lifecycle"] = lifecycle
+    return shape
+
+
 def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | None:
     """Translate one observer `(event, payload)` call into a `ProgressEvent`.
 
@@ -141,7 +157,8 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
         summary = payload.get("summary")
         if not isinstance(summary, str) or not summary.strip():
             return None
-        shape = {key: payload[key] for key in _SHAPE_ALLOWLIST if key in payload}
+        # Summaries only update copy; they must not start, close, or reopen a row.
+        shape = _progress_shape(event, payload)
         return ProgressEvent(step=summary.strip(), shape=shape)
     tool_name = payload.get("tool_name")
     label = _TOOL_PROGRESS_LABELS.get((event, tool_name)) if isinstance(tool_name, str) else None
@@ -151,12 +168,18 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
         label = _STEP_LABELS.get(event)
     if label is None:
         return None
-    shape = {key: payload[key] for key in _SHAPE_ALLOWLIST if key in payload}
+    shape = _progress_shape(event, payload)
     try:
         step = label.format(**shape)
     except KeyError:
         step = label
     return ProgressEvent(step=step, shape=shape)
+
+
+@dataclass(frozen=True)
+class _QueuedProgress:
+    event: ProgressEvent
+    is_summary: bool
 
 
 @dataclass(frozen=True)
@@ -170,7 +193,7 @@ class ProgressEmitter:
     one instance per in-flight turn, consumed by `app.py`'s SSE endpoint."""
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[ProgressEvent | _PendingSummary | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[_QueuedProgress | _PendingSummary | None] = asyncio.Queue()
         self._closed = False
         self._reserved_summaries: set[str] = set()
 
@@ -197,7 +220,9 @@ class ProgressEmitter:
             return  # Its reserved slot delivers it, never append it after completion.
         progress_event = to_progress_event(event, payload)
         if progress_event is not None:
-            self._queue.put_nowait(progress_event)
+            self._queue.put_nowait(
+                _QueuedProgress(progress_event, event == _PROGRESS_SUMMARY_EVENT)
+            )
 
     def close(self) -> None:
         """Seal the queue after producers finish; the sentinel follows every reserved slot."""
@@ -208,10 +233,13 @@ class ProgressEmitter:
 
     async def stream(self) -> AsyncIterator[ProgressEvent]:
         """Async-iterate progress events until `close()` is called."""
+        labels: dict[str, str] = {}
+        completed: set[str] = set()
         while True:
             event = await self._queue.get()
             if event is None:
                 return
+            is_summary = isinstance(event, _PendingSummary)
             if isinstance(event, _PendingSummary):
                 try:
                     summary = await asyncio.shield(event.task)
@@ -226,6 +254,25 @@ class ProgressEmitter:
                 )
                 if event is None:
                     continue
+            else:
+                is_summary = event.is_summary
+                event = event.event
+            call_id = event.shape.get("tool_call_id")
+            lifecycle = event.shape.get("lifecycle")
+            if isinstance(call_id, str):
+                if is_summary:
+                    # Reserved summaries arrive first. Unreserved late copy must
+                    # not rename or reopen a completed row.
+                    if call_id in completed:
+                        continue
+                    labels[call_id] = event.step
+                elif lifecycle:
+                    # Keep the task summary as the label; status belongs solely
+                    # in lifecycle. A missing summary uses the first safe label.
+                    label = labels.setdefault(call_id, event.step)
+                    event = replace(event, step=label)
+                    if lifecycle != "start":
+                        completed.add(call_id)
             yield event
 
 

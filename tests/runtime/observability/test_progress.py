@@ -13,7 +13,7 @@ def test_to_progress_event_renders_known_events() -> None:
     event = to_progress_event("tool_dispatch_start", {"tool_name": "runQuery"})
     assert event is not None
     assert event.step == "finding the requested information…"
-    assert event.shape == {"tool_name": "runQuery"}
+    assert event.shape == {"tool_name": "runQuery", "lifecycle": "start"}
 
 
 def test_to_progress_event_unknown_event_returns_none() -> None:
@@ -144,6 +144,7 @@ def test_all_dispatch_stages_hide_internal_names_even_without_summary_model() ->
             assert tool not in event.step
             assert "blueprint" not in event.step.lower()
             assert event.shape["tool_name"] == tool
+            assert event.shape["lifecycle"] == stage
 
 
 async def test_summary_start_and_completion_remain_distinct_events():
@@ -172,4 +173,5 @@ async def test_summary_start_and_completion_remain_distinct_events():
     assert events[0].step == "Counting active staff by department for September"
     assert events[1].shape["tool_call_id"] == "headcount"
     assert events[2].shape["tool_call_id"] == "salary"
-    assert "did not finish" in events[3].step
+    assert events[3].step == events[1].step == events[0].step
+    assert events[3].shape["lifecycle"] == "error"

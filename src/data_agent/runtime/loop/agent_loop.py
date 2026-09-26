@@ -2436,7 +2436,7 @@ class AgentLoop:
             work=_resume_work,
         )
         self._observer(
-            "tool_dispatch_ok" if tool_result.status == "ok" else "tool_dispatch_error",
+            "tool_dispatch_" + tool_result.status,
             {
                 "tool_name": "runBlueprint",
                 "tool_call_id": resume_call_id,

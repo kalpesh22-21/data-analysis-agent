@@ -52,8 +52,10 @@ async def test_summaries_run_concurrently_but_cannot_overtake_reserved_slots():
     gates[0].set()
     await asyncio.wait_for(consumer, 1)
     assert [event.shape["tool_call_id"] for event in received] == ["0"] * 3 + ["1"] * 3
+    assert [e.shape.get("lifecycle") for e in received] == [None, "start", "ok"] * 2
     assert received[0].step == "Business task 0"
     assert received[3].step == "Business task 1"
+    assert [e.step for e in received] == ["Business task 0"] * 3 + ["Business task 1"] * 3
 
 
 class ControlledSummary:
@@ -124,13 +126,13 @@ async def test_real_turn_executes_before_summary_and_result_follows_drained_prog
     ]
     paired = [event for event in progress if event["shape"].get("tool_call_id") == "call_1"]
     assert len(paired) == 3
+    assert [p["shape"].get("lifecycle") for p in paired] == [None, "start", "ok"]
     assert paired[0]["step"] == (
         "Finding the requested employee details"
         if outcome == "summary"
         else "finding the requested information"
     )
-    assert paired[1]["step"] == "finding the requested information…"
-    assert "finished" in paired[2]["step"]
+    assert paired[1]["step"] == paired[2]["step"] == paired[0]["step"]
     assert "event: result" in frames[-1]
     assert "summary_task" not in "".join(frames)
     assert "private provider" not in "".join(frames)
