@@ -47,6 +47,26 @@ _EXECUTION_KEYS = (
 )
 
 
+def recent_conversation(messages, column_scope, turn_index):
+    """Bounded prior dialogue, filtered exactly like the agent's own history."""
+    from data_agent.runtime.context.scope_filter import filter_messages
+
+    eligible = [
+        m
+        for m in filter_messages(messages, column_scope)
+        if m.turn_index < turn_index and m.role in {"user", "assistant"}
+    ]
+    return tuple(
+        {
+            "role": m.role,
+            "content": m.content[:2000],
+            "turn_index": m.turn_index,
+            "truncated": len(m.content) > 2000,
+        }
+        for m in eligible[-8:]
+    )
+
+
 def catalog_context(catalog, executions, column_scope):
     """All authorized table rules, even when the SQL omitted their predicates.
 
@@ -187,6 +207,8 @@ def coverage_package(brief, results, analysis_state, column_scope):
             "column_allowlist_active": bool(column_scope),
             "row_access": "warehouse-enforced; effective row population not supplied",
             "company_wide_completeness": "unknown",
+            "requested_period_completeness": "not_established",
+            "ingestion_freshness": "not_established",
         },
     }
 
@@ -194,6 +216,11 @@ def coverage_package(brief, results, analysis_state, column_scope):
 async def enrich_brief(
     brief, *, trail, turn_index, session_id, store, catalog_provider, credentials, analysis_state
 ):
+    doc = await store.get_or_create_session(session_id)
+    brief = replace(
+        brief,
+        recent_conversation=recent_conversation(doc.messages, credentials.column_scope, turn_index),
+    )
     current = {e.tool_call_id: e for e in trail if e.turn_index == turn_index and e.status == "ok"}
     results = [dict(r) for r in brief.results]
     sqls = []

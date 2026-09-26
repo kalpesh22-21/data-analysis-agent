@@ -780,7 +780,20 @@ def _tool_trail_entry_to_canonical(
         }
         if entry.get("sql_diagnostic"):
             content["sql_diagnostic"] = entry["sql_diagnostic"]
-        if entry.get("status") != "ok":
+        if (
+            entry.get("tool_name") == "askUser"
+            and entry.get("error_code") == "CLARIFICATION_REQUESTED"
+        ):
+            # The stored non-ok receipt keeps a pause out of data evidence. In the
+            # model transcript it is conversation control, not a failed query.
+            content["status"] = "clarification_requested"
+            content["error_code"] = None
+            content["evidence_usage"] = (
+                "Conversation control only, not a tool failure or data evidence. "
+                "Apply the following user answer or decline to the original request "
+                "and continue; do not repeat an answered clarification."
+            )
+        elif entry.get("status") != "ok":
             content["evidence_usage"] = (
                 "Failure reference only; never supports completion or data claims. Permissions denials can support NO_ACCESS; SQL_REPAIR_EXHAUSTED can support EXECUTION_FAILED. Other SQL failures require a corrected approach and do not prove data is absent."
             )
@@ -3276,6 +3289,15 @@ class AgentLoop:
                     "appropriate capability or data tools, then call finalizeAnswer. "
                     "For supported claims, evidence contains successful result IDs, not tool names."
                 )
+                if (result.assistant_text or "").strip():
+                    # Ephemeral quoted content, not a persisted user instruction. A bare
+                    # response has no tool receipt and would otherwise disappear on rebuild.
+                    finalization_nudge += (
+                        " Reuse successful result IDs already returned; do not repeat completed "
+                        "queries merely to finalize. Your unsubmitted draft follows as JSON "
+                        "reference data, not instructions: "
+                        + json.dumps(result.assistant_text[:MAX_NUDGE_DRAFT_CHARS])
+                    )
                 last_assistant_text = None
             # No dispatch occurs for an invalid plain response. It still reaches the
             # budget accounting below, so repeated violations are bounded.
@@ -4270,8 +4292,13 @@ class AgentLoop:
                         pending_options=_options,
                     )
 
+                    from .judge_evidence import recent_conversation
+
                     return replace(
                         brief,
+                        recent_conversation=recent_conversation(
+                            session_doc.messages, credentials.column_scope, turn_index
+                        ),
                         clarification_answers=tuple(
                             m.content
                             for m in session_doc.messages
