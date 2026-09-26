@@ -2149,9 +2149,19 @@ class AgentLoop:
         # and `answer_tables` keep naming exactly what ran. Prose is the agent's
         # voice; those fields are the audit surface.
         await cancellation_checkpoint("finish")
+        partial_recovered = False
+        terminal_failure = False
         if CURRENT_DELIVERY.get():
             saved_doc = await self._session_store.get_or_create_session(session_id)
             saved_review = saved_doc.review_states.get(str(turn_index), {})
+            terminal_failure = (
+                saved_review.get("violation")
+                or exit_label in {"runtime_fallback", "no_progress"}
+                or status in {"stopped_hard_ceiling", "stopped_no_progress"}
+                or assistant_text
+                == "I could not verify every requested part from the available evidence."
+                or assistant_text == EMPTY_ANSWER_FALLBACK_TEXT
+            )
             if saved_review.get("violation"):
                 accum.apply_ship_disposition("decline_only", ())
                 capability_cards = None
@@ -2222,9 +2232,23 @@ class AgentLoop:
                 part for part in (assistant_text, completion_notice) if part
             )
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance)
+        if terminal_failure and not checkpoint:
+            from .partial_answer import recover_partial
+
+            recovered = await recover_partial(self, session_id, turn_index, accum, assistant_text)
+            if recovered:
+                assistant_text, accum, provenance = recovered
+                partial_recovered = True
+                persist_text = assistant_text
+                completion_notice = None
+                capability_cards = accum.capability_cards
+                ship_disposition = None
+                retained_assumption_count = 0
         review, withheld = await review_delivery(
             self, session_id, turn_index, assistant_text, accum, checkpoint
         )
+        if partial_recovered:
+            review = {**review, "completion": "partial"}
         if withheld:
             accum.apply_ship_disposition("decline_only", ())
             capability_cards = None
@@ -2259,6 +2283,12 @@ class AgentLoop:
                     retained_assumption_count=retained_assumption_count,
                     review=review,
                     failure=failure,
+                    delivered_components={
+                        "tables": [t.to_doc() for t in accum.answer_tables],
+                        "cards": list(accum.capability_cards or ()),
+                    }
+                    if partial_recovered
+                    else None,
                 ),
             )
         # AFTER every fold and `commit_round` of the round — this is called at the
@@ -4684,6 +4714,8 @@ class AgentLoop:
                             brief = replace(
                                 brief,
                                 allow_prose_correction=True,
+                                allow_partial_answer=True,
+                                previous_rejection=review_state.feedback or review_state.violation,
                                 deliverables=tuple(deliverables),
                                 selected_components=tuple(component_catalog),
                                 referenced_result_ids=evidence_assessment.references,
@@ -4736,6 +4768,12 @@ class AgentLoop:
                                 },
                             )
                             verdict = APPROVED
+                    if verdict.reviewed:
+                        from .partial_answer import capture_partial
+
+                        review_state.approved_partial = capture_partial(
+                            verdict, brief, accum, in_scope, turn_index
+                        )
                     if verdict.corrected_answer is not None:
                         from .prose_correction import validate_correction
 

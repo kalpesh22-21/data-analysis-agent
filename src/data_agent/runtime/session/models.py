@@ -69,6 +69,7 @@ class TurnMessage:
     retained_assumption_count: int | None = None
     review: dict[str, Any] | None = None
     failure: dict[str, Any] | None = None
+    delivered_components: dict[str, Any] | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -77,6 +78,11 @@ class TurnMessage:
             "content": self.content,
             **({"review": self.review} if self.review is not None else {}),
             **({"failure": self.failure} if self.failure is not None else {}),
+            **(
+                {"delivered_components": self.delivered_components}
+                if self.delivered_components is not None
+                else {}
+            ),
             "ts": self.ts,
             "provenance": _provenance_to_doc(self.provenance),
             **(
@@ -97,6 +103,7 @@ class TurnMessage:
             content=doc["content"],
             review=doc.get("review"),
             failure=doc.get("failure"),
+            delivered_components=doc.get("delivered_components"),
             ts=doc["ts"],
             provenance=_provenance_from_doc(doc.get("provenance")),
             ship_disposition=doc.get("ship_disposition")

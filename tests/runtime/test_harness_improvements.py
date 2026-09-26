@@ -178,7 +178,7 @@ async def test_corrected_answer_gets_final_validation():
     assert (await store.get_or_create_session(CREDS.session_id)).review_states["0"]["calls"] == 2
 
 
-async def test_final_rejection_does_not_grant_third_review():
+async def test_final_rejection_allows_only_terminal_partial_review():
     rejected = JudgeVerdict(False, "contradicts_result", "Correct the count.", True)
     judge = Judge([rejected, rejected])
     loop, *_ = build(
@@ -192,7 +192,8 @@ async def test_final_rejection_does_not_grant_third_review():
     )
     out = await run(loop)
     assert "125" not in out.assistant_text
-    assert len(judge.briefs) == 2
+    assert len(judge.briefs) == 3
+    assert judge.briefs[-1].terminal_partial_review
 
 
 async def test_assumptions_after_finalizer_are_reviewed():

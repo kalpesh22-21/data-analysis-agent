@@ -208,8 +208,22 @@ def project_history(
             assumptions = (assumptions or [])[: assistant.retained_assumption_count or 0] or None
             if assistant.ship_disposition != "ship_tables_with_hedge":
                 answer_tables_by_turn.pop(turn_index, None)
+        if assistant is not None and assistant.delivered_components is not None:
+            # A reviewed partial is an exact selection, independent of the last
+            # attempted full-answer designation. Message scope filtering already
+            # validated the union of its approved evidence and components.
+            assumptions = None
+            answer_tables_by_turn[turn_index] = [
+                AnswerTable(**table, provenance=assistant.provenance)
+                for table in assistant.delivered_components.get("tables", ())
+            ]
         turns.append(
             {
+                **(
+                    {"capability_cards": assistant.delivered_components.get("cards", [])}
+                    if assistant and assistant.delivered_components is not None
+                    else {}
+                ),
                 "turn_index": turn_index,
                 "question": questions[turn_index],
                 "answer": assistant.content if assistant is not None else None,

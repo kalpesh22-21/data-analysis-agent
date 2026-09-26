@@ -839,7 +839,7 @@ async def test_the_two_exits_share_one_allowance() -> None:
     )
     assert outcome.status == "done"
     assert store.claims.count("answer_judge") == 0
-    assert judge.calls_made == 2
+    assert judge.calls_made == 3  # two proposals, one terminal partial review
     assert [p["site"] for p in _events(events, ANSWER_JUDGE_REFUSED_EVENT)] == [
         "exit_prose",
         "exit_table",

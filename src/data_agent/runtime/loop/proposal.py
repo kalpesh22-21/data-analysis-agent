@@ -20,6 +20,7 @@ class ReviewState:
     delivery_version: str = ""
     delivery_status: str = ""
     prose_correction: dict[str, str] = field(default_factory=dict)
+    approved_partial: dict[str, Any] = field(default_factory=dict)
     calls: int = 0
     repaired: bool = False
     answer_version: str = ""
@@ -54,6 +55,7 @@ class ReviewState:
             state.delivery_version = ""
             state.delivery_status = ""
             state.prose_correction = {}
+            state.approved_partial = {}
             state.feedback = ""
             state.result_ids = ()
             state.assumptions_before_refusal = ()

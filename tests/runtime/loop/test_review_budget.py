@@ -124,10 +124,10 @@ async def test_failed_repair_charges_budget_and_preserves_rejection(monkeypatch)
     out = await run(loop)
     assert out.review["status"] == "rejected"
     assert not out.answer_tables
-    assert contexts[0].review_seconds == 60.0
-    assert len(contexts) == 1  # only the failed repair has spent time
+    assert contexts[0].review_seconds == 30.0
+    assert len(contexts) == 2  # repair and one terminal partial-answer attempt
     assert contexts[0].repair_reserve_seconds == 0.0
-    assert contexts[0].terminal_reserve_seconds == 30.0
+    assert contexts[0].terminal_reserve_seconds == 0.0
     assert (await store.get_or_create_session(CREDS.session_id)).review_states["0"]["violation"]
 
 

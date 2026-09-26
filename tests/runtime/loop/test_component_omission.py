@@ -161,7 +161,7 @@ async def test_invalid_omission_target_leaves_unrelated_table_and_card_selected(
     ]
 
 
-async def test_second_rejection_falls_back_without_third_review_or_rejected_card():
+async def test_second_rejection_allows_only_terminal_partial_review():
     judge = Judge(
         [refusal("p"), JudgeVerdict(False, "unsupported_by_evidence", "Still unsupported.", True)]
     )
@@ -178,7 +178,8 @@ async def test_second_rejection_falls_back_without_third_review_or_rejected_card
     )
     outcome = await run(loop, "Count employees and provide SSN information.")
     assert outcome.capability_cards is None
-    assert len(judge.briefs) == 2
+    assert len(judge.briefs) == 3
+    assert judge.briefs[-1].terminal_partial_review
     assert (await store.get_or_create_session(CREDS.session_id)).review_states["0"]["calls"] == 2
 
 

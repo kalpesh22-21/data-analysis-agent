@@ -986,7 +986,8 @@ async def test_v2_refused_card_repick_fixture():
     assert outcome.status == "done"
     assert not outcome.capability_cards
     assert invented not in outcome.assistant_text
-    assert len(judge.briefs) == 2
+    assert len(judge.briefs) == 3
+    assert judge.briefs[-1].terminal_partial_review
     assert len(judge.briefs[1].capability_presented) == 1
     assert names[1] in json.dumps(judge.briefs[1].capability_presented)
     assert names[0] not in json.dumps(judge.briefs[1].capability_presented)

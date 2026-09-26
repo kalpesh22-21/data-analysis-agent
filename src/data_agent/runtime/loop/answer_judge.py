@@ -193,6 +193,7 @@ class JudgeVerdict:
     result_ids: tuple[str, ...] = ()
     repair_type: str = ""
     corrected_answer: str | None = None
+    partial_answer: Mapping[str, Any] | None = None
 
 
 # Unavailable review is fail-open only for an otherwise valid answer. reviewed=False
@@ -230,6 +231,9 @@ class JudgeBrief:
     # `answerWithTable` `answer` argument at `exit_table`.
     draft: str = ""
     allow_prose_correction: bool = False
+    allow_partial_answer: bool = False
+    terminal_partial_review: bool = False
+    previous_rejection: str = ""
     # `(caption, sql_or_blueprint_id)` per designated table — `exit_table` only.
     designated_tables: tuple[tuple[str | None, str], ...] = ()
     # The question the model wants to ask — `ask_user` only.
@@ -252,6 +256,9 @@ class JudgeBrief:
             "evidence_package": dict(self.evidence_package),
             "referenced_result_ids": list(self.referenced_result_ids),
             "allow_prose_correction": self.allow_prose_correction,
+            "allow_partial_answer": self.allow_partial_answer,
+            "terminal_partial_review": self.terminal_partial_review,
+            "previous_rejection": self.previous_rejection,
             "question": self.question,
             "clarification_answers": list(self.clarification_answers),
             "recent_conversation": list(self.recent_conversation),
@@ -459,6 +466,29 @@ def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> d
                         "omit_component",
                     ],
                 },
+                "partial_answer": {
+                    "type": ["object", "null"],
+                    "description": (
+                        "When allow_partial_answer is true and you reject the full answer, "
+                        "optionally approve this exact supported subset for fallback delivery. "
+                        "This is a separate approval, not a suggested unreviewed draft."
+                    ),
+                    "properties": {
+                        "answer": {"type": "string", "maxLength": 20000},
+                        "evidence": {"type": "array", "items": {"type": "string"}},
+                        "table_result_ids": {"type": "array", "items": {"type": "string"}},
+                        "capability_refs": {"type": "array", "items": {"type": "string"}},
+                        "unfinished": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                    },
+                    "required": [
+                        "answer",
+                        "evidence",
+                        "table_result_ids",
+                        "capability_refs",
+                        "unfinished",
+                    ],
+                    "additionalProperties": False,
+                },
                 "corrected_answer": {
                     "type": ["string", "null"],
                     "maxLength": 20000,
@@ -506,6 +536,24 @@ def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> d
 # after which a prompt edit silently changes judge behaviour with nothing testing it. What
 # follows restates ONLY the rules these criteria test.
 _ANSWER_JUDGE_PROMPT = (
+    "When allow_partial_answer is true, a rejected full answer may include partial_answer: "
+    "your independently approved useful findings, exact evidence IDs, and an explicit list of "
+    "unfinished parts. Review that subset fully before returning it. Keep approved=false with "
+    "the full answer's violation and feedback so repairs may continue. The runtime can later "
+    "deliver the approved subset if work stops. Lead with supported findings. Even one request "
+    "can have useful partial findings. Never infer correctness from tool success alone. "
+    "Use existing evidence only, including successful results not selected in the original draft. "
+    "Select displayed tables/cards only from selected_components, by table_result_ids or "
+    "capability_refs; empty arrays display none. No original assumptions or other components "
+    "will accompany the partial answer; state necessary qualifications in answer. The exact "
+    "display is answer followed by two newlines and 'Unfinished: ' plus unfinished items joined "
+    "with spaces. Approve this complete display and its selected components together. "
+    "When terminal_partial_review is true, work has stopped: use partial_answer whenever "
+    "useful supported findings exist instead of approving a generic inability message. No "
+    "further agent or query round is available. "
+    "Respect previous_rejection: remove or correct rejected claims and dependencies. If no "
+    "useful supported findings remain, omit partial_answer. Do not invent a finding to avoid "
+    "a limitation message. Do not return partial_answer for ask_user or when disabled. "
     "Extra evidence is allowed. Do not reject an otherwise supported answer merely because "
     "it includes redundant, irrelevant, or unused evidence references. Ignore extras and judge "
     "whether the appropriate successful evidence correctly and sufficiently supports each "
@@ -834,10 +882,12 @@ def _valid_correction(arguments, site):
                 "feedback",
                 "repair_type",
                 "corrected_answer",
+                "partial_answer",
                 "intent_id",
                 "result_ids",
             }
         )
+        and arguments.get("partial_answer") is None
         and arguments.get("approved") is True
         and arguments.get("repair_type") == "prose"
         and arguments.get("violation") == ""
@@ -905,7 +955,9 @@ def parse_verdict(
     if not isinstance(approved, bool):
         _logger.warning("answer judge: approved was %r, not a boolean — approving", approved)
         return APPROVED
-    if not _valid_correction(arguments, site):
+    if (
+        arguments.get("approved") is True and arguments.get("partial_answer") is not None
+    ) or not _valid_correction(arguments, site):
         return APPROVED
     if approved:
         if arguments.get("corrected_answer") is not None:
@@ -952,6 +1004,7 @@ def parse_verdict(
         intent_id=sanitize_text(str(arguments.get("intent_id", "")), 100),
         result_ids=tuple(refs[:20]),
         repair_type=repair,
+        partial_answer=arguments.get("partial_answer") if site != "ask_user" else None,
     )
 
 
@@ -1197,6 +1250,8 @@ class AnswerJudge:
         if verdict.corrected_answer is not None and not brief.allow_prose_correction:
             malformed = True
             verdict = APPROVED
+        if verdict.partial_answer is not None and not brief.allow_partial_answer:
+            verdict = replace(verdict, partial_answer=None)
         total = usage.get("total_tokens")
         outcome = "malformed" if malformed else "approved" if verdict.approved else "rejected"
         # 09 §I: judge spend is deliberately OUTSIDE `max_window_token_spend`, so this
@@ -1245,7 +1300,9 @@ def _looks_malformed(
     approved = call.arguments.get("approved")
     if not isinstance(approved, bool):
         return True
-    if not _valid_correction(call.arguments, site):
+    if (approved and call.arguments.get("partial_answer") is not None) or not _valid_correction(
+        call.arguments, site
+    ):
         return True
     if approved:
         return False

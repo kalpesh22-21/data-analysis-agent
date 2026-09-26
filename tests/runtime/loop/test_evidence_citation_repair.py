@@ -157,8 +157,9 @@ async def test_explicit_rejection_cannot_be_bypassed_by_redundant_citations(prio
     assert not out.answer_tables
     assert out.assistant_text != DRAFT
     assert out.review["status"] == "rejected"
-    assert len(judge.briefs) == 2
-    assert all(b.draft == DRAFT for b in judge.briefs)
+    assert len(judge.briefs) == 3  # one bounded partial-answer review
+    assert judge.briefs[-1].allow_partial_answer
+    assert all(b.draft == DRAFT for b in judge.briefs if not b.terminal_partial_review)
 
 
 async def test_unavailable_review_can_fail_open_without_fabricating_approval():

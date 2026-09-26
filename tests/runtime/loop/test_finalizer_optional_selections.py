@@ -21,7 +21,7 @@ async def test_answer_and_table_only_reaches_judge_with_original_draft(reject):
     loop, _, _, _, events = build([discovery(), query(), final, final], judge)
     out = await run(loop)
     assert judge.briefs
-    proposal_briefs = judge.briefs
+    proposal_briefs = [b for b in judge.briefs if not b.terminal_partial_review]
     assert all(brief.draft == draft for brief in proposal_briefs)
     assert all(brief.referenced_result_ids == ("q",) for brief in proposal_briefs)
     assert judge.briefs[0].selected_components[0]["result_id"] == "q"

@@ -157,7 +157,7 @@ async def test_explicit_rejection_remains_binding(prior_rejection):
     out = await run(loop)
     assert not out.capability_cards and not out.answer_tables
     assert out.review["status"] == "rejected"
-    assert len(judge.briefs) == 1
+    assert len(judge.briefs) == 1 + int(prior_rejection)
 
 
 async def test_no_verdict_exhaustion_can_deliver_retained_components():

@@ -21,6 +21,9 @@ class DeliveryContext:
     repair_reserve_seconds: float = 30.0
     turn_index: int | None = None
     terminal_reserve_seconds: float = 0.0
+    terminal_review_version: str = ""
+    terminal_review_status: str = ""
+    partial_review_attempted: bool = False
 
 
 CURRENT_DELIVERY: ContextVar[DeliveryContext | None] = ContextVar("delivery", default=None)
@@ -230,6 +233,14 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
     )
     # A refusal from a proposal remains binding even if a fallback's prose is approved.
     outstanding = bool(state.violation) and not pending
+    if not outstanding and not pending and context.terminal_review_version == version:
+        state.delivery_version = version
+        state.delivery_status = context.terminal_review_status
+        await loop._session_store.write_review_state(session_id, turn_index, state.to_doc())
+        loop._observer(
+            "loop_delivery_review", {"site": site, "status": state.delivery_status, "calls": 1}
+        )
+        return {"status": state.delivery_status, "attempts": 1}, False
     if outstanding:
         loop._observer("loop_delivery_review", {"site": site, "status": "rejected", "calls": 0})
         return {"status": "rejected"}, True
