@@ -492,6 +492,12 @@ def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> d
 # after which a prompt edit silently changes judge behaviour with nothing testing it. What
 # follows restates ONLY the rules these criteria test.
 _ANSWER_JUDGE_PROMPT = (
+    "Extra evidence is allowed. Do not reject an otherwise supported answer merely because "
+    "it includes redundant, irrelevant, or unused evidence references. Ignore extras and judge "
+    "whether the appropriate successful evidence correctly and sufficiently supports each "
+    "claim and requested deliverable. Request repair for incorrect measurements, unsupported "
+    "claims, or insufficient support, not citation cleanup. Failed attempts and control receipts "
+    "do not establish data absence or supply affirmative support. "
     "Ground repair feedback in the actual source grain and catalog descriptions. An employee snapshot is not automatically a hire-event history; do not assert cross-year rehire behavior without evidence. Counting employees by their documented hire_date is a valid snapshot-based hire-date comparison; do not demand all historical hire events unless requested. Describe records available in the source rather than inventing original-hire or rehire guarantees. Check coverage of explicitly requested zero-activity groups and periods across selected results. Missing groups inside an assigned result are not a separate deliverable. "
     "User clarification_answers refine the original request. Apply those answers; never reject "
     "a correct narrowed answer because it does not repeat an already answered clarification. "

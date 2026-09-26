@@ -715,8 +715,8 @@ async def test_capability_registry_is_reloaded_on_http_resume(monkeypatch, avail
     )
 
 
-async def test_sql_evidence_cannot_be_bound_as_product_guidance():
-    from data_agent.runtime.loop.proposal import deliverable_evidence
+async def test_extra_type_hint_cannot_relabel_sql_evidence_as_product_guidance():
+    from data_agent.runtime.loop.proposal import assess_deliverable_evidence
 
     loop, store, *_ = build(
         [
@@ -738,7 +738,7 @@ async def test_sql_evidence_cannot_be_bound_as_product_guidance():
     )
     await run(loop)
     doc = await store.get_or_create_session(CREDS.session_id)
-    _, error = deliverable_evidence(
+    assessment = assess_deliverable_evidence(
         doc.analysis_state,
         {
             "evidence": ["q"],
@@ -753,7 +753,8 @@ async def test_sql_evidence_cannot_be_bound_as_product_guidance():
         },
         doc.tool_trail,
     )
-    assert "wrong type" in error
+    assert assessment.feedback is None
+    assert assessment.deliverables[1]["evidence"] == [{"result_id": "q", "kind": "warehouse"}]
 
 
 def test_join_check_covers_both_directions_and_ignores_min_max():

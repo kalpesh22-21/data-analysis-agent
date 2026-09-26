@@ -184,7 +184,7 @@ from .loop_safety import (
     NO_PROGRESS_TEXT,
     LoopSafety,
 )
-from .proposal import ReviewState, deliverable_evidence, fingerprint
+from .proposal import SUPPORTING_LOOKUP_TOOLS, ReviewState, assess_deliverable_evidence, fingerprint
 from .read_guard import ReadGuard, repeated_read_guard_event
 from .turn_accumulators import (
     AnswerEnvelope,
@@ -783,6 +783,12 @@ def _tool_trail_entry_to_canonical(
         if entry.get("status") != "ok":
             content["evidence_usage"] = (
                 "Failure reference only; never supports completion or data claims. Permissions denials can support NO_ACCESS; SQL_REPAIR_EXHAUSTED can support EXECUTION_FAILED. Other SQL failures require a corrected approach and do not prove data is absent."
+            )
+        elif entry.get("tool_name") in SUPPORTING_LOOKUP_TOOLS:
+            content["evidence_usage"] = (
+                "Discovery context only. Do not cite this result in finalizeAnswer.evidence "
+                "or a completed deliverable's result_ids. Use successful answer-producing "
+                "query results for totals, rankings, and complete data answers."
             )
         # A SUCCESSFUL, D56-verified runBlueprint result is the trusted answer for
         # this intent. Surface an explicit, in-band marker + a terse human-readable
@@ -3378,8 +3384,11 @@ class AgentLoop:
                 dispatched_ids.add(tool_call.id)
                 is_unified_finalizer = tool_call.name == "finalizeAnswer"
                 if is_unified_finalizer:
-                    from .proposal import validate_proposal_args
+                    from .proposal import normalize_proposal_args, validate_proposal_args
 
+                    tool_call = replace(
+                        tool_call, arguments=normalize_proposal_args(tool_call.arguments)
+                    )
                     error = validate_proposal_args(tool_call.arguments)
                     if error:
                         tool_call = replace(tool_call, argument_error=error)
@@ -4428,9 +4437,18 @@ class AgentLoop:
                     selected_components,
                 )
 
-                deliverables, evidence_error = deliverable_evidence(
+                evidence_assessment = assess_deliverable_evidence(
                     analysis_state, proposal_args, evidence_trail
                 )
+                deliverables = evidence_assessment.deliverables
+                evidence_error = evidence_assessment.feedback
+                if evidence_assessment.ignored_references:
+                    # Known irrelevant receipts need no repair round. The judge still
+                    # assesses whether the retained evidence supports the answer.
+                    self._observer(
+                        "loop_answer_evidence_extras_ignored",
+                        {"dropped_count": len(evidence_assessment.ignored_references)},
+                    )
                 evidence_complaints = [evidence_error] if evidence_error else []
                 refs = proposal_args.get("capability_refs", [])
                 if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
@@ -4638,7 +4656,7 @@ class AgentLoop:
                                 brief,
                                 deliverables=tuple(deliverables),
                                 selected_components=tuple(component_catalog),
-                                referenced_result_ids=tuple(proposal_args.get("evidence", ())),
+                                referenced_result_ids=evidence_assessment.references,
                                 capability_presented=tuple(
                                     {
                                         **card,

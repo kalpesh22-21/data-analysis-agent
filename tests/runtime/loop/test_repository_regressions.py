@@ -7,7 +7,7 @@ import pytest
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.scope_filter import compute_scope_hash
 from data_agent.runtime.loop.answer_rules import first_match
-from data_agent.runtime.loop.proposal import deliverable_evidence
+from data_agent.runtime.loop.proposal import assess_deliverable_evidence
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import AnalysisState, TrackedIntent, TrailEntry, TurnMessage
 
@@ -52,18 +52,23 @@ def test_access_denial_supports_a_limitation_but_not_a_completed_answer():
             ),
         ),
     )
-    rows, error = deliverable_evidence(
+    assessment = assess_deliverable_evidence(
         state, {"answer": "Salary is available; I cannot provide SSN."}, [salary, denied]
     )
-    assert error is None
-    assert rows[0]["evidence"] == [{"result_id": "salary", "kind": "warehouse"}]
-    assert rows[1]["evidence"] == []
-    assert rows[1]["limitations"] == [{"result_id": "ssn", "reason_code": "NO_ACCESS"}]
+    assert assessment.feedback is None
+    assert assessment.deliverables[0]["evidence"] == [{"result_id": "salary", "kind": "warehouse"}]
+    assert assessment.deliverables[1]["evidence"] == []
+    assert assessment.deliverables[1]["limitations"] == [
+        {"result_id": "ssn", "reason_code": "NO_ACCESS"}
+    ]
     invalid = replace(
         state, intents=(replace(state.intents[1], status="completed", reason_code=None),)
     )
-    assert deliverable_evidence(invalid, {"answer": "Here is the SSN."}, [denied])[1]
-    assert deliverable_evidence(state, {"answer": "Salary only."}, [salary])[1]
+    assessment = assess_deliverable_evidence(invalid, {"answer": "Here is the SSN."}, [denied])
+    # Judge must assess the unsupported claim; denial is not evidence.
+    assert assessment.feedback is None
+    assert assessment.deliverables[0]["evidence"] == []
+    assert assess_deliverable_evidence(state, {"answer": "Salary only."}, [salary]).feedback
 
 
 def test_a_decline_does_not_bypass_numeric_grounding():

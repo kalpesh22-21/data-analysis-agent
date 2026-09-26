@@ -152,12 +152,14 @@ def coverage_package(brief, results, analysis_state, column_scope):
         )
         refs = evidence_ids(proposed.get("evidence", ()))
         bound = getattr(intent, "evidence_tool_call_id", None)
-        if bound and bound not in refs:
+        if not proposed and bound and bound not in refs:
             refs.append(bound)
         refs.extend(
             r["tool_call_id"]
             for r in results
-            if intent.intent_id in r.get("serves_intents", ()) and r["tool_call_id"] not in refs
+            if not proposed
+            and intent.intent_id in r.get("serves_intents", ())
+            and r["tool_call_id"] not in refs
         )
         assigned.update(refs)
         parts.append(

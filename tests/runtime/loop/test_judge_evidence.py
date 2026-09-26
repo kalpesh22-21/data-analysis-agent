@@ -330,3 +330,25 @@ def test_capability_review_retains_parameter_meaning_and_unresolved_selection():
     assert context["additional_arguments"] == {"status": "active"}
     assert context["parameters"] == definition["parameters"]
     assert context["filter_definitions"] == [{"name": "department", "values": ["Sales"]}]
+
+
+def test_explicit_sanitized_bindings_do_not_reintroduce_dropped_state_receipts():
+    state = type(
+        "State",
+        (),
+        {
+            "intents": (
+                TrackedIntent(
+                    intent_id="i1",
+                    description="Count",
+                    status="completed",
+                    evidence_tool_call_id="control",
+                ),
+            )
+        },
+    )()
+    brief = JudgeBrief("exit_prose", "Count?", deliverables=({"intent_id": "i1", "evidence": []},))
+    package = coverage_package(
+        brief, [{"tool_call_id": "control", "serves_intents": ["i1"]}], state, frozenset()
+    )
+    assert package["parts"][0]["result_ids"] == []

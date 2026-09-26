@@ -663,8 +663,16 @@ FINALIZE_ANSWER_SCHEMA = {
                     "required": ["result_id"],
                 },
             },
-            "capability_refs": {"type": "array", "items": {"type": "string"}},
-            "evidence": {"type": "array", "items": {"type": "string"}},
+            "capability_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Prepared UI options to select. Omission selects none.",
+            },
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Successful current-turn supporting result IDs. If omitted, use the explicitly selected table result IDs.",
+            },
             "deliverables": {
                 "type": "array",
                 "items": {
@@ -682,7 +690,7 @@ FINALIZE_ANSWER_SCHEMA = {
                 },
             },
         },
-        "required": ["answer", "tables", "capability_refs", "evidence"],
+        "required": ["answer", "tables"],
     },
 }
 

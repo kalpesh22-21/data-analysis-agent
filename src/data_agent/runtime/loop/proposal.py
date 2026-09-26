@@ -103,37 +103,81 @@ def evidence_kind(entry) -> str | None:
     return None
 
 
-def deliverable_evidence(state, args, trail) -> tuple[list[dict[str, Any]], str | None]:
-    eligible = {e.tool_call_id: e for e in trail if evidence_kind(e)}
+# These successful discovery receipts describe values/samples, not completed answers.
+# Used for model-facing discovery guidance; all known ineligible citations are ignored.
+SUPPORTING_LOOKUP_TOOLS = frozenset({"resolveValues", "sampleRows"})
 
-    # Legacy answerWithText accepted tool names. Resolve only an unambiguous name;
-    # new finalizeAnswer always advertises execution IDs.
+
+@dataclass(frozen=True)
+class EvidenceAssessment:
+    deliverables: list[dict[str, Any]]
+    references: tuple[str, ...]
+    errors: tuple[str, ...]
+    ignored_references: tuple[str, ...]
+
+    @property
+    def feedback(self) -> str | None:
+        return "\n\n".join(self.errors) or None
+
+
+def assess_deliverable_evidence(state, args, trail) -> EvidenceAssessment:
+    """Validate all references using ONLY the caller's current-turn, scope-filtered trail."""
+    eligible = {e.tool_call_id: e for e in trail if evidence_kind(e)}
+    known = {e.tool_call_id: e for e in trail}
+    errors, refs, extras = [], [], []
+
+    def label(ref):
+        # Quote and bound model-authored identifiers; never interpolate raw control text.
+        return json.dumps(ref, ensure_ascii=True, default=str)[:180]
+
     def resolve(ref):
+        if not isinstance(ref, str):
+            return None, f"An evidence reference {label(ref)} is not a result ID string."
         if ref in eligible:
-            return ref
+            return ref, None
+        entry = known.get(ref)
+        if entry is not None:
+            # Failed work and control/discovery receipts are not affirmative evidence.
+            # Their existence is valid; excluding them requires no agent repair.
+            extras.append(ref)
+            return None, None
+        # Legacy answer tools allowed unambiguous tool names. Exact execution IDs remain preferred.
         matches = [key for key, e in eligible.items() if e.tool_name == ref]
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return (
+                None,
+                f"An evidence reference {label(ref)} is ambiguous. Use an exact returned result_id.",
+            )
+        # Missing and inaccessible are deliberately indistinguishable.
+        return None, (
+            f"An evidence reference {label(ref)} is unavailable in the accessible current-turn evidence. "
+            "Use a successful current-turn result_id."
+        )
 
     supplied = args.get("evidence", [])
     if not isinstance(supplied, list):
-        return [], "evidence must be a list of result IDs."
-    refs = []
+        errors.append("evidence must be a list of result IDs.")
+        supplied = []
     for ref in supplied:
-        ident = resolve(ref) if isinstance(ref, str) else None
-        if ident is None:
-            return (
-                [],
-                "An evidence reference is missing, unsuccessful, ambiguous, or outside your access. Use a successful current-turn result_id.",
-            )
-        refs.append(ident)
+        ident, error = resolve(ref)
+        if error:
+            errors.append(error)
+        elif ident is not None:
+            refs.append(ident)
     deliverables = args.get("deliverables", [])
     if not isinstance(deliverables, list):
-        return [], "deliverables must be a list."
+        errors.append("deliverables must be a list.")
+        deliverables = []
     explicit = {d.get("intent_id"): d for d in deliverables if isinstance(d, dict)}
     rows = []
     intents = state.intents if state else ()
-    if any(key not in {i.intent_id for i in intents} for key in explicit):
-        return [], "A deliverable references an undeclared intent. Declare it before finalizing."
+    for key in explicit:
+        if key not in {i.intent_id for i in intents}:
+            errors.append(
+                f"A deliverable references undeclared intent {label(key)}. Declare it before finalizing."
+            )
     for intent in intents:
         d = explicit.get(intent.intent_id, {})
         named = d.get(
@@ -146,45 +190,33 @@ def deliverable_evidence(state, args, trail) -> tuple[list[dict[str, Any]], str 
             and e.tool_call_id == intent.evidence_tool_call_id
             and e.status != "ok"
         }
-        if not isinstance(named, list) or any(
-            r not in eligible and r not in blocking_refs for r in named
-        ):
-            return (
-                [],
-                f"Provide accessible successful result IDs for {intent.intent_id}, or disclose its missing evidence.",
-            )
-        expected = d.get("evidence_type")
-        if (
-            expected
-            and named
-            and any(evidence_kind(eligible[r]) != expected for r in named if r in eligible)
-        ):
-            return (
-                [],
-                f"Evidence for {intent.intent_id} has the wrong type; preserve other supported parts and correct this binding.",
-            )
+        if not isinstance(named, list):
+            errors.append(f"result_ids for {intent.intent_id} must be a list.")
+            named = []
+        valid = []
+        limitations = []
+        for ref in named:
+            if isinstance(ref, str) and ref in blocking_refs:
+                limitations.append({"result_id": ref, "reason_code": intent.reason_code})
+            elif isinstance(ref, str) and ref in eligible:
+                valid.append(ref)
+            else:
+                ident, error = resolve(ref)
+                if error or ident is not None:
+                    errors.append(
+                        f"Evidence binding for {intent.intent_id}: "
+                        + (error or f"Use the exact result_id instead of {label(ref)}.")
+                    )
+        # Evidence kinds come from actual receipts, not optional model annotations.
+        # A mistaken evidence_type hint must not discard a valid result binding.
         rows.append(
             {
                 "intent_id": intent.intent_id,
                 "request": intent.description,
                 "status": intent.status,
                 "proposed_answer": d.get("answer", args.get("answer", "")),
-                "evidence": [
-                    {"result_id": r, "kind": evidence_kind(eligible[r])}
-                    for r in named
-                    if r in eligible
-                ],
-                **(
-                    {
-                        "limitations": [
-                            {"result_id": r, "reason_code": intent.reason_code}
-                            for r in named
-                            if r in blocking_refs
-                        ]
-                    }
-                    if blocking_refs
-                    else {}
-                ),
+                "evidence": [{"result_id": r, "kind": evidence_kind(eligible[r])} for r in valid],
+                **({"limitations": limitations} if limitations else {}),
             }
         )
     if not intents:
@@ -195,7 +227,25 @@ def deliverable_evidence(state, args, trail) -> tuple[list[dict[str, Any]], str 
                 "evidence": [{"result_id": r, "kind": evidence_kind(eligible[r])} for r in refs],
             }
         )
-    return rows, None
+    return EvidenceAssessment(
+        rows, tuple(dict.fromkeys(refs)), tuple(errors), tuple(dict.fromkeys(extras))
+    )
+
+
+def normalize_proposal_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Default omitted selections; inferred table references still require validation."""
+    normalized = dict(args)
+    normalized.setdefault("capability_refs", [])
+    if "evidence" not in normalized:
+        tables = normalized.get("tables")
+        normalized["evidence"] = list(
+            dict.fromkeys(
+                table["result_id"]
+                for table in (tables if isinstance(tables, list) else [])
+                if isinstance(table, dict) and isinstance(table.get("result_id"), str)
+            )
+        )
+    return normalized
 
 
 def validate_proposal_args(args: Any) -> str | None:

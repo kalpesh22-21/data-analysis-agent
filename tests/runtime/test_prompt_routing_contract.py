@@ -90,9 +90,8 @@ def test_unified_finalizer_is_the_only_advertised_answer_tool():
     assert set(FINALIZE_ANSWER_SCHEMA["parameters"]["required"]) == {
         "answer",
         "tables",
-        "capability_refs",
-        "evidence",
     }
+    assert {"capability_refs", "evidence"} <= properties.keys()
     assert "result_id" in properties["tables"]["items"]["properties"]
     assert "sql" not in properties["tables"]["items"]["properties"]
     assert "deliverables" in properties
