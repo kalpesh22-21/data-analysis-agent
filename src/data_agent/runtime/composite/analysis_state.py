@@ -169,52 +169,24 @@ NO_ACCESS_ERROR_CODES = frozenset({"COLUMN_SCOPE_VIOLATION", "SCRATCH_SESSION_VI
 # the iteration order is irrelevant; it is sorted only to be deterministic.
 DERIVABLE_REASON_CODES: tuple[str, ...] = tuple(sorted(MODEL_REASON_CODES))
 
-# The one shape the model may send. Unknown keys are REJECTED, not ignored, at
-# both levels — a typo'd key that silently vanished would look like a state
-# update that landed.
-_TOP_LEVEL_KEYS = frozenset({"intents"})
-_INIT_ITEM_KEYS = frozenset({"description"})
-_UPDATE_ITEM_KEYS = frozenset({"intent_id", "status", "result_id"})
-# REMOVED FROM THE MODEL-FACING SCHEMA, STILL TOLERATED ON THE WIRE. The model no
-# longer sees either field — but its own earlier tool calls are replayed to it
-# verbatim every round, and a conversation that carried them before this change
-# still does. So a replayed `evidence_tool_call_id` / `reason_code` is DROPPED
-# SILENTLY, empty or not, rather than rejected as an unknown key: the runtime
-# derives both, so a supplied value is never read and can only disagree, and
-# refusing the call would cost an answer over a field the model was told about by
-# its own history. Dropped BEFORE the mode is inferred, so both halves of the tool
-# see the same payload — see `_drop_legacy_fields`.
-_LEGACY_ITEM_KEYS = frozenset({"evidence_tool_call_id", "reason_code"})
-# Every field the TOOL SCHEMA declares on an intent item. Normalisation (below)
-# only ever elides one of THESE: an unknown key survives whatever its value and
-# is still rejected, so "unknown keys are rejected, not ignored" holds exactly.
-_KNOWN_ITEM_KEYS = _INIT_ITEM_KEYS | _UPDATE_ITEM_KEYS
-# The one remaining ENUM field. It needs its own rule because an enum has no empty
-# member: a model that cannot omit a key has nothing information-free to put
-# there, so it emits the FIRST member (see `_declaration_fields`). `reason_code`
-# used to be the second entry and is now dropped outright, one step earlier.
-_ENUM_ITEM_KEYS = frozenset({"status"})
-
+# Only these fields are consumed. Legacy evidence/reason fields and other extra
+# metadata are ignored; the runtime derives evidence disposition from receipts.
+_KNOWN_ITEM_KEYS = frozenset({"description", "intent_id", "status", "result_id"})
 # `loop_analysis_state_rejected.reason` is an ENUM of rule names — never the
 # offending value (D25). Every rejection path below picks one of these.
 REJECTION_REASONS = frozenset(
     {
         "no_turn_context",
         "malformed_arguments",
-        "unknown_top_level_key",
         "empty_intents",
         "too_many_intents",
-        "unknown_item_key",
-        "model_supplied_intent_id",
         "missing_description",
         "description_too_long",
         "second_initialize",
         "missing_intent_id",
         "unknown_intent_id",
         "duplicate_intent_id",
-        "description_rewrite",
         "invalid_status",
-        "status_on_initialize",
         # A terminal update the runtime could not bind to any qualifying call —
         # the model did the bookkeeping without doing (or tagging) the work, and
         # the auto-bind backstop found no candidate either. `invalid_reason_code`,
@@ -732,111 +704,9 @@ def _reject(reason: str, detail: str) -> AnalysisStateRejectedError:
     return AnalysisStateRejectedError(reason, detail)
 
 
-# ---------------------------------------------------------------------------
-# Normalisation — A KEY CARRYING NO INFORMATION IS ABSENT
-#
-# THE MODEL CANNOT OMIT KEYS. Found live (gpt-5.5, "active headcount by
-# department, and average salary by department"): it emitted every property this
-# tool's flat item schema declares and filled the ones it was not using with
-# PLACEHOLDERS — `""` for a string, and the FIRST ENUM MEMBER for an enum:
-#
-#   {"description": "Active headcount by department.", "intent_id": "",
-#    "evidence_tool_call_id": "", "reason_code": "NO_ACCESS", "status": "pending"}
-#
-# That is a semantically correct INITIALIZE. It was rejected as
-# `model_supplied_intent_id` — as were the five retries after it, each with a
-# clear `denial_detail` in front of the model. No state was ever created, six
-# tool calls were burned, and the turn answered anyway: the whole feature was
-# INERT and failed SILENTLY. The schema description already said "Do not invent
-# ids: the runtime assigns them", so this is not fixable with wording; the
-# validator has to accept the only argument shape the model can produce.
-#
-# The rule is derived from what downstream READS require (the repo's own
-# recorded lesson — spot-patching the named field that happened to fail is what
-# missed this class four rounds running), and it has one clause per JSON type:
-#
-#   1. A STRING with no content — `""`, whitespace, `null` — is ABSENT.
-#      `intent_id` and `description` are `.strip()`-checked before use, so `""` is
-#      definitionally not a value in either.
-#   2. An ENUM the item's shape CANNOT READ is a placeholder, because an enum
-#      has no empty member for the model to fall back on. `status` cannot be read
-#      on a declaration (every intent starts `pending`).
-#
-# A THIRD, BLUNTER CLAUSE arrived with the 2026-08-12 trim: `evidence_tool_call_id`
-# and `reason_code` are no longer declared at all, so on the wire they can only be
-# stale replay. They are dropped WHATEVER they hold — `_drop_legacy_fields`, one
-# step before clause 1 — since the runtime derives both and a supplied value is
-# never read. The payload above therefore normalises to `{"description": "Active
-# headcount by department."}` on today's build.
-#
-# What is NOT elided, because it is a claim rather than a placeholder: a
-# NON-EMPTY `intent_id` on initialize (still `model_supplied_intent_id` — ids
-# stay runtime-assigned), a non-`pending` `status` on initialize, and a non-empty
-# `description` on update. A string field can express emptiness, so a value in one
-# is deliberate.
-# ---------------------------------------------------------------------------
-
-
 def _carries_no_information(value: Any) -> bool:
-    """Clause 1: `None`, `""` and `"   "` are the values that are not values."""
-    if value is None:
-        return True
-    return isinstance(value, str) and not value.strip()
-
-
-def _drop_legacy_fields(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The TOLERANT-READING clause: `evidence_tool_call_id` and `reason_code` are dropped on
-    arrival, whatever they hold, in BOTH modes.
-
-    An elision of the whole FIELD, not of a placeholder. Neither is in the model-facing
-    schema any more, so anything arriving under those names is stale replay of the model's
-    own earlier calls, and the runtime derives both facts from the trail. Dropping silently
-    is the only behaviour that cannot cost an answer: rejecting would fail a correct update
-    over a field the model was shown by its own history, and READING one would let a
-    mismatch reach the ledger the validators exist to keep honest.
-
-    Runs BEFORE `_elide_empty_fields`, so those two names never reach the unknown-key
-    checks in either mode.
-    """
-    return [
-        {key: value for key, value in item.items() if key not in _LEGACY_ITEM_KEYS}
-        for item in items
-    ]
-
-
-def _elide_empty_fields(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Clause 1, applied to BOTH modes before the mode is even inferred — so an update
-    carrying `{"intent_id": "i2", "status": "completed", "description": ""}` is not
-    rejected for a `description` it did not really send.
-    """
-    return [
-        {
-            key: value
-            for key, value in item.items()
-            if not (key in _KNOWN_ITEM_KEYS and _carries_no_information(value))
-        }
-        for item in items
-    ]
-
-
-def _declaration_fields(item: dict[str, Any]) -> dict[str, Any]:
-    """Clause 2 on an INITIALIZE, where the one enum cannot be read: every declared intent
-    starts `pending`.
-
-    `status == "pending"` is accepted and ignored — it is the first enum member, i.e. the
-    model's filler, and it agrees with what the runtime writes anyway. Any OTHER status is
-    a real contradiction (nothing can be completed or blocked at the moment it is declared)
-    and is REJECTED, not normalised away.
-    """
-    status = item.get("status")
-    if status is not None and status != "pending":
-        raise _reject(
-            "status_on_initialize",
-            f"a newly declared intent cannot already be '{status}' — every intent starts "
-            "pending. Declare them, then update their status by 'intent_id' once you "
-            "have the evidence.",
-        )
-    return {key: value for key, value in item.items() if key not in _ENUM_ITEM_KEYS}
+    """Empty model placeholders carry no optional value."""
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 def _require_intent_items(model_args: Any) -> list[dict[str, Any]]:
@@ -846,12 +716,6 @@ def _require_intent_items(model_args: Any) -> list[dict[str, Any]]:
         raise _reject(
             "malformed_arguments",
             "updateAnalysisState takes an object with one key, 'intents'.",
-        )
-    unknown = sorted(set(model_args) - _TOP_LEVEL_KEYS)
-    if unknown:
-        raise _reject(
-            "unknown_top_level_key",
-            f"unknown argument(s) {unknown}. updateAnalysisState takes only 'intents'.",
         )
     raw = model_args.get("intents")
     if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
@@ -865,41 +729,25 @@ def _require_intent_items(model_args: Any) -> list[dict[str, Any]]:
             f"{len(raw)} intents were supplied but at most {MAX_INTENTS} may be tracked. "
             "Track the distinct deliverables the user asked for, not every sub-step.",
         )
-    # Normalisation, here rather than in either mode's validator: both clauses are
-    # mode-INDEPENDENT and must land before the mode is inferred, so both halves of
-    # the tool see the same payload — first the two retired fields, then "a key
-    # carrying no information is absent".
-    return _elide_empty_fields(_drop_legacy_fields(list(raw)))
+    # Ignore extras and treat empty optional fields as absent before validators
+    # distinguish declarations from updates. Required fields still validate below.
+    return [
+        {
+            key: value
+            for key, value in item.items()
+            if key in _KNOWN_ITEM_KEYS and not _carries_no_information(value)
+        }
+        for item in raw
+    ]
 
 
 def _validate_initialize_items(items: list[dict[str, Any]]) -> list[str]:
-    """Initialize accepts ONE key per item: `description`. Ids do not exist yet, and
-    evidence cannot: state calls are dispatched first, so no call cited here could have
-    run. Every intent therefore starts `pending`, and the non-overlapping shapes make a
-    mis-inferred mode visible rather than silent.
-
-    `_declaration_fields` runs first on each item — `status` is elided as a placeholder, a
-    non-`pending` one raises there — so what reaches the key check below is what the model
-    actually MEANT to send.
-    """
+    """Declare descriptions; ignore extras and assign pending IDs in the runtime."""
     descriptions: list[str] = []
     for raw_item in items:
-        item = _declaration_fields(raw_item)
-        unknown = sorted(set(item) - _INIT_ITEM_KEYS)
-        if "intent_id" in unknown:
-            raise _reject(
-                "model_supplied_intent_id",
-                "intent ids are assigned by the runtime — do not supply 'intent_id' when "
-                "you first declare the intents. The result of this call tells you the ids.",
-            )
-        if unknown:
-            raise _reject(
-                "unknown_item_key",
-                f"unknown field(s) {unknown} when declaring intents. Declaring an intent "
-                "takes only 'description'; statuses come in a later call, once you know "
-                "the ids.",
-            )
-        description = item.get("description")
+        # Declaration only consumes descriptions. Extra IDs/status/evidence cannot
+        # override runtime-assigned IDs or the initial pending disposition.
+        description = raw_item.get("description")
         if not isinstance(description, str) or not description.strip():
             raise _reject(
                 "missing_description",
@@ -922,15 +770,7 @@ def _validate_initialize_items(items: list[dict[str, Any]]) -> list[str]:
 
 
 def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Update accepts EXACTLY `intent_id` + `status`. It may NOT carry a `description`:
-    rewriting one is how the model would launder a hard ask into an easy one, and
-    adding or deleting is closed structurally by merge-by-id.
-
-    THERE IS NO EVIDENCE FIELD LEFT TO SHAPE-CHECK. Both retired fields were dropped in
-    `_drop_legacy_fields`, and the evidence obligation now lives against the TRAIL in
-    `_bind_evidence_against_trail` — strictly stronger than the payload rule it replaced,
-    which could only check that a non-empty string was present.
-    """
+    """Validate required update information, ignoring extras and frozen descriptions."""
     # A payload shaped ENTIRELY like an initialize (descriptions, no ids) sent
     # while a live state exists is a RE-DECLARATION attempt, not a botched update.
     # Both are rejected either way, but "you already declared these, update them by
@@ -946,20 +786,8 @@ def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
     validated: list[dict[str, Any]] = []
     for item in items:
-        unknown = sorted(set(item) - _UPDATE_ITEM_KEYS)
-        if "description" in unknown:
-            raise _reject(
-                "description_rewrite",
-                "an intent's description is fixed once declared and cannot be rewritten. "
-                "Send only 'intent_id' and the new 'status'.",
-            )
-        if unknown:
-            raise _reject(
-                "unknown_item_key",
-                f"unknown field(s) {unknown}. An update takes 'intent_id' and 'status', "
-                "and nothing else — the runtime finds the call that evidences the intent "
-                "and, for a blocked one, works out the reason from it.",
-            )
+        # Extra metadata (including echoed descriptions) is ignored. The stored
+        # description remains immutable; required IDs/status/evidence still validate.
         intent_id = item.get("intent_id")
         if not isinstance(intent_id, str) or not intent_id.strip():
             raise _reject(

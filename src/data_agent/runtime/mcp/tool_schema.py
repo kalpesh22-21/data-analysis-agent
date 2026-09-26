@@ -509,7 +509,7 @@ ANSWER_WITH_TEXT_TOOL_SCHEMA: dict[str, Any] = {
 # carried — capable of disagreeing, incapable of adding anything.
 #
 # The two removed names are still TOLERATED on the wire and silently dropped
-# (`analysis_state._LEGACY_ITEM_KEYS`), because the model's own earlier calls are
+# (along with other extra metadata), because the model's own earlier calls are
 # replayed to it verbatim and a mid-conversation deploy would otherwise start
 # refusing correct updates.
 #
@@ -536,7 +536,7 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
         "an intent with 'none found'. Blocked intents need distinct evidence establishing "
         "the limitation. Updates run before other calls in a batch, so newly proposed work "
         "cannot supply evidence until the next response. You may close existing intents and "
-        "call finalizeAnswer together. Empty optional fields are treated as absent."
+        "call finalizeAnswer together. Empty optional fields are treated as absent. Extra fields are ignored; descriptions and IDs are assigned only on declaration and cannot be rewritten by updates."
     ),
     "parameters": {
         "type": "object",

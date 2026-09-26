@@ -247,69 +247,44 @@ async def test_a_pending_update_tolerates_the_placeholder_enum_too() -> None:
     assert result.result_full["intents"][0]["reason_code"] is None
 
 
-async def test_an_empty_intent_id_is_absent_but_a_supplied_one_is_still_rejected() -> None:
-    """The boundary the fix must not cross. `""` carries no information and is
-    absent; a REAL id on a first declaration is the model minting its own, and ids
-    stay runtime-assigned."""
-    observer = _Recorder()
-    result = await _reject(
-        _tool(InMemorySessionStore(), observer),
+async def test_extra_declaration_metadata_does_not_override_runtime_ids():
+    store = InMemorySessionStore()
+    result = await _tool(store).run(
         {
             "intents": [
-                {
-                    "description": "a",
-                    "intent_id": "i7",
-                    "status": "pending",
-                    "evidence_tool_call_id": "",
-                    "reason_code": "NO_ACCESS",
-                }
+                {"description": "a", "intent_id": "i7", "status": "pending", "note": "extra"}
             ]
         },
+        _credentials(),
+        turn=TurnContext(turn_index=TURN),
     )
-    assert "assigned by the runtime" in result.denial_detail
-    assert {"reason": "model_supplied_intent_id", "intent_count": 1} in observer.named(
-        "loop_analysis_state_rejected"
-    )
+    assert result.status == "ok"
+    intent = live_analysis_state(await store.get_or_create_session(SESSION_ID), TURN).intents[0]
+    assert intent.intent_id == "i1" and intent.description == "a"
 
 
-async def test_a_non_pending_status_on_initialize_is_rejected_not_ignored() -> None:
-    """`pending` is the enum's first member, so it is the model's filler AND what
-    the runtime writes anyway — ignoring it is safe. Any other status is a claim
-    that a just-declared intent is already resolved, and nothing could have
-    resolved it: state calls are dispatched before every other call in the batch."""
+async def test_declaration_extras_cannot_claim_unsupported_completion():
     for status in ("completed", "blocked"):
         store = InMemorySessionStore()
-        observer = _Recorder()
-        result = await _reject(
-            _tool(store, observer),
-            {
-                "intents": [
-                    {
-                        "description": "a",
-                        "intent_id": "",
-                        "status": status,
-                        "evidence_tool_call_id": "",
-                        "reason_code": "NO_ACCESS",
-                    }
-                ]
-            },
+        result = await _tool(store).run(
+            {"intents": [{"description": "a", "status": status, "result_id": "missing"}]},
+            _credentials(),
+            turn=TurnContext(turn_index=TURN),
         )
-        assert status in result.denial_detail
-        assert {"reason": "status_on_initialize", "intent_count": 1} in observer.named(
-            "loop_analysis_state_rejected"
-        )
-        doc = await store.get_or_create_session(SESSION_ID)
-        assert doc.analysis_state is None
+        assert result.status == "ok"
+        intent = live_analysis_state(await store.get_or_create_session(SESSION_ID), TURN).intents[0]
+        assert intent.status == "pending" and intent.evidence_tool_call_id is None
 
 
-async def test_an_unknown_key_is_still_rejected_even_when_it_is_empty() -> None:
-    """Normalisation elides only the fields the SCHEMA declares. A typo'd key is
-    not one of them, whatever it holds — otherwise a mistyped 'descriptoin' would
-    vanish and the call would look like it landed."""
-    await _reject(
-        _tool(InMemorySessionStore()),
+async def test_extra_typo_is_ignored_but_does_not_replace_required_description():
+    tool = _tool(InMemorySessionStore())
+    result = await tool.run(
         {"intents": [{"description": "a", "descriptoin": ""}]},
+        _credentials(),
+        turn=TurnContext(turn_index=TURN),
     )
+    assert result.status == "ok"
+    await _reject(_tool(InMemorySessionStore()), {"intents": [{"descriptoin": "a"}]})
 
 
 async def test_an_all_placeholder_item_has_no_description_at_all() -> None:
@@ -371,26 +346,31 @@ async def test_dropping_an_intent_is_structurally_impossible() -> None:
     ]
 
 
-async def test_rewriting_a_description_is_rejected() -> None:
-    """The description is the record enforcement reads. Rewriting it is how a hard
-    ask would be laundered into an easy one."""
+async def test_echoed_or_changed_description_is_ignored_and_original_is_preserved():
     store = InMemorySessionStore()
     tool = await _initialized(store, "attrition by department for last quarter")
-    result = await _reject(
-        tool,
+    result = await tool.run(
         {"intents": [{"intent_id": "i1", "status": "pending", "description": "say hello"}]},
+        _credentials(),
+        turn=TurnContext(turn_index=TURN),
     )
-    assert "cannot be rewritten" in result.denial_detail
-    doc = await store.get_or_create_session(SESSION_ID)
-    assert live_analysis_state(doc, TURN).intents[0].description == (
-        "attrition by department for last quarter"
+    assert result.status == "ok"
+    assert (
+        live_analysis_state(await store.get_or_create_session(SESSION_ID), TURN)
+        .intents[0]
+        .description
+        == "attrition by department for last quarter"
     )
 
 
-async def test_model_supplied_intent_id_on_initialize_is_rejected() -> None:
-    store = InMemorySessionStore()
-    result = await _reject(_tool(store), {"intents": [{"description": "a", "intent_id": "i7"}]})
-    assert "assigned by the runtime" in result.denial_detail
+async def test_model_supplied_declaration_id_is_ignored():
+    result = await _tool(InMemorySessionStore()).run(
+        {"intents": [{"description": "a", "intent_id": "i7"}]},
+        _credentials(),
+        turn=TurnContext(turn_index=TURN),
+    )
+    assert result.status == "ok"
+    assert result.result_full["intents"][0]["intent_id"] == "i1"
 
 
 async def test_a_second_initialize_is_rejected() -> None:
@@ -402,14 +382,14 @@ async def test_a_second_initialize_is_rejected() -> None:
     assert [i.description for i in live_analysis_state(doc, TURN).intents] == ["a"]
 
 
-async def test_unknown_keys_are_rejected_not_ignored() -> None:
-    """A typo'd key that silently vanished would look like a state update that
-    landed."""
-    store = InMemorySessionStore()
-    await _reject(_tool(store), {"intents": [{"description": "a"}], "mode": "initialize"})
-
-    tool = await _initialized(InMemorySessionStore(), "a")
-    await _reject(tool, {"intents": [{"intent_id": "i1", "status": "pending", "note": "x"}]})
+async def test_unknown_metadata_is_ignored_in_both_modes():
+    tool = _tool(InMemorySessionStore())
+    for args in (
+        {"intents": [{"description": "a", "note": {"extra": True}}], "mode": "initialize"},
+        {"intents": [{"intent_id": "i1", "status": "pending", "note": "x"}], "mode": "update"},
+    ):
+        result = await tool.run(args, _credentials(), turn=TurnContext(turn_index=TURN))
+        assert result.status == "ok"
 
 
 async def test_an_over_length_description_is_rejected_not_truncated() -> None:

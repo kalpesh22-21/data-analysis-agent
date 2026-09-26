@@ -318,7 +318,7 @@ async def test_every_emitted_analysis_state_event_carries_exactly_its_declared_k
         for payload in _named(events, "loop_intent_completed")
     )
     assert _named(events, "loop_analysis_state_rejected") == [
-        {"reason": "unknown_top_level_key", "intent_count": 0}
+        {"reason": "malformed_arguments", "intent_count": 0}
     ]
 
 
