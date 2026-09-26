@@ -353,7 +353,11 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         # WORK_JUDGED: the SQL itself could not be parsed/validated. The verdict is on
         # the query the model wrote.
         kind=DenialKind.WORK_JUDGED,
-        user_message=("I couldn't validate that query safely — let me try explainQuery first."),
+        user_message=(
+            "The query could not be validated for column scope. Simplify or restructure the SQL "
+            "and use unambiguous descriptive aliases. explainQuery uses the same guard and "
+            "will not bypass this rejection."
+        ),
     ),
     "DATABASE_NOT_ALLOWED": DenialInfo(
         code="DATABASE_NOT_ALLOWED",
@@ -395,6 +399,16 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         retryable=False,
         kind=DenialKind.GATE,
         user_message="The same SQL failed twice with the same error. This attempt was not executed. Use a materially corrected query, or bind this result_id to a blocked intent and disclose that execution could not be completed. This does not prove missing data or denied permissions.",
+    ),
+    "INVALID_COLUMN_REFERENCE": DenialInfo(
+        code="INVALID_COLUMN_REFERENCE",
+        retryable=True,
+        kind=DenialKind.WORK_JUDGED,
+        user_message=(
+            "A referenced column is absent from the physical catalog. Check getTableSchema "
+            "and use an available column. If semantic rules reference it, report a "
+            "catalog/schema mismatch. Restructuring the SQL will not add the missing column."
+        ),
     ),
     "CLICKHOUSE_QUERY_ERROR": DenialInfo(
         code="CLICKHOUSE_QUERY_ERROR",

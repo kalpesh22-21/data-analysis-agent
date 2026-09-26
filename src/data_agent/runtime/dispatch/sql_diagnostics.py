@@ -58,6 +58,33 @@ def encode_diagnostic(message: str, sql: str) -> str:
     return PREFIX + json.dumps(sql_diagnostic(message, sql))
 
 
+def encode_column_reference_diagnostic(message: str, sql: str) -> str:
+    """Expose only bounded identifiers also present in the submitted query."""
+    from .denial_mapping import classify_denial
+
+    result = {
+        "engine_code": "INVALID_COLUMN_REFERENCE",
+        "message": classify_denial("INVALID_COLUMN_REFERENCE").user_message,
+        "retryable": True,
+    }
+    match = re.match(
+        r"Column '([A-Za-z_][A-Za-z_0-9]{0,127})' is not present in the physical catalog for "
+        r"([A-Za-z_0-9., ]{1,2048})\. Check getTableSchema",
+        message[:4096],
+    )
+    if match:
+        try:
+            tree = sqlglot.parse_one(sql, dialect="clickhouse")
+            columns = {col.name for col in tree.find_all(sqlglot.exp.Column)}
+            tables = {f"{table.db}.{table.name}" for table in tree.find_all(sqlglot.exp.Table)}
+            if match[1] in columns:
+                result["column"] = match[1]
+                result["tables"] = [t for t in match[2].split(", ") if t in tables][:16]
+        except Exception:
+            pass  # The generic repair guidance remains usable for unparseable SQL.
+    return PREFIX + json.dumps(result)
+
+
 def decode_diagnostic(detail: str | None) -> dict | None:
     if not detail or not detail.startswith(PREFIX):
         return None
@@ -99,6 +126,12 @@ def repeated_sql_failure(
             else e.denial_detail or "",
         )
         for e in matches
-        if e.error_code in {"CLICKHOUSE_QUERY_ERROR", "DISALLOWED_KEYWORD", "AGGREGATION_RISK"}
+        if e.error_code
+        in {
+            "CLICKHOUSE_QUERY_ERROR",
+            "INVALID_COLUMN_REFERENCE",
+            "DISALLOWED_KEYWORD",
+            "AGGREGATION_RISK",
+        }
     ]
     return any(errors.count(signature) >= 2 for signature in set(errors))

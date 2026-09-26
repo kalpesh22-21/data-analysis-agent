@@ -25,7 +25,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
-from data_agent.runtime.dispatch.sql_diagnostics import encode_diagnostic
+from data_agent.runtime.dispatch.sql_diagnostics import (
+    encode_column_reference_diagnostic,
+    encode_diagnostic,
+)
 from data_agent.runtime.mcp.client import MCPClient, MCPToolError
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.redaction import tool_span_args
@@ -657,9 +660,13 @@ class ToolDispatcher:
                 denial_detail = exc.message
             if denial.code == "CLICKHOUSE_QUERY_ERROR":
                 denial_detail = encode_diagnostic(exc.message or "", str(model_args.get("sql", "")))
+            if denial.code == "INVALID_COLUMN_REFERENCE":
+                denial_detail = encode_column_reference_diagnostic(
+                    exc.message or "", str(model_args.get("sql", ""))
+                )
             user_message = (
                 denial.user_message
-                if denial.code == "CLICKHOUSE_QUERY_ERROR"
+                if denial.code in {"CLICKHOUSE_QUERY_ERROR", "INVALID_COLUMN_REFERENCE"}
                 else denial_detail or denial.user_message
             )
             emit(

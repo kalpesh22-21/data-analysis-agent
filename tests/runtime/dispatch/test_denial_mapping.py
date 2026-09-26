@@ -28,6 +28,7 @@ _ALL_SEVEN_CODES = {
 # of the original seven): the cartesian-join block. Retryable — the model can
 # self-correct by adding an ON/USING condition or wrapping a constant side.
 _GUARDRAIL_CODES = {
+    "INVALID_COLUMN_REFERENCE",
     "OUT_OF_SCOPE_REQUEST",
     "READ_REFETCH_LIMIT",
     "HELP_CENTER_CIRCUIT_OPEN",
@@ -69,6 +70,7 @@ _TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR"}
 _RECEIVE_LIMIT_CODES = {"RESULT_TOO_LARGE", "MCP_RESPONSE_UNSUPPORTED_ENCODING"}
 
 _EXPECTED_RETRYABLE = {
+    "INVALID_COLUMN_REFERENCE": True,
     "RESULT_TOO_LARGE": True,
     "MCP_RESPONSE_UNSUPPORTED_ENCODING": False,
     "OUT_OF_SCOPE_REQUEST": True,
@@ -291,6 +293,7 @@ _EXPECTED_KIND = {
     "CARTESIAN_JOIN_FORBIDDEN": DenialKind.WORK_JUDGED,
     # The warehouse ran it and rejected it.
     "CLICKHOUSE_QUERY_ERROR": DenialKind.WORK_JUDGED,
+    "INVALID_COLUMN_REFERENCE": DenialKind.WORK_JUDGED,
     # The model named a table/column that does not exist — TABLE_NOT_FOUND reached
     # through the composite instead of the MCP.
     "RESOLVE_VALUES_UNKNOWN_TARGET": DenialKind.WORK_JUDGED,
