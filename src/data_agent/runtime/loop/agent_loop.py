@@ -4683,6 +4683,7 @@ class AgentLoop:
                             )
                             brief = replace(
                                 brief,
+                                allow_prose_correction=True,
                                 deliverables=tuple(deliverables),
                                 selected_components=tuple(component_catalog),
                                 referenced_result_ids=evidence_assessment.references,
@@ -4735,6 +4736,47 @@ class AgentLoop:
                                 },
                             )
                             verdict = APPROVED
+                    if verdict.corrected_answer is not None:
+                        from .prose_correction import validate_correction
+
+                        correction_error = validate_correction(
+                            verdict,
+                            original=final_text,
+                            provenance=await self._compute_turn_provenance_union(
+                                session_id, turn_index
+                            ),
+                            turn_sql=accum.sql_executed,
+                            assumptions=accum.assumptions or (),
+                            question=question,
+                            has_evidence=bool(
+                                any(d["evidence"] for d in deliverables)
+                                or accum.capability_cards
+                                or accum.has_answer_tables
+                            ),
+                            declined_clarification=declined_question,
+                        )
+                        if correction_error:
+                            verdict = JudgeVerdict(
+                                False,
+                                "unsupported_by_evidence",
+                                correction_error,
+                                reviewed=True,
+                                repair_type="prose",
+                            )
+                        else:
+                            original_text, original_version = final_text, version
+                            final_text = verdict.corrected_answer
+                            complete = {**complete, "answer": final_text}
+                            version = fingerprint(complete)
+                            review_state.answer_version = version
+                            review_state.prose_correction = {
+                                "original_answer": original_text,
+                                "corrected_answer": final_text,
+                                "original_version": original_version,
+                                "corrected_version": version,
+                            }
+                            proposal_args = {**proposal_args, "answer": final_text}
+                            self._observer("loop_answer_judge_prose_corrected", {"site": site})
                     if verdict.approved and verdict.reviewed:
                         review_state.approved_version = version
                         review_state.violation = ""

@@ -192,6 +192,7 @@ class JudgeVerdict:
     intent_id: str = ""
     result_ids: tuple[str, ...] = ()
     repair_type: str = ""
+    corrected_answer: str | None = None
 
 
 # Unavailable review is fail-open only for an otherwise valid answer. reviewed=False
@@ -228,6 +229,7 @@ class JudgeBrief:
     # The answer under judgement: `result.assistant_text` at `exit_prose`, the
     # `answerWithTable` `answer` argument at `exit_table`.
     draft: str = ""
+    allow_prose_correction: bool = False
     # `(caption, sql_or_blueprint_id)` per designated table — `exit_table` only.
     designated_tables: tuple[tuple[str | None, str], ...] = ()
     # The question the model wants to ask — `ask_user` only.
@@ -249,6 +251,7 @@ class JudgeBrief:
         doc: dict[str, Any] = {
             "evidence_package": dict(self.evidence_package),
             "referenced_result_ids": list(self.referenced_result_ids),
+            "allow_prose_correction": self.allow_prose_correction,
             "question": self.question,
             "clarification_answers": list(self.clarification_answers),
             "recent_conversation": list(self.recent_conversation),
@@ -456,10 +459,19 @@ def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> d
                         "omit_component",
                     ],
                 },
+                "corrected_answer": {
+                    "type": ["string", "null"],
+                    "maxLength": 20000,
+                    "description": (
+                        "Only when allow_prose_correction is true: the complete corrected answer "
+                        "you approve, with approved=true, repair_type=prose, and empty violation "
+                        "and feedback. Omit or use null for ordinary approval or rejection."
+                    ),
+                },
                 "approved": {
                     "type": "boolean",
                     "description": (
-                        "True when the answer may be sent to the user as it stands. "
+                        "True when the original answer, or your exact corrected_answer, may be sent. "
                         "Reject supported violations; do not speculate about omitted "
                         "evidence or reject for style preferences."
                     ),
@@ -513,6 +525,17 @@ _ANSWER_JUDGE_PROMPT = (
     "presentation repair; wrong calculations or requested metric semantics require analysis repair. "
     "Preserve a correct primary ranking: rename or omit an unnecessary mislabeled secondary metric "
     "rather than changing the primary calculation. "
+    "When allow_prose_correction is true, you may approve with corrected_answer instead of "
+    "returning a prose-only issue to the agent. Return the COMPLETE exact answer you approve, "
+    "approved=true, repair_type=prose, violation='', feedback=''. Make only minimal wording "
+    "changes: remove unsupported explanations, qualify accessible-data coverage, or align prose "
+    "labels with an already correct metric. Preserve all numeric values, requested meaning, "
+    "results, evidence, selected tables, captions, assumptions, and UI options. Review the full "
+    "corrected answer and unchanged components before approving. If SQL, calculations, metric "
+    "semantics, evidence, component selection, assumptions, or user input must change, reject "
+    "with actionable feedback instead. Do not use a prose correction to hide missing work. "
+    "If allow_prose_correction is false (including clarification and fallback review), do not "
+    "return corrected_answer. Use ordinary approval or rejection. "
     "Ground repair feedback in the actual source grain and catalog descriptions. An employee snapshot is not automatically a hire-event history; do not assert cross-year rehire behavior without evidence. Counting employees by their documented hire_date is a valid snapshot-based hire-date comparison; do not demand all historical hire events unless requested. Describe records available in the source rather than inventing original-hire or rehire guarantees. Check coverage of explicitly requested zero-activity groups and periods across selected results. Missing groups inside an assigned result are not a separate deliverable. "
     "User clarification_answers refine the original request. Apply those answers; never reject "
     "a correct narrowed answer because it does not repeat an already answered clarification. "
@@ -797,6 +820,35 @@ def _system_prompt(site: JudgeSite, *, capabilities_enabled: bool = True) -> str
 # --- the guard on what comes back -------------------------------------------
 
 
+def _valid_correction(arguments, site):
+    corrected = arguments.get("corrected_answer")
+    if corrected is None:
+        return True
+    return (
+        site != "ask_user"
+        and not (
+            arguments.keys()
+            - {
+                "approved",
+                "violation",
+                "feedback",
+                "repair_type",
+                "corrected_answer",
+                "intent_id",
+                "result_ids",
+            }
+        )
+        and arguments.get("approved") is True
+        and arguments.get("repair_type") == "prose"
+        and arguments.get("violation") == ""
+        and arguments.get("feedback") == ""
+        and isinstance(corrected, str)
+        and bool(corrected.strip())
+        and len(corrected) <= 20000
+        and not any(ord(c) < 32 and c not in "\n\t\r" for c in corrected)
+    )
+
+
 def parse_verdict(
     result: ModelTurnResult, site: JudgeSite, *, capabilities_enabled: bool = True
 ) -> JudgeVerdict:
@@ -853,7 +905,13 @@ def parse_verdict(
     if not isinstance(approved, bool):
         _logger.warning("answer judge: approved was %r, not a boolean — approving", approved)
         return APPROVED
+    if not _valid_correction(arguments, site):
+        return APPROVED
     if approved:
+        if arguments.get("corrected_answer") is not None:
+            return JudgeVerdict(
+                True, repair_type="prose", corrected_answer=arguments["corrected_answer"]
+            )
         return APPROVED
 
     violation = arguments.get("violation")
@@ -1136,6 +1194,9 @@ class AnswerJudge:
             result, brief.site, capabilities_enabled=self.capabilities_enabled
         )
         verdict = parse_verdict(result, brief.site, capabilities_enabled=self.capabilities_enabled)
+        if verdict.corrected_answer is not None and not brief.allow_prose_correction:
+            malformed = True
+            verdict = APPROVED
         total = usage.get("total_tokens")
         outcome = "malformed" if malformed else "approved" if verdict.approved else "rejected"
         # 09 §I: judge spend is deliberately OUTSIDE `max_window_token_spend`, so this
@@ -1183,6 +1244,8 @@ def _looks_malformed(
         return True
     approved = call.arguments.get("approved")
     if not isinstance(approved, bool):
+        return True
+    if not _valid_correction(call.arguments, site):
         return True
     if approved:
         return False
