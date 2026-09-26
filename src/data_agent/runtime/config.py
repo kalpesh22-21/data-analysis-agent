@@ -468,12 +468,19 @@ class RuntimeSettings(BaseSettings):
         30.0,
         gt=0,
         description=(
-            "Per-call timeout for the judge. Unavailable review fails open for otherwise valid "
-            "answers but cannot clear a prior rejection. The judge adds a repair on positive "
-            "evidence, never withhold an answer because it could not be reached. Sized "
-            "against the wall-clock window rather than against typical latency: a judge "
-            "still running at this point has already eaten the headroom a rejection "
-            "would need to be actionable."
+            "Per-call judge timeout, including provider queue time. Unavailable review "
+            "cannot clear an explicit rejection."
+        ),
+    )
+    answer_judge_review_budget_seconds: float | None = Field(
+        None,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "Total judge-call wall time per run/resume request. Unset uses three times "
+            "the per-call timeout. Repair and terminal recovery each reserve one per-call "
+            "timeout, capped at one third of the total. Final delivery can use all remaining time. "
+            "Provider queue time counts; agent generation has a separate execution budget."
         ),
     )
     answer_judge_min_headroom_seconds: float = Field(

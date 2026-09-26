@@ -966,6 +966,7 @@ class AgentLoop:
         # terminal path; `None` is the stronger statement and the cheaper one.
         answer_judge: AnswerJudge | None = None,
         judge_catalog: Any = None,
+        answer_judge_review_budget_seconds: float | None = None,
         # Seconds of wall clock a judge rejection needs to be worth making (09 §H).
         # Below this the judge is SKIPPED and the answer ships: a rejection issued at
         # 168s of a 180s window buys a regeneration the guard cuts off mid-round, and
@@ -1028,6 +1029,7 @@ class AgentLoop:
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
         self._judge_catalog = judge_catalog
         self._answer_judge = answer_judge
+        self._answer_judge_review_budget_seconds = answer_judge_review_budget_seconds
         self._answer_judge_min_headroom_seconds = answer_judge_min_headroom_seconds
         self._preview_row_count = preview_row_count
         self._clock = clock
@@ -4720,7 +4722,7 @@ class AgentLoop:
                                 analysis_state=analysis_state,
                             )
                             brief_ready = True
-                            verdict = await review_once(self, brief)
+                            verdict = await review_once(self, brief, repair=review_state.repaired)
                         except Exception as exc:
                             self._observer(
                                 ANSWER_JUDGE_FAILED_EVENT,

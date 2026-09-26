@@ -976,6 +976,7 @@ def create_app(
                 else None
             ),
             judge_catalog=catalog_provider,
+            answer_judge_review_budget_seconds=settings.answer_judge_review_budget_seconds,
             answer_judge_min_headroom_seconds=settings.answer_judge_min_headroom_seconds,
             # 09 §D.3: the SAME number the assembler renders the model's context with,
             # so the judge's view of a result is byte-identical to the model's.

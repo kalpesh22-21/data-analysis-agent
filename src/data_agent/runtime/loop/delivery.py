@@ -17,8 +17,10 @@ from .proposal import ReviewState, fingerprint
 @dataclass
 class DeliveryContext:
     credentials: object
-    review_seconds: float = 30.0
+    review_seconds: float = 90.0
+    repair_reserve_seconds: float = 30.0
     turn_index: int | None = None
+    terminal_reserve_seconds: float = 0.0
 
 
 CURRENT_DELIVERY: ContextVar[DeliveryContext | None] = ContextVar("delivery", default=None)
@@ -59,7 +61,15 @@ def dependency_failure(exc, dependency):
 def delivery_boundary(method):
     @wraps(method)
     async def wrapped(self, *args, **kwargs):
-        context = DeliveryContext(kwargs["credentials"])
+        per_call = getattr(self._answer_judge, "timeout_seconds", 30.0)
+        configured = self._answer_judge_review_budget_seconds
+        total = configured if configured is not None else 3 * per_call
+        context = DeliveryContext(
+            kwargs["credentials"],
+            review_seconds=total,
+            repair_reserve_seconds=min(per_call, total / 3),
+            terminal_reserve_seconds=min(per_call, total / 3),
+        )
         token = CURRENT_DELIVERY.set(context)
         try:
             try:
@@ -93,22 +103,39 @@ def delivery_boundary(method):
     return wrapped
 
 
-async def review_once(loop, brief):
+async def review_once(loop, brief, *, repair=False, terminal=False):
     import asyncio
 
     context = CURRENT_DELIVERY.get()
-    available = context.review_seconds if context else 30.0
+    per_call = getattr(loop._answer_judge, "timeout_seconds", 30.0)
+    available = (
+        max(
+            0.0,
+            context.review_seconds
+            - (0.0 if terminal else context.terminal_reserve_seconds)
+            - (0.0 if repair or terminal else context.repair_reserve_seconds),
+        )
+        if context
+        else per_call
+    )
     if available <= 0:
         return APPROVED
     started = time.monotonic()
     try:
         return await asyncio.wait_for(
             loop._answer_judge.review(brief),
-            timeout=min(available, getattr(loop._answer_judge, "timeout_seconds", 30.0)),
+            timeout=min(available, per_call),
         )
     finally:
         if context:
-            context.review_seconds = max(0.0, context.review_seconds - (time.monotonic() - started))
+            elapsed = time.monotonic() - started
+            context.review_seconds = max(0.0, context.review_seconds - elapsed)
+            if terminal:
+                context.terminal_reserve_seconds = max(
+                    0.0, context.terminal_reserve_seconds - elapsed
+                )
+            if repair:
+                context.repair_reserve_seconds = max(0.0, context.repair_reserve_seconds - elapsed)
 
 
 def delivery_version(text, accum, pending=None):
@@ -260,7 +287,11 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
                 credentials=context.credentials,
                 analysis_state=live_analysis_state(doc, turn_index),
             )
-            verdict = await review_once(loop, brief)
+            # This request is ending (including a pause whose resume gets a new
+            # context). No further agent repair can use its reserves, so final
+            # delivery may spend the remaining aggregate budget. Prior explicit
+            # rejections are still handled above; this is not a new repair round.
+            verdict = await review_once(loop, brief, terminal=True)
         except Exception:
             loop._observer("loop_answer_judge_failed", {"reason": "delivery_review_failed"})
             continue
