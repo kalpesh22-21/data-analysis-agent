@@ -2836,18 +2836,11 @@ class AgentLoop:
         """Emit `loop_answer_table_intent_uncovered` when a COMPLETED intent's result is not
         among the designated tables.
 
-        DERIVATION IS A CHECK HERE, NEVER A SOURCE. The tables are LISTED by the model
-        because the evidence call is the wrong query: a designated `sql` is deliberately
-        not required to be one the agent ran, because the executed query usually carries a
-        LIMIT the agent chose for its own reading and paging needs the un-capped shape.
-        Deriving the tables from the evidence would page that capped query and silently
-        truncate every grid. (`getTableSchema` evidence has no pageable SQL at all, and a
-        `blocked` intent's evidence is a denial.)
-
-        NOT A REFUSAL. A scalar part of a multi-part answer correctly belongs in the prose,
-        so this counts a signal, not an error. Best-effort by construction: an intent whose
-        evidence call ran in an EARLIER window contributes nothing, because
-        `result_sql_by_call_id` is window-local.
+        This is an observability check, not table selection or a refusal. Model
+        selections and automatically attached cited scalar results have already
+        been resolved through the normal designation path. Blocked intents have
+        no required table. An earlier window's result may be absent from the
+        window-local result_sql_by_call_id map.
         """
         if state is None:
             return
@@ -3471,7 +3464,11 @@ class AgentLoop:
                 dispatched_ids.add(tool_call.id)
                 is_unified_finalizer = tool_call.name == "finalizeAnswer"
                 if is_unified_finalizer:
-                    from .proposal import normalize_proposal_args, validate_proposal_args
+                    from .proposal import (
+                        include_scalar_result_tables,
+                        normalize_proposal_args,
+                        validate_proposal_args,
+                    )
 
                     tool_call = replace(
                         tool_call, arguments=normalize_proposal_args(tool_call.arguments)
@@ -3479,6 +3476,16 @@ class AgentLoop:
                     error = validate_proposal_args(tool_call.arguments)
                     if error:
                         tool_call = replace(tool_call, argument_error=error)
+                    else:
+                        visible_trail = scope_filter.filter_trail(
+                            await self._session_store.load_trail(session_id),
+                            credentials.column_scope, current_turn_index=turn_index,
+                        )
+                        tool_call = replace(tool_call, arguments=include_scalar_result_tables(
+                            tool_call.arguments,
+                            [e for e in visible_trail if e.turn_index == turn_index],
+                            analysis_state, review_state.excluded_components,
+                        ))
                     tool_call = replace(
                         tool_call,
                         name=ANSWER_TABLE_TOOL_NAME

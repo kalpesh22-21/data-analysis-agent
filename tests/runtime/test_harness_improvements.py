@@ -998,37 +998,19 @@ async def test_final_judge_receives_the_users_clarification_answer():
     assert judge.briefs[-1].clarification_answers == ("Sales",)
 
 
-async def test_repair_can_remove_a_table_from_live_answer_and_history():
+async def test_presentation_repair_keeps_cited_scalar_query_in_live_answer_and_history():
     from data_agent.runtime.session_history import project_history
 
-    judge = Judge(
-        [
-            JudgeVerdict(
-                False,
-                "unexplained_gap",
-                "Present the scalar in prose.",
-                True,
-                repair_type="presentation",
-            )
-        ]
-    )
-    initial = call(
-        "finalizeAnswer",
-        "first",
-        answer="There are 120 employees.",
-        tables=[{"result_id": "q"}],
-        capability_refs=[],
-        evidence=["q"],
-    )
+    judge = Judge([JudgeVerdict(False, "unexplained_gap", "Make the prose concise.", True, repair_type="presentation")])
+    initial = call("finalizeAnswer", "first", answer="There are 120 employees.", tables=[{"result_id": "q"}], capability_refs=[], evidence=["q"])
     loop, store, _, _, _ = build([discovery(), query(), batch(initial), batch(finish())], judge)
     outcome = await run(loop, "How many employees?")
-    assert outcome.status == "done" and outcome.answer_tables is None
-    assert len(judge.briefs) == 2 and judge.briefs[-1].designated_tables == ()
+    assert outcome.status == "done"
+    assert outcome.answer_tables[0]["sql"] == SQL
+    assert len(judge.briefs) == 2 and judge.briefs[-1].designated_tables
     doc = await store.get_or_create_session(CREDS.session_id)
     history = project_history(doc.messages, doc.tool_trail, frozenset(), None)
-    assert history["turns"][0]["answer_tables"] is None
-    tables, _ = await loop._compute_turn_answer_tables(CREDS.session_id, 0)
-    assert tables == []
+    assert history["turns"][0]["answer_tables"] == outcome.answer_tables
 
 
 @pytest.mark.parametrize("reviewed", [False, True])

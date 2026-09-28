@@ -650,7 +650,7 @@ GET_CAPABILITY_TOOL_SCHEMA: dict[str, Any] = {
 FINALIZE_ANSWER_SCHEMA = {
     "type": "function",
     "name": "finalizeAnswer",
-    "description": "Send the complete final answer after all work and preparation finishes. This is the only finalization tool. Select existing result IDs for paginated tables and prepared capability refs for UI options. Cite successful current-turn result IDs in evidence. Preserve supported parts and disclose gaps.",
+    "description": "Send the complete final answer after all work and preparation finishes. This is the only finalization tool. Select existing result IDs for paginated tables, including one-row counts/totals, and prepared capability refs for UI options. Cite successful current-turn result IDs in evidence. Preserve supported parts and disclose gaps.",
     "parameters": {
         "type": "object",
         "properties": {

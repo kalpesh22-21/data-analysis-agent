@@ -134,10 +134,9 @@ def _is_multi_row_answer_call(tool_name: str, status: str, preview: ResultPrevie
     """Whether one call is a SUCCESSFUL, data-returning call that produced MORE THAN ONE
     ROW — the fact the answer-shape gate counts.
 
-    `row_count > 1`, not `>= 1`, and the strictness is the whole safety margin: ZERO rows
-    is a legitimate prose answer ("no employees match"), and ONE row is a single figure
-    ("headcount is 412"). Refusing either would turn a correct turn into an extra
-    round-trip and a confusing instruction to table something that is not a table.
+    Zero/one-row results are attached automatically by the finalizer when cited
+    as warehouse evidence. This counter handles larger untabled results; it does
+    not need to force an additional model turn for scalar presentation.
 
     Module-private: `AnswerShapeCounter` holds BOTH call sites (the trail seed and the
     live count), so the two can no longer disagree about what is being counted.

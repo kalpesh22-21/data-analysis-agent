@@ -252,6 +252,28 @@ def normalize_proposal_args(args: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def include_scalar_result_tables(args, trail, state=None, excluded=()):
+    """Keep cited scalar warehouse answers inspectable without an extra model turn."""
+    assessment = assess_deliverable_evidence(state, args, trail)
+    if assessment.errors:
+        return args
+    tables = list(args.get("tables", []))
+    selected = {t.get("result_id") for t in tables if isinstance(t, dict)}
+    blocked = {c.get("result_id") for c in excluded}
+    references = set(assessment.references)
+    for entry in trail:
+        if (
+            entry.tool_call_id in references - selected - blocked
+            and evidence_kind(entry) == "warehouse"
+            and entry.provenance is not None
+            and entry.result_preview is not None
+            and entry.result_preview.row_count <= 1
+        ):
+            tables.append({"result_id": entry.tool_call_id, "caption": "Summary"})
+            selected.add(entry.tool_call_id)
+    return {**args, "tables": tables}
+
+
 def validate_proposal_args(args: Any) -> str | None:
     from jsonschema import Draft202012Validator
 

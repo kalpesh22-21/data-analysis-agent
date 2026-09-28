@@ -69,7 +69,7 @@ def test_procedure_has_each_stage(step):
         "exact result_id",
         "Two executions of the same blueprint",
         "Preserve requested top-N semantics",
-        "Scalars belong in prose",
+        "single-value answers require a query-backed one-row table",
         "never by inventing or hand-calculating",
         "Evidence for one part does not establish another",
         "recordAssumptions",
