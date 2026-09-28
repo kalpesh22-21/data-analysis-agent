@@ -532,6 +532,8 @@ class ToolDispatcher:
         status: str,
         error_code: str | None,
         result_preview: ResultPreview | None = None,
+        denial_detail: str | None = None,
+        tool_call_id: str | None = None,
     ) -> None:
         if self._tracer is None:
             return
@@ -548,8 +550,14 @@ class ToolDispatcher:
             error_code=error_code,
             result_preview=span_result,
             reveal_complex_args=self._disable_redaction,
-        ):
-            pass
+        ) as span:
+            if denial_detail:
+                from .denial_targets import record_column_denial
+
+                record_column_denial(
+                    span, code=error_code, detail=denial_detail, args=model_args,
+                    tool_name=tool_name, tool_call_id=tool_call_id,
+                )
 
     async def _resolve_catalog(self, credentials: RuntimeCredentials) -> CatalogHandle:
         """Resolve schema for pre-execution measurement checks, not provenance."""
@@ -676,7 +684,10 @@ class ToolDispatcher:
                 "tool_dispatch_denied",
                 {"tool_name": tool_name, "error_code": denial.code, "tool_call_id": tool_call_id},
             )
-            self._emit_tool_span(tool_name, model_args, status="denied", error_code=denial.code)
+            self._emit_tool_span(
+                tool_name, model_args, status="denied", error_code=denial.code,
+                denial_detail=denial_detail, tool_call_id=tool_call_id,
+            )
             return ToolResult(
                 status="denied",
                 tool_name=tool_name,

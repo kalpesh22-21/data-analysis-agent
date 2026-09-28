@@ -3737,10 +3737,36 @@ class AgentLoop:
                 ):
                     gate_refusal = blueprint_gate.check_run_blueprint(call_args)
 
+                if gate_refusal is None and tool_call.name in {"runQuery", "explainQuery", "sampleRows"}:
+                    from data_agent.runtime.dispatch.denial_targets import repeated_target_denial
+
+                    current_doc = await self._session_store.get_or_create_session(session_id)
+                    repeated_code = repeated_target_denial(
+                        tool_call.name, call_args, current_doc.tool_trail, turn_index,
+                        scope_filter.compute_scope_hash(credentials.column_scope),
+                    )
+                    if repeated_code:
+                        code = (
+                            "COLUMN_SCOPE_VIOLATION"
+                            if repeated_code == "COLUMN_SCOPE_VIOLATION"
+                            else "SQL_REPAIR_EXHAUSTED"
+                        )
+                        gate_refusal = replace(
+                            refusal(tool_call.name, code), retryable=False, provenance=None,
+                            denial_detail=(
+                                "Repeated attempts still reference the same denied column. "
+                                "Rewording the SQL will not fix this. Remove the denied dependency, "
+                                "use other successful evidence, or disclose the limitation."
+                            ),
+                        )
+                        self._observer("loop_semantic_denial_exhausted", {
+                            "tool_name": tool_call.name, "tool_call_id": tool_call.id,
+                            "error_code": repeated_code,
+                        })
+
                 if gate_refusal is None and tool_call.name == "runQuery":
                     from data_agent.runtime.dispatch.sql_diagnostics import repeated_sql_failure
 
-                    current_doc = await self._session_store.get_or_create_session(session_id)
                     if repeated_sql_failure(
                         str(call_args.get("sql", "")),
                         current_doc.tool_trail,
