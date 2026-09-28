@@ -404,9 +404,8 @@ def create_app(
         )
 
     # The ANSWER JUDGE (doc 09), opt-in via `answer_judge_enabled`. Built ONCE here,
-    # on the main model client unless `answer_judge_model` names another — the same
-    # arrangement the summarizer above uses, and for the same reason: a second cheap
-    # client is a deployment choice, not a code path.
+    # on the main model client unless a separate model or judge-only thinking budget
+    # is configured. A dedicated client keeps judge settings out of agent requests.
     #
     # ONLY THE CLIENT IS BUILT HERE. The `AnswerJudge` itself is constructed per
     # request inside `_build_agent_loop`, because it carries the request's `observer`
@@ -431,13 +430,18 @@ def create_app(
         judge_model_client = (
             build_openai_model_client(
                 api_key=settings.openai_api_key,
-                model=settings.answer_judge_model,
+                model=settings.answer_judge_model or settings.openai_model,
                 base_url=settings.openai_base_url,
                 use_reasoning_metadata=settings.use_reasoning_metadata,
                 tool_choice=settings.model_tool_choice,
                 api_mode=settings.model_api,
+                thinking_token_budget=(
+                    settings.answer_judge_thinking_token_budget
+                    if settings.answer_judge_thinking_budget_enabled
+                    else None
+                ),
             )
-            if settings.answer_judge_model
+            if settings.answer_judge_model or settings.answer_judge_thinking_budget_enabled
             else model_client
         )
 

@@ -160,3 +160,18 @@ def test_the_redaction_opt_out_is_reachable_by_env_var(monkeypatch) -> None:
     exact name an operator would type, not assumed from the field name."""
     monkeypatch.setenv("OTLP_DISABLE_REDACTION", "false")
     assert RuntimeSettings(_env_file=None).otlp_disable_redaction is False
+
+
+def test_judge_thinking_budget_is_opt_in_and_validated(monkeypatch):
+    monkeypatch.setenv("ANSWER_JUDGE_THINKING_BUDGET_ENABLED", "false")
+    monkeypatch.setenv("ANSWER_JUDGE_THINKING_TOKEN_BUDGET", "2048")
+    settings = RuntimeSettings(_env_file=None)
+    assert not settings.answer_judge_thinking_budget_enabled
+    assert settings.answer_judge_thinking_token_budget == 2048
+    monkeypatch.setenv("ANSWER_JUDGE_THINKING_BUDGET_ENABLED", "true")
+    monkeypatch.setenv("ANSWER_JUDGE_THINKING_TOKEN_BUDGET", "1024")
+    settings = RuntimeSettings(_env_file=None)
+    assert settings.answer_judge_thinking_budget_enabled
+    assert settings.answer_judge_thinking_token_budget == 1024
+    with pytest.raises(ValueError):
+        RuntimeSettings(_env_file=None, answer_judge_thinking_token_budget=-1)

@@ -302,7 +302,9 @@ class OpenAIModelClient:
         use_reasoning_metadata: bool = False,
         tool_choice: Literal["required", "auto"] = "required",
         api_mode: Literal["auto", "chat"] = "auto",
+        thinking_token_budget: int | None = None,
     ) -> None:
+        self._thinking_token_budget = thinking_token_budget
         self._use_reasoning_metadata = use_reasoning_metadata
         self._tool_choice = tool_choice
         self._api_mode = api_mode
@@ -329,12 +331,17 @@ class OpenAIModelClient:
             use_reasoning_metadata=self._use_reasoning_metadata,
             tool_choice=self._tool_choice,
             api_mode=self._api_mode,
+            thinking_token_budget=self._thinking_token_budget,
         )
 
     async def send_turn(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurnResult:
-        if self._api_mode == "chat" or self._use_reasoning_metadata:
+        if (
+            self._api_mode == "chat"
+            or self._use_reasoning_metadata
+            or self._thinking_token_budget is not None
+        ):
             return await self._call_chat_with_retry(messages, tools)
         if not self._fell_back_this_turn:
             try:
@@ -377,6 +384,11 @@ class OpenAIModelClient:
                     model=self._model,
                     messages=chat_messages,
                     tools=chat_tools,
+                    **(
+                        {"extra_body": {"thinking_token_budget": self._thinking_token_budget}}
+                        if self._thinking_token_budget is not None
+                        else {}
+                    ),
                     **({"tool_choice": self._tool_choice} if chat_tools else {}),
                 )
                 return _chat_result_to_turn(response)
@@ -395,6 +407,7 @@ def build_openai_model_client(
     use_reasoning_metadata: bool = False,
     tool_choice: Literal["required", "auto"] = "required",
     api_mode: Literal["auto", "chat"] = "auto",
+    thinking_token_budget: int | None = None,
 ) -> OpenAIModelClient:
     """Construct an `OpenAIModelClient` wired to a real `AsyncOpenAI` client.
 
@@ -408,6 +421,7 @@ def build_openai_model_client(
         use_reasoning_metadata=use_reasoning_metadata,
         tool_choice=tool_choice,
         api_mode=api_mode,
+        thinking_token_budget=thinking_token_budget,
     )
 
 

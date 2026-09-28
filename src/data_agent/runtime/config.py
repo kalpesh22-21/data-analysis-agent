@@ -464,6 +464,14 @@ class RuntimeSettings(BaseSettings):
             "progress_summary_model uses."
         ),
     )
+    answer_judge_thinking_budget_enabled: bool = Field(
+        False, description="Enable a judge-only vLLM thinking token limit via Chat Completions."
+    )
+    answer_judge_thinking_token_budget: int = Field(
+        4096,
+        ge=0,
+        description="Reasoning token limit when the judge thinking-budget flag is enabled. Requires compatible vLLM reasoning configuration.",
+    )
     answer_judge_timeout_seconds: float = Field(
         30.0,
         gt=0,

@@ -514,3 +514,19 @@ async def test_chat_mode_sdk_tool_round_trip_without_responses_probe(keep_reason
         )
         assert (await client.send_turn(messages, [])).assistant_text == "Done."
         assert len(requests) == 2
+
+
+@pytest.mark.parametrize("budget", [0, 2048])
+async def test_thinking_budget_uses_chat_and_survives_begin_turn(budget):
+    transport = _FakeOpenAIClient([], [_chat_message_result("verdict")])
+    client = OpenAIModelClient(transport, model="kimi", thinking_token_budget=budget)
+    result = await client.begin_turn().send_turn([{"role": "user", "content": "Review"}], [])
+    assert result.assistant_text == "verdict"
+    assert not transport.responses.calls
+    assert transport.chat.completions.calls[0]["extra_body"] == {"thinking_token_budget": budget}
+
+
+async def test_unset_thinking_budget_leaves_chat_request_unchanged():
+    transport = _FakeOpenAIClient([], [_chat_message_result("verdict")])
+    await OpenAIModelClient(transport, model="kimi", api_mode="chat").begin_turn().send_turn([], [])
+    assert "extra_body" not in transport.chat.completions.calls[0]

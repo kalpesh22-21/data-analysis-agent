@@ -1283,3 +1283,36 @@ def test_create_app_without_extra_observers_is_unchanged(monkeypatch) -> None:
     )
     response = client.post("/turn", json={"message": "hello"}, headers=HEADERS)
     assert _parse_sse(response.text)[-1]["data"]["status"] == "done"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_judge_thinking_budget_builds_only_a_dedicated_judge_client(monkeypatch, enabled):
+    calls = []
+
+    def build_client(**kwargs):
+        calls.append(kwargs)
+        return ScriptedModelClient([])
+
+    monkeypatch.setattr(app_module, "build_openai_model_client", build_client)
+    create_app(
+        settings=RuntimeSettings(
+            _env_file=None,
+            openai_api_key="test-key",
+            openai_model="kimi",
+            answer_judge_enabled=True,
+            answer_judge_model="",
+            answer_judge_thinking_budget_enabled=enabled,
+            answer_judge_thinking_token_budget=1024,
+            progress_summary_enabled=False,
+            help_center_enabled=False,
+            capability_tools_enabled=False,
+            retrieval_enabled=False,
+        ),
+        session_store=InMemorySessionStore(),
+        mcp_client=FakeMCPClient(tools=[], scripted={}),
+        model_client=ScriptedModelClient([]),
+    )
+    assert len(calls) == int(enabled)
+    if enabled:
+        assert calls[0]["model"] == "kimi"
+        assert calls[0]["thinking_token_budget"] == 1024
