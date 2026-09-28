@@ -352,3 +352,103 @@ def test_explicit_sanitized_bindings_do_not_reintroduce_dropped_state_receipts()
         brief, [{"tool_call_id": "control", "serves_intents": ["i1"]}], state, frozenset()
     )
     assert package["parts"][0]["result_ids"] == []
+
+
+def test_catalog_does_not_expand_unrelated_documentation_into_columns():
+    columns = {
+        "hire_date": {"type": "Date"},
+        "rehire_date": {"type": "Date"},
+        "status": {"type": "String"},
+        "employee_id": {"type": "String"},
+        "state": {"type": "String"},
+        **{f"allocation_{i}": {"type": "String", "description": "x" * 100} for i in range(20)},
+    }
+    handle = load_catalog_handle_from_catalog(
+        {
+            "hr.employee": {
+                "columns": columns,
+                "grain": ["employee_id"],
+                "schema_notes": [
+                    "hire_date and allocation_0 have missing values",
+                    "rehire_date uses a 1900-01-01 sentinel",
+                ],
+                "rules": [
+                    {
+                        "predicate": "status != 'Not Hired'",
+                        "applies_when": "Default termination-state analysis",
+                    }
+                ],
+                "ambiguities": [
+                    {"term": "hire_date", "resolves_to": ["hire_date", "rehire_date"]},
+                    {"term": "allocation", "resolves_to": [f"allocation_{i}" for i in range(20)]},
+                ],
+                "join_keys": [{"column": "allocation_0", "joins": "allocation.id"}],
+            }
+        }
+    )
+    before = handle.documentation_for("hr.employee")
+    table = catalog_context(
+        handle, ["SELECT avg(today()-hire_date) FROM hr.employee"], frozenset()
+    )["tables"][0]
+    assert set(table["columns"]) == {"hire_date", "rehire_date", "status", "employee_id"}
+    assert len(table["ambiguities"]) == 1
+    assert table["join_keys"] == []
+    assert table["rules"] == before["rules"]
+    assert table["schema_notes"] == before["schema_notes"]
+    assert handle.documentation_for("hr.employee") == before
+
+
+def test_sql_compaction_preserves_repair_evidence_and_unmatched_proposals():
+    old = "SELECT avg(dateDiff('year', hire_date, today())) FROM employee"
+    new = "SELECT avg(dateDiff('month', hire_date, today())) / 12 FROM employee"
+    unexecuted = "SELECT count(*) FROM employee"
+    results = tuple(
+        {
+            "tool_call_id": ref,
+            "args": {"sql": sql, "limit": 10},
+            "execution": {"sql": sql},
+            "result_preview": {"preview_rows": [[value]]},
+        }
+        for ref, sql, value in [("q6", old, 4.65), ("q10", new, 4.86)]
+    )
+    brief = JudgeBrief(
+        "exit_table",
+        "Average tenure?",
+        results=results,
+        sql_executed=(old, new),
+        previous_rejection="Derive years from months",
+        designated_tables=(("Tenure", new),),
+        selected_components=(
+            {"result_id": "q10", "sql": new},
+            {"result_id": "unknown", "sql": unexecuted},
+        ),
+    )
+    payload = brief.payload()
+    encoded = json.dumps(payload)
+    assert encoded.count(old) == 1
+    assert encoded.count(new) == 1
+    assert payload["tables_shown_to_the_user"] == [{"caption": "Tenure", "result_id": "q10"}]
+    assert payload["selected_components"][1]["sql"] == unexecuted
+    assert [r["result_preview"]["preview_rows"] for r in payload["results"]] == [[[4.65]], [[4.86]]]
+    assert payload["previous_rejection"] == brief.previous_rejection
+    assert results[0]["args"]["sql"] == old
+
+
+def test_sql_only_table_identity_does_not_choose_between_distinct_executions():
+    sql = "SELECT count(*) FROM employee"
+    brief = JudgeBrief(
+        "exit_table",
+        "Count?",
+        designated_tables=(("Count", sql),),
+        results=tuple(
+            {
+                "tool_call_id": ref,
+                "execution": {"sql": sql},
+                "result_preview": {"preview_rows": [[value]]},
+            }
+            for ref, value in [("first", 5), ("second", 6)]
+        ),
+    )
+    payload = brief.payload()
+    assert payload["tables_shown_to_the_user"][0]["identified_by"] == sql
+    assert len(payload["results"]) == 2

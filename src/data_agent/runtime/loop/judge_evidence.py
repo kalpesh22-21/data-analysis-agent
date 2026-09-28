@@ -130,11 +130,20 @@ def catalog_context(catalog, executions, column_scope):
             tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", json.dumps(value)))
             return not (tokens & denied)
 
+        # Select optional metadata against SQL columns, before expanding rule dependencies.
+        # Otherwise an unrelated ambiguity/join can pull the whole schema into review.
+        sql_columns = set(needed)
+
+        def relevant(value, sql_columns=sql_columns):
+            return bool(set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", json.dumps(value))) & sql_columns)
+
         result: dict[str, Any] = {"table": key, "omitted_for_scope": []}
         for name in _METADATA_KEYS:
             value = raw.get(name)
-            if value is None:
+            if value is None or name == "schema_notes":
                 continue
+            if name in {"join_keys", "ambiguities", "measures"} and isinstance(value, list):
+                value = [item for item in value if relevant(item)]
             if name == "rules" and isinstance(value, list):
                 result[name] = []
                 for rule in value:
@@ -147,8 +156,45 @@ def catalog_context(catalog, executions, column_scope):
             else:
                 result["omitted_for_scope"].append(name)
         # Rule/join/grain columns matter even when absent from the query.
-        tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", json.dumps(result)))
+        # Only semantic checks expand required column definitions. Broad prose such
+        # as schema notes must not recursively import every column it mentions.
+        dependency_metadata = {
+            k: result[k]
+            for k in (
+                "grain",
+                "primary_key",
+                "rules",
+                "default_filters",
+                "ambiguities",
+                "join_keys",
+                "measures",
+            )
+            if k in result
+        }
+        if "rules" in dependency_metadata:
+            # A prose phrase such as "termination-state" is not a dependency on
+            # an employee's home-address `state` column. Keep full rules in the
+            # packet, but derive their columns from predicates when supplied.
+            dependency_metadata["rules"] = [
+                rule.get("predicate", rule) if isinstance(rule, dict) else rule
+                for rule in dependency_metadata["rules"]
+            ]
+        tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", json.dumps(dependency_metadata)))
         needed.update(tokens & allowed)
+        # Notes about rule/ambiguity dependencies (e.g. rehire-date sentinels)
+        # matter too. Retain those notes without expanding columns from their prose.
+        notes = raw.get("schema_notes")
+        if notes is not None:
+            selected_notes = (
+                [note for note in notes if relevant(note, needed)]
+                if isinstance(notes, list)
+                else notes
+            )
+            if safe(selected_notes):
+                result["schema_notes"] = selected_notes
+            else:
+                result["omitted_for_scope"].append("schema_notes")
+
         columns = raw.get("columns", {})
         result["columns"] = {
             c: columns.get(c, {"type": catalog.schema[key][c], "documentation_unavailable": True})
