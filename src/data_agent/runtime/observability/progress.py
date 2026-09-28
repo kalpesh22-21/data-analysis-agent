@@ -71,9 +71,7 @@ _STEP_LABELS: dict[str, str] = {
     "loop_help_center_circuit_opened": "product guidance is temporarily unavailable",
     "loop_no_new_evidence_stop": "stopping — no additional information was found",
     "loop_ask_user_batch_calls_dropped": "deferring other work until your answer",
-    # Retrieval fires TWO shape-only steps (design §3.5): a start signal while it
-    # searches, and a completion step carrying the (blueprints, knowledge) counts.
-    "retrieval_start": "looking for information relevant to your question…",
+    # Retrieval start remains an internal observer event; only completion is shown.
     "retrieval": "reviewing the information available for your question",
     "blueprint_rule_resolved": "identified the requested group to include",
     "tool_dispatch_start": "working on the next part of your question…",
