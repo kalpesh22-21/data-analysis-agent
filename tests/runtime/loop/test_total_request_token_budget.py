@@ -60,6 +60,7 @@ _MAX_WINDOWS = 3
 
 def _fat_result() -> dict[str, Any]:
     return {
+        "provenance": {"version": 1, "columns": [[_E, "EmployeeCode"], [_E, "Department"]]},
         "columns": ["EmployeeCode", "Department"],
         "rows": [[f"E{i}", _WIDE_CELL] for i in range(20)],
         "row_count": 20,

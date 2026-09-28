@@ -84,6 +84,7 @@ async def test_missing_column_feedback_reaches_model_and_corrected_query_can_shi
     ]
     assert feedback
     assert feedback[0]["sql_diagnostic"]["column"] == "field_id"
+    assert feedback[0]["sql_diagnostic"]["api_message"] == MESSAGE
     assert feedback[0]["result_preview"] is None
     assert not any(
         "result withheld: provenance" in json.dumps(request.messages) for request in model.calls
@@ -110,16 +111,16 @@ def test_identical_failures_are_bounded_but_corrected_sql_is_allowed():
 @pytest.mark.parametrize(
     "message", ["secret raw backend text", MESSAGE.replace("field_id", "secret_column")]
 )
-def test_unrecognized_or_unrequested_diagnostic_details_do_not_leak(message):
+def test_actual_api_message_is_preserved_without_inventing_identifier_hints(message):
     diagnostic = decode_diagnostic(encode_column_reference_diagnostic(message, SQL))
     assert "column" not in diagnostic
     assert "tables" not in diagnostic
-    assert "secret" not in json.dumps(diagnostic)
+    assert diagnostic["api_message"] == message
 
 
-def test_valid_column_diagnostic_does_not_copy_raw_suffix_or_unrequested_tables():
+def test_identifier_hints_are_scoped_while_actual_api_message_is_preserved():
     message = MESSAGE.replace(TABLE, TABLE + ", private.secret_table") + " secret raw backend text"
     diagnostic = decode_diagnostic(encode_column_reference_diagnostic(message, SQL))
     assert diagnostic["column"] == "field_id"
     assert diagnostic["tables"] == [TABLE]
-    assert "secret" not in json.dumps(diagnostic)
+    assert diagnostic["api_message"] == message

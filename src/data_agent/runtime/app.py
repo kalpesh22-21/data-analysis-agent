@@ -596,8 +596,8 @@ def create_app(
     # Reader-only runtime (singleton-hydrator redesign): the runtime NO LONGER seeds the
     # neo4j graph on the request path — the independent `replicas:1` hydrator daemon
     # (scripts/run_hydrator.py) owns ALL seeding + the nuke/rebuild. The catalog cache is
-    # KEPT (it builds the per-turn provenance handle via `ToolDispatcher._resolve_catalog`
-    # → `capture_provenance`), but with NO `on_catalog_loaded` seed callback. The cache's
+    # KEPT for measurement checks and value resolution; query provenance now comes
+    # from the API response. There is NO `on_catalog_loaded` seed callback. The cache's
     # HTTP client is built with `service_key=settings.mcp_service_key` (via
     # `build_catalog_cache`), so the runtime's catalog-handle fetch uses the STATIC
     # service key — a full decouple, no user JWT ever reaches the MCP export. The

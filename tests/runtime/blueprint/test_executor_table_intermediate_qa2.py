@@ -287,7 +287,8 @@ async def test_hostile_endpoint_table_name_is_ast_quoted_not_injected() -> None:
     outcome = await executor.execute(
         blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
     )
-    assert isinstance(outcome, ExecCompleted)
+    assert isinstance(outcome, ExecFailed)
+    assert outcome.error_code == "PARSE_FAILED_CLOSED"
     consumer_sql = execution_calls(mcp)[2].args["sql"]
     # Re-parse: it is a SINGLE statement (not a multi-statement Block), i.e. no
     # breakout — the DROP did not become its own statement.

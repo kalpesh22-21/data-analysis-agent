@@ -313,12 +313,11 @@ async def test_final_node_fanout_is_withheld_across_the_dag() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Provenance union — None if ANY inner call is undetermined (the Slice-B fix,
-# now across the DAG). A node reading an UNCATALOGUED table → None provenance.
+# An API validation failure stops the DAG and retains its actionable reason.
 # ---------------------------------------------------------------------------
 
 
-async def test_provenance_union_is_none_if_any_node_undetermined() -> None:
+async def test_api_parse_failure_stops_dag_with_original_error() -> None:
     detail = _detail(
         [
             {"order": 0, "output": {"n": "scalar"}, "sql_template": "SELECT count() AS n FROM dbpcm_warehouse.ghost"},
@@ -333,7 +332,7 @@ async def test_provenance_union_is_none_if_any_node_undetermined() -> None:
     mcp = FakeMCPClient(
         scripted={
             "runQuery": [
-                _rq(["n"], [[5]]),                            # node 0 → ghost table → prov None
+                _rq(["n"], [[5]]),                            # node 0 is rejected by the fake API
                 _rq(["department"], [["Sales"], ["Eng"]]),
                 _rq(["__bp_n", "__bp_d"], [[2, 2]]),
             ]
@@ -342,10 +341,9 @@ async def test_provenance_union_is_none_if_any_node_undetermined() -> None:
     outcome = await _executor(mcp, detail).execute(
         blueprint_id="bp-sem", slot_bindings={}, credentials=_creds()
     )
-    assert isinstance(outcome, ExecCompleted)
-    # One inner call had undetermined provenance → the WHOLE union is None
-    # (fail-closed: the answer drops from D44 replay).
-    assert outcome.provenance is None
+    assert isinstance(outcome, ExecFailed)
+    assert outcome.error_code == "PARSE_FAILED_CLOSED"
+    assert "ghost" in outcome.user_message
 
 
 # ---------------------------------------------------------------------------

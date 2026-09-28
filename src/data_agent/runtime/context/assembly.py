@@ -74,9 +74,10 @@ _STREAM_RANK_ASSISTANT = 2
 # including empty/narrow, and it fills the dangling `tool_call`'s required result
 # slot so the model stops re-emitting the identical call (design §2).
 _WITHHELD_PROVENANCE_SENTINEL = (
-    "result withheld: provenance could not be determined for this call, so its "
-    "result cannot be shown. Do not retry the identical call — it will be withheld "
-    "again. Try a different query or approach, or ask the user."
+    "[API_PROVENANCE_MISSING] This stored result has no validated provenance receipt, "
+    "so its data cannot be replayed. The query may have succeeded; this does not prove "
+    "missing data or a SQL error. Use other successful results, or disclose that this "
+    "result's access metadata is unavailable. Do not repeat identical SQL to repair metadata."
 )
 
 # Repeated-idempotent-read guard (generalizes D94 to "identical repeat of an

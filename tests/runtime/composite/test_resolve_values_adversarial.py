@@ -96,12 +96,13 @@ async def test_missing_rows_key_is_ok_empty() -> None:
     assert r.result_full["values"] == []
 
 
-async def test_non_dict_result_is_ok_empty() -> None:
-    # A bare list (wrong shape entirely) must not crash — degrade to empty.
+async def test_non_dict_result_is_a_protocol_error() -> None:
+    # A malformed response must not masquerade as a valid empty dataset.
     composite, _ = _composite(scripted={"runQuery": [["not", "a", "dict"]]})
     r = await composite.run({"table": _T, "column": "EarnCode", "concept": "x"}, _credentials())
-    assert r.status == "ok"
-    assert r.result_full["values"] == []
+    assert r.status == "denied"
+    assert r.error_code == "API_PROVENANCE_INVALID"
+    assert r.result_full is None
 
 
 async def test_value_column_absent_from_result_is_ok_empty() -> None:

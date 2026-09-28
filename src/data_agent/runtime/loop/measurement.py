@@ -498,9 +498,14 @@ async def validate_join_cardinality(
                     + (
                         json.dumps(diagnostic)
                         if diagnostic
-                        else str(result.error_code or "QUERY_ERROR")
+                        else f"{result.error_code or 'QUERY_ERROR'}: "
+                        + (result.denial_detail or result.user_message or "Query validation failed.")
                     )
-                    + " Correct the underlying query or use the tested SQL procedure."
+                    + (
+                        " Correct the underlying query or use the tested SQL procedure."
+                        if result.retryable
+                        else " Use other successful results or disclose this limitation."
+                    )
                 )
             if not rows or len(rows[0]) < 2 or rows[0][0] != rows[0][1]:
                 return "The aggregate join can duplicate measured records, or its cardinality could not be checked. Aggregate each source to the intended grain or use a semijoin."

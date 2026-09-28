@@ -55,7 +55,7 @@ from tests.runtime.final_answer import final_answer
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
-CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Salary": "Decimal(18,2)"}})
+CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Name": "String", "Salary": "Decimal(18,2)"}})
 
 SESSION_ID = "sess-tool-span-e2e"
 JWT = "jwt-secret-should-never-leak"

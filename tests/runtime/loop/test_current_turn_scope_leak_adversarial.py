@@ -101,13 +101,7 @@ def _messages_blob(recorded_turn) -> str:
 
 
 async def test_successful_out_of_scope_sample_rows_never_reaches_model_same_turn() -> None:
-    """A `sampleRows(employee)` call succeeds (the MCP itself does not
-    column-scope `sampleRows`) and returns PII rows, but the caller's
-    `column_scope` only grants `employee.EmployeeCode`. The declarative
-    all-columns provenance (`EmployeeCode`, `Name`, `Salary`) is therefore
-    NOT a subset of scope — this entry must be dropped even though it
-    belongs to the turn CURRENTLY in progress, because it carries real
-    result rows."""
+    """An API receipt outside caller scope is a protocol error, with no leaked rows."""
     model = ScriptedModelClient(
         [
             ModelTurnResult(
@@ -146,18 +140,17 @@ async def test_successful_out_of_scope_sample_rows_never_reaches_model_same_turn
 
     trail = await work_trail(store, SESSION_ID)
     assert len(trail) == 1
-    assert trail[0].status == "ok"
-    assert trail[0].provenance == frozenset(
-        {(_E, "EmployeeCode"), (_E, "Name"), (_E, "Salary")}
-    )  # confirms the drop would otherwise NOT fire (declarative provenance exceeds scope)
+    assert trail[0].status == "denied"
+    assert trail[0].error_code == "API_PROVENANCE_INVALID"
+    assert trail[0].provenance is None
 
     # The SECOND send_turn call (same external turn, iteration 2) must NOT
-    # have seen this turn's own successful-but-out-of-scope tool result.
+    # have seen the out-of-scope rows, but must see the explicit contract error.
     assert len(model.calls) == 2
     second_call_blob = _messages_blob(model.calls[1])
     assert _PII_NAME not in second_call_blob
     assert _PII_SALARY not in second_call_blob
-    assert "call_1" not in second_call_blob
+    assert "API_PROVENANCE_INVALID" in second_call_blob
 
     # And the final outcome/assistant text obviously carries no PII either.
     assert outcome.assistant_text is not None

@@ -114,7 +114,7 @@ class TestDemoMCPRoutingRobustness:
         # A plain node query over the bad table (no `__bp_`) must return the
         # withheld fan-out sentinel row + row_count 12, never the good 3-row shape.
         result = await self._run(
-            f"SELECT department, headcount FROM {demo._BP_BAD_TABLE} GROUP BY department"
+            f"SELECT department, count(DISTINCT emp_id) AS headcount FROM {demo._BP_BAD_TABLE} GROUP BY department"
         )
         assert result["row_count"] == 12
         assert result["rows"] == [[demo._FANOUT_LEAK_ROW, demo._FANOUT_LEAK_FIGURE]]
@@ -123,7 +123,7 @@ class TestDemoMCPRoutingRobustness:
         # The good table string cannot contain `_bad`, so a good node query returns
         # the clean 3-row result — proving the superstring hazard is one-directional.
         result = await self._run(
-            f"SELECT department, n FROM {demo._BP_GOOD_TABLE} GROUP BY department"
+            f"SELECT department, count(DISTINCT emp_id) AS n FROM {demo._BP_GOOD_TABLE} GROUP BY department"
         )
         assert result["row_count"] == 3
         assert demo._FANOUT_LEAK_ROW not in {row[0] for row in result["rows"]}
@@ -344,16 +344,8 @@ class TestProvenanceDeterminism:
         assert isinstance(fast, ExecCompleted) and fast.provenance is not None
         assert isinstance(tenure, ExecCompleted) and tenure.provenance is not None
 
-    async def test_uncatalogued_table_completes_but_provenance_is_none(self) -> None:
-        # PIN: a blueprint touching a table NOT in the demo catalogue does NOT
-        # fail-closed at the executor — it still returns ExecCompleted/verified with
-        # `provenance=None`. This is exactly why the launcher folds the blueprint
-        # tables into its CatalogHandle: without that fix the verified result carries
-        # undetermined provenance, the D44 replay filter drops it from the very turn
-        # that produced it, and the model is stranded in a re-emit loop. This test
-        # is the load-bearing proof that the catalogue fix is NECESSARY, and pins
-        # that the fail-closed happens downstream (replay filter), not here.
-        executor, _ = _executor_and_mcp(catalog_schema={})  # nothing catalogued
+    async def test_api_receipt_does_not_depend_on_agent_catalog(self) -> None:
+        executor, _ = _executor_and_mcp(catalog_schema={})
         outcome = await executor.execute(
             blueprint_id=demo._BP_GOOD_ID,
             slot_bindings={"department": "Sales"},
@@ -361,7 +353,7 @@ class TestProvenanceDeterminism:
         )
         assert isinstance(outcome, ExecCompleted)
         assert outcome.result_full["status"] == "verified"
-        assert outcome.provenance is None  # undetermined → dropped downstream (D44)
+        assert outcome.provenance
 
 
 # ==========================================================================

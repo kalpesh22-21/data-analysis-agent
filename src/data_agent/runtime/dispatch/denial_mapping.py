@@ -126,6 +126,15 @@ BLUEPRINT_NOT_SEARCHED_MESSAGE = (
 OUT_OF_SCOPE_REQUEST_CODE = "OUT_OF_SCOPE_REQUEST"
 
 _DENIAL_TABLE: dict[str, DenialInfo] = {
+    "API_PROVENANCE_INVALID": DenialInfo(
+        code="API_PROVENANCE_INVALID",
+        retryable=False,
+        kind=DenialKind.INFRA_FAILED,
+        user_message=(
+            "The data API did not return valid provenance metadata. The API deployment "
+            "must be corrected; repeating the SQL will not resolve this."
+        ),
+    ),
     "RESULT_TOO_LARGE": DenialInfo(
         code="RESULT_TOO_LARGE", retryable=True, kind=DenialKind.GATE,
         user_message="The response exceeded the size limit and was not retained. Narrow the requested scope or aggregate the data without dropping required records.",

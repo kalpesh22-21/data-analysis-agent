@@ -50,7 +50,7 @@ JWT = "jwt-not-under-test"
 
 # Assert against the actual nudge constant so wording tweaks never break these tests.
 _NUDGE_FRAGMENT = _REPEATED_IDEMPOTENT_READ_NUDGE
-_WITHHELD_FRAGMENT = "result withheld: provenance could not be determined"
+_WITHHELD_FRAGMENT = "[API_PROVENANCE_MISSING] This stored result has no validated provenance receipt"
 
 TOOLS_SCHEMA = [
     {"type": "function", "name": "getTableSchema", "description": "", "parameters": {}},
@@ -311,8 +311,7 @@ async def test_non_idempotent_repeat_is_not_guarded() -> None:
 
 
 class _RetrySampleRowsModel:
-    """The D94 regression double: re-emit `sampleRows(ghost_table)` until the
-    WITHHELD-PROVENANCE sentinel (not the read-guard nudge) is visible."""
+    """Stop repeating the read as soon as the API validation error is visible."""
 
     _CALL_ID = "call_ghost"
 
@@ -323,16 +322,16 @@ class _RetrySampleRowsModel:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
-        saw_withheld = any(
+        saw_api_error = any(
             m.get("role") == "tool"
             and m.get("tool_call_id") == self._CALL_ID
             and isinstance(m.get("content"), str)
-            and _WITHHELD_FRAGMENT in m["content"]
+            and "PARSE_FAILED_CLOSED" in m["content"]
             for m in messages
         )
-        if saw_withheld:
+        if saw_api_error:
             return final_answer(
-                assistant_text="I cannot answer because that result is withheld.",
+                assistant_text="I don't have any information to answer your question.",
                 usage={"total_tokens": 1},
             )
         return ModelTurnResult(
@@ -350,10 +349,8 @@ class _RetrySampleRowsModel:
         return self
 
 
-async def test_d94_withheld_provenance_sentinel_still_fires_unchanged() -> None:
-    """Regression: branching `_build_withheld_sentinel_message` on the guard
-    marker must not disturb the original D94 ok+None path — an uncatalogued
-    sampleRows still surfaces the WITHHELD sentinel (not the read-guard nudge)."""
+async def test_api_parse_error_reaches_model_without_a_withheld_result() -> None:
+    """API validation errors are delivered immediately, without waiting for a guard."""
     model = _RetrySampleRowsModel()
     mcp = FakeMCPClient(scripted={"sampleRows": [_query_response() for _ in range(20)]})
     loop, store = _build_loop(model, mcp)
@@ -365,18 +362,18 @@ async def test_d94_withheld_provenance_sentinel_still_fires_unchanged() -> None:
     assert outcome.status == "done"
     assert len(model.calls) == 2
     second_ctx = model.calls[1]["messages"]
-    # The D94 withheld sentinel appears; the read-guard nudge does NOT.
+    # The real API error appears; the read-guard nudge does not.
     assert any(
         m.get("role") == "tool"
         and isinstance(m.get("content"), str)
-        and _WITHHELD_FRAGMENT in m["content"]
+        and "PARSE_FAILED_CLOSED" in m["content"]
         for m in second_ctx
     )
     assert not _sees_nudge(second_ctx)
-    # It was a real stranded ok+None entry, never a guard entry.
+    # The failed attempt is recorded as a denial, never a successful empty read.
     trail = await store.load_trail(SESSION_ID)
     assert len(trail) == 2
-    assert trail[0].status == "ok" and trail[0].provenance is None
+    assert trail[0].status == "denied" and trail[0].provenance is None
     assert _guard_entries(trail) == []
 
 

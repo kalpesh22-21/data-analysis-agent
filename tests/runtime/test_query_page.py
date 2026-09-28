@@ -136,6 +136,9 @@ def _client(monkeypatch, *, scripted: dict | None = None) -> tuple[TestClient, F
             ]
         },
     )
+    for response in mcp._scripted.get("runQuery", []):
+        if isinstance(response, dict):
+            response["provenance"] = {"version": 1, "columns": [["db.t", "department"]]}
     app = create_app(
         settings=RuntimeSettings(_env_file=None),
         session_store=InMemorySessionStore(),

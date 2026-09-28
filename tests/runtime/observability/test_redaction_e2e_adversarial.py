@@ -38,7 +38,7 @@ from tests.runtime.final_answer import final_answer
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
 _E = "dbpcm_warehouse.employee"
-CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Salary": "Decimal(18,2)"}})
+CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Name": "String", "Salary": "Decimal(18,2)"}})
 
 SESSION_ID = "sess-redaction-e2e"
 JWT = "jwt-secret-value-should-never-appear"
@@ -58,7 +58,7 @@ async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
 
 def _credentials() -> RuntimeCredentials:
     return RuntimeCredentials(
-        session_id=SESSION_ID, jwt=JWT, column_scope=frozenset({PII_SCOPE_COLUMN})
+        session_id=SESSION_ID, jwt=JWT, column_scope=frozenset({PII_SCOPE_COLUMN, f"{_E}.EmployeeCode", f"{_E}.Name"})
     )
 
 

@@ -235,7 +235,7 @@ async def test_a_stranded_read_rendered_as_a_sentinel_is_not_counted_as_readable
 
     A D44-stranded (`ok` + undetermined-provenance) entry is rendered by
     `_build_withheld_sentinel_message` as a `tool` message under its OWN
-    `tool_call_id` whose content is the data-free "result withheld … Do not retry"
+    `tool_call_id` whose content is the data-free "API_PROVENANCE_MISSING … Do not retry"
     text. A naive `{m["tool_call_id"] for m in canonical if m["role"] == "tool"}`
     counts that as visible — so the guard would fire and the model, seeing only the
     withheld marker, could never recover the schema.
@@ -283,7 +283,7 @@ async def test_a_stranded_read_rendered_as_a_sentinel_is_not_counted_as_readable
 
     # The sentinel really was rendered (otherwise this proves nothing) ...
     assert any(
-        m.get("role") == "tool" and "result withheld" in str(m.get("content", ""))
+        m.get("role") == "tool" and "API_PROVENANCE_MISSING" in str(m.get("content", ""))
         for m in model.calls[0].messages
     )
     # ... and the repeat was NOT treated as already-readable: it re-fetched.
@@ -445,7 +445,7 @@ async def test_explain_query_sql_never_reaches_the_exemption_event() -> None:
     """D25, on the NEW event as well as the guard's. `explainQuery`'s `sql` can carry
     PII literals, so it identifies as the empty target rather than by its text — a
     less specific span is the right trade against a query literal in the backend."""
-    pii = "SELECT * FROM employee WHERE last_name = 'Rasmussen'"
+    pii = "SELECT * FROM employee WHERE EmployeeCode = 'Rasmussen'"
 
     def call(call_id: str) -> ToolCallRequest:
         return ToolCallRequest(id=call_id, name="explainQuery", arguments={"sql": pii})

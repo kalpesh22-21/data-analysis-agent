@@ -810,52 +810,32 @@ def test_a_malformed_per_table_provenance_costs_its_table_not_the_session() -> N
     assert restored.tool_trail[0].answer_table_provenance == (None,)
 
 
-async def test_per_table_provenance_is_excluded_from_the_turn_union() -> None:
-    """TRAP 3, asserted directly. `_compute_turn_provenance_union` is FAIL-CLOSED:
-    one `None` collapses it and the turn's whole answer is dropped from every later
-    replay. Per-table provenance is a separate, additive field for exactly that
-    reason, and the `answerWithTable` entry's OWN provenance stays `frozenset()`.
-
-    Driven with a designated query the extractor CANNOT resolve (an uncatalogued
-    table), which is the shape that would collapse the union if it were folded in.
-    """
-    unparseable = "SELECT * FROM not_in_the_catalog.mystery"
-    loop, store, _events = _build(
-        [_answer("a1", answer="x", tables=[{"sql": HEADCOUNT_SQL}, {"sql": unparseable}])]
-    )
+async def test_invalid_table_returns_api_error_and_can_be_corrected() -> None:
+    loop, store, _events = _build([
+        _answer("a1", answer="x", tables=[{"sql": HEADCOUNT_SQL}, {"sql": "SELECT * FROM not_in_the_catalog.mystery"}]),
+        _answer("a2", answer="x", tables=[{"sql": HEADCOUNT_SQL}]),
+    ])
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    entry = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER][0]
-    # The entry's own provenance is DETERMINED-EMPTY: this call read no warehouse
-    # data. `None` here would hand the model the D94 "result withheld" sentinel.
-    assert entry.provenance == frozenset()
-    # The undetermined per-table value is present on the additive field…
-    assert entry.answer_table_provenance == (frozenset({(_E, "department_name")}), None)
-    # …and the turn union is still DETERMINED, so the answer survives replay.
+    entries = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER]
+    assert entries[0].status == "denied"
+    assert entries[0].error_code == "PARSE_FAILED_CLOSED"
+    assert "mystery" in entries[0].denial_detail
+    assert entries[1].provenance == frozenset()
+    assert entries[1].answer_table_provenance == (frozenset({(_E, "department_name")}),)
     assert outcome.provenance is not None
-    # Both tables still ship: an undetermined provenance is not proof of anything,
-    # and `/query/page` re-enforces scope at execution under the caller's own JWT.
-    assert len(outcome.answer_tables) == 2
-
-
-async def test_a_designated_query_outside_scope_is_dropped_live() -> None:
-    """The fail-open 08 §D.3 actually closes: a designated `sql=` need not have been
-    executed, so its columns appear in NO trail entry's provenance and the turn
-    union does not cover them. Without a per-table check the transcript offers a
-    table that simply 403s when the browser tries to page it."""
-    scope = frozenset({f"{_E}.department_name", f"{_E}.employee_code"})
-    loop, _store, events = _build(
-        [
-            _answer(
-                "a1",
-                answer="x",
-                tables=[{"sql": HEADCOUNT_SQL}, {"sql": SALARY_SQL}],
-            )
-        ]
-    )
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(scope), user_message="q?")
     assert [t["sql"] for t in outcome.answer_tables] == [HEADCOUNT_SQL]
-    assert {"reason": "out_of_scope"} in _payloads(events, "loop_answer_table_item_dropped")
+
+
+async def test_out_of_scope_table_returns_error_before_corrected_delivery() -> None:
+    scope = frozenset({f"{_E}.department_name", f"{_E}.employee_code"})
+    loop, store, _events = _build([
+        _answer("a1", answer="x", tables=[{"sql": HEADCOUNT_SQL}, {"sql": SALARY_SQL}]),
+        _answer("a2", answer="x", tables=[{"sql": HEADCOUNT_SQL}]),
+    ])
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(scope), user_message="q?")
+    entries = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER]
+    assert entries[0].error_code == "API_PROVENANCE_INVALID"
+    assert [t["sql"] for t in outcome.answer_tables] == [HEADCOUNT_SQL]
 
 
 async def test_history_filters_tables_individually_and_the_turn_gate_still_dominates() -> None:

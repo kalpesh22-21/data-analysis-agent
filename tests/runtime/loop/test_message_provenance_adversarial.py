@@ -194,69 +194,13 @@ async def test_clarification_only_assistant_turn_survives_any_narrowing() -> Non
     assert "I cannot answer without more information." in last_call_blob
 
 
-async def test_undetermined_provenance_turns_assistant_message_always_dropped() -> None:
-    """A turn whose only tool call had undetermined provenance (here: an
-    uncatalogued `sampleRows` table) makes that turn's assistant message
-    undetermined too — dropped even under the widest possible (allow-all)
-    re-assembly scope (D44 fail-closed, read literally).
+async def test_legacy_unknown_provenance_assistant_message_is_dropped() -> None:
+    from data_agent.runtime.session.models import TurnMessage
 
-    THE SENTINEL IS DELIBERATELY PROSE-SHAPED. It used to be
-    `UNDETERMINED_PROVENANCE_ANSWER`, and the answer-prose scrub (ISSUES I1)
-    correctly redacts that — a SCREAMING_SNAKE token is identifier-shaped, exactly
-    like the `EMPLOYEE_MASTER` this rule exists to withhold. Keeping it would NOT
-    have gone unnoticed: the turn-0 equality assertion below compares
-    `turn0.assistant_text` against the sentinel, and the loop scrubs that string
-    before returning it, so the test would have failed LOUDLY the day the scrub
-    landed. The real hazard is narrower and survives that fix: the FINAL
-    assertion — the one this test exists for — goes VACUOUS, because a string the
-    scrub deletes at the door can never appear in a re-assembled blob whether the
-    D44 drop works or not. A loud failure on the setup assertion is not a
-    substitute for a load-bearing one on the assertion under test. A sentinel only
-    needs to be UNIQUE, so it is now a unique sentence."""
     store = InMemorySessionStore()
-    model = ScriptedModelClient(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="call_1",
-                        name="sampleRows",
-                        arguments={"database": "dbpcm_warehouse", "table": "scratch_upload"},
-                    )
-                ]
-            ),
-            final_answer(
-                assistant_text="I cannot verify the sampled upload — undetermined provenance sentinel answer."
-            ),
-            final_answer(assistant_text="I cannot answer without more information."),
-        ]
-    )
-    mcp = FakeMCPClient(
-        scripted={
-            "sampleRows": [{"columns": ["x"], "rows": [["v1"]], "row_count": 1, "truncated": False}]
-        }
-    )
-    loop = _build_loop(model, mcp, store)
-
-    turn0 = await loop.run(
-        session_id=SESSION_ID,
-        credentials=_credentials(frozenset()),
-        user_message="Sample the upload.",
-    )
-    assert turn0.status == "done"
-    assert (
-        turn0.assistant_text
-        == "I cannot verify the sampled upload — undetermined provenance sentinel answer."
-    )
-
-    # Re-assemble under the WIDEST possible scope (allow-all) — still dropped.
-    turn1 = await loop.run(
-        session_id=SESSION_ID, credentials=_credentials(frozenset()), user_message="Anything else?"
-    )
-    assert turn1.status == "done"
-
-    last_call_blob = _messages_blob(model.calls[-1])
-    assert (
-        "I cannot verify the sampled upload — undetermined provenance sentinel answer."
-        not in last_call_blob
-    )
+    await store.get_or_create_session(SESSION_ID)
+    await store.append_message(SESSION_ID, TurnMessage(
+        turn_index=0, role="assistant", content=PII_ANSWER, ts="t0", provenance=None,
+    ))
+    context = await ContextAssembler(store).assemble(SESSION_ID, frozenset(), current_turn_index=1)
+    assert PII_ANSWER not in str(context)

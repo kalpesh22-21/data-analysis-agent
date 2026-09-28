@@ -37,7 +37,7 @@ from tests.runtime.final_answer import final_answer
 pytestmark = pytest.mark.usefixtures("answer_tools")
 
 SESSION_ID = "sess-answer-with-table"
-CATALOG = CatalogHandle({"db.t": {"c": "String"}})
+CATALOG = CatalogHandle({"scratch.s_sess-answer-with-table_bp_1": {"c": "String"}, "db.t": {"c": "String"}, "durable.answer_1": {"c": "String"}, "dbpcm_warehouse.employee_hires_by_month": {"month": "String", "hires": "UInt64"}, "dbpcm_warehouse.employee": {"department": "String", "EmployeeCode": "String", "month": "String"}})
 _ANSWER_SQL = "SELECT department, count() AS n FROM dbpcm_warehouse.employee GROUP BY department"
 
 
@@ -486,13 +486,13 @@ async def test_a_raising_hook_never_breaks_the_turn() -> None:
     hooks.register_ephemeral(_boom)
     loop, _ = _build_loop(
         ScriptedModelClient(
-            [_answer("a1", answer="x", tables=[{"sql": "SELECT * FROM scratch.t"}])]
+            [_answer("a1", answer="x", tables=[{"sql": "SELECT c FROM scratch.`s_sess-answer-with-table_bp_1`"}])]
         ),
         hooks=hooks,
     )
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
     assert outcome.status == "done"
-    assert outcome.answer_sql == "SELECT * FROM scratch.t"  # unchanged, not lost
+    assert outcome.answer_sql == "SELECT c FROM scratch.`s_sess-answer-with-table_bp_1`"  # unchanged, not lost
 
 
 def _boom(event: AnswerTableEvent) -> str:

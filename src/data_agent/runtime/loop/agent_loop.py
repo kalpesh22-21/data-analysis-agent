@@ -2755,7 +2755,30 @@ class AgentLoop:
 
         tables: list[AnswerTable] = []
         for table in finalized.tables:
-            provenance = await self._tool_dispatcher.capture_sql_provenance(table.sql, credentials)
+            from data_agent.runtime.dispatch.denial_mapping import classify_denial
+            from data_agent.runtime.mcp.client import MCPToolError
+
+            try:
+                provenance = await self._tool_dispatcher.capture_sql_provenance(
+                    table.sql, credentials
+                )
+            except MCPToolError as exc:
+                denial = classify_denial(exc.code)
+                return (
+                    [],
+                    ToolResult(
+                        status="denied",
+                        tool_name="answerWithTable",
+                        error_code=denial.code,
+                        retryable=denial.retryable,
+                        user_message=denial.user_message,
+                        provenance=None,
+                        result_preview=None,
+                        result_full=None,
+                        denial_detail=exc.message,
+                    ),
+                    carried_designation,
+                )
             enriched = enrich_table(table, blueprint_runs, provenance=provenance)
             # The read-path check, applied live through the SAME predicate
             # `session_history.project_history` uses. It bites only for a designated

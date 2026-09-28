@@ -633,7 +633,7 @@ class BlueprintExecutor:
             if result.status != "ok":
                 return ExecFailed(
                     error_code=result.error_code or UNSUPPORTED_CODE,
-                    user_message=result.user_message or _UNSUPPORTED_MESSAGE,
+                    user_message=result.denial_detail or result.user_message or _UNSUPPORTED_MESSAGE,
                     retryable=bool(result.retryable),
                     provenance=result.provenance,
                 )

@@ -1,25 +1,4 @@
-"""D94 Part 1 (end-to-end) — the `ok`+`None` provenance sentinel actually BREAKS
-the retry-until-budget-cap loop, driven through the real `AgentLoop`.
-
-Mirrors the adversarial loop harnesses
-(`tests/runtime/loop/test_current_turn_scope_leak_adversarial.py`,
-`tests/runtime/loop/test_budget_termination_adversarial.py`): a real
-`ToolDispatcher` + `FakeMCPClient` + `ContextAssembler`, and a model double.
-
-The stranded condition is produced by a REAL dispatch path (not a hand-built
-trail entry): a `sampleRows` against a table absent from the `CatalogHandle`.
-The MCP itself does not column-scope `sampleRows`, so the call returns
-`status="ok"`; the runtime's declarative provenance capture then finds the table
-uncatalogued and records `provenance=None` (`provenance/capture.py:92-94`). That
-is exactly the catalog/extractor skew D94 addresses.
-
-The model double faithfully MODELS the production hang: on every round-trip it
-re-emits the identical `sampleRows` call UNLESS it can see, in the messages it
-was handed, a tool result for that call id carrying the withheld sentinel — in
-which case it stops with a final answer. Before D94, the sentinel would never
-appear, so this model spins to the budget cap; with D94 it terminates via the
-normal `done` path. This is the load-bearing "loop breaks" assertion.
-"""
+"""API validation errors reach the model immediately and break blind retry loops."""
 
 from __future__ import annotations
 
@@ -41,14 +20,14 @@ from tests.runtime.final_answer import final_answer
 pytestmark = pytest.mark.usefixtures("answer_tools")
 
 # The catalog knows `employee` but NOT `ghost_table` — a sampleRows against the
-# latter succeeds at the MCP yet yields undetermined (None) provenance.
+# latter is rejected by the API before any rows can reach the agent.
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String"}})
 
 SESSION_ID = "sess-d94-loop-break"
 JWT = "jwt-not-under-test"
 
-_SENTINEL_FRAGMENT = "result withheld: provenance could not be determined"
+_ERROR_FRAGMENT = "PARSE_FAILED_CLOSED"
 _PII = "PII_ROW_VALUE_do_not_surface"
 
 TOOLS_SCHEMA = [
@@ -64,15 +43,8 @@ def _credentials() -> RuntimeCredentials:
     return RuntimeCredentials(session_id=SESSION_ID, jwt=JWT, column_scope=frozenset())
 
 
-class _RetryUntilSentinelModel:
-    """Models the real hang: re-emit the identical `sampleRows(ghost_table)`
-    call every round-trip UNTIL a tool result carrying the withheld sentinel for
-    that call id is visible in the handed-in messages, then stop with an answer.
-
-    Without the D94 sentinel this NEVER stops on its own — the loop's budget cap
-    is the only thing that would (which is precisely the bug). With the sentinel,
-    it terminates via the normal `done` path.
-    """
+class _RetryUntilErrorModel:
+    """Retry until the API validation error arrives, then stop."""
 
     _CALL_ID = "call_ghost"
 
@@ -83,17 +55,17 @@ class _RetryUntilSentinelModel:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurnResult:
         self.calls.append({"messages": messages})
-        # Did the model receive a withheld sentinel for its dangling call?
-        saw_sentinel = any(
+        # Did the model receive the API error for its call?
+        saw_error = any(
             m.get("role") == "tool"
             and m.get("tool_call_id") == self._CALL_ID
             and isinstance(m.get("content"), str)
-            and _SENTINEL_FRAGMENT in m["content"]
+            and _ERROR_FRAGMENT in m["content"]
             for m in messages
         )
-        if saw_sentinel:
+        if saw_error:
             return final_answer(
-                assistant_text="I cannot answer because that result is withheld.",
+                assistant_text="I don't have any information to answer your question.",
                 usage={"total_tokens": 1},
             )
         return ModelTurnResult(
@@ -107,7 +79,7 @@ class _RetryUntilSentinelModel:
             usage={"total_tokens": 1},
         )
 
-    def begin_turn(self) -> _RetryUntilSentinelModel:
+    def begin_turn(self) -> _RetryUntilErrorModel:
         return self
 
 
@@ -146,8 +118,8 @@ def _ghost_mcp() -> FakeMCPClient:
     )
 
 
-async def test_sentinel_breaks_retry_loop_and_terminates_normally() -> None:
-    model = _RetryUntilSentinelModel()
+async def test_api_error_breaks_retry_loop_and_terminates_normally() -> None:
+    model = _RetryUntilErrorModel()
     loop, store = _build_loop(model, _ghost_mcp())
 
     outcome = await loop.run(
@@ -158,21 +130,20 @@ async def test_sentinel_breaks_retry_loop_and_terminates_normally() -> None:
     assert outcome.status == "done"
     assert outcome.status not in {"paused_budget_cap", "stopped_hard_ceiling"}
 
-    # The stranded entry really is ok+None (the skew condition under test).
+    # The failed read is recorded as a denial, with no data provenance.
     trail = await store.load_trail(SESSION_ID)
     assert len(trail) == 2
-    assert trail[0].status == "ok"
+    assert trail[0].status == "denied"
     assert trail[0].provenance is None
 
-    # It broke fast: exactly two model round-trips (emit call, then see sentinel
+    # It broke fast: exactly two model round-trips (emit call, then see error
     # and stop) — nowhere near max_budget_windows * max_loop_iterations.
     assert len(model.calls) == 2
 
 
-async def test_second_round_trip_context_contains_the_sentinel_for_the_dangling_call() -> None:
-    """The dangling `tool_call` now has a matching tool result — the sentinel —
-    in the exact slot the model re-inferred a missing result before."""
-    model = _RetryUntilSentinelModel()
+async def test_second_round_trip_contains_original_api_error() -> None:
+    """A failed call has a paired result carrying its actual API error."""
+    model = _RetryUntilErrorModel()
     loop, _ = _build_loop(model, _ghost_mcp())
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
@@ -184,11 +155,11 @@ async def test_second_round_trip_context_contains_the_sentinel_for_the_dangling_
         if m.get("role") == "tool"
         and m.get("tool_call_id") == "call_ghost"
         and isinstance(m.get("content"), str)
-        and _SENTINEL_FRAGMENT in m["content"]
+        and _ERROR_FRAGMENT in m["content"]
     ]
     assert len(sentinel_tool_msgs) == 1
 
-    # And the PII rows the stranded (ok+None) result carried never leaked.
+    # No rows from the invalid response leaked.
     blob = json.dumps(second_ctx, default=str, ensure_ascii=False)
     assert _PII not in blob
 
@@ -197,7 +168,7 @@ async def test_every_assistant_tool_call_has_a_matching_tool_result() -> None:
     """The OpenAI message-pairing invariant the sentinel exists to preserve:
     across every model round-trip, each assistant `tool_call` id has exactly one
     matching `tool` result and there are no orphan tool results."""
-    model = _RetryUntilSentinelModel()
+    model = _RetryUntilErrorModel()
     loop, _ = _build_loop(model, _ghost_mcp())
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 

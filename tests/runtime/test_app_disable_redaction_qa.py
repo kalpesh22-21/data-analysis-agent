@@ -102,7 +102,7 @@ def _build_app(monkeypatch, *, disable_redaction: bool | None, span_exporter: An
                 ModelTurnResult(assistant_text="Looked it up."),
             ]
         ),
-        catalog=CatalogHandle({}),
+        catalog=CatalogHandle({"default.t": {"national_id": "String", "ssn": "String"}}),
         span_exporter=span_exporter,
     )
 
@@ -212,7 +212,7 @@ def _read_tools_app(monkeypatch, *, disable_redaction: bool, pii_query: str) -> 
                 ModelTurnResult(assistant_text="Found it."),
             ]
         ),
-        catalog=CatalogHandle({}),
+        catalog=CatalogHandle({"default.t": {"national_id": "String", "ssn": "String"}}),
         retrieval=retrieval,
         span_exporter=InMemorySpanExporter(),
     )

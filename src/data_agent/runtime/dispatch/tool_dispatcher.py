@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -32,11 +33,11 @@ from data_agent.runtime.dispatch.sql_diagnostics import (
 from data_agent.runtime.mcp.client import MCPClient, MCPToolError
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.redaction import tool_span_args
-from data_agent.runtime.provenance.capture import capture_provenance
+from data_agent.runtime.provenance.capture import DATA_TOOLS, capture_provenance
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.models import ResultPreview
 
-from .denial_mapping import DenialInfo, classify_denial
+from .denial_mapping import KNOWN_DENIAL_CODES, DenialInfo, DenialKind, classify_denial
 from .schema_preview import _estimate_tokens, fit_schema_under_cap
 
 if TYPE_CHECKING:
@@ -493,12 +494,10 @@ class ToolDispatcher:
         disable_redaction: bool = False,
     ) -> None:
         self._mcp_client = mcp_client
-        # `catalog` is EITHER a fixed `CatalogHandle` (tests / fixed-catalog callers)
-        # OR an async provider resolving the handle from this turn's credentials via
-        # the process-wide `CatalogCache` (D75 Wave 1b). Resolved per-dispatch just
-        # before `capture_provenance`; the cache guarantees one fetch, so warm turns
-        # are cheap.
+        # Retained for the agent's pre-execution aggregation/measurement checks.
+        # Execution provenance comes exclusively from the API response.
         self._catalog = catalog
+        self._query_provenance: dict[tuple, frozenset[tuple[str, str]]] = {}
         self._preview_row_count = preview_row_count
         # Per-result preview SIZE cap (tokens): bounds a single stored tool result
         # (esp. a wide getTableSchema) so it cannot balloon the trail. See
@@ -553,37 +552,23 @@ class ToolDispatcher:
             pass
 
     async def _resolve_catalog(self, credentials: RuntimeCredentials) -> CatalogHandle:
-        """This dispatcher's catalog for THIS turn — see `resolve_catalog` above."""
+        """Resolve schema for pre-execution measurement checks, not provenance."""
         return await resolve_catalog(self._catalog, credentials)
 
     async def capture_sql_provenance(
         self, sql: str, credentials: RuntimeCredentials
     ) -> frozenset[tuple[str, str]] | None:
-        """The D44 USES set of a query that is NOT being dispatched.
-
-        `answerWithTable` may designate a query the agent never ran — that is the
-        documented contract, because the executed query usually carries a LIMIT the agent
-        chose for its own reading and paging needs the un-capped shape. Such a query
-        appears in no trail entry's provenance, so the turn union does not cover it and
-        the read path cannot otherwise tell whether the table it offers is still in scope.
-
-        SAME extractor, SAME catalog, SAME `capture_provenance` entry point as a real
-        `runQuery` dispatch, so the two can never disagree about one query. Reads NOTHING
-        and dispatches NOTHING: it parses a string. Degrades to `None` (undetermined)
-        rather than raising.
-        """
-        try:
-            catalog = await self._resolve_catalog(credentials)
-            return await capture_provenance(
-                "runQuery", {"sql": sql}, catalog, session_id=credentials.session_id
+        """Reuse an execution receipt, or ask the API to validate unexecuted table SQL."""
+        key = (credentials.session_id, credentials.jwt, credentials.column_scope, sql)
+        if key in self._query_provenance:
+            return self._query_provenance[key]
+        result = await self.dispatch("explainQuery", {"sql": sql}, credentials, emit_progress=False)
+        if result.status != "ok":
+            raise MCPToolError(
+                result.error_code,
+                result.denial_detail or result.user_message or "Query validation failed.",
             )
-        except Exception:
-            _logger.warning(
-                "could not capture provenance for a designated answer table — "
-                "treating it as undetermined",
-                exc_info=True,
-            )
-            return None
+        return result.provenance
 
     async def dispatch(
         self,
@@ -629,45 +614,63 @@ class ToolDispatcher:
                 jwt=credentials.jwt,
                 session_id=credentials.session_id,
             )
+            provenance = capture_provenance(tool_name, raw_result)
+            if tool_name in DATA_TOOLS:
+                from data_agent.runtime.context.scope_filter import is_provenance_in_scope
+
+                if not is_provenance_in_scope(provenance, credentials.column_scope):
+                    raise MCPToolError(
+                        "API_PROVENANCE_INVALID",
+                        "The API provenance includes columns outside the request's access scope. "
+                        "This is an API contract mismatch, not an empty query result.",
+                    )
+                raw_result = {
+                    key: value for key, value in raw_result.items() if key != "provenance"
+                }
+                if tool_name in {"runQuery", "explainQuery"}:
+                    key = (
+                        credentials.session_id,
+                        credentials.jwt,
+                        credentials.column_scope,
+                        model_args.get("sql") or model_args.get("query", ""),
+                    )
+                    self._query_provenance[key] = provenance
+                    if len(self._query_provenance) > 128:
+                        self._query_provenance.pop(next(iter(self._query_provenance)))
         except MCPToolError as exc:
             denial: DenialInfo = classify_denial(exc.code)
-            # B4/D25 posture: the model-facing message is normally the GENERIC
-            # canned string from `denial_mapping.py` — raw backend / transport text
-            # is NEVER surfaced. The single narrow exception is
-            # COLUMN_SCOPE_VIOLATION: its `exc.message` is an author-CONTROLLED
-            # `ColumnScopeError` string that NAMES the out-of-scope column(s)
-            # (catalog metadata only — not PII / cell values), so showing it lets
-            # the model self-correct by seeing WHICH columns it lacks instead of
-            # retrying blind. All other codes (and the transport path below) stay
-            # canned, except for allowlisted structured SQL diagnostics (never raw text).
-            #
-            # It rides `denial_detail`, NOT `user_message`. This carve-out used to
-            # set only `user_message` and claim the specific text "already reached
-            # the model on the live turn" — it never did, on the live turn or any
-            # other: `TrailEntry` has no `user_message` field, so the string was
-            # dropped at persistence and `_render_entry` regenerated the generic one
-            # from `error_code`. The model has always been told "columns outside your
-            # current permissions" with no column named. `denial_detail` IS
-            # persisted, so the specific text now actually arrives.
-            #
-            # Replay safety: a denial carries `provenance=None`, and
-            # `scope_filter.filter_trail` exempts a non-`ok` entry only for the
-            # CURRENT turn — a prior-turn denial is dropped outright. So this detail
-            # can only ever render inside the turn whose scope produced it, and can
-            # never leak a column name into a later, narrower-scoped turn.
-            denial_detail: str | None = None
-            if denial.code == "COLUMN_SCOPE_VIOLATION" and exc.message:
-                denial_detail = exc.message
+            # Preserve actionable API errors for same-turn model recovery. The
+            # progress/span channels still carry only the code. Failure history
+            # remains scope-bound and never supplies affirmative data evidence.
+            detail = (
+                exc.message.replace(credentials.jwt, "[credential removed]")
+                if credentials.jwt
+                else exc.message
+            )
+            # Connection strings and bearer credentials are not SQL diagnostics.
+            detail = re.sub(
+                r"(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+:[^\s/@]+@", r"\1[credentials removed]@", detail
+            )
+            detail = re.sub(
+                r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [credential removed]", detail
+            )
+            detail = "".join(c for c in detail if ord(c) >= 32 or c in "\n\t")[:4000]
+            denial_detail = (
+                detail
+                if exc.code in {"COLUMN_SCOPE_VIOLATION", "API_PROVENANCE_INVALID"}
+                or (exc.code in KNOWN_DENIAL_CODES and denial.kind == DenialKind.WORK_JUDGED)
+                else None
+            )
             if denial.code == "CLICKHOUSE_QUERY_ERROR":
-                denial_detail = encode_diagnostic(exc.message or "", str(model_args.get("sql", "")))
+                denial_detail = encode_diagnostic(detail, str(model_args.get("sql", "")))
             if denial.code == "INVALID_COLUMN_REFERENCE":
                 denial_detail = encode_column_reference_diagnostic(
-                    exc.message or "", str(model_args.get("sql", ""))
+                    detail, str(model_args.get("sql", ""))
                 )
             user_message = (
-                denial.user_message
-                if denial.code in {"CLICKHOUSE_QUERY_ERROR", "INVALID_COLUMN_REFERENCE"}
-                else denial_detail or denial.user_message
+                denial_detail
+                if denial.code == "COLUMN_SCOPE_VIOLATION" and denial_detail
+                else denial.user_message
             )
             emit(
                 "tool_dispatch_denied",
@@ -718,10 +721,6 @@ class ToolDispatcher:
                 result_full=None,
             )
 
-        catalog = await self._resolve_catalog(credentials)
-        provenance = await capture_provenance(
-            tool_name, model_args, catalog, session_id=credentials.session_id
-        )
         preview = _build_preview(
             raw_result,
             self._preview_row_count,

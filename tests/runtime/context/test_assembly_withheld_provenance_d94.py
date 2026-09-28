@@ -39,9 +39,10 @@ _E = "dbpcm_warehouse.employee"
 # block — NOT imported from the implementation, so a drift in the shipped
 # constant is caught byte-for-byte (note the U+2014 em-dash).
 EXPECTED_SENTINEL = (
-    "result withheld: provenance could not be determined for this call, so its "
-    "result cannot be shown. Do not retry the identical call — it will be withheld "
-    "again. Try a different query or approach, or ask the user."
+    "[API_PROVENANCE_MISSING] This stored result has no validated provenance receipt, "
+    "so its data cannot be replayed. The query may have succeeded; this does not prove "
+    "missing data or a SQL error. Use other successful results, or disclose that this "
+    "result's access metadata is unavailable. Do not repeat identical SQL to repair metadata."
 )
 
 # A recognizable token planted in the stranded entry's data-bearing fields; it

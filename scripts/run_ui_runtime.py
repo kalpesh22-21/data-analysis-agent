@@ -670,6 +670,14 @@ class DemoModelClient:
         return self
 
 
+def _demo_schema():
+    return {
+        f"{_DEMO_DATABASE}.{_DEMO_TABLE}": _DEMO_SCHEMA_RESPONSE["columns"],
+        **_BP_TABLE_SCHEMAS,
+        _D44_PAYROLL_TABLE: {"department": "String", "salary": "UInt64"},
+    }
+
+
 class DemoMCPClient(FakeMCPClient):
     """`FakeMCPClient`, extended so `runQuery` is content-routed off the submitted SQL
     (whichever of the `sql`/`query` arg keys is present) instead of a fixed FIFO queue:
@@ -682,7 +690,27 @@ class DemoMCPClient(FakeMCPClient):
     scope check and parser, never from string matching.
     """
 
-    async def call_tool(
+    async def call_tool(self, tool_name, args, *, jwt, session_id):
+        """Simulate the API receipt using the demo service's own fixed schema."""
+        from data_agent.sqlparse import ProvenanceExtractionError, extract_column_provenance
+
+        if tool_name == "explainQuery":
+            self.calls.append(RecordedCall(tool_name=tool_name, args=dict(args), jwt=jwt, session_id=session_id))
+            result = _rows_result(["explain"], [["Demo plan"]], row_count=1)
+        else:
+            result = await self._call_demo_tool(tool_name, args, jwt=jwt, session_id=session_id)
+        if tool_name not in {"runQuery", "sampleRows", "explainQuery"}:
+            return result
+        sql = str(args.get("sql") or args.get("query") or "")
+        if tool_name == "sampleRows":
+            sql = f"SELECT * FROM {args['database']}.{args['table']}"
+        try:
+            uses = extract_column_provenance(sql, _demo_schema(), session_id=session_id)
+        except ProvenanceExtractionError as exc:
+            raise MCPToolError("PARSE_FAILED_CLOSED", str(exc)) from exc
+        return {**result, "provenance": {"version": 1, "columns": [list(pair) for pair in sorted(uses)]}}
+
+    async def _call_demo_tool(
         self,
         tool_name: str,
         args: dict[str, Any],
@@ -787,18 +815,7 @@ def build_demo_app():
         couchbase_password=_COUCHBASE_PASSWORD,
     )
 
-    catalog = CatalogHandle(
-        {
-            f"{_DEMO_DATABASE}.{_DEMO_TABLE}": _DEMO_SCHEMA_RESPONSE["columns"],
-            # The blueprint tables (D89) — so the executor's inner runQuery
-            # provenance is DETERMINED and the verified result survives D44 replay.
-            **_BP_TABLE_SCHEMAS,
-            # The payroll table (D44) — catalogued so the turn-1 query's
-            # provenance resolves to `demo.payroll.salary`; narrowing the JWT
-            # scope to exclude it then drops the entry from turn-2 replay.
-            _D44_PAYROLL_TABLE: {"department": "String", "salary": "UInt64"},
-        }
-    )
+    catalog = CatalogHandle(_demo_schema())
 
     mcp_client = DemoMCPClient(
         tools=[

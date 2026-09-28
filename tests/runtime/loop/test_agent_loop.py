@@ -765,7 +765,7 @@ async def test_current_turn_denial_is_visible_to_model_within_same_turn() -> Non
     content = json.loads(tool_messages[0]["content"])
     assert content["status"] == "denied"
     assert content["error_code"] == "TABLE_NOT_FOUND"
-    assert content["user_message"] == "I couldn't find that table. Let me verify the table name."
+    assert content["user_message"] == "no such table"
     assert content["result_preview"] is None  # no rows ever leak from a denial
 
 

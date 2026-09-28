@@ -25,7 +25,7 @@ from tests.runtime.loop.test_repository_regressions import entry
 from tests.runtime.test_harness_improvements import CATALOG, CREDS, batch, build, call
 
 
-async def test_engine_diagnostic_survives_persistence_and_canonical_replay_without_raw_text():
+async def test_engine_diagnostic_survives_replay_with_actual_error_and_without_credentials():
     raw = "UNKNOWN_FUNCTION: Function with name 'COUNTIF' does not exist. secret-row-value bearer secret"
     dispatcher = ToolDispatcher(
         FakeMCPClient(scripted={"runQuery": [MCPToolError("CLICKHOUSE_QUERY_ERROR", raw)]}), CATALOG
@@ -41,17 +41,19 @@ async def test_engine_diagnostic_survives_persistence_and_canonical_replay_witho
     receipt = type(receipt).from_doc(receipt.to_doc())
     rendered = render_entry(receipt, 5)
     assert rendered["sql_diagnostic"]["suggested_function"] == "countIf"
-    assert "secret" not in json.dumps(rendered)
+    assert "secret-row-value" in rendered["sql_diagnostic"]["api_message"]
+    assert "bearer secret" not in json.dumps(rendered)
     canonical = _tool_trail_entry_to_canonical(rendered)
     text = json.dumps(canonical)
     assert "sql_diagnostic" in text and "failed" in text
-    assert "secret" not in text
+    assert "secret-row-value" in text
+    assert "bearer secret" not in text
     assert "countIf" not in rendered["user_message"]
 
 
-def test_unknown_error_text_is_not_forwarded():
+def test_unrecognized_sql_error_keeps_api_message_and_generic_repair_hint():
     assert sql_diagnostic("secret arbitrary error", "SELECT 1")["engine_code"] == "QUERY_ERROR"
-    assert "secret" not in str(sql_diagnostic("UNKNOWN_FUNCTION secret", "SELECT 1"))
+    assert sql_diagnostic("UNKNOWN_FUNCTION secret", "SELECT 1")["api_message"] == "UNKNOWN_FUNCTION secret"
     assert decode_diagnostic("sql_diagnostic:invalid") is None
 
 
@@ -269,7 +271,7 @@ async def test_window_join_duplicate_probe_blocks_execution_and_reports_probe_er
         CATALOG,
     )
     detail = await validate_join_cardinality(sql, broken, CREDS)
-    assert "UNKNOWN_IDENTIFIER" in detail and "secret-value" not in detail
+    assert "UNKNOWN_IDENTIFIER secret-value" in detail
     assert "not proof of duplicate" in detail
 
 

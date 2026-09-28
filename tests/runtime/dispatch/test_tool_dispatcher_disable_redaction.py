@@ -34,7 +34,7 @@ from data_agent.runtime.observability import tracing
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 
 _E = "dbpcm_warehouse.employee"
-CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Salary": "Decimal(18,2)"}})
+CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Name": "String", "Salary": "Decimal(18,2)"}})
 
 SESSION_ID = "sess-disable-redaction"
 JWT = "jwt-secret-should-never-leak"

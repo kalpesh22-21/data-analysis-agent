@@ -82,6 +82,7 @@ def _creds() -> RuntimeCredentials:
 def _result(mult: int) -> dict[str, Any]:
     cell = "engineering-operations-emea-" * mult
     return {
+        "provenance": {"version": 1, "columns": [[_E, "EmployeeCode"], [_E, "Department"]]},
         "columns": ["EmployeeCode", "Department"],
         "rows": [[f"E{i}", cell] for i in range(10)],
         "row_count": 10,

@@ -93,6 +93,7 @@ class _FatRunQueryMCP:
     async def call_tool(self, tool_name, args, *, jwt, session_id):
         self.calls.append(tool_name)
         return {
+            "provenance": {"version": 1, "columns": [[_E, "EmployeeCode"], [_E, "Department"]]},
             "columns": ["EmployeeCode", "Department"],
             "rows": [[f"E{i}", f"Dept-{i}-lorem-ipsum-dolor"] for i in range(20)],
             "row_count": 20,

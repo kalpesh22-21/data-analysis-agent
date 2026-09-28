@@ -1,4 +1,4 @@
-"""Bounded repair context; raw engine messages never enter model history."""
+"""Bounded API/SQL failure details and repair hints for same-turn model recovery."""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ def sql_diagnostic(message: str, sql: str) -> dict:
     code = next((c for c in MESSAGES if re.search(r"\b" + c + r"\b", message)), "QUERY_ERROR")
     result = {
         "engine_code": code,
+        "api_message": message[:4000],
         "message": MESSAGES.get(
             code, "Check the SQL against the scoped schema and ClickHouse procedure."
         ),
@@ -64,6 +65,7 @@ def encode_column_reference_diagnostic(message: str, sql: str) -> str:
 
     result = {
         "engine_code": "INVALID_COLUMN_REFERENCE",
+        "api_message": message[:4000],
         "message": classify_denial("INVALID_COLUMN_REFERENCE").user_message,
         "retryable": True,
     }

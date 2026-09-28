@@ -62,7 +62,7 @@ class TestDemoMCPBlueprintRouting:
         mcp = demo.DemoMCPClient(tools=[], scripted={})
         result = await mcp.call_tool(
             "runQuery",
-            {"sql": f"SELECT department, n FROM {demo._BP_GOOD_TABLE} GROUP BY department"},
+            {"sql": f"SELECT department, count(DISTINCT emp_id) AS n FROM {demo._BP_GOOD_TABLE} GROUP BY department"},
             jwt="j",
             session_id="s",
         )
