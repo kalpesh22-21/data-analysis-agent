@@ -24,6 +24,8 @@ class DeliveryContext:
     terminal_review_version: str = ""
     terminal_review_status: str = ""
     partial_review_attempted: bool = False
+    review_unavailable: bool = False
+    resilient_exit: bool = False
 
 
 CURRENT_DELIVERY: ContextVar[DeliveryContext | None] = ContextVar("delivery", default=None)
@@ -125,10 +127,17 @@ async def review_once(loop, brief, *, repair=False, terminal=False):
         return APPROVED
     started = time.monotonic()
     try:
-        return await asyncio.wait_for(
+        verdict = await asyncio.wait_for(
             loop._answer_judge.review(brief),
             timeout=min(available, per_call),
         )
+        if context and verdict.approved and not verdict.reviewed:
+            context.review_unavailable = True
+        return verdict
+    except Exception:
+        if context:
+            context.review_unavailable = True
+        raise
     finally:
         if context:
             elapsed = time.monotonic() - started
@@ -244,6 +253,11 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
     if outstanding:
         loop._observer("loop_delivery_review", {"site": site, "status": "rejected", "calls": 0})
         return {"status": "rejected"}, True
+    if context.resilient_exit and not pending:
+        # Salvage already got its bounded opportunity. Do not start another full
+        # review of the fallback, or turn unavailable review into an approval.
+        loop._observer("loop_delivery_review", {"site": site, "status": "exhausted", "calls": 0})
+        return {"status": "exhausted", "attempts": 0}, False
     status = "rejected" if outstanding or bool(pending and state.question_refusals) else "exhausted"
     for _ in range(2):
         if context.review_seconds <= 0:

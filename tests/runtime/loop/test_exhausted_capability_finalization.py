@@ -96,6 +96,7 @@ def setup(
     loop._runtime_tools["getCapabilityTool"] = GetCapabilityTool(
         client=client, hydrate=register, visible_names=set()
     )
+    loop._answer_judge_review_budget_seconds = 90.0
     return loop, store, model, events
 
 

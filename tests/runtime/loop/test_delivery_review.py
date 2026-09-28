@@ -73,7 +73,7 @@ async def test_dependency_failure_streams_result_and_persists_history(dependency
     answer = history["turns"][0]
     assert answer["failure"]["dependency"] == dependency
     assert answer["failure"]["retryable"] is retryable
-    assert answer["review"]["status"] == "approved"
+    assert answer["review"]["status"] == "exhausted"
     assert len([m for m in doc.messages if m.role == "assistant"]) == 1
     assert any(e == "loop_dependency_failed" for e, _ in events)
 
@@ -85,6 +85,7 @@ async def test_spent_finalization_still_reviews_fallback():
         judge,
         rows=[{"columns": ["Department", "n"], "rows": [["A", 1], ["B", 2]], "row_count": 2}],
     )
+    loop._answer_judge_review_budget_seconds = 90.0
     out = await run(loop)
     assert judge.briefs
     assert judge.briefs[-1].draft == out.assistant_text

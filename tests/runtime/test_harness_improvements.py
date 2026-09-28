@@ -190,6 +190,7 @@ async def test_final_rejection_allows_only_terminal_partial_review():
         ],
         judge,
     )
+    loop._answer_judge_review_budget_seconds = 90.0
     out = await run(loop)
     assert "125" not in out.assistant_text
     assert len(judge.briefs) == 3

@@ -77,7 +77,7 @@ def setup(
                 )
             )
         ]
-    return build(
+    result = build(
         steps,
         judge,
         extra={"resolveValues": Tool("resolveValues", {"values": ["Active"]})},
@@ -90,6 +90,9 @@ def setup(
             }
         ],
     )
+
+    result[0]._answer_judge_review_budget_seconds = 90.0
+    return result
 
 
 class RejectFabricatedGap(Judge):
@@ -135,6 +138,7 @@ async def test_only_pivotal_evidence_can_block_original_draft_review(ledger, fir
     assert not any(e == "loop_finalization_block_exhausted" for e, _ in events)
     assert ("loop_answer_evidence_extras_ignored", {"dropped_count": 1}) in events
     assert (await store.get_or_create_session(CREDS.session_id)).messages[-1].content == DRAFT
+
 
 
 async def test_clean_evidence_uses_normal_review_without_exhaustion():

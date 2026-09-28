@@ -176,6 +176,7 @@ async def test_second_rejection_allows_only_terminal_partial_review():
         judge=judge,
         extra={"identifier": Tool("identifier", CARD)},
     )
+    loop._answer_judge_review_budget_seconds = 90.0
     outcome = await run(loop, "Count employees and provide SSN information.")
     assert outcome.capability_cards is None
     assert len(judge.briefs) == 3

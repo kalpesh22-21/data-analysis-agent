@@ -2171,6 +2171,11 @@ class AgentLoop:
                         saved_review.get("site", "exit_prose"), saved_review["violation"]
                     )
         ship_disposition = ship_guard.disposition(judge_site) if ship_guard is not None else None
+        if (
+            ship_disposition == "ship_tables_with_hedge" and not accum.has_answer_tables
+            or ship_disposition == "ship_cards_with_hedge" and not accum.capability_cards
+        ):
+            ship_disposition = "decline_only"
         retained_assumption_count = None
         if assistant_text == HELP_UNAVAILABLE_TEXT:
             ship_disposition = "decline_only"
@@ -2249,7 +2254,12 @@ class AgentLoop:
         )
         if partial_recovered:
             review = {**review, "completion": "partial"}
-        if withheld:
+        # A resilient exit has already applied the ship guard and rendered its
+        # rationale. Preserve that safe disposition instead of replacing it with
+        # a generic decline merely because another review was unavailable.
+        if terminal_failure and ship_disposition == "decline_only":
+            provenance = frozenset()
+        if withheld and not (terminal_failure and ship_disposition):
             accum.apply_ship_disposition("decline_only", ())
             capability_cards = None
             ship_disposition = "decline_only"

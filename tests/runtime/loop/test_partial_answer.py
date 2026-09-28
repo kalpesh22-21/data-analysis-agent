@@ -19,6 +19,16 @@ from tests.runtime.test_harness_improvements import (
     run,
 )
 
+# These scenarios exercise exit recovery with a realistic reserved review budget.
+_build = build
+
+
+def build(*args, **kwargs):
+    result = _build(*args, **kwargs)
+    result[0]._answer_judge_review_budget_seconds = 90.0
+    return result
+
+
 PART = {
     "answer": "Sales has 120 employees in the available records.",
     "evidence": ["q"],
@@ -155,7 +165,7 @@ async def test_new_successful_evidence_requires_fresh_partial_review():
     out = await run(loop)
     assert out.assistant_text != TEXT
     assert out.review["status"] == "rejected"
-    assert len(judge.briefs) == 3
+    assert len(judge.briefs) == 2  # Unavailable review is not retried on exit.
 
 
 async def test_service_failure_after_successful_query_recovers_without_final_proposal():
@@ -213,6 +223,7 @@ async def test_partial_selects_only_approved_capability_and_persists_selection()
         "unfinished": ["Compensation history could not be verified."],
     }
     loop, store, _, _ = setup(Judge([reject(part)]))
+    loop._answer_judge_review_budget_seconds = 90.0
     out = await run(loop)
     assert out.review["completion"] == "partial"
     assert [c["name"] for c in out.capability_cards] == ["employees"]
@@ -271,3 +282,94 @@ async def test_extra_known_discovery_citation_does_not_discard_supported_partial
     assert len(judge.briefs) == 2
     doc = await store.get_or_create_session(CREDS.session_id)
     assert doc.review_states["0"]["approved_partial"]["evidence"] == ["q"]
+
+
+async def test_unavailable_judge_skips_exit_retry_and_keeps_existing_rationale():
+    from data_agent.runtime.loop.judge_ship_guard import ship_decline_text
+
+    judge = Judge([reject(), APPROVED])
+    loop, store, _, _, events = build([discovery(), query(), final(), final()], judge)
+    out = await run(loop)
+    assert len(judge.briefs) == 2
+    assert out.review["status"] == "rejected"
+    assert out.assistant_text == ship_decline_text("unsupported_by_evidence")
+    assert not out.answer_tables
+    doc = await store.get_or_create_session(CREDS.session_id)
+    assert doc.messages[-1].content == out.assistant_text
+
+
+async def test_slow_exit_review_is_cancelled_without_another_final_review(monkeypatch):
+    import asyncio
+
+    from data_agent.runtime.loop.judge_ship_guard import ship_decline_text
+
+    monkeypatch.setattr(Judge, "timeout_seconds", 0.02)
+
+    class SlowExitJudge(Judge):
+        cancelled = False
+
+        async def review(self, brief):
+            if brief.terminal_partial_review:
+                self.briefs.append(brief)
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.cancelled = True
+            return await super().review(brief)
+
+    judge = SlowExitJudge([reject(), reject()])
+    loop, _, _, _, events = build([discovery(), query(), final(), final()], judge)
+    out = await asyncio.wait_for(run(loop), timeout=1)
+    assert judge.cancelled and len(judge.briefs) == 3
+    assert out.review["status"] == "rejected"
+    assert out.assistant_text == ship_decline_text("unsupported_by_evidence")
+    assert not out.answer_tables
+    assert ("loop_partial_answer_failed", {"reason": "exit_deadline"}) in events
+
+
+async def test_exit_skips_new_review_when_less_than_thirty_seconds_remain():
+    judge = Judge([reject(), reject(), reject(PART)])
+    loop, _, _, _, _ = build([discovery(), query(), final(), final()], judge)
+    loop._answer_judge_review_budget_seconds = 29.0
+    out = await run(loop)
+    assert len(judge.briefs) == 2
+    assert out.review["status"] == "rejected"
+    assert out.assistant_text != TEXT
+
+
+async def test_cached_partial_is_reused_even_without_thirty_seconds_remaining():
+    judge = Judge([reject(PART), APPROVED])
+    loop, _, _, _, _ = build([discovery(), query(), final(), final()], judge)
+    loop._answer_judge_review_budget_seconds = 5.0
+    out = await run(loop)
+    assert out.assistant_text == TEXT
+    assert out.review["status"] == "approved"
+    assert len(judge.briefs) == 2
+
+
+@pytest.mark.parametrize("configured,remaining,expected", [(60.0, 90.0, 60.0), (60.0, 45.0, 45.0), (30.0, 90.0, 30.0)])
+async def test_exit_deadline_uses_configured_timeout_and_remaining_budget(monkeypatch, configured, remaining, expected):
+    import asyncio
+    from types import SimpleNamespace
+
+    from data_agent.runtime.loop import partial_answer
+    from data_agent.runtime.loop.delivery import CURRENT_DELIVERY, DeliveryContext
+
+    deadlines = []
+
+    async def fake_wait(awaitable, timeout):
+        deadlines.append(timeout)
+        return await awaitable
+
+    async def recovered(*args):
+        return "cached"
+
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait)
+    monkeypatch.setattr(partial_answer, "_recover_partial", recovered)
+    token = CURRENT_DELIVERY.set(DeliveryContext(CREDS, review_seconds=remaining))
+    try:
+        loop = SimpleNamespace(_answer_judge=SimpleNamespace(timeout_seconds=configured))
+        assert await partial_answer.recover_partial(loop, "s", 0, None, None) == "cached"
+        assert deadlines == [expected]
+    finally:
+        CURRENT_DELIVERY.reset(token)

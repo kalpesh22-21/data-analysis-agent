@@ -127,7 +127,34 @@ def restore_partial(snapshot):
     return snapshot["answer"], accum, provenance
 
 
+# Do not start a new exit review without a realistic admission window.
+MIN_EXIT_REVIEW_SECONDS = 30.0
+
+
 async def recover_partial(loop, session_id, turn_index, accum, draft):
+    import asyncio
+
+    from .delivery import CURRENT_DELIVERY
+
+    context = CURRENT_DELIVERY.get()
+    if context:
+        context.resilient_exit = True
+    timeout = getattr(loop._answer_judge, "timeout_seconds", 30.0)
+    if context and context.review_seconds >= MIN_EXIT_REVIEW_SECONDS:
+        timeout = min(timeout, context.review_seconds)
+    try:
+        return await asyncio.wait_for(
+            _recover_partial(loop, session_id, turn_index, accum, draft),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        if context:
+            context.review_unavailable = True
+        loop._observer("loop_partial_answer_failed", {"reason": "exit_deadline"})
+        return None
+
+
+async def _recover_partial(loop, session_id, turn_index, accum, draft):
     """One terminal review using existing evidence, or reuse an unchanged approval."""
     from .delivery import CURRENT_DELIVERY, delivery_version, review_once
     from .judge_evidence import enrich_brief
@@ -154,8 +181,9 @@ async def recover_partial(loop, session_id, turn_index, accum, draft):
             # No queries, no model-agent turn, and at most one judge call here.
             if (
                 not any(evidence_kind(e) for e in current)
-                or context.review_seconds <= 0
+                or context.review_seconds < MIN_EXIT_REVIEW_SECONDS
                 or context.partial_review_attempted
+                or context.review_unavailable
             ):
                 return None
             context.partial_review_attempted = True
