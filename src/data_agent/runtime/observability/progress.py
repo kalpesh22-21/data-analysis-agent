@@ -71,14 +71,12 @@ _STEP_LABELS: dict[str, str] = {
     "loop_help_center_circuit_opened": "product guidance is temporarily unavailable",
     "loop_no_new_evidence_stop": "stopping — no additional information was found",
     "loop_ask_user_batch_calls_dropped": "deferring other work until your answer",
-    # Retrieval start remains an internal observer event; only completion is shown.
-    "retrieval": "reviewing the information available for your question",
+    # Retrieval and model-call starts stay internal; UI progress comes from tool steps.
     "blueprint_rule_resolved": "identified the requested group to include",
     "tool_dispatch_start": "working on the next part of your question…",
     "tool_dispatch_ok": "finished this step; continuing with your answer",
     "tool_dispatch_denied": "this step could not proceed; checking what can still be answered",
     "tool_dispatch_error": "this step did not finish; checking how to continue",
-    "loop_model_call_start": "working out the next step for your answer…",
     "loop_repeated_capability_call_guarded": "using the previously prepared information",
     "loop_capability_card_deduped": "combining duplicate views",
     "loop_model_call_timeout": "answer preparation timed out",

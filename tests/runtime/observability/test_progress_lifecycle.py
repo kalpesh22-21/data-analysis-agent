@@ -88,9 +88,7 @@ async def test_dispatch_lifecycle_survives_sse_for_remote_and_runtime_tools(path
     assert "SELECT EmployeeCode" not in "".join(frames)
 
 
-@pytest.mark.parametrize(
-    "event", ["tool_progress_summary", "loop_model_call_start", "loop_turn_done"]
-)
+@pytest.mark.parametrize("event", ["tool_progress_summary", "loop_turn_done"])
 def test_non_dispatch_events_cannot_inject_lifecycle(event):
     progress = to_progress_event(event, {"summary": "Checking progress", "lifecycle": "denied"})
     assert progress is not None

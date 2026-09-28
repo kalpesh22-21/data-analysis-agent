@@ -175,3 +175,12 @@ async def test_summary_start_and_completion_remain_distinct_events():
     assert events[2].shape["tool_call_id"] == "salary"
     assert events[3].step == events[1].step == events[0].step
     assert events[3].shape["lifecycle"] == "error"
+
+
+def test_initial_progress_trio_is_suppressed():
+    for event, payload in (
+        ("retrieval_start", {}),
+        ("retrieval", {"blueprints": 5, "knowledge": 4}),
+        ("loop_model_call_start", {"window": 1}),
+    ):
+        assert to_progress_event(event, payload) is None

@@ -20,7 +20,7 @@ class BlockedTurn:
     async def __call__(self):
         self.task = asyncio.current_task()
         try:
-            self.emitter.observe("loop_model_call_start", {})
+            self.emitter.observe("tool_dispatch_start", {"tool_name": "runQuery"})
             self.started.set()
             await asyncio.Event().wait()
         finally:
@@ -37,7 +37,7 @@ class BlockedTurn:
 async def test_closing_generator_cancels_and_awaits_turn():
     turn = BlockedTurn()
     stream = _stream_turn(turn, turn.emitter)
-    assert "event: progress" in await anext(stream)
+    assert "event: progress" in await asyncio.wait_for(anext(stream), 2)
     await stream.aclose()
     turn.assert_stopped()
 
@@ -101,7 +101,7 @@ async def test_completed_turn_keeps_progress_and_terminal_result():
     emitter = ProgressEmitter()
 
     async def work():
-        emitter.observe("loop_model_call_start", {})
+        emitter.observe("tool_dispatch_start", {"tool_name": "runQuery"})
         return TurnOutcome(
             status="done",
             assistant_text="Synthetic answer",

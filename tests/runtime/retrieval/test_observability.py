@@ -119,7 +119,7 @@ def _collecting_pipeline(
     )
 
 
-async def test_retrieval_start_is_internal_and_progress_shows_counts() -> None:
+async def test_retrieval_events_remain_internal() -> None:
     events: list[tuple[str, dict]] = []
     await _collecting_pipeline(events).retrieve(
         question=_Q, column_scope=frozenset(), user_id=None
@@ -137,12 +137,9 @@ async def test_retrieval_start_is_internal_and_progress_shows_counts() -> None:
     assert set(payload) == {"blueprints", "knowledge"}
     assert _Q not in str(payload)
 
-    # The public progress translation suppresses start and retains completion.
+    # Both retrieval events stay internal, including blueprint/knowledge counts.
     assert to_progress_event("retrieval_start", start_payload) is None
-    progress = to_progress_event("retrieval", payload)
-    assert progress is not None
-    assert set(progress.shape) == {"blueprints", "knowledge"}
-    assert _Q not in str(progress.shape)
+    assert to_progress_event("retrieval", payload) is None
 
 
 async def test_embedder_degrade_is_not_silent() -> None:
