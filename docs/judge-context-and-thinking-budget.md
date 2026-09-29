@@ -14,6 +14,24 @@ and ambiguities are selected by referenced columns. Rules and selected semantic
 metadata can bring in needed column definitions; broad schema prose cannot pull in
 unrelated columns. Existing scope filtering and explicit size-omission markers apply.
 
+## Value-resolution evidence
+
+Final answer reviews include `evidence_package.resolution_receipts` when authorized,
+successful current-turn `resolveValues` calls are available. Each row-free receipt
+identifies its source call, concept, target table/column, distinct returned candidate
+count (`matched_count`), ranking/degradation status and per-execution IN-list checks.
+Candidate values, descriptions, frequencies and result rows are not copied.
+
+The runtime compares directly bound string-literal IN predicates against the stored
+resolution result. `true` confirms membership, `false` indicates at least one literal
+was not returned by that receipt, and `null` means unknown (unreadable evidence,
+unsupported expression or ambiguous binding). Only executions after that resolution
+are checked. Distinct resolutions are never unioned. No warehouse calls are added.
+
+A receipt confirms code origin, not semantic correctness or population completeness.
+Missing receipts do not prove hardcoding, skipped resolution or measurement mismatch.
+The judge still checks the query, interpretation and catalog rules independently.
+
 ## Configuration
 
 ```sh

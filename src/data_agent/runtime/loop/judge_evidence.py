@@ -17,6 +17,7 @@ from sqlglot import exp
 from data_agent.runtime.dispatch.tool_dispatcher import resolve_catalog
 
 from .answer_judge import evidence_ids
+from .resolution_receipts import resolution_receipts
 
 _METADATA_KEYS = (
     "description",
@@ -317,6 +318,16 @@ async def enrich_brief(
             if entry.result_preview:
                 definitions.extend(entry.result_preview.preview_rows)
     package = coverage_package(brief, results, analysis_state, credentials.column_scope)
+    receipts = await resolution_receipts(
+        trail=trail,
+        results=results,
+        turn_index=turn_index,
+        session_id=session_id,
+        store=store,
+        column_scope=credentials.column_scope,
+    )
+    if receipts:
+        package["resolution_receipts"] = receipts
     package["blueprint_definitions"] = definitions
     try:
         catalog = (
