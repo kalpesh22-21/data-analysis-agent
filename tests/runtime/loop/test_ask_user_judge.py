@@ -355,7 +355,9 @@ async def test_a_denied_claim_exhausts_and_the_pause_proceeds() -> None:
         {"violation": "non_contextual_question"}
     ]
     assert store.claims == ["ask_user_judge"], "it asked, and was refused"
-    assert judge.calls_made == 2
+    assert judge.calls_made == 1  # reuse the rejected question review at delivery
+    assert outcome.review["status"] == "rejected"
+    assert not (await store.get_or_create_session(SESSION_ID)).pause_checkpoint.consumed
     assert model.calls_made == 1
 
 
@@ -414,8 +416,9 @@ async def test_no_repair_headroom_still_reviews_delivery() -> None:
     outcome = await loop.run(
         session_id=SESSION_ID, credentials=_credentials(), user_message="average salary in Sales"
     )
-    assert outcome.status == "done"
-    assert outcome.pending_question is None
+    assert outcome.status == "paused_ask_user"
+    assert outcome.pending_question is not None
+    assert outcome.review["status"] == "rejected"
     assert judge.calls_made == 1
     assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == [{"reason": "wall_clock"}]
     assert store.claims == []

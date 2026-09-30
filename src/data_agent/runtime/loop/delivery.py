@@ -218,6 +218,14 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
     pending = checkpoint.pending_question if checkpoint else None
     version = delivery_version(text, accum, pending)
     if (
+        pending
+        and state.delivery_version == version
+        and state.delivery_status in {"approved", "rejected", "exhausted"}
+    ):
+        # The question already passed the askUser repair gate. Re-reviewing it at
+        # finish time cannot re-round and used to turn a pause into a generic decline.
+        return {"status": state.delivery_status}, False
+    if (
         state.delivery_version == version
         and state.delivery_status == "approved"
         and (not state.violation or pending and state.site != "ask_user")

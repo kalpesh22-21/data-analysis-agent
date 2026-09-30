@@ -96,7 +96,7 @@ from data_agent.runtime.loop.reliability import (
     cancellation_checkpoint,
     observe_turn_abort,
 )
-from data_agent.runtime.model.client import ModelClient, begin_turn_client
+from data_agent.runtime.model.client import ModelClient, ToolCallRequest, begin_turn_client
 from data_agent.runtime.model.conversation import (
     assign_unique_call_ids,
     conversation_call_ids,
@@ -2259,6 +2259,11 @@ class AgentLoop:
         # a generic decline merely because another review was unavailable.
         if terminal_failure and ship_disposition == "decline_only":
             provenance = frozenset()
+        # Withholding a clarification is not evidence that the answer is ungrounded.
+        # If its repair allowance is spent (or a resumed tool pauses), retain the
+        # checkpoint and truthful review disposition so the user can still continue.
+        if withheld and checkpoint is not None:
+            withheld = False
         if withheld and not (terminal_failure and ship_disposition):
             accum.apply_ship_disposition("decline_only", ())
             capability_cards = None
@@ -2268,10 +2273,6 @@ class AgentLoop:
             if completion_notice:
                 assistant_text += "\n\n" + completion_notice
             provenance = frozenset()
-            if checkpoint is not None:
-                # Do not publish or leave resumable an explicitly rejected question.
-                checkpoint = replace(checkpoint, consumed=True)
-                status = "done"
         if persist_text is not None or (status == "done" and assistant_text):
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
             # that persist pass the same string they pass as *assistant_text*, so
@@ -3420,6 +3421,8 @@ class AgentLoop:
                 None,
             )
 
+            runtime_pause: ToolPause | None = None
+
             # S3: never dispatch an unbounded number of tool calls from one
             # model response — cap per iteration (RuntimeSettings-configurable,
             # default 8), applied to `other_calls` above. Any calls beyond the cap
@@ -3481,11 +3484,15 @@ class AgentLoop:
                             await self._session_store.load_trail(session_id),
                             credentials.column_scope, current_turn_index=turn_index,
                         )
-                        tool_call = replace(tool_call, arguments=include_scalar_result_tables(
-                            tool_call.arguments,
-                            [e for e in visible_trail if e.turn_index == turn_index],
-                            analysis_state, review_state.excluded_components,
-                        ))
+                        tool_call = replace(
+                            tool_call,
+                            arguments=include_scalar_result_tables(
+                                tool_call.arguments,
+                                [e for e in visible_trail if e.turn_index == turn_index],
+                                analysis_state,
+                                review_state.excluded_components,
+                            ),
+                        )
                     tool_call = replace(
                         tool_call,
                         name=ANSWER_TABLE_TOOL_NAME
@@ -3754,7 +3761,11 @@ class AgentLoop:
                 ):
                     gate_refusal = blueprint_gate.check_run_blueprint(call_args)
 
-                if gate_refusal is None and tool_call.name in {"runQuery", "explainQuery", "sampleRows"}:
+                if gate_refusal is None and tool_call.name in {
+                    "runQuery",
+                    "explainQuery",
+                    "sampleRows",
+                }:
                     from data_agent.runtime.dispatch.denial_targets import repeated_target_denial
 
                     current_doc = await self._session_store.get_or_create_session(session_id)
@@ -3776,10 +3787,14 @@ class AgentLoop:
                                 "use other successful evidence, or disclose the limitation."
                             ),
                         )
-                        self._observer("loop_semantic_denial_exhausted", {
-                            "tool_name": tool_call.name, "tool_call_id": tool_call.id,
-                            "error_code": repeated_code,
-                        })
+                        self._observer(
+                            "loop_semantic_denial_exhausted",
+                            {
+                                "tool_name": tool_call.name,
+                                "tool_call_id": tool_call.id,
+                                "error_code": repeated_code,
+                            },
+                        )
 
                 if gate_refusal is None and tool_call.name == "runQuery":
                     from data_agent.runtime.dispatch.sql_diagnostics import repeated_sql_failure
@@ -3987,17 +4002,6 @@ class AgentLoop:
                 # complete, mirroring `askUser`). A dispatched MCP tool never
                 # sets `.pause`, so this is inert on the normal path.
                 if tool_result.pause is not None:
-                    # Computed INSIDE the branch that consumes it. It used to be
-                    # read once per tool call and used on the ~0.1% of them that
-                    # pause; `TurnAccumulators.envelope` is pure (no store, no
-                    # observer — `turn_accumulators.answer_envelope` and
-                    # `rollup_verification`/`AnswerTable.to_doc` below it only build
-                    # values), so where it is called cannot be observed, only how
-                    # often. `tests/runtime/loop/test_turn_exit_contract.py::
-                    # test_an_in_loop_pause_carries_the_envelope_of_the_same_batch`
-                    # pins that it is still read LATE — after the folds of the
-                    # calls that drained before this one.
-                    envelope = accum.envelope()
                     for pending in result.tool_calls:
                         if pending.id in dispatched_ids and pending.id != tool_call.id:
                             continue
@@ -4022,22 +4026,16 @@ class AgentLoop:
                                 model_response=model_response,
                             ),
                         )
-                    return await self._pause_from_runtime_tool(
-                        session_id=session_id,
-                        pause=tool_result.pause,
-                        window_count=window_count,
-                        assistant_text=result.assistant_text,
-                        tool_calls_made=tool_calls_made,
-                        # Fix 2: surface whatever succeeded earlier in this window.
-                        sql_executed=accum.sql_executed,
-                        envelope=envelope,
-                        assumptions=accum.assumptions,
-                        # Carry this call's intent tag onto the checkpoint (see
-                        # `_pause_from_runtime_tool`): the trail entry for this work
-                        # is written after the resume, under a new id.
-                        serves_intent=serves_intent,
-                        serves_intents=serves_intents,
+                        dispatched_ids.add(pending.id)
+                    # Runtime-authored questions need the same judge/refusal gate
+                    # as askUser. No extra model round produced this question.
+                    runtime_pause = tool_result.pause
+                    ask_user_call = ToolCallRequest(
+                        id=tool_call.id,
+                        name="askUser",
+                        arguments=dict(runtime_pause.pending_question),
                     )
+                    break
                 tool_calls_made += 1
                 result_full_ref: str | None = None
                 # Final-answer arguments contain derived prose. Give their trail
@@ -4446,25 +4444,8 @@ class AgentLoop:
                         # replay normally on the next round-trip, so re-rounding
                         # here does not lose the ledger update that rode along.
                         continue
-                    # THE WINDOW'S ALLOWANCE IS SPENT. THE PAUSE PROCEEDS — the
-                    # runtime never hard-locks a turn (05 §J.5), and here shipping
-                    # the question is strictly better than the alternatives:
-                    # refusing again spends the window on a disagreement, and
-                    # suppressing the pause would end the turn with no answer and
-                    # no question.
-                    #
-                    # ⚠ REACHED ONLY WHEN THE PERSISTED CLAIM IS SPENT AND THIS
-                    # GATE DOES NOT KNOW IT. Within one `_run_loop_body` the
-                    # `has_spent` peek inside `_judge` pre-empts this branch and no
-                    # model call is made at all — so the ordinary
-                    # refuse-then-ask-again sequence emits `..._skipped`, NOT this
-                    # event. What lands here is the askUser RESUME: `window_count`
-                    # is unchanged across one (D55), a fresh gate is built on
-                    # re-entry, and the claim it finds was spent by the previous
-                    # invocation. Keeping both is deliberate — the peek is the
-                    # cheap common case, and this is the honest handler for the
-                    # case the peek cannot see, which would otherwise drop a
-                    # judged rejection with no event at all.
+                    # A spent allowance leaves a resumable clarification, carrying
+                    # its rejected disposition instead of turning it into a decline.
                     self._observer(
                         ASK_USER_JUDGE_EXHAUSTED_EVENT,
                         {"violation": ask_verdict.violation},
@@ -4497,21 +4478,32 @@ class AgentLoop:
                     question, ask_user_call.arguments.get("options")
                 )
                 question, options = normalized["question"], normalized["options"]
-                if ask_verdict.approved and ask_verdict.reviewed:
-                    review_state.question_refusals.clear()
+                if ask_verdict.reviewed or not ask_verdict.approved:
+                    if ask_verdict.approved:
+                        review_state.question_refusals.clear()
                     review_state.delivery_version = delivery_version(
                         result.assistant_text, accum, normalized
                     )
-                    review_state.delivery_status = "approved"
+                    review_state.delivery_status = (
+                        "approved" if ask_verdict.approved else "rejected"
+                    )
                     await self._session_store.write_review_state(
                         session_id, turn_index, review_state.to_doc()
                     )
                 checkpoint = PauseCheckpoint(
-                    reason="askUser",
+                    reason=runtime_pause.reason if runtime_pause else "askUser",
                     pending_question={"question": question, "options": options},
                     awaiting="user_answer",
                     consumed=False,
                     budget_window_count=window_count,
+                    blueprint_id=runtime_pause.blueprint_id if runtime_pause else None,
+                    slot_bindings_json=runtime_pause.slot_bindings_json if runtime_pause else None,
+                    completed_nodes_json=runtime_pause.completed_nodes_json
+                    if runtime_pause
+                    else None,
+                    awaiting_node=runtime_pause.awaiting_node if runtime_pause else None,
+                    serves_intent=serves_intent if runtime_pause else None,
+                    serves_intents=serves_intents if runtime_pause else (),
                 )
                 # Best-effort partials (§1) ride along; `provenance` is left unset
                 # (the fail-closed union is reused only on the `done` returns).

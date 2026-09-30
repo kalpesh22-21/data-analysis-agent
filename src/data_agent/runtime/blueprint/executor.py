@@ -19,6 +19,7 @@ tool's crash guard contains.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import re
@@ -124,8 +125,8 @@ _ABORTED_MESSAGE = (
 )
 
 # The DISTINCT-domain probe row cap — bounds a slot existence/mapping probe so a
-# high-cardinality column never pulls an unbounded domain. A value not in the
-# first N distincts resolves as no_match → askUser (never a silent guess).
+# high-cardinality column never pulls an unbounded domain. Concrete scalar values
+# are filtered before this cap, so a valid code cannot be lost outside the first page.
 _DOMAIN_PROBE_LIMIT = 500
 
 # `emit_progress=False` on EVERY inner dispatch below (node query, domain probe,
@@ -633,7 +634,9 @@ class BlueprintExecutor:
             if result.status != "ok":
                 return ExecFailed(
                     error_code=result.error_code or UNSUPPORTED_CODE,
-                    user_message=result.denial_detail or result.user_message or _UNSUPPORTED_MESSAGE,
+                    user_message=result.denial_detail
+                    or result.user_message
+                    or _UNSUPPORTED_MESSAGE,
                     retryable=bool(result.retryable),
                     provenance=result.provenance,
                 )
@@ -721,7 +724,11 @@ class BlueprintExecutor:
         for spec in blueprint.slots:
             raw = slot_bindings.get(spec.name)
             if _is_present(raw) and spec.binds_to:
-                domain, probe_entries = await self._probe_domain(spec.binds_to, credentials)
+                domain, probe_entries, failure = await self._probe_domain(
+                    spec.binds_to, credentials, raw=raw, slot_type=spec.type
+                )
+                if failure is not None:
+                    return bound, omitted_patterns, failure
                 provenances.extend(probe_entries)
             else:
                 domain = None
@@ -942,42 +949,67 @@ class BlueprintExecutor:
     # -- helpers --------------------------------------------------------------
 
     async def _probe_domain(
-        self, binds_to: str, credentials: RuntimeCredentials
-    ) -> tuple[list[str] | None, list[frozenset[tuple[str, str]] | None]]:
-        """Return the scope-enforced DISTINCT domain of `binds_to` ("database.table.column") and
-        the provenance entries to fold into the union:
+        self, binds_to: str, credentials: RuntimeCredentials, *, raw: Any, slot_type: str
+    ) -> tuple[list[str] | None, list[frozenset[tuple[str, str]] | None], ExecFailed | None]:
+        """Verify proposed values without enumerating a capped, unrelated domain.
 
-          - a malformed `binds_to`, or a denied or errored probe -> `(None, [])`: no domain
-            (the resolver binds directly, and the NODE query's own D57 enforcement still
-            gates it — never a fabricated match), and NOTHING is added to the union, since a
-            denied probe read nothing.
-          - a SUCCESSFUL probe -> `(values, [probe.provenance])`, appended UNCONDITIONALLY
-            even when `None`, so a successful probe with undetermined provenance POISONS the
-            union — the same fail-closed rule as the node and grain queries.
-
-        An ordinary dispatched runQuery; it does not count against the model budget.
+        Concrete string/entity/period bindings use a targeted predicate. The same
+        credentialed dispatcher enforces access; failed probes never masquerade as
+        successful resolution. Lists retain the bounded domain resolver for now.
         """
         db_table, sep, column = binds_to.rpartition(".")
         if not sep or not db_table or not column:
-            return None, []
-        probe_sql = (
-            exp.select(exp.column(column))
-            .distinct()
-            .from_(db_table)
-            .limit(_DOMAIN_PROBE_LIMIT)
-            .sql(dialect="clickhouse")
-        )
+            return None, [], ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, True)
+        query = exp.select(exp.column(column)).distinct().from_(db_table)
+        if isinstance(raw, str) and slot_type in {"string", "entity", "period"}:
+            value = raw.strip()
+            if slot_type == "period":
+                predicate = exp.EQ(this=exp.column(column), expression=exp.Literal.string(value))
+            else:
+                predicate = exp.EQ(
+                    this=exp.func("lowerUTF8", exp.func("toString", exp.column(column))),
+                    expression=exp.Literal.string(value.casefold()),
+                )
+            query = query.where(predicate)
         probe = await self._tool_dispatcher.dispatch(
             "runQuery",
-            {"sql": probe_sql, "limit": None},
+            {"sql": query.limit(_DOMAIN_PROBE_LIMIT).sql(dialect="clickhouse"), "limit": None},
             credentials,
-            emit_progress=False,  # internal blueprint query — see the emit_progress note at the top of this module
+            emit_progress=False,
         )
         if probe.status != "ok":
-            return None, []  # a denied/errored probe read nothing → contributes nothing
-        _columns, rows, _row_count, _truncated = _unpack_result(probe.result_full)
+            return (
+                None,
+                [],
+                ExecFailed(
+                    probe.error_code or SLOT_INVALID_CODE,
+                    probe.user_message or _SLOT_INVALID_MESSAGE,
+                    bool(probe.retryable),
+                    probe.provenance,
+                ),
+            )
+        _columns, rows, _row_count, truncated = _unpack_result(probe.result_full)
+        if truncated:
+            return (
+                None,
+                [],
+                ExecFailed(
+                    SLOT_INVALID_CODE,
+                    "Slot verification was incomplete. Use the raw query tools to verify the supplied binding.",
+                    True,
+                ),
+            )
         values = [str(row[0]) for row in rows if row and row[0] is not None]
-        return values, [probe.provenance]  # append UNCONDITIONALLY (None poisons the union)
+        if values and slot_type == "period" and isinstance(raw, str):
+            # The equality probe can return a DateTime serialized with a midnight
+            # suffix. A valid ISO date already verified by SQL keeps its typed input.
+            try:
+                dt.date.fromisoformat(raw.strip())
+            except ValueError:
+                pass
+            else:
+                values = [raw.strip()]
+        return values, [probe.provenance], None
 
     async def _restore_materialized(
         self,

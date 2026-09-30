@@ -40,6 +40,7 @@ question.
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -76,7 +77,9 @@ class SpanOutcome(Protocol):
     error_code: str | None
 
 
-def _stamp[OutcomeT: SpanOutcome](span: Span, outcome: OutcomeT) -> OutcomeT:
+def _stamp[OutcomeT: SpanOutcome](
+    span: Span, outcome: OutcomeT, *, reveal_result: bool = False, include_result: bool = False
+) -> OutcomeT:
     """Overwrite the span's optimistic `status="ok"` with what actually happened.
 
     Returns *outcome* so the caller's `with` body stays a single expression — see the
@@ -86,6 +89,28 @@ def _stamp[OutcomeT: SpanOutcome](span: Span, outcome: OutcomeT) -> OutcomeT:
     span.set_attribute("tool.status", outcome.status)
     if outcome.error_code is not None:
         span.set_attribute("tool.error_code", outcome.error_code)
+    if not include_result:
+        return outcome
+    pause = getattr(outcome, "pause", None)
+    preview = getattr(outcome, "result_preview", None)
+    if pause is not None:
+        span.set_attribute("tool.status", "paused")
+        span.set_attribute("tool.result.kind", "pause")
+        span.set_attribute("tool.pause.reason", pause.reason)
+        span.set_attribute("tool.pause.has_question", bool(pause.pending_question))
+        if pause.awaiting_node is not None:
+            span.set_attribute("tool.pause.awaiting_node", pause.awaiting_node)
+    elif preview is not None:
+        span.set_attribute("tool.result.kind", "result")
+        span.set_attribute("tool.result.row_count", preview.row_count)
+        span.set_attribute("tool.result.column_count", len(preview.columns))
+        span.set_attribute("tool.result.truncated", preview.truncated)
+        if reveal_result:
+            encoded = json.dumps(preview.preview_rows, default=str)
+            span.set_attribute("tool.result.preview_rows", encoded[:8000])
+            span.set_attribute("tool.result.preview_omitted_for_size", len(encoded) > 8000)
+    else:
+        span.set_attribute("tool.result.kind", "empty" if outcome.status == "ok" else "error")
     return outcome
 
 
@@ -113,7 +138,12 @@ async def in_tool_span[OutcomeT: SpanOutcome](
         reveal_complex_args=reveal_complex_args,
         record_exception=False,
     ) as span:
-        return _stamp(span, await work())
+        return _stamp(
+            span,
+            await work(),
+            reveal_result=reveal_complex_args,
+            include_result=tool_name in {"getBlueprint", "runBlueprint"},
+        )
 
 
 class RuntimeToolBase(ABC):

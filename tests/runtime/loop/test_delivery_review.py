@@ -101,7 +101,7 @@ async def test_no_verdict_exhaustion_is_not_approval():
     assert len(judge.briefs) == 3  # one proposal attempt plus two delivery attempts
 
 
-async def test_rejected_question_cannot_escape_through_no_verdict_repair():
+async def test_rejected_question_stays_resumable_without_becoming_approved():
     judge = Judge(
         [
             JudgeVerdict(False, "non_contextual_question", "Ask about the period.", reviewed=True),
@@ -118,9 +118,11 @@ async def test_rejected_question_cannot_escape_through_no_verdict_repair():
     )
     out = await run(loop)
     assert out.review["status"] == "rejected"
-    assert out.pending_question is None
+    assert out.pending_question is not None
+    assert out.status == "paused_ask_user"
+    assert out.assistant_text != "I don't have enough verified information to answer your question."
     doc = await store.get_or_create_session(CREDS.session_id)
-    assert doc.pause_checkpoint.consumed
+    assert not doc.pause_checkpoint.consumed
     assert doc.review_states["0"]["question_refusals"]
 
 
