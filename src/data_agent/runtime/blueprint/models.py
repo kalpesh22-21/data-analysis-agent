@@ -20,8 +20,18 @@ from typing import Any
 # Valid slot `type`s (D41/D49). Kept as a frozenset so the parse layer and the
 # loader validation agree on the closed set.
 SLOT_TYPES: frozenset[str] = frozenset(
-    {"string", "entity", "enum", "period", "as_of_date", "list",
-     "relative_window", "positive_integer", "period_range"}
+    {
+        "string",
+        "entity",
+        "enum",
+        "period",
+        "as_of_date",
+        "list",
+        "relative_window",
+        "positive_integer",
+        "nonnegative_integer",
+        "period_range",
+    }
 )
 
 # One plain-English gloss per SLOT_TYPE, surfaced by `getBlueprint` so the MODEL
@@ -43,6 +53,7 @@ SLOT_TYPE_GLOSS: dict[str, str] = {
         "not \"6 months\")."
     ),
     "positive_integer": "a whole number greater than zero, passed as a bare integer.",
+    "nonnegative_integer": "a whole number zero or greater, passed as a bare integer.",
     "period_range": "an explicit {start, end} date range.",
 }
 
@@ -87,8 +98,7 @@ def slot_type_gloss(type_: Any) -> str:
 # because it was written the other way round).
 WINDOW_ANCHOR_GLOSS: dict[str, str] = {
     "data": (
-        "this blueprint's window counts back from the latest data on record, not "
-        "from today's date."
+        "this blueprint's window counts back from the latest data on record, not from today's date."
     ),
     "calendar": (
         "this blueprint's window is bound to the calendar dates you supply, not to "
@@ -217,6 +227,7 @@ NODE_REF_KEY = "ref"
 # defaults; kept here so the parse-time bounds gate and the resolver agree.
 RELATIVE_WINDOW_FLOOR = 1
 RELATIVE_WINDOW_CEILING = 120
+INTEGER_CEILING = 2**31 - 1
 
 # Hard cap on declared `slots` (reviewer S3). Each `binds_to` slot can fire an
 # unbudgeted inner DISTINCT domain probe at execution, so a poisoned READ record
@@ -240,7 +251,7 @@ class SlotSpec:
     enum_values: tuple[str, ...] | None = None  # closed set for `type: enum`
     optional_pattern: str | None = None  # SQL fragment for an absent optional slot
     # Inclusive bounds for a `relative_window` integer (trailing "last N <unit>",
-    # D41/D49). Meaningful ONLY for `relative_window`; ignored for every other type.
+    # D41/D49), or numeric parameter. Numeric types have independent bounds.
     # `None` defers to the resolver's safety defaults (lo=1, hi=120 hard ceiling so
     # an absurd `INTERVAL 999999 MONTH` can't be authored or bound).
     min_value: int | None = None
@@ -272,7 +283,10 @@ class SlotSpec:
         # values are validated structurally, not matched against a DISTINCT set), so
         # a `binds_to` here would only fire a useless probe — reject it at parse.
         if binds_to is not None and type_ in (
-            "relative_window", "positive_integer", "period_range"
+            "relative_window",
+            "positive_integer",
+            "nonnegative_integer",
+            "period_range",
         ):
             raise BlueprintParseError(
                 f"slot {name!r} of type {type_!r} must not declare 'binds_to' — a "
@@ -292,7 +306,7 @@ class SlotSpec:
         if optional_pattern is not None and not isinstance(optional_pattern, str):
             raise BlueprintParseError(f"slot {name!r} 'optional_pattern' must be a string")
         # `min_value`/`max_value` — ints when present (only meaningful for
-        # `relative_window`; carried but unused for other types). A bool is an int
+        # integer slots; carried but unused for nonnumeric types). A bool is an int
         # subclass, so reject it explicitly (a `true` bound is an authoring bug).
         min_value = raw.get("min_value")
         if min_value is not None and (not isinstance(min_value, int) or isinstance(min_value, bool)):
@@ -300,18 +314,18 @@ class SlotSpec:
         max_value = raw.get("max_value")
         if max_value is not None and (not isinstance(max_value, int) or isinstance(max_value, bool)):
             raise BlueprintParseError(f"slot {name!r} 'max_value' must be an integer")
-        # H1b: an authored bound must satisfy `1 <= min_value <= max_value <=
-        # RELATIVE_WINDOW_CEILING` so an absurd `max_value: 999999` or an inverted
-        # `min > max` NEVER loads (the ceiling is a HARD cap, D49). Checked at WRITE
-        # (BlueprintParseError) — the resolver additionally clamps at READ (H1a).
-        lo = min_value if min_value is not None else RELATIVE_WINDOW_FLOOR
-        hi = max_value if max_value is not None else RELATIVE_WINDOW_CEILING
+        # Temporal windows retain D49; other integer parameters use their own
+        # bounded range. Never expand a temporal cap to accommodate a row limit.
+        floor = 0 if type_ == "nonnegative_integer" else 1
+        ceiling = RELATIVE_WINDOW_CEILING if type_ == "relative_window" else INTEGER_CEILING
+        lo = min_value if min_value is not None else floor
+        hi = max_value if max_value is not None else ceiling
         if min_value is not None or max_value is not None:
-            if not (RELATIVE_WINDOW_FLOOR <= lo <= hi <= RELATIVE_WINDOW_CEILING):
+            if not (floor <= lo <= hi <= ceiling):
                 raise BlueprintParseError(
                     f"slot {name!r} bounds must satisfy "
-                    f"{RELATIVE_WINDOW_FLOOR} <= min_value <= max_value <= "
-                    f"{RELATIVE_WINDOW_CEILING}, got min={min_value!r} max={max_value!r}"
+                    f"{floor} <= min_value <= max_value <= "
+                    f"{ceiling}, got min={min_value!r} max={max_value!r}"
                 )
         return cls(
             name=name,

@@ -250,5 +250,7 @@ async def test_null_scalar_fails_closed_never_binds_null_as_sql() -> None:
         blueprint_id="bp-inj", slot_bindings={}, credentials=_creds()
     )
     assert isinstance(outcome, ExecFailed)
-    assert outcome.error_code == SLOT_INVALID_CODE
+    assert outcome.error_code == "RUN_BLUEPRINT_INTERMEDIATE_UNAVAILABLE"
+    assert outcome.retryable is False
+    assert "tok" in outcome.user_message and "NULL" in outcome.user_message
     assert len(mcp.calls) == 1  # node 1 (the consumer) never dispatched

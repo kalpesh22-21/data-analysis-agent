@@ -19,7 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import RELATIVE_WINDOW_CEILING, RELATIVE_WINDOW_FLOOR, SlotSpec
+from .models import INTEGER_CEILING, RELATIVE_WINDOW_CEILING, RELATIVE_WINDOW_FLOOR, SlotSpec
 
 # Deictic / relative period words — never resolved to a concrete period here
 # (D49: fuzzy NL is never guessed); they route to `AskUser` (or, in Slice B, to a
@@ -150,8 +150,8 @@ def resolve_slot(
     # The windowed-period types resolve BEFORE the string/entity container guard
     # (line below): a `period_range` value is legitimately a dict/list, which that
     # guard would otherwise reject as "not a single value" (F1 windowed-slot gap).
-    if spec.type in ("relative_window", "positive_integer"):
-        return _resolve_relative_window(raw, spec)
+    if spec.type in ("relative_window", "positive_integer", "nonnegative_integer"):
+        return _resolve_integer(raw, spec)
     if spec.type == "period_range":
         return _resolve_period_range(raw, spec)
 
@@ -296,16 +296,16 @@ def _resolve_list(raw: Any, spec: SlotSpec, domain: Iterable[str] | None) -> Slo
     return SlotBinding(name=spec.name, value=resolved, resolved_from="list")
 
 
-def _resolve_relative_window(raw: Any, spec: SlotSpec) -> SlotResolution:
+def _resolve_integer(raw: Any, spec: SlotSpec) -> SlotResolution:
     """A trailing "last N <unit>" window: resolve the raw value to a BOUNDED integer `n`, bound
-        as an `INTERVAL {n} <unit>` number literal (D10 — never interpolated). Pure code, no LLM.
+    as an `INTERVAL {n} <unit>` number literal (D10 — never interpolated). Pure code, no LLM.
 
-        Accepts ONLY an `int` or a PURE-DIGIT string. ANY trailing non-digit text — "6 months",
-        "6 weeks", "6; DROP" — is REJECTED: the unit lives in the TEMPLATE (`INTERVAL {n} MONTH`),
-        so taking a leading integer and dropping the trailing "weeks" would silently bind a WEEK
-        count as MONTHS. A float, a non-numeric, or any trailing text goes to `AskUser`. `n` must
-        fall in `[lo, hi]`, where the ceiling is a HARD cap the resolver clamps to even if a spec
-        declares more, and `n >= 1` always.
+    Accepts ONLY an `int` or a PURE-DIGIT string. ANY trailing non-digit text — "6 months",
+    "6 weeks", "6; DROP" — is REJECTED: the unit lives in the TEMPLATE (`INTERVAL {n} MONTH`),
+    so taking a leading integer and dropping the trailing "weeks" would silently bind a WEEK
+    count as MONTHS. A float, a non-numeric, or any trailing text goes to `AskUser`. `n` must
+    fall in `[lo, hi]`, where the ceiling is a HARD cap the resolver clamps to even if a spec
+    declares more, and zero is accepted only by `nonnegative_integer`.
     """
     value = _normalize(raw)
     if isinstance(value, bool):
@@ -313,7 +313,7 @@ def _resolve_relative_window(raw: Any, spec: SlotSpec) -> SlotResolution:
         return AskUser(
             slot=spec.name,
             reason="invalid",
-            question=f"'{spec.name}' expects a whole number of periods (e.g. 6).",
+            question=f"'{spec.name}' expects a whole number (e.g. 6).",
         )
     if isinstance(value, int):
         n = value
@@ -328,12 +328,14 @@ def _resolve_relative_window(raw: Any, spec: SlotSpec) -> SlotResolution:
         return AskUser(
             slot=spec.name,
             reason="invalid",
-            question=f"'{spec.name}' expects a plain whole number of periods (e.g. 6), no unit.",
+            question=f"'{spec.name}' expects a plain whole number (e.g. 6), no unit.",
         )
-    lo = spec.min_value if spec.min_value is not None else _RELATIVE_WINDOW_MIN
-    hi = spec.max_value if spec.max_value is not None else _RELATIVE_WINDOW_MAX
-    lo = max(lo, _RELATIVE_WINDOW_MIN)  # n >= 1 always (a 0/negative window is no filter)
-    hi = min(hi, _RELATIVE_WINDOW_MAX)  # H1a: the ceiling is HARD even if max_value > it
+    floor = 0 if spec.type == "nonnegative_integer" else 1
+    ceiling = _RELATIVE_WINDOW_MAX if spec.type == "relative_window" else INTEGER_CEILING
+    lo = spec.min_value if spec.min_value is not None else floor
+    hi = spec.max_value if spec.max_value is not None else ceiling
+    lo = max(lo, floor)  # zero is allowed only for nonnegative integer parameters
+    hi = min(hi, ceiling)  # H1a: the ceiling is HARD even if max_value > it
     if not (lo <= n <= hi):
         return AskUser(
             slot=spec.name,
@@ -365,7 +367,7 @@ def _resolve_period_range(raw: Any, spec: SlotSpec) -> SlotResolution:
             reason="invalid",
             question=(
                 f"'{spec.name}' needs explicit start and end dates "
-                "(e.g. {\"start\": \"2026-01-01\", \"end\": \"2026-03-31\"})."
+                '(e.g. {"start": "2026-01-01", "end": "2026-03-31"}).'
             ),
         )
     start = _normalize(start)

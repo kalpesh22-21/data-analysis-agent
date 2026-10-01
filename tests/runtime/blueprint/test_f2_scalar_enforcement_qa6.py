@@ -176,7 +176,9 @@ async def test_scalar_node_null_cell_fails_closed() -> None:
         blueprint_id="bp-f2", slot_bindings={}, credentials=_creds()
     )
     assert isinstance(outcome, ExecFailed)
-    assert outcome.error_code == SLOT_INVALID_CODE
+    assert outcome.error_code == "RUN_BLUEPRINT_INTERMEDIATE_UNAVAILABLE"
+    assert outcome.retryable is False
+    assert "tok" in outcome.user_message and "NULL" in outcome.user_message
     assert len(mcp.calls) == 1
 
 

@@ -150,11 +150,14 @@ def assert_read_only_select(tree: exp.Expression) -> None:
 
 
 def contains_star(tree: exp.Expression) -> bool:
-    """True iff the parsed template contains a `*` star anywhere, top-level OR in a subquery. A
-        star names ZERO columns, so it reads EVERY column while showing an empty footprint; the
-        loader rejects it, and a blueprint must name its columns.
+    """Reject column-expanding stars, including nested/qualified stars.
+
+    COUNT(*) counts rows without expanding the source column footprint.
     """
-    return any(isinstance(node, exp.Star) for node in tree.walk())
+    return any(
+        isinstance(node, exp.Star) and not isinstance(node.parent, exp.Count)
+        for node in tree.walk()
+    )
 
 
 def referenced_slots(sql_template: str) -> set[str]:

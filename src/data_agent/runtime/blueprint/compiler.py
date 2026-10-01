@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from sqlglot import exp
+from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify_columns import qualify_columns, validate_qualify_columns
 from sqlglot.optimizer.qualify_tables import qualify_tables
 from sqlglot.schema import MappingSchema
@@ -1215,7 +1216,33 @@ def _assert_template_reads_within_uses(
         # (e.g. an empty column map), and every failure on this path must surface as a
         # `CorpusLoadError`, never a raw sqlglot exception.
         schema = MappingSchema(schema_dict, dialect="clickhouse")
-        qualified = qualify_tables(tree.copy(), dialect="clickhouse")
+        prepared = tree.copy()
+        # Expand explicitly quoted display aliases only in GROUP/ORDER clauses.
+        # WHERE and bare identifiers retain strict source-column qualification.
+        for select in prepared.find_all(exp.Select):
+            aliases = {
+                a.alias: a.this
+                for a in select.expressions
+                if isinstance(a, exp.Alias) and a.args["alias"].args.get("quoted")
+            }
+            for clause_name in ("group", "order"):
+                clause = select.args.get(clause_name)
+                if clause is None:
+                    continue
+                for column in list(clause.find_all(exp.Column)):
+                    if column.find_ancestor(exp.Select) is not select or column.table:
+                        continue
+                    source = aliases.get(column.name)
+                    if source is None or not column.this.args.get("quoted"):
+                        continue
+                    # A simple identifier alias can collide with a real column.
+                    # Spaced display labels cannot silently hide that bare read.
+                    if isinstance(source, exp.Column) and " " not in column.name:
+                        continue
+                    column.replace(source.copy())
+        qualified = qualify_tables(
+            normalize_identifiers(prepared, dialect="clickhouse"), dialect="clickhouse"
+        )
         _assert_source_tables_in_uses(bp_id, where, qualified, schema_dict)
         qualified = qualify_columns(
             qualified,

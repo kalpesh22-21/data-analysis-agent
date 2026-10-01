@@ -678,6 +678,23 @@ class BlueprintExecutor:
             # downstream and return a "verified" wrong answer, §2.4).
             scalar_out = _extract_scalar_output(node, result.result_full)
             if scalar_out is None:
+                columns, rows, _, _ = _unpack_result(result.result_full)
+                missing = [
+                    name
+                    for name, kind in node.output.items()
+                    if kind == "scalar"
+                    and name in columns
+                    and len(rows) == 1
+                    and len(rows[0]) == len(columns)
+                    and rows[0][columns.index(name)] is None
+                ]
+                if missing:
+                    return ExecFailed(
+                        "RUN_BLUEPRINT_INTERMEDIATE_UNAVAILABLE",
+                        f"Blueprint node {node.order} returned NULL for intermediate "
+                        f"{', '.join(missing)}; the dependent calculation cannot run with this data.",
+                        retryable=False,
+                    )
                 _logger.warning(
                     "blueprint %s node %s declared a scalar output but did not return "
                     "a single cell; SLOT_INVALID (no arbitrary fanned-out bind)",
@@ -723,7 +740,7 @@ class BlueprintExecutor:
         omitted_patterns: dict[str, str] = {}
         for spec in blueprint.slots:
             raw = slot_bindings.get(spec.name)
-            if _is_present(raw) and spec.binds_to:
+            if _is_present(raw) and spec.binds_to and spec.type != "enum":
                 domain, probe_entries, failure = await self._probe_domain(
                     spec.binds_to, credentials, raw=raw, slot_type=spec.type
                 )
@@ -876,7 +893,13 @@ class BlueprintExecutor:
                 blueprint.id,
                 reason,
             )
-            return ExecFailed(VERIFY_FAILED_CODE, _VERIFY_FAILED_MESSAGE, retryable=True)
+            return ExecFailed(
+                VERIFY_FAILED_CODE,
+                f"{_VERIFY_FAILED_MESSAGE} Verification detail: {reason or 'grain probe unavailable'}. "
+                f"Declared grain: {list(blueprint.result_grain.columns)}; "
+                f"result columns: {_unpack_result(terminal_result)[0]}.",
+                retryable=True,
+            )
 
         columns, rows, row_count, truncated = _unpack_result(terminal_result)
         result_full: dict[str, Any] = {
