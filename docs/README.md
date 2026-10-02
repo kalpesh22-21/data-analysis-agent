@@ -22,6 +22,10 @@ fundamentals of OpenAI's in-house data agent but adapted for a **curated** wareh
 | 11 | [Testing](11-testing.md) | Four-layer pyramid; Docker + Playwright(MCP) spec-conformance suite |
 | 12 | [Extensibility](12-extensibility.md) | Skills & lifecycle hooks: hook points, skill manifests, interface contracts, invariant constraints |
 
+## Proposed designs
+
+- [Compact episodic memory](episodic-memory-design.md) — task checkpoints, bounded context, retrieval, and evidence expansion; planned for later implementation.
+
 ## Decision record
 
 - [decisions/DECISIONS.md](decisions/DECISIONS.md) — locked decisions, dated, with rationale.
