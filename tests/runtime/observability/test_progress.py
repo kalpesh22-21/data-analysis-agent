@@ -12,7 +12,7 @@ from data_agent.runtime.observability.progress import (
 def test_to_progress_event_renders_known_events() -> None:
     event = to_progress_event("tool_dispatch_start", {"tool_name": "runQuery"})
     assert event is not None
-    assert event.step == "finding the requested information…"
+    assert event.step == "Finding the requested information…"
     assert event.shape == {"tool_name": "runQuery", "lifecycle": "start"}
 
 
@@ -42,7 +42,7 @@ def test_to_progress_event_never_carries_sql_or_credentials() -> None:
 def test_to_progress_event_falls_back_to_bare_label_on_missing_placeholder() -> None:
     event = to_progress_event("tool_dispatch_start", {})
     assert event is not None
-    assert event.step == "working on the next part of your question…"  # no KeyError raised
+    assert event.step == "Working on the next part of your question…"  # no KeyError raised
 
 
 def test_tool_progress_summary_uses_summary_verbatim_bypassing_labels() -> None:
@@ -95,7 +95,7 @@ async def test_progress_emitter_streams_events_until_closed() -> None:
     emitter.close()
 
     events = [e async for e in emitter.stream()]
-    assert [e.step for e in events] == ["checking what information is available…", "done"]
+    assert [e.step for e in events] == ["Checking what information is available…", "Done"]
 
 
 async def test_progress_emitter_drops_unknown_events_silently() -> None:
@@ -184,3 +184,12 @@ def test_initial_progress_trio_is_suppressed():
         ("loop_model_call_start", {"window": 1}),
     ):
         assert to_progress_event(event, payload) is None
+
+
+def test_analysis_state_progress_is_suppressed_including_summaries():
+    for event in ("tool_dispatch_start", "tool_dispatch_ok", "tool_dispatch_denied",
+                  "tool_dispatch_error", "tool_progress_summary"):
+        assert to_progress_event(event, {
+            "tool_name": "updateAnalysisState", "tool_call_id": "state-1",
+            "summary": "Organizing the requested parts",
+        }) is None

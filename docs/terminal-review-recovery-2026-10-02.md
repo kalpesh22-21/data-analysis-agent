@@ -34,3 +34,7 @@ Tests cover real timeout cancellation without duplicate review, exhausted receip
 The judge-fix full run passed 8,631 tests with 229 skipped and the same 22 previously established baseline evaluation failures. Follow-up progress changes are covered by the affected loop/observability/harness suite.
 
 No changes to the remote corpus, hydrator publication policy, API schema/scope behavior, or episodic-memory implementation are included.
+
+## Progress follow-up
+
+Default progress labels and static summary fallbacks start with a capital letter. Authored summaries remain verbatim. `updateAnalysisState` dispatch and summary events are suppressed from UI progress, and the loop does not schedule its progress summarizer. Tool execution and internal tracing remain unchanged.

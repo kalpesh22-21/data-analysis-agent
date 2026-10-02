@@ -68,7 +68,7 @@ async def test_summarize_strips_wrapping_quotes() -> None:
     fake = _FakeModelClient('"Listing tables in the warehouse"')
     summarizer = ProgressSummarizer(fake)
 
-    assert await summarizer.summarize("listTables", {}) == "checking what information is available"
+    assert await summarizer.summarize("listTables", {}) == "Checking what information is available"
 
 
 @pytest.mark.parametrize(
@@ -85,7 +85,7 @@ async def test_summarize_replaces_mechanical_language(produced: str) -> None:
         await ProgressSummarizer(_FakeModelClient(produced)).summarize(
             "searchBlueprints", {"query": "employee positions"}
         )
-        == "finding a suitable way to calculate the measures you requested"
+        == "Finding a suitable way to calculate the measures you requested"
     )
 
 
@@ -230,7 +230,7 @@ async def test_unknown_tool_uses_generic_static_line_without_calling_model() -> 
         "someNewTool", {"database": "dbpcm_warehouse", "table": "employee"}
     )
 
-    assert line == "working on your question"
+    assert line == "Working on your question"
     assert fake.calls == []
 
 
@@ -295,7 +295,7 @@ async def test_a_line_repeating_a_withheld_identifier_falls_back_to_the_static_l
         "runQuery", {"sql": "SELECT count() FROM dbpcm_warehouse.employee"}
     )
 
-    assert line == "finding the requested information"
+    assert line == "Finding the requested information"
 
 
 async def test_the_post_filter_catches_a_bare_table_name_from_a_withheld_arg() -> None:
@@ -306,7 +306,7 @@ async def test_the_post_filter_catches_a_bare_table_name_from_a_withheld_arg() -
         "getTableSchema", {"database": "dbpcm_warehouse", "table": "EmployeeMaster"}
     )
 
-    assert line == "checking which details can answer your question"
+    assert line == "Checking which details can answer your question"
 
 
 async def test_the_post_filter_catches_a_bare_table_name_from_the_withheld_sql() -> None:
@@ -319,7 +319,7 @@ async def test_the_post_filter_catches_a_bare_table_name_from_the_withheld_sql()
         "runQuery", {"sql": "SELECT count() FROM employee_master WHERE Active = 1"}
     )
 
-    assert line == "finding the requested information"
+    assert line == "Finding the requested information"
 
 
 async def test_the_post_filter_is_case_insensitive() -> None:
@@ -333,7 +333,7 @@ async def test_the_post_filter_is_case_insensitive() -> None:
     ):
         fake = _FakeModelClient(produced)
         line = await ProgressSummarizer(fake).summarize("runQuery", {"sql": sql})
-        assert line == "finding the requested information", produced
+        assert line == "Finding the requested information", produced
 
 
 async def test_the_post_filter_reads_a_withheld_identifier_out_of_a_nested_argument() -> None:
@@ -346,7 +346,7 @@ async def test_the_post_filter_reads_a_withheld_identifier_out_of_a_nested_argum
         "runQuery", {"payload": {"q": {"sql": "SELECT 1 FROM dbpcm_warehouse.payroll"}}}
     )
 
-    assert line == "finding the requested information"
+    assert line == "Finding the requested information"
 
 
 async def test_the_post_filter_leaves_a_clean_line_alone() -> None:
@@ -383,7 +383,7 @@ async def test_an_unknown_tool_falls_back_to_the_generic_line() -> None:
 
     line = await summarizer.summarize("someNewTool", {"table": "dbpcm_warehouse.employee"})
 
-    assert line == "working on your question"
+    assert line == "Working on your question"
 
 
 # --- the UNCONDITIONAL structural check (provenance-independent) ------------
@@ -404,7 +404,7 @@ async def test_a_dotted_identifier_from_an_allowlisted_arg_is_still_replaced() -
         "resolveValues", {"concept": "earnings codes in dbpcm_warehouse.payroll"}
     )
 
-    assert line == "matching your wording to the available choices"
+    assert line == "Matching your wording to the available choices"
 
 
 async def test_a_dotted_identifier_in_a_slot_value_or_search_query_is_replaced() -> None:
@@ -414,19 +414,19 @@ async def test_a_dotted_identifier_in_a_slot_value_or_search_query_is_replaced()
             "runBlueprint",
             {"id": "bp-headcount", "slot_bindings": {"department": "dbpcm_warehouse.employee"}},
             "Running headcount over dbpcm_warehouse.employee",
-            "calculating the requested result",
+            "Calculating the requested result",
         ),
         (
             "searchBlueprints",
             {"query": "overtime from payroll_detail table"},
             "Searching blueprints over payroll_detail",
-            "finding a suitable way to calculate the measures you requested",
+            "Finding a suitable way to calculate the measures you requested",
         ),
         (
             "recordAssumptions",
             {"assumptions": ["Used employee.AnnualSalary for pay"]},
             "Noting that employee.AnnualSalary was used",
-            "noting the assumptions behind the answer",
+            "Noting the assumptions behind the answer",
         ),
     )
     for tool, arguments, produced, expected in cases:
@@ -445,7 +445,7 @@ async def test_a_backtick_quoted_identifier_is_replaced() -> None:
         line = await ProgressSummarizer(_FakeModelClient(produced)).summarize(
             "searchBlueprints", {"query": "headcount"}
         )
-        assert line == "finding a suitable way to calculate the measures you requested", produced
+        assert line == "Finding a suitable way to calculate the measures you requested", produced
 
 
 async def test_a_sql_fragment_in_the_line_is_replaced() -> None:
@@ -457,7 +457,7 @@ async def test_a_sql_fragment_in_the_line_is_replaced() -> None:
         line = await ProgressSummarizer(_FakeModelClient(produced)).summarize(
             "searchBlueprints", {"query": "headcount"}
         )
-        assert line == "finding a suitable way to calculate the measures you requested", produced
+        assert line == "Finding a suitable way to calculate the measures you requested", produced
 
 
 async def test_the_shape_check_leaves_ordinary_business_prose_alone() -> None:
@@ -547,4 +547,4 @@ async def test_request_context_is_bounded_and_cannot_license_internal_progress()
     fake = _FakeModelClient("Searching blueprints in internal_payroll")
     line = await ProgressSummarizer(fake).summarize("runQuery", {}, user_request="x" * 10000)
     assert len(fake.calls[0][0][-1]["content"]) < 1400
-    assert line == "finding the requested information"
+    assert line == "Finding the requested information"

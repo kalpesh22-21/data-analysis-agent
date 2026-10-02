@@ -18,7 +18,7 @@ from tests.runtime.dispatch.test_tool_dispatcher import CATALOG, _credentials
 @pytest.mark.parametrize("status", ["ok", "denied", "error"])
 async def test_dispatch_lifecycle_survives_sse_for_remote_and_runtime_tools(path, status):
     emitter = ProgressEmitter()
-    name = "runQuery" if path == "mcp" else "updateAnalysisState"
+    name = "runQuery" if path == "mcp" else "recordAssumptions"
     payload = {"tool_name": name, "tool_call_id": "step-1"}
 
     async def execute():
@@ -172,4 +172,4 @@ async def test_without_summary_completion_keeps_start_label(status):
     emitter.close()
     events = [event async for event in emitter.stream()]
     assert [event.shape["lifecycle"] for event in events] == ["start", status]
-    assert events[0].step == events[1].step == "finding the requested information…"
+    assert events[0].step == events[1].step == "Finding the requested information…"

@@ -87,12 +87,6 @@ _STEP_LABELS: dict[str, str] = {
     "loop_hard_ceiling_stop": "stopping here because this request has reached its time or work limit",
 }
 
-_TOOL_PROGRESS_LABELS: dict[tuple[str, str], str] = {
-    ("tool_dispatch_start", "updateAnalysisState"): "I’m organizing the parts of your question…",
-    ("tool_dispatch_ok", "updateAnalysisState"): "I’ve mapped out what needs to be answered",
-}
-
-
 @dataclass(frozen=True)
 class ProgressEvent:
     """One coarse, PII-safe progress step for the UI (D61)."""
@@ -142,6 +136,8 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
     Returns `None` for observer events that have no user-facing progress label; callers
     simply drop those.
     """
+    if payload.get("tool_name") == "updateAnalysisState":
+        return None
     # Answer tools stage proposals; their dispatch success is not judge approval.
     if payload.get("tool_name") in {"answerWithText", "answerWithTable", "finalizeAnswer"}:
         if payload.get("judge_approved") is not True:
@@ -157,8 +153,8 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
         shape = _progress_shape(event, payload)
         return ProgressEvent(step=summary.strip(), shape=shape)
     tool_name = payload.get("tool_name")
-    label = _TOOL_PROGRESS_LABELS.get((event, tool_name)) if isinstance(tool_name, str) else None
-    if label is None and event == "tool_dispatch_start" and isinstance(tool_name, str):
+    label = None
+    if event == "tool_dispatch_start" and isinstance(tool_name, str):
         label = _static_line(tool_name) + "…"
     if label is None:
         label = _STEP_LABELS.get(event)
@@ -169,7 +165,7 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
         step = label.format(**shape)
     except KeyError:
         step = label
-    return ProgressEvent(step=step, shape=shape)
+    return ProgressEvent(step=step[:1].upper() + step[1:], shape=shape)
 
 
 @dataclass(frozen=True)

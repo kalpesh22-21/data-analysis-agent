@@ -1642,7 +1642,7 @@ class AgentLoop:
         user_request: str = "",
     ) -> None:
         """Reserve an ordered progress slot and start a summary without delaying execution."""
-        if self._progress_summarizer is None:
+        if self._progress_summarizer is None or tool_name == "updateAnalysisState":
             return
         task = asyncio.create_task(
             self._summarize_and_emit(

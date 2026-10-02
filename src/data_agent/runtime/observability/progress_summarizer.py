@@ -355,7 +355,8 @@ def _static_line(tool_name: str) -> str:
     """The safe, deterministic line for *tool_name*, used when the model's line is
     rejected. Never contains the tool name or internal implementation terms.
     """
-    return _STATIC_LINES.get(tool_name, _GENERIC_STATIC_LINE)
+    line = _STATIC_LINES.get(tool_name, _GENERIC_STATIC_LINE)
+    return line[:1].upper() + line[1:]
 
 
 class ProgressSummarizer:
