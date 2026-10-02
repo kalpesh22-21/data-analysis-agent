@@ -677,6 +677,10 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "tokens",
     "reviewed",
     "outcome",
+    # Partial delivery shape only; never answer text or evidence identifiers.
+    "evidence_count",
+    "text_length",
+    "card_count",
     # --- the finish-time answer rules (05 §L) ---
     # `loop_answer_rule_refused.rule` / `loop_answer_rule_exhausted.rule` — WHICH rule
     # the finishing prose tripped (`ungrounded_quantity`, `markdown_table`). A closed

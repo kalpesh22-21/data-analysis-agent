@@ -131,7 +131,7 @@ def restore_partial(snapshot):
 MIN_EXIT_REVIEW_SECONDS = 30.0
 
 
-async def recover_partial(loop, session_id, turn_index, accum, draft):
+async def recover_partial(loop, session_id, turn_index, accum, draft, *, allow_review=True):
     import asyncio
 
     from .delivery import CURRENT_DELIVERY
@@ -144,7 +144,7 @@ async def recover_partial(loop, session_id, turn_index, accum, draft):
         timeout = min(timeout, context.review_seconds)
     try:
         return await asyncio.wait_for(
-            _recover_partial(loop, session_id, turn_index, accum, draft),
+            _recover_partial(loop, session_id, turn_index, accum, draft, allow_review=allow_review),
             timeout=timeout,
         )
     except TimeoutError:
@@ -154,7 +154,7 @@ async def recover_partial(loop, session_id, turn_index, accum, draft):
         return None
 
 
-async def _recover_partial(loop, session_id, turn_index, accum, draft):
+async def _recover_partial(loop, session_id, turn_index, accum, draft, *, allow_review=True):
     """One terminal review using existing evidence, or reuse an unchanged approval."""
     from .delivery import CURRENT_DELIVERY, delivery_version, review_once
     from .judge_evidence import enrich_brief
@@ -166,6 +166,9 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
     state = ReviewState.restore(
         doc.review_states.get(str(turn_index)), compute_scope_hash(context.credentials.column_scope)
     )
+    if not allow_review and not state.approved_partial:
+        loop._observer("loop_partial_answer_failed", {"reason": "no_approved_partial"})
+        return None
     try:
         results, anchor, trail = await loop._judge_results(
             session_id,
@@ -179,12 +182,21 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
             snapshot = state.approved_partial = {}
         if not snapshot:
             # No queries, no model-agent turn, and at most one judge call here.
-            if (
-                not any(evidence_kind(e) for e in current)
-                or context.review_seconds < MIN_EXIT_REVIEW_SECONDS
-                or context.partial_review_attempted
-                or context.review_unavailable
-            ):
+            reason = (
+                "no_approved_partial"
+                if not allow_review
+                else "no_evidence"
+                if not any(evidence_kind(e) for e in current)
+                else "insufficient_review_budget"
+                if context.review_seconds < MIN_EXIT_REVIEW_SECONDS
+                else "already_attempted"
+                if context.partial_review_attempted
+                else "review_unavailable"
+                if context.review_unavailable
+                else ""
+            )
+            if reason:
+                loop._observer("loop_partial_answer_failed", {"reason": reason})
                 return None
             context.partial_review_attempted = True
             brief = loop._judge_brief(
@@ -258,6 +270,7 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                     )
             snapshot = capture_partial(verdict, brief, accum, current, turn_index)
         if not snapshot:
+            loop._observer("loop_partial_answer_failed", {"reason": "no_valid_partial"})
             return None
         text, recovered, provenance = restore_partial(snapshot)
         state.approved_partial = snapshot
@@ -266,9 +279,16 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
         state.violation = ""
         state.delivery_version = delivery_version(text, recovered)
         state.delivery_status = "approved"
+        state.delivery_reason = ""
         await loop._session_store.write_review_state(session_id, turn_index, state.to_doc())
         loop._observer(
-            "loop_partial_answer_recovered", {"evidence_count": len(snapshot["evidence"])}
+            "loop_partial_answer_recovered",
+            {
+                "evidence_count": len(snapshot["evidence"]),
+                "text_length": len(text),
+                "table_count": len(recovered.answer_tables),
+                "card_count": len(recovered.capability_cards or ()),
+            },
         )
         return text, recovered, provenance
     except Exception:

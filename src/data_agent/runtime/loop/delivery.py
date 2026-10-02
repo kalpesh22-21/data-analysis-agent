@@ -25,7 +25,9 @@ class DeliveryContext:
     terminal_review_status: str = ""
     partial_review_attempted: bool = False
     review_unavailable: bool = False
+    review_failure_reason: str = ""
     resilient_exit: bool = False
+    corrected_answer: str | None = None
 
 
 CURRENT_DELIVERY: ContextVar[DeliveryContext | None] = ContextVar("delivery", default=None)
@@ -133,10 +135,14 @@ async def review_once(loop, brief, *, repair=False, terminal=False):
         )
         if context and verdict.approved and not verdict.reviewed:
             context.review_unavailable = True
+            context.review_failure_reason = "unreviewed"
         return verdict
-    except Exception:
+    except Exception as exc:
         if context:
             context.review_unavailable = True
+            context.review_failure_reason = (
+                "timeout" if isinstance(exc, TimeoutError) else "review_failed"
+            )
         raise
     finally:
         if context:
@@ -231,6 +237,14 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
         and (not state.violation or pending and state.site != "ask_user")
     ):
         return {"status": "approved"}, False
+    if (
+        not pending
+        and state.delivery_version == version
+        and state.delivery_status == "exhausted"
+        and not state.violation
+    ):
+        loop._observer("loop_delivery_review", {"status": "exhausted", "calls": 0})
+        return {"status": "exhausted"}, False
     site = (
         "ask_user"
         if pending
@@ -267,10 +281,8 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
         loop._observer("loop_delivery_review", {"site": site, "status": "exhausted", "calls": 0})
         return {"status": "exhausted", "attempts": 0}, False
     status = "rejected" if outstanding or bool(pending and state.question_refusals) else "exhausted"
-    for _ in range(2):
-        if context.review_seconds <= 0:
-            break
-        calls += 1
+    if context.review_seconds > 0:
+        calls = 1
         try:
             results, anchor, trail = await loop._judge_results(
                 session_id, turn_index, context.credentials.column_scope
@@ -307,6 +319,8 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
                 brief,
                 clarification_answers=tuple(questions[1:]),
                 selected_components=tuple(components),
+                allow_partial_answer=not pending,
+                allow_prose_correction=not pending,
             )
             from .judge_evidence import enrich_brief
 
@@ -327,21 +341,51 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
             verdict = await review_once(loop, brief, terminal=True)
         except Exception:
             loop._observer("loop_answer_judge_failed", {"reason": "delivery_review_failed"})
-            continue
-        if not verdict.approved:
-            if pending:
-                state.question_refusals[question_version] = verdict.violation
-            else:
-                state.site = site
-                state.reject(verdict, version, accum.assumptions)
-            status = "rejected"
-            break
-        if verdict.reviewed:
-            status = "rejected" if outstanding else "approved"
-            if pending:
-                state.question_refusals.clear()
-            break
+        else:
+            if not pending and verdict.reviewed:
+                from .partial_answer import capture_partial
+
+                snapshot = capture_partial(verdict, brief, accum, current_trail, turn_index)
+                if snapshot:
+                    state.approved_partial = snapshot
+            if not pending and verdict.corrected_answer is not None:
+                from .prose_correction import validate_correction
+
+                error = validate_correction(
+                    verdict,
+                    original=text or "",
+                    provenance=await loop._compute_turn_provenance_union(session_id, turn_index),
+                    turn_sql=accum.sql_executed,
+                    assumptions=accum.assumptions or (),
+                    question=questions[0] if questions else "",
+                    has_evidence=bool(results or accum.has_answer_tables or accum.capability_cards),
+                    declined_clarification=False,
+                )
+                if error:
+                    from .answer_judge import JudgeVerdict
+
+                    verdict = JudgeVerdict(
+                        False, "unsupported_by_evidence", error, reviewed=True, repair_type="prose"
+                    )
+                else:
+                    context.corrected_answer = verdict.corrected_answer
+                    version = delivery_version(verdict.corrected_answer, accum)
+                    loop._observer("loop_answer_judge_prose_corrected", {"site": site})
+            if not verdict.approved:
+                if pending:
+                    state.question_refusals[question_version] = verdict.violation
+                else:
+                    state.site = site
+                    state.reject(verdict, version, accum.assumptions)
+                status = "rejected"
+            elif verdict.reviewed:
+                status = "rejected" if outstanding else "approved"
+                if pending:
+                    state.question_refusals.clear()
     state.delivery_version, state.delivery_status = version, status
+    state.delivery_reason = (
+        (context.review_failure_reason or "review_unavailable") if status == "exhausted" else ""
+    )
     await loop._session_store.write_review_state(session_id, turn_index, state.to_doc())
     loop._observer("loop_delivery_review", {"site": site, "status": status, "calls": calls})
     return {"status": status, "attempts": calls}, status == "rejected"

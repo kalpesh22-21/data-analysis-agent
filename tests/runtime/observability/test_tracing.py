@@ -294,3 +294,13 @@ def test_tool_span_still_records_exceptions_by_default() -> None:
 
     (span,) = exporter.get_finished_spans()
     assert [event.name for event in span.events] == ["exception"]
+
+
+def test_partial_recovery_span_exports_shape_without_payload():
+    attributes = _observed_attributes("loop_partial_answer_recovered", {
+        "evidence_count": 2, "text_length": 100, "table_count": 1, "card_count": 0,
+        "answer": "PRIVATE", "evidence": ["PRIVATE"],
+    })
+    for name, value in {"evidence_count": 2, "text_length": 100, "table_count": 1, "card_count": 0}.items():
+        assert attributes[name] == value
+    assert "PRIVATE" not in str(attributes)

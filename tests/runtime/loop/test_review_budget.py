@@ -175,10 +175,11 @@ async def test_terminal_reserve_survives_exhausted_proposal_and_repair(monkeypat
 
 @pytest.mark.parametrize("total,initial_timeout", [(180.0, 60.0), (90.0, 30.0)])
 @pytest.mark.parametrize("final_result", ["approved", "rejected", "timeout"])
-async def test_final_delivery_uses_remaining_reserves_after_initial_timeout(
-    monkeypatch, total, initial_timeout, final_result
+@pytest.mark.parametrize("changed_delivery", [False, True])
+async def test_final_delivery_reuses_timeout_unless_delivery_changed(
+    monkeypatch, total, initial_timeout, final_result, changed_delivery
 ):
-    """Reproduce the live timeout without waiting: delivery must make a real call."""
+    """An unchanged timeout is final; a changed delivery can use the reserve."""
     now = [0.0]
     deadlines = []
     contexts = []
@@ -215,17 +216,32 @@ async def test_final_delivery_uses_remaining_reserves_after_initial_timeout(
     judge = TimedJudge()
     loop, _, _, _, _ = build([discovery(), query(), batch(finish())], judge)
     loop._answer_judge_review_budget_seconds = total
+    if changed_delivery:
+        original_finish = loop._finish
+
+        async def changed_finish(**kwargs):
+            kwargs["assistant_text"] += " These are the available records."
+            return await original_finish(**kwargs)
+
+        loop._finish = changed_finish
     out = await run(loop)
+    if not changed_delivery:
+        assert deadlines == [initial_timeout]
+        assert len(judge.briefs) == 1
+        assert out.review["status"] == "exhausted"
+        assert "120" in out.assistant_text
+        assert contexts[-1].review_seconds == total - initial_timeout
+        return
     assert deadlines[:2] == [initial_timeout, 60.0]
     assert (
         out.review["status"]
         == {"approved": "approved", "rejected": "rejected", "timeout": "exhausted"}[final_result]
     )
-    assert len(judge.briefs) == (3 if final_result == "timeout" and total == 180 else 2)
+    assert len(judge.briefs) == 2
     assert contexts[-1].review_seconds >= 0
     assert now[0] <= total
     if final_result == "timeout":
-        assert contexts[-1].review_seconds == 0
+        assert contexts[-1].review_seconds == max(0, total - initial_timeout - 60)
     if final_result == "rejected":
         assert "120" not in out.assistant_text
         assert not out.answer_tables

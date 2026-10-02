@@ -361,7 +361,7 @@ async def test_exit_deadline_uses_configured_timeout_and_remaining_budget(monkey
         deadlines.append(timeout)
         return await awaitable
 
-    async def recovered(*args):
+    async def recovered(*args, **kwargs):
         return "cached"
 
     monkeypatch.setattr(asyncio, "wait_for", fake_wait)

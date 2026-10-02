@@ -2252,6 +2252,27 @@ class AgentLoop:
         review, withheld = await review_delivery(
             self, session_id, turn_index, assistant_text, accum, checkpoint
         )
+        delivery_context = CURRENT_DELIVERY.get()
+        if delivery_context and delivery_context.corrected_answer is not None:
+            assistant_text = delivery_context.corrected_answer
+            delivery_context.corrected_answer = None
+        if withheld and review.get("status") == "rejected" and not checkpoint and not partial_recovered:
+            # Finish has no agent repair round. Reuse only a validated subset
+            # already supplied by a judge; never start another review here.
+            from .partial_answer import recover_partial
+
+            recovered = await recover_partial(
+                self, session_id, turn_index, accum, assistant_text, allow_review=False
+            )
+            if recovered:
+                assistant_text, accum, provenance = recovered
+                partial_recovered = True
+                persist_text = assistant_text
+                capability_cards = accum.capability_cards
+                completion_notice = None
+                ship_disposition = None
+                retained_assumption_count = 0
+                review, withheld = {"status": "approved"}, False
         if partial_recovered:
             review = {**review, "completion": "partial"}
         # A resilient exit has already applied the ship guard and rendered its
@@ -4879,6 +4900,17 @@ class AgentLoop:
                         ship_guard.note_approval()
                         review_state.delivery_version = delivery_version(final_text, accum)
                         review_state.delivery_status = "approved"
+                        review_state.delivery_reason = ""
+                    elif verdict.approved:
+                        # An unavailable review is a disposition, never an approval.
+                        # Reuse it only for this exact delivery and without overriding
+                        # any outstanding substantive rejection.
+                        review_state.delivery_version = delivery_version(final_text, accum)
+                        review_state.delivery_status = "exhausted"
+                        delivery_context = CURRENT_DELIVERY.get()
+                        review_state.delivery_reason = (
+                            delivery_context.review_failure_reason if delivery_context else ""
+                        ) or "review_unavailable"
                     elif not verdict.approved:
                         self._observer(
                             ANSWER_JUDGE_REFUSED_EVENT,

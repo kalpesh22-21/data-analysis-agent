@@ -19,6 +19,7 @@ class ReviewState:
     question_refusals: dict[str, str] = field(default_factory=dict)
     delivery_version: str = ""
     delivery_status: str = ""
+    delivery_reason: str = ""
     prose_correction: dict[str, str] = field(default_factory=dict)
     approved_partial: dict[str, Any] = field(default_factory=dict)
     calls: int = 0
@@ -54,6 +55,7 @@ class ReviewState:
             state.approved_version = ""
             state.delivery_version = ""
             state.delivery_status = ""
+            state.delivery_reason = ""
             state.prose_correction = {}
             state.approved_partial = {}
             state.feedback = ""
