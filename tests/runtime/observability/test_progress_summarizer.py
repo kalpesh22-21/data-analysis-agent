@@ -19,6 +19,7 @@ import pytest
 from data_agent.runtime.model.client import ModelTurnResult
 from data_agent.runtime.observability.progress_summarizer import (
     _ARG_ALLOWLIST,
+    _QUERY_FALLBACKS,
     _STATIC_LINES,
     _SYSTEM_PROMPT,
     ProgressSummarizer,
@@ -295,7 +296,7 @@ async def test_a_line_repeating_a_withheld_identifier_falls_back_to_the_static_l
         "runQuery", {"sql": "SELECT count() FROM dbpcm_warehouse.employee"}
     )
 
-    assert line == "Finding the requested information"
+    assert line in _QUERY_FALLBACKS["count"]
 
 
 async def test_the_post_filter_catches_a_bare_table_name_from_a_withheld_arg() -> None:
@@ -319,7 +320,7 @@ async def test_the_post_filter_catches_a_bare_table_name_from_the_withheld_sql()
         "runQuery", {"sql": "SELECT count() FROM employee_master WHERE Active = 1"}
     )
 
-    assert line == "Finding the requested information"
+    assert line in _QUERY_FALLBACKS["count"]
 
 
 async def test_the_post_filter_is_case_insensitive() -> None:
@@ -333,7 +334,7 @@ async def test_the_post_filter_is_case_insensitive() -> None:
     ):
         fake = _FakeModelClient(produced)
         line = await ProgressSummarizer(fake).summarize("runQuery", {"sql": sql})
-        assert line == "Finding the requested information", produced
+        assert line in _QUERY_FALLBACKS["count"], produced
 
 
 async def test_the_post_filter_reads_a_withheld_identifier_out_of_a_nested_argument() -> None:

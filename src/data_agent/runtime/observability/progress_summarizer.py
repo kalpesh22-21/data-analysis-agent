@@ -17,12 +17,16 @@ output — the loop supplies a per-tool fallback so every reserved slot can be d
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 from contextvars import ContextVar
 from functools import wraps
 from typing import Any
+
+import sqlglot
+from sqlglot import exp
 
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 
@@ -351,10 +355,65 @@ def _looks_structural(line: str) -> bool:
     return any(_is_identifier_shaped(token) for token in _WORD_TOKEN.findall(line))
 
 
-def _static_line(tool_name: str) -> str:
-    """The safe, deterministic line for *tool_name*, used when the model's line is
-    rejected. Never contains the tool name or internal implementation terms.
+_QUERY_FALLBACKS = {
+    "count": ("Counting matching records", "Checking how many records match", "Calculating the matching record count"),
+    "average": ("Calculating the average", "Working out the average value", "Checking the average across matching records"),
+    "total": ("Calculating the total", "Adding up the matching values", "Working out the overall total"),
+    "grouped": ("Comparing results across groups", "Summarizing the results by group", "Calculating a breakdown by group"),
+    "ranked": ("Sorting the matching results", "Organizing the results in order", "Preparing the ordered results"),
+    "trend": ("Summarizing results over time", "Calculating the breakdown over time", "Preparing the results by time period"),
+    "lookup": ("Finding the matching records", "Looking up the requested details", "Gathering the matching information"),
+}
+
+
+def _query_kind(sql: Any) -> str | None:
+    """Classify structure only; identifiers/literals never become progress copy."""
+    if not isinstance(sql, str) or not sql.strip() or len(sql) > 16000:
+        return None
+    try:
+        tree = sqlglot.parse_one(sql, dialect="clickhouse")
+        if not isinstance(tree, exp.Select):
+            return None
+        group = tree.args.get("group")
+        if group and any(
+            isinstance(node, exp.Func) and (
+                node.sql_name().lower() in {"date_trunc", "timestamp_trunc", "year", "month", "quarter"}
+                or isinstance(node, exp.Anonymous) and node.name.lower().startswith("tostartof")
+            )
+            for node in group.walk()
+        ):
+            return "trend"
+        if tree.args.get("order") and tree.args.get("limit"):
+            return "ranked"
+        if group:
+            return "grouped"
+        # Only the outer projection describes what this call presents; aggregates
+        # inside a nested lookup must not mislabel the whole operation.
+        aggregates = [node for item in tree.expressions for node in item.walk()
+                      if isinstance(node, exp.AggFunc) and node.find_ancestor(exp.Select) is tree]
+        if aggregates and all(isinstance(node, exp.Count) for node in aggregates):
+            return "count"
+        if aggregates and all(isinstance(node, exp.Avg) for node in aggregates):
+            return "average"
+        if aggregates and all(isinstance(node, exp.Sum) for node in aggregates):
+            return "total"
+        return "lookup" if not aggregates else None
+    except Exception:
+        return None
+
+
+def _static_line(tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+    """Safe fallback, with stable variation for supported runQuery shapes.
+
+    Hash-based sampling selects equivalent copy once per SQL value, keeping the
+    start, fallback and completion labels consistent. It never outputs SQL text.
     """
+    sql = (arguments or {}).get("sql")
+    kind = _query_kind(sql) if tool_name == "runQuery" else None
+    if kind:
+        choices = _QUERY_FALLBACKS[kind]
+        index = int.from_bytes(hashlib.sha256(sql.encode()).digest()[:4], "big") % len(choices)
+        return choices[index]
     line = _STATIC_LINES.get(tool_name, _GENERIC_STATIC_LINE)
     return line[:1].upper() + line[1:]
 
@@ -402,7 +461,7 @@ class ProgressSummarizer:
         # to translate internal names into vague mechanical prose. Use the reviewed,
         # deterministic wording for those calls instead.
         if tool_name in _ALWAYS_STATIC or tool_name not in _MODEL_SUMMARIZED_TOOLS:
-            return _static_line(tool_name)
+            return _static_line(tool_name, arguments)
         # THE GUARD, before anything is built: the model only ever sees the
         # allowlisted arguments for this tool (nothing at all for an unlisted one).
         projected = _project_args(tool_name, arguments)
@@ -436,7 +495,7 @@ class ProgressSummarizer:
             or _looks_structural(text)
             or _leaks_identifiers(text, _forbidden_tokens(tool_name, arguments))
         ):
-            return _static_line(tool_name)
+            return _static_line(tool_name, arguments)
         return text
 
 

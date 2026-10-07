@@ -155,7 +155,8 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
     tool_name = payload.get("tool_name")
     label = None
     if event == "tool_dispatch_start" and isinstance(tool_name, str):
-        label = _static_line(tool_name) + "…"
+        fallback = payload.get("fallback_summary")
+        label = (fallback if isinstance(fallback, str) and fallback else _static_line(tool_name)) + "…"
     if label is None:
         label = _STEP_LABELS.get(event)
     if label is None:
@@ -238,9 +239,9 @@ class ProgressEmitter:
                 except asyncio.CancelledError:
                     if asyncio.current_task().cancelling():
                         raise
-                    summary = _static_line(event.payload["tool_name"])
+                    summary = event.payload.get("fallback_summary") or _static_line(event.payload["tool_name"])
                 except Exception:
-                    summary = _static_line(event.payload["tool_name"])
+                    summary = event.payload.get("fallback_summary") or _static_line(event.payload["tool_name"])
                 event = to_progress_event(
                     _PROGRESS_SUMMARY_EVENT, {**event.payload, "summary": summary}
                 )

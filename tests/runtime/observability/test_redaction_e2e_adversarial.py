@@ -30,6 +30,7 @@ from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
+from data_agent.runtime.observability.progress_summarizer import _QUERY_FALLBACKS
 from data_agent.runtime.observability.redaction import mask_sql
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
@@ -108,13 +109,13 @@ async def test_dispatcher_observer_never_receives_pii_sql_or_result_rows() -> No
 
     blob = _blob_of(events)
     _assert_no_pii(blob)
-    # The dispatcher's own observer contract carries only tool_name/error_code plus
+    # The dispatcher's own observer contract carries canned fallback copy, tool_name/error_code plus
     # the opaque model tool_call_id (see tool_dispatcher.py) — args/results are never
     # forwarded to it at all. The tool_call_id is a model-generated call handle
     # (e.g. "call_1"), not derived from SQL, scope or a result row, so it cannot
     # carry PII; the `_assert_no_pii` scan above is what actually guards that.
     for _event, payload in events:
-        assert set(payload.keys()) <= {"tool_name", "error_code", "tool_call_id"}
+        assert set(payload.keys()) <= {"tool_name", "error_code", "tool_call_id", "fallback_summary"}
 
 
 async def test_progress_emitter_wired_into_a_real_turn_never_carries_pii() -> None:
@@ -187,7 +188,7 @@ async def test_progress_emitter_wired_into_a_real_turn_never_carries_pii() -> No
     # Sanity: real progress events were actually produced (not a vacuous
     # "empty stream trivially has no PII" pass).
     assert len(progress_events) >= 3
-    assert any(e.step == "Finding the requested information…" for e in progress_events)
+    assert any(e.step in {line + "…" for line in _QUERY_FALLBACKS["lookup"]} for e in progress_events)
 
 
 async def test_mask_sql_applied_before_any_span_write_strips_the_exact_pii_used_here() -> None:

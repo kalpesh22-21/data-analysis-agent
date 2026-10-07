@@ -1663,6 +1663,7 @@ class AgentLoop:
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
                     "summary_task": task,
+                    "fallback_summary": _static_line(tool_name, arguments),
                     **({"judge_approved": True} if judge_approved else {}),
                 },
             )
@@ -1679,7 +1680,7 @@ class AgentLoop:
         user_request: str = "",
     ) -> str:
         """Resolve every slot with a summary or safe fallback within five seconds."""
-        summary = _static_line(tool_name)
+        summary = _static_line(tool_name, arguments)
         try:
             produced = await asyncio.wait_for(
                 self._progress_summarizer.summarize(

@@ -613,7 +613,12 @@ class ToolDispatcher:
         # so a future event added to this method cannot silently escape the gate by
         # forgetting to check the flag — it has to pick an observer.
         emit = self._observer if emit_progress else _default_observer
-        emit("tool_dispatch_start", {"tool_name": tool_name, "tool_call_id": tool_call_id})
+        start_payload = {"tool_name": tool_name, "tool_call_id": tool_call_id}
+        if emit_progress and tool_name == "runQuery":
+            from data_agent.runtime.observability.progress_summarizer import _static_line
+
+            start_payload["fallback_summary"] = _static_line(tool_name, model_args)
+        emit("tool_dispatch_start", start_payload)
 
         try:
             raw_result = await self._mcp_client.call_tool(

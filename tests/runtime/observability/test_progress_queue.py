@@ -130,7 +130,7 @@ async def test_real_turn_executes_before_summary_and_result_follows_drained_prog
     assert paired[0]["step"] == (
         "Finding the requested employee details"
         if outcome == "summary"
-        else "Finding the requested information"
+        else "Finding the matching records"
     )
     assert paired[1]["step"] == paired[2]["step"] == paired[0]["step"]
     assert "event: result" in frames[-1]

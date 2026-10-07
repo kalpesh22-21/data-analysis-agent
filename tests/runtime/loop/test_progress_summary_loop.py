@@ -194,7 +194,7 @@ async def test_slow_summarizer_does_not_block_dispatch_or_turn(monkeypatch) -> N
     assert "tool_dispatch_start" in [e for e, _ in events]
     assert (
         next(p["summary"] for e, p in events if e == "tool_progress_summary")
-        == "Finding the requested information"
+        == "Finding the matching records"
     )
 
     # Lifecycle: the loop drained its task set at turn end (no leak) …
@@ -272,7 +272,7 @@ async def test_a_raising_summarizer_does_not_break_the_turn() -> None:
     # Failures still resolve the reserved slot with a business-language fallback.
     assert (
         next(p["summary"] for e, p in events if e == "tool_progress_summary")
-        == "Finding the requested information"
+        == "Finding the matching records"
     )
     # The instant template label still carried the turn.
     assert "tool_dispatch_start" in [e for e, _ in events]
