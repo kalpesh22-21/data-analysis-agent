@@ -310,3 +310,25 @@ seam is this schema; the only judgment call inside it (raw vs resolved slots) is
   Add one unit test for `_outcome_to_dict` projecting the `frozenset` provenance → sorted
   `"db.table.column"` strings and `ResultPreview` → `.to_doc()`.
 ```
+
+
+## Explicit tables and extra evidence (2026-10-07)
+
+`answer_tables` contains only explicitly selected answer tables. Citing a result
+in `finalizeAnswer.evidence` does not designate a table, even for a single-row
+scalar. The runtime no longer synthesizes grids captioned “Summary”.
+
+The additive, nullable `extra_evidence` result field contains eligible cited
+results not selected as tables or capability cards. Each receipt contains
+`result_id`, `kind`, `tool_name`, and the existing bounded `result_preview` when
+available. Warehouse receipts also include `sql` (nullable); blueprint receipts
+include `blueprint_id`. Preview truncation remains explicit. No tool arguments
+or full result payloads are copied. These are supporting receipts, not additional
+answer grids; consumers must not merge them into `answer_tables`.
+
+Receipts are deduplicated in citation order, restricted to accessible successful
+evidence, and exclude omitted components. An empty collection is `null`. The same
+field is persisted on assistant messages and exposed in history under the existing
+answer scope filter. Withheld deliveries clear it; recovered partial answers carry
+only the evidence supporting that approved partial. Judge evidence selection is
+unchanged. Older histories without this field return `null`.

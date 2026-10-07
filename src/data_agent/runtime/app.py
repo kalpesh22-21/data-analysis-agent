@@ -215,6 +215,7 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
         # in the loop, so an old client that ignores this key renders exactly as it
         # did (the posture `assumptions` shipped with).
         "answer_tables": outcome.answer_tables,
+        "extra_evidence": outcome.extra_evidence,
         "provenance": (
             sorted(f"{db}.{col}" for db, col in outcome.provenance)
             if outcome.provenance is not None

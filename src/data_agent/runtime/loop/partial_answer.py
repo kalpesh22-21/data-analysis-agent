@@ -9,7 +9,7 @@ from data_agent.runtime.context.scope_filter import compute_scope_hash
 from data_agent.runtime.session.models import live_analysis_state
 
 from .answer_rules import first_match
-from .proposal import ReviewState, evidence_kind, fingerprint, selected_components
+from .proposal import ReviewState, evidence_kind, extra_evidence, fingerprint, selected_components
 from .turn_accumulators import TurnAccumulators
 
 
@@ -107,6 +107,17 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
             "answer": text,
             "tables": tables,
             "cards": cards,
+            "extra_evidence": extra_evidence(
+                part["evidence"], list(eligible.values()),
+                selected=part["table_result_ids"] + [
+                    c["result_id"] for c in brief.selected_components
+                    if c.get("capability_ref") in part["capability_refs"]
+                ],
+                sql_by_id={
+                    **{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
+                    **accum.result_sql_by_call_id,
+                },
+            ),
             "evidence": part["evidence"],
             "unfinished": part["unfinished"],
             "evidence_version": evidence_version(trail, turn_index),
@@ -123,6 +134,7 @@ def restore_partial(snapshot):
     accum = TurnAccumulators(
         answer_tables=tables, sql=[t.sql for t in tables], capability_cards=snapshot["cards"]
     )
+    accum.extra_evidence = snapshot.get("extra_evidence")
     accum.select_capabilities([c["name"] for c in snapshot["cards"]])
     return snapshot["answer"], accum, provenance
 

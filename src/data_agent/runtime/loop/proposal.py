@@ -254,26 +254,29 @@ def normalize_proposal_args(args: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def include_scalar_result_tables(args, trail, state=None, excluded=()):
-    """Keep cited scalar warehouse answers inspectable without an extra model turn."""
-    assessment = assess_deliverable_evidence(state, args, trail)
-    if assessment.errors:
-        return args
-    tables = list(args.get("tables", []))
-    selected = {t.get("result_id") for t in tables if isinstance(t, dict)}
-    blocked = {c.get("result_id") for c in excluded}
-    references = set(assessment.references)
-    for entry in trail:
-        if (
-            entry.tool_call_id in references - selected - blocked
-            and evidence_kind(entry) == "warehouse"
-            and entry.provenance is not None
-            and entry.result_preview is not None
-            and entry.result_preview.row_count <= 1
-        ):
-            tables.append({"result_id": entry.tool_call_id, "caption": "Summary"})
-            selected.add(entry.tool_call_id)
-    return {**args, "tables": tables}
+def extra_evidence(references, trail, selected=(), excluded=(), sql_by_id=None):
+    """Project cited support separately from explicitly selected UI components.
+
+    Callers supply scope-filtered evidence. Never expose tool arguments or full
+    results; previews retain their existing bounded/truncated representation.
+    """
+    blocked = set(selected) | set(excluded)
+    known = {entry.tool_call_id: entry for entry in trail}
+    receipts = []
+    for ref in dict.fromkeys(references):
+        entry = known.get(ref)
+        if ref in blocked or entry is None or not evidence_kind(entry) or entry.provenance is None:
+            continue
+        receipt = {"result_id": ref, "kind": evidence_kind(entry), "tool_name": entry.tool_name}
+        if evidence_kind(entry) == "warehouse":
+            receipt["sql"] = (sql_by_id or {}).get(ref) or entry.args.get("sql")
+            if entry.tool_name == "runBlueprint":
+                receipt["blueprint_id"] = entry.args.get("blueprint_id") or entry.args.get("id")
+                receipt["sql"] = receipt["sql"] or (sql_by_id or {}).get(receipt["blueprint_id"])
+        if entry.result_preview is not None:
+            receipt["result_preview"] = entry.result_preview.to_doc()
+        receipts.append(receipt)
+    return receipts or None
 
 
 def validate_proposal_args(args: Any) -> str | None:

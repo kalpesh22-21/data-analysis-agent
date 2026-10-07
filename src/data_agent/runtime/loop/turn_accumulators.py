@@ -220,6 +220,7 @@ class TurnAccumulators:
         # EVERY table the model has designated so far this turn (08). Last
         # `answerWithTable` wins over the WHOLE set, never appends.
         self._answer_tables: list[AnswerTable] = list(answer_tables or ())
+        self.extra_evidence: list[dict[str, Any]] | None = None
         # `blueprint_id -> BlueprintRun` (terminal SQL + D56 verification + slots)
         # for every blueprint that ran SUCCESSFULLY this turn, captured at dispatch
         # (the result is in hand there, so this needs no D46 KV de-reference). It is
@@ -370,6 +371,11 @@ class TurnAccumulators:
             self._answer_tables = list(resolved)
 
     def exclude_components(self, components) -> None:
+        excluded_ids = {component.get("result_id") for component in components}
+        self.extra_evidence = [
+            receipt for receipt in self.extra_evidence or ()
+            if receipt["result_id"] not in excluded_ids
+        ] or None
         for component in components:
             if component["kind"] == "capability":
                 self._excluded_capabilities.add(component["capability_ref"])
@@ -537,6 +543,7 @@ class TurnAccumulators:
         return "ship_tables_with_hedge" if self.has_answer_tables else "decline_only"
 
     def apply_ship_disposition(self, disposition: str, assumptions: tuple[str, ...]) -> None:
+        self.extra_evidence = None
         self._assumptions = [item for item in self._assumptions if item in assumptions]
         if disposition not in {"ship_cards_with_hedge", "ship_components_with_hedge"}:
             self.clear_capabilities()

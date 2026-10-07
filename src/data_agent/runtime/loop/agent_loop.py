@@ -531,6 +531,7 @@ class TurnOutcome:
     # they can never disagree with the list. `None` when the turn designated no
     # table, the same `[] -> None` fork as `sql_executed`/`assumptions`.
     answer_tables: list[dict[str, Any]] | None = None
+    extra_evidence: list[dict[str, Any]] | None = None
     # recordAssumptions (docs/decisions/ui-assumptions-contract.md): the
     # model-declared, plain-English assumptions behind the answer — a first-class
     # result field mirroring `sql` in EVERY respect (additive, nullable, `[] ->
@@ -2316,6 +2317,7 @@ class AgentLoop:
                     retained_assumption_count=retained_assumption_count,
                     review=review,
                     failure=failure,
+                    extra_evidence=accum.extra_evidence,
                     delivered_components={
                         "tables": [t.to_doc() for t in accum.answer_tables],
                         "cards": list(accum.capability_cards or ()),
@@ -2357,6 +2359,7 @@ class AgentLoop:
             blueprint_use=envelope.blueprint_use,
             verification=envelope.verification,
             answer_tables=envelope.answer_tables,
+            extra_evidence=accum.extra_evidence,
             provenance=provenance,
             # `[]` (no recordAssumptions this turn) -> `None`, same fork as
             # `sql_executed`: the UI treats "no assumptions" and "empty" identically.
@@ -3490,7 +3493,6 @@ class AgentLoop:
                 is_unified_finalizer = tool_call.name == "finalizeAnswer"
                 if is_unified_finalizer:
                     from .proposal import (
-                        include_scalar_result_tables,
                         normalize_proposal_args,
                         validate_proposal_args,
                     )
@@ -3501,20 +3503,6 @@ class AgentLoop:
                     error = validate_proposal_args(tool_call.arguments)
                     if error:
                         tool_call = replace(tool_call, argument_error=error)
-                    else:
-                        visible_trail = scope_filter.filter_trail(
-                            await self._session_store.load_trail(session_id),
-                            credentials.column_scope, current_turn_index=turn_index,
-                        )
-                        tool_call = replace(
-                            tool_call,
-                            arguments=include_scalar_result_tables(
-                                tool_call.arguments,
-                                [e for e in visible_trail if e.turn_index == turn_index],
-                                analysis_state,
-                                review_state.excluded_components,
-                            ),
-                        )
                     tool_call = replace(
                         tool_call,
                         name=ANSWER_TABLE_TOOL_NAME
@@ -4623,6 +4611,17 @@ class AgentLoop:
                         **accum.result_sql_by_call_id,
                     },
                 )
+                from .proposal import extra_evidence
+
+                accum.extra_evidence = extra_evidence(
+                    evidence_assessment.references, evidence_trail,
+                    selected=[c["result_id"] for c in component_catalog],
+                    excluded=[c.get("result_id") for c in review_state.excluded_components],
+                    sql_by_id={
+                        **{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
+                        **accum.result_sql_by_call_id,
+                    },
+                ) if not evidence_error else None
                 complete = {
                     "answer": final_text,
                     "tables": [t.to_doc() for t in accum.answer_tables],

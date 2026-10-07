@@ -70,12 +70,14 @@ class TurnMessage:
     review: dict[str, Any] | None = None
     failure: dict[str, Any] | None = None
     delivered_components: dict[str, Any] | None = None
+    extra_evidence: list[dict[str, Any]] | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
             "turn_index": self.turn_index,
             "role": self.role,
             "content": self.content,
+            **({"extra_evidence": self.extra_evidence} if self.extra_evidence is not None else {}),
             **({"review": self.review} if self.review is not None else {}),
             **({"failure": self.failure} if self.failure is not None else {}),
             **(
@@ -104,6 +106,7 @@ class TurnMessage:
             review=doc.get("review"),
             failure=doc.get("failure"),
             delivered_components=doc.get("delivered_components"),
+            extra_evidence=doc.get("extra_evidence"),
             ts=doc["ts"],
             provenance=_provenance_from_doc(doc.get("provenance")),
             ship_disposition=doc.get("ship_disposition")

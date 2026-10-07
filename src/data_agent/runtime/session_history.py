@@ -227,6 +227,7 @@ def project_history(
                 "turn_index": turn_index,
                 "question": questions[turn_index],
                 "answer": assistant.content if assistant is not None else None,
+                "extra_evidence": assistant.extra_evidence if assistant is not None else None,
                 **(
                     {"review": assistant.review}
                     if assistant and assistant.review is not None

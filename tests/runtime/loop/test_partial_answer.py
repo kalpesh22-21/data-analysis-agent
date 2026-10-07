@@ -68,6 +68,7 @@ async def test_terminal_review_delivers_partial_and_history_omits_unapproved_tab
     assert out.assistant_text == TEXT
     assert out.review == {"status": "approved", "completion": "partial"}
     assert not out.answer_tables and not out.assumptions
+    assert [r["result_id"] for r in out.extra_evidence] == ["q"]
     assert len(judge.briefs) == 3
     assert judge.briefs[-1].allow_partial_answer
     assert judge.briefs[-1].previous_rejection
@@ -78,6 +79,7 @@ async def test_terminal_review_delivers_partial_and_history_omits_unapproved_tab
     history = project_history(doc.messages, doc.tool_trail, CREDS.column_scope, None)
     assert history["turns"][0]["answer"] == TEXT
     assert not history["turns"][0]["answer_tables"]
+    assert history["turns"][0]["extra_evidence"] == out.extra_evidence
 
 
 async def test_cached_partial_survives_unavailable_later_review_and_keeps_approved_table():
