@@ -472,6 +472,17 @@ class RuntimeSettings(BaseSettings):
         ge=0,
         description="Reasoning token limit when the judge thinking-budget flag is enabled. Requires compatible vLLM reasoning configuration.",
     )
+    answer_judge_timeout_retry_enabled: bool = Field(
+        True, description="Retry a timed-out judge once with vLLM thinking disabled."
+    )
+    answer_judge_timeout_retry_seconds: float = Field(
+        30.0, gt=0, allow_inf_nan=False,
+        description="Maximum no-thinking retry duration, capped by remaining shared review budget.",
+    )
+    answer_judge_timeout_retry_template_kwargs: dict[str, bool] = Field(
+        default_factory=lambda: {"enable_thinking": False, "thinking": False},
+        description="Model-template-specific vLLM kwargs used only on the timeout retry.",
+    )
     answer_judge_timeout_seconds: float = Field(
         30.0,
         gt=0,

@@ -129,13 +129,39 @@ async def review_once(loop, brief, *, repair=False, terminal=False):
         return APPROVED
     started = time.monotonic()
     try:
-        verdict = await asyncio.wait_for(
-            loop._answer_judge.review(brief),
-            timeout=min(available, per_call),
-        )
+        try:
+            verdict = await asyncio.wait_for(
+                loop._answer_judge.review(brief), timeout=min(available, per_call),
+            )
+        except TimeoutError:
+            verdict = replace(APPROVED, failure_reason="timeout")
+        if verdict.failure_reason == "timeout":
+            factory = getattr(loop._answer_judge, "timeout_retry", None)
+            retry = factory() if callable(factory) else None
+            # Borrow unused repair reserve for timeout recovery, but retain the
+            # terminal reserve on non-terminal calls. All elapsed time is charged
+            # below, once, including a failed retry.
+            remaining = (
+                context.review_seconds - (0.0 if terminal else context.terminal_reserve_seconds)
+                - (time.monotonic() - started)
+                if context else getattr(retry, "timeout_seconds", 0.0)
+            )
+            if retry is not None and remaining > 0:
+                loop._observer("loop_answer_judge_timeout_retry", {"site": brief.site})
+                try:
+                    verdict = await asyncio.wait_for(
+                        retry.review(brief), timeout=min(remaining, retry.timeout_seconds),
+                    )
+                except TimeoutError:
+                    verdict = replace(APPROVED, failure_reason="timeout")
+            if verdict.failure_reason == "timeout":
+                if context:
+                    context.review_unavailable = True
+                    context.review_failure_reason = "timeout"
+                raise TimeoutError("Judge review timed out")
         if context and verdict.approved and not verdict.reviewed:
             context.review_unavailable = True
-            context.review_failure_reason = "unreviewed"
+            context.review_failure_reason = verdict.failure_reason or "unreviewed"
         return verdict
     except Exception as exc:
         if context:
@@ -154,6 +180,10 @@ async def review_once(loop, brief, *, repair=False, terminal=False):
                 )
             if repair:
                 context.repair_reserve_seconds = max(0.0, context.repair_reserve_seconds - elapsed)
+            elif not terminal:
+                context.repair_reserve_seconds = max(
+                    0.0, context.repair_reserve_seconds - max(0.0, elapsed - available)
+                )
 
 
 def delivery_version(text, accum, pending=None):

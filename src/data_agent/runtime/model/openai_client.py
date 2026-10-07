@@ -303,7 +303,9 @@ class OpenAIModelClient:
         tool_choice: Literal["required", "auto"] = "required",
         api_mode: Literal["auto", "chat"] = "auto",
         thinking_token_budget: int | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
+        self._chat_template_kwargs = dict(chat_template_kwargs or {})
         self._thinking_token_budget = thinking_token_budget
         self._use_reasoning_metadata = use_reasoning_metadata
         self._tool_choice = tool_choice
@@ -332,7 +334,17 @@ class OpenAIModelClient:
             tool_choice=self._tool_choice,
             api_mode=self._api_mode,
             thinking_token_budget=self._thinking_token_budget,
+            chat_template_kwargs=self._chat_template_kwargs,
         )
+
+    def without_thinking(self, template_kwargs: dict[str, Any]) -> OpenAIModelClient:
+        """An isolated retry handle; never mutate the shared main/judge client."""
+        client = self.begin_turn()
+        client._api_mode = "chat"
+        client._thinking_token_budget = None
+        client._chat_template_kwargs = dict(template_kwargs)
+        client._max_retries = 0
+        return client
 
     async def send_turn(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -341,6 +353,7 @@ class OpenAIModelClient:
             self._api_mode == "chat"
             or self._use_reasoning_metadata
             or self._thinking_token_budget is not None
+            or self._chat_template_kwargs
         ):
             return await self._call_chat_with_retry(messages, tools)
         if not self._fell_back_this_turn:
@@ -384,11 +397,12 @@ class OpenAIModelClient:
                     model=self._model,
                     messages=chat_messages,
                     tools=chat_tools,
-                    **(
-                        {"extra_body": {"thinking_token_budget": self._thinking_token_budget}}
-                        if self._thinking_token_budget is not None
-                        else {}
-                    ),
+                    **({"extra_body": {
+                        **({"thinking_token_budget": self._thinking_token_budget}
+                           if self._thinking_token_budget is not None else {}),
+                        **({"chat_template_kwargs": self._chat_template_kwargs}
+                           if self._chat_template_kwargs else {}),
+                    }} if self._thinking_token_budget is not None or self._chat_template_kwargs else {}),
                     **({"tool_choice": self._tool_choice} if chat_tools else {}),
                 )
                 return _chat_result_to_turn(response)

@@ -472,7 +472,9 @@ async def test_timeout_approves_and_is_reported() -> None:
         timeout_seconds=0.01,
         observer=lambda e, p: events.append((e, p)),
     )
-    assert await judge.review(_brief()) is APPROVED
+    verdict = await judge.review(_brief())
+    assert verdict.approved and not verdict.reviewed
+    assert verdict.failure_reason == "timeout"
     assert ("loop_answer_judge_failed", {"reason": "timeout"}) in events
 
 

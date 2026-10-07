@@ -530,3 +530,16 @@ async def test_unset_thinking_budget_leaves_chat_request_unchanged():
     transport = _FakeOpenAIClient([], [_chat_message_result("verdict")])
     await OpenAIModelClient(transport, model="kimi", api_mode="chat").begin_turn().send_turn([], [])
     assert "extra_body" not in transport.chat.completions.calls[0]
+
+
+async def test_no_thinking_retry_is_isolated_and_removes_thinking_budget():
+    transport = _FakeOpenAIClient([], [_chat_message_result("verdict"), _chat_message_result("normal")])
+    client = OpenAIModelClient(transport, model="judge", thinking_token_budget=4096)
+    retry = client.without_thinking({"enable_thinking": False, "thinking": False})
+    await retry.begin_turn().send_turn([], [])
+    await client.begin_turn().send_turn([], [])
+    assert transport.chat.completions.calls[0]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
+    }
+    assert transport.chat.completions.calls[1]["extra_body"] == {"thinking_token_budget": 4096}
+    assert retry._max_retries == 0

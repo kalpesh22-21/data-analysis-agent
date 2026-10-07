@@ -969,6 +969,9 @@ def create_app(
                     token_budget=settings.answer_judge_evidence_token_budget,
                     capabilities_enabled=settings.capability_tools_enabled,
                     timeout_seconds=settings.answer_judge_timeout_seconds,
+                    timeout_retry_enabled=settings.answer_judge_timeout_retry_enabled,
+                    timeout_retry_seconds=settings.answer_judge_timeout_retry_seconds,
+                    timeout_retry_template_kwargs=settings.answer_judge_timeout_retry_template_kwargs,
                     observer=observer,
                     # The judge opens its OWN `answer_judge` CHAIN span, so the
                     # auto-instrumented OpenAI `LLM` span nests under it instead of

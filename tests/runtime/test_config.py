@@ -175,3 +175,15 @@ def test_judge_thinking_budget_is_opt_in_and_validated(monkeypatch):
     assert settings.answer_judge_thinking_token_budget == 1024
     with pytest.raises(ValueError):
         RuntimeSettings(_env_file=None, answer_judge_thinking_token_budget=-1)
+
+
+def test_judge_timeout_retry_configuration(monkeypatch):
+    monkeypatch.setenv("ANSWER_JUDGE_TIMEOUT_RETRY_ENABLED", "false")
+    monkeypatch.setenv("ANSWER_JUDGE_TIMEOUT_RETRY_SECONDS", "45")
+    monkeypatch.setenv("ANSWER_JUDGE_TIMEOUT_RETRY_TEMPLATE_KWARGS", '{"thinking":false}')
+    settings = RuntimeSettings(_env_file=None)
+    assert not settings.answer_judge_timeout_retry_enabled
+    assert settings.answer_judge_timeout_retry_seconds == 45
+    assert settings.answer_judge_timeout_retry_template_kwargs == {"thinking": False}
+    with pytest.raises(ValueError):
+        RuntimeSettings(_env_file=None, answer_judge_timeout_retry_seconds=0)

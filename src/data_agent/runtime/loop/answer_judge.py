@@ -12,7 +12,7 @@ clears and the nudge splicing, exactly as it does for the other four gates — s
 
 EVERYTHING FAILS OPEN. A disabled judge, an unreachable provider, a timeout, a malformed
 response, an invented violation slug and a rejection the runtime cannot name all return
-`APPROVED`, so the turn behaves exactly as a deployment with no judge wired. The asymmetry
+an unreviewed verdict; timeouts carry a reason for the bounded no-thinking retry. The asymmetry
 is 05 §L.6's and it is sharper here than for any regex: a false negative costs what today
 already costs, while a false positive burns a round-trip telling a model that answered
 correctly that it did not — and 05 §J.2 measured the response to that, an apology asserting
@@ -43,6 +43,9 @@ from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
+
+import httpx
+from openai import APITimeoutError
 
 from data_agent.runtime.model.client import ModelClient, ModelTurnResult, begin_turn_client
 from data_agent.runtime.observability import tracing
@@ -194,6 +197,7 @@ class JudgeVerdict:
     repair_type: str = ""
     corrected_answer: str | None = None
     partial_answer: Mapping[str, Any] | None = None
+    failure_reason: str = ""
 
 
 # Unavailable review is fail-open only for an otherwise valid answer. reviewed=False
@@ -1174,6 +1178,11 @@ class AnswerJudge:
     enabled: bool = True
     timeout_seconds: float = 30.0
     capabilities_enabled: bool = True
+    timeout_retry_enabled: bool = True
+    timeout_retry_seconds: float = 30.0
+    timeout_retry_template_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {"enable_thinking": False, "thinking": False}
+    )
     observer: Any = None
     # The turn's `Tracer`. `None` (Layer-1 tests, an unconfigured deploy) means no
     # judge span is opened and the auto-instrumented LLM span parents to whatever is
@@ -1227,6 +1236,15 @@ class AnswerJudge:
             },
             {"role": "user", "content": _dump(fitted)},
         ]
+
+    def timeout_retry(self):
+        factory = getattr(self.model_client, "without_thinking", None)
+        if not self.timeout_retry_enabled or not callable(factory):
+            return None
+        return replace(
+            self, model_client=factory(self.timeout_retry_template_kwargs),
+            timeout_seconds=self.timeout_retry_seconds, timeout_retry_enabled=False,
+        )
 
     async def review(self, brief: JudgeBrief) -> JudgeVerdict:
         """Judge one finish. Never raises, never returns `None`, never retries."""
@@ -1282,7 +1300,7 @@ class AnswerJudge:
             result = await asyncio.wait_for(
                 client.send_turn(messages, tools), timeout=self.timeout_seconds
             )
-        except TimeoutError:
+        except (TimeoutError, httpx.TimeoutException, APITimeoutError):
             _logger.warning(
                 "answer judge: timed out after %.1fs at %s — approving",
                 self.timeout_seconds,
@@ -1290,7 +1308,7 @@ class AnswerJudge:
             )
             self._emit(ANSWER_JUDGE_FAILED_EVENT, {"reason": "timeout"})
             _mark(outcome="timeout")
-            return APPROVED
+            return replace(APPROVED, failure_reason="timeout")
         except asyncio.CancelledError:
             _mark(outcome="cancelled")
             # NOT swallowed. A cancellation is the turn being torn down, not a judge
