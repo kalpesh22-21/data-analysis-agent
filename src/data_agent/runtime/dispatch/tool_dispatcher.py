@@ -487,6 +487,7 @@ class ToolDispatcher:
         mcp_client: MCPClient,
         catalog: CatalogHandle | CatalogProvider,
         *,
+        data_as_of_enabled: bool = True,
         preview_row_count: int = 20,
         max_tool_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
         schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
@@ -495,6 +496,7 @@ class ToolDispatcher:
         disable_redaction: bool = False,
     ) -> None:
         self._mcp_client = mcp_client
+        self._data_as_of_enabled = data_as_of_enabled
         # Retained for the agent's pre-execution aggregation/measurement checks.
         # Execution provenance comes exclusively from the API response.
         self._catalog = catalog
@@ -629,7 +631,9 @@ class ToolDispatcher:
                 session_id=credentials.session_id,
             )
             provenance = capture_provenance(tool_name, raw_result)
-            data_as_of = capture_data_as_of(tool_name, raw_result)
+            data_as_of = (
+                capture_data_as_of(tool_name, raw_result) if self._data_as_of_enabled else None
+            )
             if tool_name in DATA_TOOLS:
                 from data_agent.runtime.context.scope_filter import is_provenance_in_scope
 

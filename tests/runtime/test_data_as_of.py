@@ -249,3 +249,84 @@ def test_blueprint_capture_preserves_optional_timestamp(stamp):
     runs = {}
     capture_terminal_sql("runBlueprint", result, into=runs)
     assert runs["bp"].data_as_of == stamp
+
+
+async def test_disabled_runtime_discards_incoming_metadata():
+    raw = {
+        "columns": ["n"],
+        "rows": [[1]],
+        "data_as_of": NEWER,
+        "provenance": {"version": 1, "columns": []},
+    }
+    result = await ToolDispatcher(
+        FakeMCPClient(scripted={"runQuery": [raw]}),
+        CATALOG,
+        data_as_of_enabled=False,
+    ).dispatch("runQuery", {"sql": "SELECT 1 AS n"}, _credentials())
+    assert result.status == "ok"
+    assert result.data_as_of is None
+    assert "data_as_of" not in result.result_full
+
+
+def test_disabled_environment_hides_page_metadata(monkeypatch):
+    from data_agent.runtime.config import RuntimeSettings
+
+    monkeypatch.setenv("DATA_AS_OF_ENABLED", "false")
+    assert RuntimeSettings(_env_file=None).data_as_of_enabled is False
+    client, _ = _client(
+        monkeypatch,
+        scripted={
+            "runQuery": [
+                {"columns": ["n"], "rows": [[1]], "row_count": 1, "data_as_of": NEWER},
+            ]
+        },
+    )
+    result = client.post("/query/page", json={"sql": "SELECT 1 AS n"}, headers=HEADERS)
+    assert result.status_code == 200
+    assert "data_as_of" not in result.json()
+
+
+def test_disabled_flag_hides_persisted_history_without_mutating_receipts():
+    entry = replace(_run_query_entry(0, "SELECT 1", frozenset()), data_as_of=NEWER)
+    designation = replace(
+        entry,
+        tool_call_id="answer",
+        tool_name="answerWithTable",
+        args={"tables": [{"result_id": entry.tool_call_id}]},
+        answer_table_provenance=(frozenset(),),
+    )
+    history = project_history(
+        [_user(0, "Count?"), _assistant(0, "One", frozenset())],
+        [entry, designation],
+        frozenset(),
+        None,
+        data_as_of_enabled=False,
+    )
+    turn = history["turns"][0]
+    assert "data_as_of" not in turn["answer_tables"][0]
+    assert all("data_as_of" not in call for call in turn["tool_calls"])
+    assert entry.data_as_of == NEWER
+
+
+async def test_disabled_flag_hides_resumed_outcome_in_sse():
+    from data_agent.runtime.app import _stream_turn
+    from data_agent.runtime.loop.agent_loop import TurnOutcome
+    from data_agent.runtime.observability.progress import ProgressEmitter
+
+    outcome = TurnOutcome(
+        status="done",
+        assistant_text="One",
+        pending_question=None,
+        tool_calls_made=0,
+        answer_tables=[{"sql": "SELECT 1", "data_as_of": NEWER}],
+    )
+
+    async def call():
+        return outcome
+
+    events = [
+        event async for event in _stream_turn(call, ProgressEmitter(), data_as_of_enabled=False)
+    ]
+    assert "event: result" in "".join(events)
+    assert "data_as_of" not in "".join(events)
+    assert outcome.answer_tables[0]["data_as_of"] == NEWER

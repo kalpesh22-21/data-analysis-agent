@@ -72,6 +72,7 @@ def project_history(
     pause_checkpoint: PauseCheckpoint | None,
     blueprint_terminal_sql: Mapping[str, str] | None = None,
     blueprint_runs: Mapping[str, BlueprintRun] | None = None,
+    data_as_of_enabled: bool = True,
     observer: Callable[[str, dict[str, Any]], None] = _noop_observer,
 ) -> dict[str, Any]:
     """Project the persisted `messages`/`tool_trail` into the transcript shape under
@@ -285,6 +286,11 @@ def project_history(
         else None
     )
 
+    if not data_as_of_enabled:
+        # Suppress old persisted receipts too; toggling the flag requires no data migration.
+        for turn in turns:
+            for item in [*(turn.get("answer_tables") or []), *turn["tool_calls"]]:
+                item.pop("data_as_of", None)
     return {"turns": turns, "pending_question": pending_question}
 
 

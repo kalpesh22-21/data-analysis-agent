@@ -235,6 +235,11 @@ class RuntimeSettings(BaseSettings):
         extra="ignore",
     )
 
+    data_as_of_enabled: bool = Field(
+        True,
+        description="Enable optional ingestion freshness metadata. Set DATA_AS_OF_ENABLED=false to disable.",
+    )
+
     # --- Adopted MCP (clickhouse-api, D75) ---
     mcp_max_response_bytes: int = Field(
         16 * 1024 * 1024,

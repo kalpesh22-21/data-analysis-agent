@@ -183,7 +183,7 @@ def _format_sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
+def _outcome_to_dict(outcome: TurnOutcome, *, data_as_of_enabled: bool = True) -> dict[str, Any]:
     return {
         "status": outcome.status,
         "assistant_text": outcome.assistant_text,
@@ -214,7 +214,14 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
         # three keys above keep their meaning and are derived from `answer_tables[0]`
         # in the loop, so an old client that ignores this key renders exactly as it
         # did (the posture `assumptions` shipped with).
-        "answer_tables": outcome.answer_tables,
+        "answer_tables": (
+            outcome.answer_tables
+            if data_as_of_enabled or outcome.answer_tables is None
+            else [
+                {key: value for key, value in table.items() if key != "data_as_of"}
+                for table in outcome.answer_tables
+            ]
+        ),
         "extra_evidence": outcome.extra_evidence,
         "provenance": (
             sorted(f"{db}.{col}" for db, col in outcome.provenance)
@@ -233,7 +240,10 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
 
 
 async def _stream_turn(
-    agent_loop_call: Callable[[], Awaitable[TurnOutcome]], emitter: ProgressEmitter
+    agent_loop_call: Callable[[], Awaitable[TurnOutcome]],
+    emitter: ProgressEmitter,
+    *,
+    data_as_of_enabled: bool = True,
 ) -> AsyncIterator[str]:
     """Drive one `AgentLoop.run`/`resume` call as a background task while
     streaming its `ProgressEmitter` output as SSE `progress` events, then a
@@ -265,7 +275,9 @@ async def _stream_turn(
             )
             return
 
-        yield _format_sse("result", _outcome_to_dict(outcome))
+        yield _format_sse(
+            "result", _outcome_to_dict(outcome, data_as_of_enabled=data_as_of_enabled)
+        )
     finally:
         # The request owns this worker. Retrieve its result even when the consumer
         # closes between events, and shield cleanup from Starlette's disconnect
@@ -680,6 +692,7 @@ def create_app(
         return ToolDispatcher(
             mcp_client,
             catalog_provider,
+            data_as_of_enabled=settings.data_as_of_enabled,
             preview_row_count=settings.preview_row_count,
             # Per-result preview size cap (2026-08 fix): bounds a single stored tool
             # result (esp. a wide getTableSchema) so the trail cannot balloon.
@@ -1081,7 +1094,10 @@ def create_app(
                     session_id=x_session_id, credentials=credentials, user_message=body.message
                 )
 
-        return _TurnStreamingResponse(_stream_turn(_call, emitter), media_type="text/event-stream")
+        return _TurnStreamingResponse(
+            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled),
+            media_type="text/event-stream",
+        )
 
     @app.post("/turn/resume")
     async def resume(
@@ -1118,7 +1134,10 @@ def create_app(
                     session_id=x_session_id, credentials=credentials, answer=body.answer
                 )
 
-        return _TurnStreamingResponse(_stream_turn(_call, emitter), media_type="text/event-stream")
+        return _TurnStreamingResponse(
+            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled),
+            media_type="text/event-stream",
+        )
 
     @app.get("/session/history")
     async def session_history(
@@ -1193,6 +1212,7 @@ def create_app(
             credentials.column_scope,
             doc.pause_checkpoint,
             blueprint_runs=blueprint_runs,
+            data_as_of_enabled=settings.data_as_of_enabled,
             # 08 §D.3: `history_answer_table_scope_dropped` makes the gap between
             # "the answer survived the scope filter" and "its tables survived it"
             # visible rather than inferred. The guardrail observer only spans

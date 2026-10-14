@@ -273,6 +273,8 @@ Rows returned by §4.4 **may contain real cell values** — the caller's own sco
 
 The UI displays “Data as of …” on each answer-table panel and each history query panel. The persisted answer-table value is the initial fallback; a successful `/query/page` response supersedes it, including omission (hide the previous timestamp rather than label fresh rows with an old receipt). History forwards both `answer_tables[].data_as_of` and `tool_calls[].data_as_of` without synthesizing a turn-level timestamp.
 
+Set `DATA_AS_OF_ENABLED=false` independently on either service (default `true`). On the MCP server it skips the refresh-status lookup entirely and omits the key. On the agent runtime it discards incoming timestamps and omits them from live/resumed answers, query pages, and history, including previously saved receipts; the UI therefore hides the labels. Restart the affected service after changing the environment.
+
 The API source is `dbpcm_warehouse.etl_product_refresh_status FINAL`, scoped by the caller's JWT processing center and client code, keyed by bare provenance table names. It takes `max(last_sync_date)` per product and then the minimum across products; any unmatched table omits the key. The status table is internal metadata, not a queryable tool/resource. Runtime and server may deploy in either order.
 
 #### 4.2.3 `blueprint_use`
