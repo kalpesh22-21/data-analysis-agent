@@ -787,6 +787,7 @@
           <tbody class="result-table-body"></tbody>
         </table>
       </div>
+      <div class="data-as-of result-caption" data-testid="data-as-of" hidden></div>
       <div class="result-table-caption result-caption" hidden></div>
       <div class="table-pager" hidden>
         <button type="button" class="pager-prev" disabled>Previous</button>
@@ -1064,6 +1065,7 @@
         out.push({
           sql: entry.sql,
           caption: entry.caption || null,
+          data_as_of: entry.data_as_of || null,
           blueprint_use: entry.blueprint_use || null,
           verification: entry.verification || null,
         });
@@ -1106,6 +1108,7 @@
       head: panel.querySelector(".result-table-head"),
       body: panel.querySelector(".result-table-body"),
       caption: panel.querySelector(".result-table-caption"),
+      dataAsOf: panel.querySelector(".data-as-of"),
       pager: panel.querySelector(".table-pager"),
       prev: panel.querySelector(".pager-prev"),
       next: panel.querySelector(".pager-next"),
@@ -1171,6 +1174,13 @@
   // Wire ONE cloned panel to `POST /api/query/page`. `offset` lives in this
   // closure, per panel — that is the whole point of the clone: paging one grid
   // must not page another, or page the wrong one.
+  function renderDataAsOf(element, value) {
+    var date = typeof value === "string" ? new Date(value) : null;
+    var valid = date && Number.isFinite(date.getTime());
+    element.textContent = valid ? "Data as of " + date.toISOString().replace("T", " ").replace("Z", " UTC") : "";
+    element.hidden = !valid;
+  }
+
   function wireTablePaging(panelEls, sql, autoOpen) {
     var offset = 0;
     var loaded = false;
@@ -1212,6 +1222,8 @@
             panelEls.pager.hidden = true;
             return;
           }
+          // A successful fresh page supersedes history, including unknown freshness.
+          renderDataAsOf(panelEls.dataAsOf, res.payload.data_as_of);
           var rows = Array.isArray(res.payload.rows) ? res.payload.rows : [];
           fillGrid(panelEls.head, panelEls.body, res.payload.columns, rows);
           panelEls.caption.hidden = true;
@@ -1282,6 +1294,7 @@
       }
       // The lead table of a multi-table answer opens (and so fetches) at render;
       // the rest — and a lone table, as before — wait to be opened.
+      renderDataAsOf(panelEls.dataAsOf, table.data_as_of);
       wireTablePaging(panelEls, table.sql, multi && index === 0);
     });
   }
@@ -1415,6 +1428,10 @@
       name.className = "per-sql-name";
       name.textContent = cellText(call.tool_name);
       item.appendChild(name);
+      var freshness = document.createElement("div");
+      freshness.className = "data-as-of result-caption";
+      renderDataAsOf(freshness, call.data_as_of);
+      item.appendChild(freshness);
 
       if (call.sql) {
         var pre = document.createElement("pre");

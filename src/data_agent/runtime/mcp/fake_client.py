@@ -36,7 +36,9 @@ class FakeMCPClient:
         self,
         scripted: dict[str, list[Any]] | None = None,
         tools: list[MCPToolSpec] | None = None,
+        data_as_of: str | None = None,
     ) -> None:
+        self._data_as_of = data_as_of
         self._scripted: dict[str, list[Any]] = {k: list(v) for k, v in (scripted or {}).items()}
         self._tools = list(tools) if tools is not None else []
         self.calls: list[RecordedCall] = []
@@ -61,6 +63,12 @@ class FakeMCPClient:
         response = queue.pop(0)
         if isinstance(response, Exception):
             raise response
+        if (
+            self._data_as_of is not None
+            and tool_name in {"runQuery", "sampleRows", "explainQuery"}
+            and isinstance(response, dict)
+        ):
+            return {"data_as_of": self._data_as_of, **response}
         return response
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:

@@ -160,6 +160,7 @@ class BlueprintRun:
     verification: dict[str, Any] | None = None
     slots: dict[str, Any] = field(default_factory=dict)
     source_blueprint_id: str | None = None
+    data_as_of: str | None = None
 
 
 # J6: the human-readable state of an empty blueprint result's badge. A display
@@ -234,7 +235,7 @@ def blueprint_verification(result_full: Any) -> dict[str, Any] | None:
 
 
 def blueprint_run_from_result(
-    result_full: Any, *, slots: Mapping[str, Any] | None = None
+    result_full: Any, *, slots: Mapping[str, Any] | None = None, data_as_of: str | None = None
 ) -> tuple[str, BlueprintRun] | None:
     """`(blueprint_id, BlueprintRun)` for a SUCCESSFUL blueprint `result_full`, or `None` when
     the payload carries no usable terminal SQL.
@@ -260,6 +261,7 @@ def blueprint_run_from_result(
             else slots or {}
         ),
         source_blueprint_id=blueprint_id,
+        data_as_of=data_as_of,
     )
 
 
@@ -500,11 +502,13 @@ class AnswerTable:
     blueprint_use: dict[str, Any] | None = None
     verification: dict[str, Any] | None = None
     provenance: frozenset[tuple[str, str]] | None = None
+    data_as_of: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
             "sql": self.sql,
             "caption": self.caption,
+            **({"data_as_of": self.data_as_of} if self.data_as_of is not None else {}),
             "blueprint_use": dict(self.blueprint_use) if self.blueprint_use else None,
             "verification": dict(self.verification) if self.verification else None,
         }
@@ -535,6 +539,7 @@ def enrich_table(
             else None
         ),
         verification=dict(run.verification) if run.verification else None,
+        data_as_of=run.data_as_of,
         provenance=provenance,
     )
 

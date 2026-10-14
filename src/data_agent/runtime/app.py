@@ -1180,7 +1180,9 @@ def create_app(
                 )
                 continue
             captured = blueprint_run_from_result(
-                result_full, slots=entry.args.get("slot_bindings") or {}
+                result_full,
+                slots=entry.args.get("slot_bindings") or {},
+                data_as_of=entry.data_as_of,
             )
             if captured is not None:
                 blueprint_runs[captured[0]] = captured[1]
@@ -1262,6 +1264,7 @@ def create_app(
                 # counting all rows would mean a second aggregate query per page.
                 # The UI shows "next" while a page comes back full.
                 "has_more": len(rows) >= limit,
+                **({"data_as_of": result.data_as_of} if result.data_as_of is not None else {}),
             }
         )
 

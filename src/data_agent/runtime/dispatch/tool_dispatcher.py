@@ -33,7 +33,7 @@ from data_agent.runtime.dispatch.sql_diagnostics import (
 from data_agent.runtime.mcp.client import MCPClient, MCPToolError
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.redaction import tool_span_args
-from data_agent.runtime.provenance.capture import DATA_TOOLS, capture_provenance
+from data_agent.runtime.provenance.capture import DATA_TOOLS, capture_data_as_of, capture_provenance
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.models import ResultPreview
 
@@ -157,6 +157,7 @@ class ToolResult:
     # channel to the model, and `context/budget.py::_render_entry` drops anything the
     # entry does not carry.
     window_note: str | None = None
+    data_as_of: str | None = None
     terminal: bool = False
 
 
@@ -628,6 +629,7 @@ class ToolDispatcher:
                 session_id=credentials.session_id,
             )
             provenance = capture_provenance(tool_name, raw_result)
+            data_as_of = capture_data_as_of(tool_name, raw_result)
             if tool_name in DATA_TOOLS:
                 from data_agent.runtime.context.scope_filter import is_provenance_in_scope
 
@@ -638,7 +640,9 @@ class ToolDispatcher:
                         "This is an API contract mismatch, not an empty query result.",
                     )
                 raw_result = {
-                    key: value for key, value in raw_result.items() if key != "provenance"
+                    key: value
+                    for key, value in raw_result.items()
+                    if key not in {"provenance", "data_as_of"}
                 }
                 if tool_name in {"runQuery", "explainQuery"}:
                     key = (
@@ -758,6 +762,7 @@ class ToolDispatcher:
             retryable=None,
             user_message=None,
             provenance=provenance,
+            data_as_of=data_as_of,
             result_preview=preview,
             result_full=raw_result,
         )

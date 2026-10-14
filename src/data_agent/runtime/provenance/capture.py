@@ -1,5 +1,7 @@
 """Read API-validated access dependencies; never reparse executed SQL locally."""
 
+import re
+from datetime import UTC, datetime
 from typing import Any
 
 from data_agent.runtime.mcp.client import MCPToolError
@@ -44,3 +46,30 @@ def capture_provenance(tool_name: str, result: Any) -> frozenset[tuple[str, str]
             )
         return frozenset(tuple(pair) for pair in columns)
     return frozenset() if tool_name in _NO_PROVENANCE_TOOLS else None
+
+
+def capture_data_as_of(tool_name: str, result: Any) -> str | None:
+    """Optional ingestion timestamp; accept only timezone-aware ISO datetimes.
+
+    Normalize offsets to UTC so union ordering is chronological. Missing or invalid
+    metadata never prevents a query from succeeding and never becomes a guessed time.
+    """
+    value = result.get("data_as_of") if isinstance(result, dict) else None
+    if tool_name not in DATA_TOOLS or not isinstance(value, str):
+        return None
+    if not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)",
+        value,
+    ):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value).astimezone(UTC)
+        return parsed.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (ValueError, OverflowError):
+        return None
+
+
+def union_data_as_of(values: list[str | None]) -> str | None:
+    """Oldest known ingestion time, only when every contributing read is known."""
+    normalized = [capture_data_as_of("runQuery", {"data_as_of": v}) for v in values]
+    return min(normalized) if normalized and all(normalized) else None

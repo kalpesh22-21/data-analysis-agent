@@ -133,7 +133,9 @@ def capture_terminal_sql(
     if tool_result.status != "ok" or tool_name != "runBlueprint":
         return
     captured = blueprint_run_from_result(
-        tool_result.result_full, slots=(arguments or {}).get("slot_bindings") or {}
+        tool_result.result_full,
+        slots=(arguments or {}).get("slot_bindings"),
+        data_as_of=tool_result.data_as_of,
     )
     if captured is not None:
         blueprint_id, run = captured
@@ -311,7 +313,9 @@ class TurnAccumulators:
         if tool_result.status == "ok":
             captured = (
                 blueprint_run_from_result(
-                    tool_result.result_full, slots=(arguments or {}).get("slot_bindings")
+                    tool_result.result_full,
+                    slots=(arguments or {}).get("slot_bindings"),
+                    data_as_of=tool_result.data_as_of,
                 )
                 if tool_name == "runBlueprint"
                 else None
@@ -323,7 +327,9 @@ class TurnAccumulators:
                 and isinstance(arguments, dict)
                 and isinstance(arguments.get("sql"), str)
             ):
-                self._blueprint_runs[tool_call_id] = BlueprintRun(terminal_sql=arguments["sql"])
+                self._blueprint_runs[tool_call_id] = BlueprintRun(
+                    terminal_sql=arguments["sql"], data_as_of=tool_result.data_as_of
+                )
         if tool_result.status != "ok":
             return
         if tool_name == "runQuery" and isinstance(arguments, dict):

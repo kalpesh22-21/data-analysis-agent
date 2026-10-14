@@ -13,6 +13,7 @@ no KV de-reference happens on the read path.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from data_agent.runtime.composite.answer_with_table import (
@@ -60,6 +61,7 @@ def _project_tool_call(entry: TrailEntry) -> dict[str, Any]:
         "sql": sql,
         "result_table": entry.result_preview.to_doc() if entry.result_preview else None,
         "provenance": _project_provenance(entry.provenance),
+        **({"data_as_of": entry.data_as_of} if entry.data_as_of is not None else {}),
     }
 
 
@@ -152,7 +154,14 @@ def project_history(
             and entry.tool_name == "runQuery"
             and isinstance(entry.args.get("sql"), str)
         ):
-            runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
+            runs[entry.tool_call_id] = BlueprintRun(
+                terminal_sql=entry.args["sql"], data_as_of=entry.data_as_of
+            )
+    for entry in trail:
+        if entry.status == "ok" and entry.tool_name == "runBlueprint":
+            for key in (entry.tool_call_id, entry.args.get("blueprint_id")):
+                if isinstance(key, str) and key in runs:
+                    runs[key] = replace(runs[key], data_as_of=entry.data_as_of)
     terminal_by_id = terminal_sql_by_id(runs)
     answer_tables_by_turn: dict[int, list[AnswerTable]] = {}
     scope_dropped_by_turn: dict[int, int] = {}

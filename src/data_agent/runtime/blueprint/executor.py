@@ -40,6 +40,7 @@ from data_agent.runtime.mcp.scratch_client import (
     ScratchClientError,
     ScratchClientProtocol,
 )
+from data_agent.runtime.provenance.capture import capture_data_as_of, union_data_as_of
 from data_agent.runtime.provenance.catalog_handle import SemanticCatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
 from data_agent.runtime.retrieval.scope_filter import is_blueprint_in_scope
@@ -144,6 +145,7 @@ class ExecCompleted:
     result_full: dict[str, Any]
     preview: ResultPreview
     provenance: frozenset[tuple[str, str]] | None
+    data_as_of: str | None = None
 
 
 @dataclass(frozen=True)
@@ -666,7 +668,7 @@ class BlueprintExecutor:
                 # prove the table still holds what it wrote rather than a
                 # row-TTL-expired remnant (see `_restore_materialized`).
                 running[node.order] = _node_record(
-                    {}, result.provenance, node_sql, table_name, mat_rows
+                    {}, result.provenance, node_sql, table_name, mat_rows, result.data_as_of
                 )
                 _record_empty_output(node, node_outputs)
                 continue
@@ -702,7 +704,9 @@ class BlueprintExecutor:
                     node.order,
                 )
                 return ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
-            running[node.order] = _node_record(scalar_out, result.provenance, node_sql)
+            running[node.order] = _node_record(
+                scalar_out, result.provenance, node_sql, data_as_of=result.data_as_of
+            )
             _record_output(node, scalar_out, result.result_full, node_outputs)
             terminal = (node.sql_template, node_sql, result.result_full)
 
@@ -718,6 +722,9 @@ class BlueprintExecutor:
             provenances,
             credentials,
             bound_slots=bound_slots,
+            data_as_of=union_data_as_of(
+                [r.get("data_as_of") for r in running.values() if r.get("sql")]
+            ),
             resolved_rule_bindings=rule_bindings,
         )
 
@@ -872,6 +879,7 @@ class BlueprintExecutor:
         credentials: RuntimeCredentials,
         *,
         bound_slots: dict[str, Any] | None = None,
+        data_as_of: str | None = None,
         resolved_rule_bindings: dict[str, Any] | None = None,
     ) -> ExecOutcome:
         """Run the D56 gate over the FINAL node result and build the verified
@@ -937,6 +945,7 @@ class BlueprintExecutor:
             result_full=result_full,
             preview=preview,
             provenance=_union_provenance(provenances),
+            data_as_of=data_as_of,
         )
 
     def _pause(
@@ -1938,6 +1947,7 @@ def _node_record(
     sql: str | None,
     table: str | None = None,
     row_count: int | None = None,
+    data_as_of: str | None = None,
 ) -> dict[str, Any]:
     """A completed-node record: its SCALAR `output`, the captured `provenance`, the
     bound `sql`, and — for a table PRODUCER only — the full
@@ -1960,6 +1970,7 @@ def _node_record(
         "sql": sql,
         "table": table,
         "row_count": row_count,
+        **({"data_as_of": data_as_of} if data_as_of is not None else {}),
     }
 
 
@@ -2032,6 +2043,11 @@ def _dumps_completed(running: dict[int, dict[str, Any]]) -> str | None:
             "sql": running[order].get("sql"),
             "table": running[order].get("table"),
             "row_count": running[order].get("row_count"),
+            **(
+                {"data_as_of": running[order]["data_as_of"]}
+                if running[order].get("data_as_of") is not None
+                else {}
+            ),
         }
         for order in sorted(running)
     ]
@@ -2077,6 +2093,7 @@ def _rehydrate_completed(completed_nodes_json: str | None) -> dict[int, dict[str
                     rows
                     if isinstance(rows, int) and not isinstance(rows, bool) and rows >= 0
                     else None,
+                    data_as_of=capture_data_as_of("runQuery", entry),
                 )
     return completed
 

@@ -708,7 +708,11 @@ class DemoMCPClient(FakeMCPClient):
             uses = extract_column_provenance(sql, _demo_schema(), session_id=session_id)
         except ProvenanceExtractionError as exc:
             raise MCPToolError("PARSE_FAILED_CLOSED", str(exc)) from exc
-        return {**result, "provenance": {"version": 1, "columns": [list(pair) for pair in sorted(uses)]}}
+        return {
+            **result,
+            "data_as_of": "2026-10-13T06:00:00.000Z",
+            "provenance": {"version": 1, "columns": [list(pair) for pair in sorted(uses)]},
+        }
 
     async def _call_demo_tool(
         self,

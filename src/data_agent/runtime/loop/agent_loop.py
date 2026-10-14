@@ -1542,7 +1542,9 @@ class AgentLoop:
         blueprint_runs: dict[str, BlueprintRun] = {}
         for entry in turn_entries:
             if entry.tool_name == "runQuery" and isinstance(entry.args.get("sql"), str):
-                blueprint_runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
+                blueprint_runs[entry.tool_call_id] = BlueprintRun(
+                    terminal_sql=entry.args["sql"], data_as_of=entry.data_as_of
+                )
             if entry.tool_name != "runBlueprint" or entry.result_full_ref is None:
                 continue
             result_full = await self._session_store.read_full_result(
@@ -1560,12 +1562,13 @@ class AgentLoop:
                         provenance=None,
                         result_preview=None,
                         result_full=result_full,
+                        data_as_of=entry.data_as_of,
                     ),
                     into=blueprint_runs,
                     arguments=entry.args,
                 )
                 captured = blueprint_run_from_result(
-                    result_full, slots=entry.args.get("slot_bindings")
+                    result_full, slots=entry.args.get("slot_bindings"), data_as_of=entry.data_as_of
                 )
                 if captured:
                     blueprint_runs[entry.tool_call_id] = captured[1]
@@ -2601,6 +2604,7 @@ class AgentLoop:
             # one's is, so the note has to survive the pause too — dropping it here is
             # exactly how the resume path lost the `authoritative` marker before.
             window_note=tool_result.window_note,
+            data_as_of=tool_result.data_as_of,
             # The tag survives the pause on the checkpoint, so the intent this
             # blueprint was run for closes by tag exactly as an unpaused one does.
             serves_intent=checkpoint.serves_intent,
@@ -2722,12 +2726,16 @@ class AgentLoop:
             if entry.turn_index != turn_index or entry.status != "ok":
                 continue
             if entry.tool_name == "runQuery" and isinstance(entry.args.get("sql"), str):
-                result_runs[entry.tool_call_id] = BlueprintRun(terminal_sql=entry.args["sql"])
+                result_runs[entry.tool_call_id] = BlueprintRun(
+                    terminal_sql=entry.args["sql"], data_as_of=entry.data_as_of
+                )
             elif (
                 entry.tool_name == "runBlueprint" and entry.authoritative and entry.result_full_ref
             ):
                 full = await self._session_store.read_full_result(session_id, entry.result_full_ref)
-                captured = blueprint_run_from_result(full, slots=entry.args.get("slot_bindings"))
+                captured = blueprint_run_from_result(
+                    full, slots=entry.args.get("slot_bindings"), data_as_of=entry.data_as_of
+                )
                 if captured:
                     result_runs[entry.tool_call_id] = captured[1]
         # Execution IDs and legacy blueprint IDs are different namespaces. Validate
@@ -4082,6 +4090,7 @@ class AgentLoop:
                     # data-anchored window; `None` for every other call, so every other
                     # entry serialises byte-identically.
                     window_note=tool_result.window_note,
+                    data_as_of=tool_result.data_as_of,
                     capability_terminal=tool_result.terminal
                     or bool(
                         isinstance(tool_result.result_full, dict)

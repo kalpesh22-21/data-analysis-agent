@@ -208,6 +208,7 @@ interface TurnResult {
 ```ts
 // One designated answer table — one grid per entry, in answer order.
 interface AnswerTableEntry {
+  data_as_of?: string;                // ingestion load time, ISO-8601 UTC; omitted if unknown
   sql: string;                        // page THIS string via §4.4, verbatim
   caption: string | null;             // model-authored label for this part
   blueprint_use: BlueprintUse | null; // per-table chip (null on a hand-written query)
@@ -267,6 +268,12 @@ Why the model designates: the old `result_table` was a fixed ~20-row preview the
 **Prefer `answer_tables`; treat `answer_sql` as legacy.** New clients should not read `answer_sql`/top-level `blueprint_use`/`verification` at all — they are first-table projections kept for old clients and can only under-represent a multi-part answer.
 
 Rows returned by §4.4 **may contain real cell values** — the caller's own scope-filtered answer data over an authenticated session. This is the deliberate asymmetry with `progress` (§4.1). Render every cell via `textContent` / auto-escaping — warehouse text, never trusted markup.
+
+`data_as_of` is the ingestion load time, not the query execution time or the latest business-event date. It comes only from the API receipt, normalized to ISO-8601 UTC (for example `2026-10-13T06:00:00.000Z`). Missing or malformed metadata is unknown: omit the key and hide the label. If the refresh-status table or database does not exist, the data query still succeeds and the API omits `data_as_of`. Answer tables inherit the selected serving execution's timestamp; identical SQL executed twice can have different timestamps. A blueprint uses the minimum over its executed nodes, including nodes restored after a pause; any unknown node makes the envelope unknown.
+
+The UI displays “Data as of …” on each answer-table panel and each history query panel. The persisted answer-table value is the initial fallback; a successful `/query/page` response supersedes it, including omission (hide the previous timestamp rather than label fresh rows with an old receipt). History forwards both `answer_tables[].data_as_of` and `tool_calls[].data_as_of` without synthesizing a turn-level timestamp.
+
+The API source is `dbpcm_warehouse.etl_product_refresh_status FINAL`, scoped by the caller's JWT processing center and client code, keyed by bare provenance table names. It takes `max(last_sync_date)` per product and then the minimum across products; any unmatched table omits the key. The status table is internal metadata, not a queryable tool/resource. Runtime and server may deploy in either order.
 
 #### 4.2.3 `blueprint_use`
 `null` unless a **blueprint** produced the answer. `slots` are the *raw* model-proposed bindings, which can differ from post-resolution bound values (a `resolve_via` expansion, a defaulted slot). There is **no version field** — no blueprint version concept exists.
@@ -341,6 +348,7 @@ interface QueryPageRequest {
 }
 
 interface QueryPageResponse {
+  data_as_of?: string;      // fresh dispatch ingestion time; omitted if unknown
   columns: string[];
   rows: unknown[][];        // heterogeneous JSON scalars per cell
   limit: number;            // the limit ACTUALLY applied after clamping
@@ -409,6 +417,7 @@ interface HistoryTurn {
 }
 
 interface HistoryToolCall {
+  data_as_of?: string;               // persisted ingestion time for THIS execution
   tool_name: string;                 // "runQuery" | "runBlueprint" | "resolveValues" | …
   sql: string | null;                // ALWAYS null for runBlueprint (node SQL is behind a KV ref)
   result_table: ResultTable | null;

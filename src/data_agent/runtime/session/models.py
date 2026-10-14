@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from data_agent.runtime.provenance.capture import capture_data_as_of
+
 
 @dataclass(frozen=True)
 class ResultPreview:
@@ -254,6 +256,7 @@ class TrailEntry:
     # `authoritative` on this dataclass. It is scope-inert: a closed-vocabulary sentence
     # about a window anchor, carrying no column identifier and no warehouse value.
     window_note: str | None = None
+    data_as_of: str | None = None
     capability_terminal: bool = False
     serves_intents: tuple[str, ...] = ()
     model_response: dict[str, Any] | None = None
@@ -280,6 +283,7 @@ class TrailEntry:
                 else [_provenance_to_doc(item) for item in self.answer_table_provenance]
             ),
             "window_note": self.window_note,
+            **({"data_as_of": self.data_as_of} if self.data_as_of is not None else {}),
             "capability_terminal": self.capability_terminal,
             "serves_intents": list(self.serves_intents),
             "model_response": self.model_response,
@@ -311,6 +315,7 @@ class TrailEntry:
             # `.get` + a string test: a pre-J7 document has no key (`None`), and a
             # non-string one loads as `None` rather than as a value the renderer would
             # print at the model verbatim.
+            data_as_of=capture_data_as_of("runQuery", doc),
             window_note=(
                 doc.get("window_note") if isinstance(doc.get("window_note"), str) else None
             ),
