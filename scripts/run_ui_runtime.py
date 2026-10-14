@@ -710,7 +710,6 @@ class DemoMCPClient(FakeMCPClient):
             raise MCPToolError("PARSE_FAILED_CLOSED", str(exc)) from exc
         return {
             **result,
-            "data_as_of": "2026-10-13T06:00:00.000Z",
             "provenance": {"version": 1, "columns": [list(pair) for pair in sorted(uses)]},
         }
 
@@ -879,7 +878,12 @@ def build_demo_app():
 
         span_exporter = InMemorySpanExporter()
 
+    class DemoFreshnessClient:
+        async def lookup(self, tool_name, arguments, credentials, provenance):
+            return "2026-10-13T06:00:00.000Z"
+
     return create_app(
+        freshness_client=DemoFreshnessClient(),
         settings=settings,
         session_store=session_store,
         mcp_client=mcp_client,

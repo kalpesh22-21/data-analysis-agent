@@ -92,6 +92,7 @@ from data_agent.runtime.observability.progress import ProgressEmitter, combine_o
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
+from data_agent.runtime.provenance.freshness import FreshnessClient
 from data_agent.runtime.query_page import (
     QueryPageError,
     build_page_sql,
@@ -306,6 +307,7 @@ def create_app(
     mcp_client: MCPClient | None = None,
     model_client: ModelClient | None = None,
     catalog: CatalogHandle | None = None,
+    freshness_client: FreshnessClient | None = None,
     embedding_client: EmbeddingClient | None = None,
     resolve_values: ResolveValuesComposite | None = None,
     retrieval: RetrievalPipeline | None = None,
@@ -693,6 +695,7 @@ def create_app(
             mcp_client,
             catalog_provider,
             data_as_of_enabled=settings.data_as_of_enabled,
+            freshness_client=freshness_client or FreshnessClient(settings),
             preview_row_count=settings.preview_row_count,
             # Per-result preview size cap (2026-08 fix): bounds a single stored tool
             # result (esp. a wide getTableSchema) so the trail cannot balloon.

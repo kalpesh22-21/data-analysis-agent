@@ -33,7 +33,7 @@ from data_agent.runtime.dispatch.sql_diagnostics import (
 from data_agent.runtime.mcp.client import MCPClient, MCPToolError
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.redaction import tool_span_args
-from data_agent.runtime.provenance.capture import DATA_TOOLS, capture_data_as_of, capture_provenance
+from data_agent.runtime.provenance.capture import DATA_TOOLS, capture_provenance
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.models import ResultPreview
 
@@ -488,6 +488,7 @@ class ToolDispatcher:
         catalog: CatalogHandle | CatalogProvider,
         *,
         data_as_of_enabled: bool = True,
+        freshness_client: Any = None,
         preview_row_count: int = 20,
         max_tool_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
         schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
@@ -497,6 +498,7 @@ class ToolDispatcher:
     ) -> None:
         self._mcp_client = mcp_client
         self._data_as_of_enabled = data_as_of_enabled
+        self._freshness_client = freshness_client
         # Retained for the agent's pre-execution aggregation/measurement checks.
         # Execution provenance comes exclusively from the API response.
         self._catalog = catalog
@@ -631,9 +633,7 @@ class ToolDispatcher:
                 session_id=credentials.session_id,
             )
             provenance = capture_provenance(tool_name, raw_result)
-            data_as_of = (
-                capture_data_as_of(tool_name, raw_result) if self._data_as_of_enabled else None
-            )
+            data_as_of = None
             if tool_name in DATA_TOOLS:
                 from data_agent.runtime.context.scope_filter import is_provenance_in_scope
 
@@ -642,6 +642,10 @@ class ToolDispatcher:
                         "API_PROVENANCE_INVALID",
                         "The API provenance includes columns outside the request's access scope. "
                         "This is an API contract mismatch, not an empty query result.",
+                    )
+                if self._data_as_of_enabled and self._freshness_client is not None:
+                    data_as_of = await self._freshness_client.lookup(
+                        tool_name, model_args, credentials, provenance
                     )
                 raw_result = {
                     key: value

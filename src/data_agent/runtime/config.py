@@ -240,6 +240,19 @@ class RuntimeSettings(BaseSettings):
         description="Enable optional ingestion freshness metadata. Set DATA_AS_OF_ENABLED=false to disable.",
     )
 
+    data_as_of_clickhouse_url: str = Field(
+        "", description="Direct ClickHouse HTTP URL for freshness only; empty disables the lookup."
+    )
+    data_as_of_clickhouse_user: str = Field(
+        "", description="Database user for the fixed freshness query."
+    )
+    data_as_of_clickhouse_password: str = Field("", repr=False)
+    data_as_of_clickhouse_database: str = Field(
+        "dbpcm_warehouse",
+        description="Source database whose bare table names are freshness product keys.",
+    )
+    data_as_of_timeout_seconds: float = Field(2.0, gt=0, allow_inf_nan=False)
+
     # --- Adopted MCP (clickhouse-api, D75) ---
     mcp_max_response_bytes: int = Field(
         16 * 1024 * 1024,

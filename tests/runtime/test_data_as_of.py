@@ -1,6 +1,8 @@
 """Ingestion timestamps stay tied to the serving execution through every projection."""
 
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -60,7 +62,7 @@ def test_union_is_fail_closed(values, expected):
     assert union_data_as_of(values) == expected
 
 
-async def test_dispatch_extracts_and_strips_metadata():
+async def test_dispatch_uses_runtime_lookup_and_strips_upstream_metadata():
     raw = {
         "columns": ["EmployeeCode"],
         "rows": [["E1"]],
@@ -68,8 +70,10 @@ async def test_dispatch_extracts_and_strips_metadata():
         "truncated": False,
         "provenance": {"version": 1, "columns": [["dbpcm_warehouse.employee", "EmployeeCode"]]},
     }
-    mcp = FakeMCPClient(scripted={"runQuery": [raw]}, data_as_of=NEWER)
-    result = await ToolDispatcher(mcp, CATALOG).dispatch(
+    mcp = FakeMCPClient(scripted={"runQuery": [raw]}, data_as_of=OLDER)
+    result = await ToolDispatcher(
+        mcp, CATALOG, freshness_client=SimpleNamespace(lookup=AsyncMock(return_value=NEWER))
+    ).dispatch(
         "runQuery", {"sql": "SELECT EmployeeCode FROM dbpcm_warehouse.employee"}, _credentials()
     )
     assert result.status == "ok"
@@ -160,6 +164,10 @@ def test_page_uses_fresh_dispatch_timestamp(monkeypatch, stamp):
     raw = {"columns": ["n"], "rows": [[1]], "row_count": 1, "truncated": False}
     if stamp:
         raw["data_as_of"] = stamp
+    monkeypatch.setattr(
+        "data_agent.runtime.provenance.freshness.FreshnessClient.lookup",
+        AsyncMock(return_value=stamp),
+    )
     client, _ = _client(monkeypatch, scripted={"runQuery": [raw]})
     response = client.post("/query/page", json={"sql": "SELECT 1 AS n"}, headers=HEADERS)
     assert response.status_code == 200
@@ -193,6 +201,7 @@ async def test_live_answer_and_replay_keep_serving_timestamp():
             {"columns": ["Employee Count"], "rows": [[120]], "row_count": 1, "data_as_of": NEWER}
         ],
     )
+    loop._tool_dispatcher._freshness_client = SimpleNamespace(lookup=AsyncMock(return_value=NEWER))
     outcome = await run(loop, "Count employees and show the result.")
     wire = _outcome_to_dict(outcome)
     assert wire["answer_tables"][0]["data_as_of"] == NEWER
@@ -210,9 +219,11 @@ async def test_blueprint_resume_includes_pre_pause_freshness(before_pause):
     from tests.runtime.blueprint.test_pause_resume_qa6 import _approval_detail, _executor
 
     initial = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]}, data_as_of=before_pause)
-    paused = await _executor(initial, _approval_detail()).execute(
-        blueprint_id="bp-pr", slot_bindings={}, credentials=_creds()
+    executor = _executor(initial, _approval_detail())
+    executor._tool_dispatcher._freshness_client = SimpleNamespace(
+        lookup=AsyncMock(return_value=before_pause)
     )
+    paused = await executor.execute(blueprint_id="bp-pr", slot_bindings={}, credentials=_creds())
     assert isinstance(paused, ExecPaused)
     resumed = FakeMCPClient(
         scripted={
@@ -223,7 +234,11 @@ async def test_blueprint_resume_includes_pre_pause_freshness(before_pause):
         },
         data_as_of=NEWER,
     )
-    outcome = await _executor(resumed, _approval_detail()).resume(
+    executor = _executor(resumed, _approval_detail())
+    executor._tool_dispatcher._freshness_client = SimpleNamespace(
+        lookup=AsyncMock(return_value=NEWER)
+    )
+    outcome = await executor.resume(
         blueprint_id="bp-pr",
         slot_bindings={},
         completed_nodes_json=paused.completed_nodes_json,
@@ -330,3 +345,24 @@ async def test_disabled_flag_hides_resumed_outcome_in_sse():
     assert "event: result" in "".join(events)
     assert "data_as_of" not in "".join(events)
     assert outcome.answer_tables[0]["data_as_of"] == NEWER
+
+
+async def test_upstream_timestamp_is_ignored_without_runtime_lookup():
+    mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                {
+                    "columns": ["n"],
+                    "rows": [[1]],
+                    "row_count": 1,
+                    "data_as_of": NEWER,
+                }
+            ]
+        }
+    )
+    result = await ToolDispatcher(mcp, CATALOG).dispatch(
+        "runQuery", {"sql": "SELECT 1 AS n"}, _credentials()
+    )
+    assert result.status == "ok"
+    assert result.data_as_of is None
+    assert "data_as_of" not in result.result_full

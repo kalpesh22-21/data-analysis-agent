@@ -1,9 +1,10 @@
-"""Local JWKS verification — defense-in-depth only.
+"""Local JWKS verification for replay scope and optional freshness tenant filters.
 
 This result NEVER gates a live MCP tool call; `clickhouse-api`'s own validation is the
-sole live enforcement boundary (D57/D80). It exists so `context/scope_filter.py`'s D44
-replay filter can trust the `column_scope` it uses to decide what history to re-show the
-same already-authenticated user. Deliberate divergence from the MCP: a missing, empty or
+live tool enforcement boundary (D57/D80). It also verifies tenant claims for the
+runtime-owned freshness lookup. For replay, `context/scope_filter.py`'s D44 filter
+trusts the `column_scope` it uses to decide what history to re-show the same
+already-authenticated user. Deliberate divergence from the MCP: a missing, empty or
 unparseable `column_scope` claim is `frozenset()` (allow-all) here rather than a
 rejection, matching `scope_filter.py`'s own D80(b) semantics.
 """
@@ -76,15 +77,15 @@ def _extract_column_scope(claims: dict[str, Any]) -> frozenset[str]:
     return frozenset(scope_list)
 
 
-def verify_jwt(
+def verify_jwt_claims(
     token: str,
     *,
     jwks_url: str,
     issuer: str,
     audience: str,
     signing_key_resolver: Callable[[str], Any] | None = None,
-) -> frozenset[str]:
-    """Verify *token* against *jwks_url*/*issuer*/*audience* and return its `column_scope`.
+) -> dict[str, Any]:
+    """Verify *token* against *jwks_url*/*issuer*/*audience* and return its authenticated claims.
 
         *signing_key_resolver*, if given, replaces the real `PyJWKClient` HTTP fetch (the
         Layer-1 test seam; `app.py` never passes it). Raises `JWTVerificationError` on an
@@ -128,7 +129,27 @@ def verify_jwt(
         logger.info("JWT validation failed: %s", exc)
         raise JWTVerificationError("Invalid token.", code="INVALID_AUTH") from exc
 
-    return _extract_column_scope(claims)
+    return claims
 
 
-__all__ = ["JWTVerificationError", "verify_jwt"]
+def verify_jwt(
+    token: str,
+    *,
+    jwks_url: str,
+    issuer: str,
+    audience: str,
+    signing_key_resolver: Callable[[str], Any] | None = None,
+) -> frozenset[str]:
+    """Verify a bearer token and return its replay column scope."""
+    return _extract_column_scope(
+        verify_jwt_claims(
+            token,
+            jwks_url=jwks_url,
+            issuer=issuer,
+            audience=audience,
+            signing_key_resolver=signing_key_resolver,
+        )
+    )
+
+
+__all__ = ["JWTVerificationError", "verify_jwt", "verify_jwt_claims"]
