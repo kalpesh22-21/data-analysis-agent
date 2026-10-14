@@ -268,6 +268,7 @@ def build_real_app():
             base_url=settings.openai_base_url,
             use_reasoning_metadata=settings.use_reasoning_metadata,
             tool_choice=settings.model_tool_choice,
+            api_mode=settings.model_api,
         ),
         catalog=catalog_handle(),
     )
