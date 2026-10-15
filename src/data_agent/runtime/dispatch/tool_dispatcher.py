@@ -37,7 +37,7 @@ from data_agent.runtime.provenance.capture import DATA_TOOLS, capture_provenance
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.models import ResultPreview
 
-from .denial_mapping import KNOWN_DENIAL_CODES, DenialInfo, DenialKind, classify_denial
+from .denial_mapping import MODEL_QUERY_ERROR_CODES, MODEL_SERVICE_ERROR_CODES, KNOWN_DENIAL_CODES, DenialInfo, DenialKind, classify_denial
 from .schema_preview import _estimate_tokens, fit_schema_under_cap
 
 if TYPE_CHECKING:
@@ -686,7 +686,7 @@ class ToolDispatcher:
                 or (exc.code in KNOWN_DENIAL_CODES and denial.kind == DenialKind.WORK_JUDGED)
                 else None
             )
-            if denial.code == "CLICKHOUSE_QUERY_ERROR":
+            if denial.code in MODEL_QUERY_ERROR_CODES | MODEL_SERVICE_ERROR_CODES | {"CLICKHOUSE_QUERY_ERROR"}:
                 denial_detail = encode_diagnostic(detail, str(model_args.get("sql", "")))
             if denial.code == "INVALID_COLUMN_REFERENCE":
                 denial_detail = encode_column_reference_diagnostic(

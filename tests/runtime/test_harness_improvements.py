@@ -911,7 +911,7 @@ async def test_blueprint_executor_checks_join_keys_before_consumer_execution():
     outcome = await _executor(mcp, scratch_client=FakeScratchClient()).execute(
         blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
     )
-    assert isinstance(outcome, ExecFailed) and outcome.error_code == "AGGREGATION_RISK"
+    assert isinstance(outcome, ExecFailed) and outcome.error_code == "AGGREGATION_DUPLICATE_KEYS"
     assert len(mcp.calls) == 3 and "uniqExact" in mcp.calls[-1].args["sql"]
 
 

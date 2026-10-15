@@ -137,6 +137,11 @@ class RetrievalPipeline:
     ) -> None:
         self._embedding_client = embedding_client
         self._reranker = reranker
+        if reranker is None:
+            _logger.warning(
+                "Blueprint/knowledge reranking disabled: no reranker configured; "
+                "using recall order. Configure RERANKER_API_URL to enable reranking."
+            )
         self._vector_index = vector_index
         self._user_memory = user_memory
         self._recall_k = recall_k
@@ -419,7 +424,7 @@ class RetrievalPipeline:
         try:
             scored = await self._rerank_with_span(question, candidates)
         except Exception:  # noqa: BLE001 - any rerank failure degrades to recall order
-            _logger.warning("rerank failed; using recall order", exc_info=True)
+            _logger.warning("Reranking failed; using recall order. See reranker.degraded_reason in the rerank span.")
             return list(candidates), False
         scored.sort(key=lambda c: (-(c.score or 0.0), c.id))
         return scored, True
@@ -435,10 +440,28 @@ class RetrievalPipeline:
         with self._rerank_span(len(docs)) as span:
             try:
                 scores = await self._reranker.rerank(question, docs)  # type: ignore[union-attr]
+                if len(scores) != len(candidates):
+                    if span is not None:
+                        span.set_attribute("reranker.degraded_reason", "score_count_mismatch")
+                    raise ValueError("reranker score count mismatch")
                 scored = [replace(c, score=s) for c, s in zip(candidates, scores, strict=True)]
-            except Exception:
+            except Exception as exc:
                 if span is not None:
                     span.set_attribute("reranker.reranked", False)
+                    if not (isinstance(exc, ValueError) and str(exc) == "reranker score count mismatch"):
+                        # Inspect exception types only; provider messages can contain queries.
+                        import httpx
+
+                        cause = exc
+                        timed_out = False
+                        seen: set[int] = set()
+                        while cause is not None and id(cause) not in seen:
+                            seen.add(id(cause))
+                            timed_out |= isinstance(cause, (TimeoutError, httpx.TimeoutException))
+                            cause = cause.__cause__
+                        span.set_attribute(
+                            "reranker.degraded_reason", "timeout" if timed_out else "provider_error"
+                        )
                 raise
             if span is not None:
                 span.set_attribute("reranker.reranked", True)
@@ -533,8 +556,8 @@ class RetrievalPipeline:
             model=self._reranker_model,
             document_count=document_count,
             reranked=reranked,
-        ):
-            pass
+        ) as span:
+            span.set_attribute("reranker.degraded_reason", "not_configured")
 
     def _degrade(self, reason: str, obs: Observer | None) -> RetrievedContext:
         """A retrieval-wide degrade early-return: emit a shape-only degrade span and a zeroed

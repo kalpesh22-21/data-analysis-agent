@@ -1,63 +1,180 @@
-# Hand-authored blueprint seed corpus (neo4j-corpus-design §3.2, extended with the
-# full DAG by runblueprint-design §1.2).
-#
-# A MIRROR, kept by hand: there is no generator. The source of truth is the MCP canon
-# (`clickhouse-api/app/corpus/data/blueprints/bp-*.yaml`), and
-# `tests/runtime/retrieval/test_corpus_loader_structural_key_qa.py` asserts this file
-# matches it on every field of every shared id — so when the canon changes, edit here to
-# match rather than the other way round. (Last sync: `bp-total-earnings-by-department`'s
-# `uses_rules` id `earnings_only` → `gross_earnings`, which is what the semantic catalog
-# actually declares for `register_type = 'EARN'`.)
-#
-# `uses` strings are BYTE-EXACT `"database.table.column"` scope keys of the HR
-# warehouse the Layer-2 ClickHouse seed (docker/clickhouse-init/hr-warehouse.sql)
-# + the Semantic Catalog describe — so scope filtering against a real scope is
-# genuinely exercised. Any format skew here silently drops the blueprint via the
-# set-subset scope pre-filter (§8 highest-risk contract), so these are curated
-# against the real `dbpcm_warehouse.<table>.<Column>` names.
-#
-# Each seed is an EXECUTABLE SINGLE-NODE blueprint (runblueprint-design §Q7 Slice
-# A): a top-level `sql_template` with `{slot}` bind sites, typed `slots`, and a
-# declared `result_grain` (D56 checks the result against it). The corpus loader's
-# write-time validation (§1.2) proves every `{slot}` is declared, each template
-# parses under ClickHouse, and the template's column footprint ⊆ `uses`.
-- id: bp-overtime-by-department
-  intent: Earnings by department for a given pay period, filtered to a specific pay type (type_code) such as overtime
-  slots_summary: department, pay_period, type_code
+- id: bp-accrual-balance-summary
+  intent: 'Recorded beginning, accrued, awarded and taken plan balances by company, department or plan. Optional
+    accrual plan code, employee status, department and employee. Uses taken_amount, never approved event hours.
+    No implicit PTO filter: resolve plan code for PTO. No event-date restriction, current-balance formula or assumed
+    units. Cross-plan sums require compatible units; otherwise use plan grouping/filter. Preaggregate balance rows
+    by employee/plan before LEFT JOIN; preserve source row count without assuming unique plan rows.'
+  slots_summary: group_by, accrual_code, employee_status, department, employee
   status: validated
   drift_status: clean
-  catalog_sha: ""
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
-    - dbpcm_warehouse.payroll.employee_code
-    - dbpcm_warehouse.payroll.register_type
-    - dbpcm_warehouse.payroll.type_code
-    - dbpcm_warehouse.payroll.amount
-    - dbpcm_warehouse.payroll.pay_period_end_date
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.accrual_balances.employee_code
+  - dbpcm_warehouse.accrual_balances.accrual_code
+  - dbpcm_warehouse.accrual_balances.beginning_balance
+  - dbpcm_warehouse.accrual_balances.accrued_amount
+  - dbpcm_warehouse.accrual_balances.awarded_amount
+  - dbpcm_warehouse.accrual_balances.taken_amount
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.department_name
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
-    - { name: pay_period, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
-    - { name: type_code, type: string, required: true, binds_to: dbpcm_warehouse.payroll.type_code }
-  uses_rules:
-    - gross_earnings
-  result_grain: [ Department ]
-  sql_template: |
-    SELECT e.department_name AS department, SUM(p.amount) AS earnings
-    FROM dbpcm_warehouse.payroll AS p
-    JOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code
-    WHERE p.register_type = 'EARN'
-      AND p.type_code = {type_code}
-      AND e.department_name = {department}
-      AND p.pay_period_end_date = {pay_period}
-    GROUP BY e.department_name
-
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - department
+    - plan
+  - name: accrual_code
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.accrual_balances.accrual_code
+    optional_pattern: 'TRUE'
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  sql_template: "WITH b AS (\n SELECT employee_code, accrual_code, sum(beginning_balance) AS beginning,\n sum(accrued_amount)\
+    \ AS accrued, sum(awarded_amount) AS awarded,\n sum(taken_amount) AS taken, count(*) AS balance_rows\n FROM\
+    \ dbpcm_warehouse.accrual_balances WHERE accrual_code = {accrual_code}\n GROUP BY employee_code, accrual_code\n\
+    )\nSELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'plan' THEN b.accrual_code ELSE 'Company'\
+    \ END AS `Group`, sum(CAST(b.beginning AS Nullable(Decimal(38, 6)))) AS `Beginning Balance`,\n sum(CAST(b.accrued\
+    \ AS Nullable(Decimal(38, 6)))) AS `Accrued Amount`, sum(CAST(b.awarded AS Nullable(Decimal(38, 6)))) AS `Awarded\
+    \ Amount`,\n sum(CAST(b.taken AS Nullable(Decimal(38, 6)))) AS `Taken Amount`, sum(CAST(b.balance_rows AS Nullable(Decimal(20,\
+    \ 0)))) AS `Source Balance Rows`,\n uniqExact(b.employee_code) AS `Employee Count`\nFROM b LEFT JOIN dbpcm_warehouse.employee\
+    \ e ON b.employee_code = e.employee_code\nWHERE e.employee_status = {employee_status} AND e.department_name\
+    \ = {department} AND e.employee_code = {employee}\nGROUP BY CASE {group_by} WHEN 'department' THEN e.department_name\
+    \ WHEN 'plan' THEN b.accrual_code ELSE 'Company' END\nORDER BY `Group`\n"
+- id: bp-accrual-event-summary
+  intent: Accrual event/day row counts, event hours and distinct employees by company, department, workflow status,
+    event type, event-date month or department_status (department and status together). Includes all event types
+    and leave categories unless explicitly filtered. Required half-open requested-for-date period [start,end); optional
+    workflow status enum, resolved event_type and earn_code strings, employee status, department and employee. No
+    implicit Approved or PTO filter. COUNT counts event/day rows, not distinct multi-day requests. Approved hours
+    are not taken balance usage. LEFT JOIN preserves unmatched events unless employee filters supplied; does not
+    zero-fill periods or prove full coverage.
+  slots_summary: group_by, period, event_status, event_type, earn_code, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.accrual_events.employee_code
+  - dbpcm_warehouse.accrual_events.status
+  - dbpcm_warehouse.accrual_events.event_type
+  - dbpcm_warehouse.accrual_events.earn_code
+  - dbpcm_warehouse.accrual_events.request_date
+  - dbpcm_warehouse.accrual_events.hours
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.department_name
+  slots:
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - department
+    - status
+    - event_type
+    - month
+    - department_status
+  - name: period
+    type: period_range
+    required: true
+  - name: event_status
+    type: enum
+    required: false
+    enum_values:
+    - Approved
+    - Requested
+    - Denied
+    - Removed
+    - Calendar Only
+    binds_to: dbpcm_warehouse.accrual_events.status
+    optional_pattern: 'TRUE'
+  - name: event_type
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.accrual_events.event_type
+    optional_pattern: 'TRUE'
+  - name: earn_code
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.accrual_events.earn_code
+    optional_pattern: 'TRUE'
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  - Event Status
+  sql_template: "WITH a AS (\n SELECT employee_code, status, event_type, substring(toString(request_date), 1, 7)\
+    \ AS month,\n count(*) AS event_rows, sum(hours) AS hours\n FROM dbpcm_warehouse.accrual_events\n WHERE status\
+    \ = {event_status} AND event_type = {event_type} AND earn_code = {earn_code}\n AND toDate(request_date) >= toDate({period_start})\
+    \ AND toDate(request_date) < toDate({period_end})\n GROUP BY employee_code, status, event_type, substring(toString(request_date),\
+    \ 1, 7)\n)\nSELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'department_status' THEN e.department_name\
+    \ WHEN 'status' THEN a.status WHEN 'event_type' THEN a.event_type WHEN 'month' THEN toString(a.month) ELSE 'Company'\
+    \ END AS `Group`, CASE WHEN {group_by} = 'department_status' THEN a.status ELSE 'All selected statuses' END\
+    \ AS `Event Status`, sum(CAST(a.event_rows AS Nullable(Decimal(20, 0)))) AS `Event Day Rows`,\n sum(CAST(a.hours\
+    \ AS Nullable(Decimal(38, 6)))) AS `Event Hours`, uniqExact(a.employee_code) AS `Employee Count`\nFROM a LEFT\
+    \ JOIN dbpcm_warehouse.employee e ON a.employee_code = e.employee_code\nWHERE e.employee_status = {employee_status}\
+    \ AND e.department_name = {department} AND e.employee_code = {employee}\nGROUP BY CASE {group_by} WHEN 'department'\
+    \ THEN e.department_name WHEN 'department_status' THEN e.department_name WHEN 'status' THEN a.status WHEN 'event_type'\
+    \ THEN a.event_type WHEN 'month' THEN toString(a.month) ELSE 'Company' END\n, CASE WHEN {group_by} = 'department_status'\
+    \ THEN a.status ELSE 'All selected statuses' END\nORDER BY `Group`, `Event Status`\n"
 - id: bp-active-headcount-by-department
-  intent: Active employee headcount by department, including departments with no active employees
+  intent: Active employee headcount by department, including departments with no active employees (active-only;
+    for other/all statuses use bp-employee-summary)
   slots_summary: department
   status: validated
   drift_status: clean
-  catalog_sha: ''
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_code
@@ -65,8 +182,6 @@
   - dbpcm_warehouse.department.department_code
   - dbpcm_warehouse.department.department_name
   slots:
-  # Omitting `department` includes all accessible departments, including zero counts.
-  # Apply the optional name filter to the directory, not to joined employee rows.
   - name: department
     type: string
     required: false
@@ -76,427 +191,1182 @@
   - active_employee
   result_grain:
   - department_code
-  sql_template: |
-    SELECT
-        d.department_code AS department_code,
-        d.department_name AS department,
-        coalesce(e.active_count, 0) AS headcount
-    FROM dbpcm_warehouse.department AS d
-    LEFT JOIN (
-        SELECT department_code, uniqExact(employee_code) AS active_count
-        FROM dbpcm_warehouse.employee
-        WHERE employee_status = 'A'
-        GROUP BY department_code
-    ) AS e ON d.department_code = e.department_code
-    WHERE d.department_name = {department}
-    ORDER BY headcount, department, department_code
-- id: bp-average-salary-by-department
-  intent: Average annual salary by department
-  slots_summary: department
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.department_name
-    - dbpcm_warehouse.employee.annual_salary
-  resolves:
-    salary: annual_salary
-  slots:
-    - { name: department, type: string, required: false, binds_to: dbpcm_warehouse.employee.department_name, optional_pattern: 'TRUE' }
-  result_grain: [ Department ]
-  sql_template: |
-    SELECT department_name AS department,
-           AVG(annual_salary) AS avg_salary,
-           COUNT(DISTINCT employee_code) AS headcount
-    FROM dbpcm_warehouse.employee
-    WHERE department_name = {department}
-    GROUP BY department_name
-
-# Slice-C SINGLE-NODE `resolve_via` blueprint (D67, runblueprint-design §3.4): the
-# `gross_earnings` rule maps the concept "earnings" → the earnings register_type code
-# set via the typed `resolveValues.resolve()` hook (NO model round-trip), and the
-# executor folds the ranked codes into the `{earn_codes}` predicate as a typed AST
-# IN-list (F1/D10 — never interpolated). Value-only ranking (register_type has no
-# sibling description column) against the real embedder + the DISTINCT-domain freq.
-# The seed's catalog-faithful register_type domain is {EARN, EETAX, DDUCT,
-# NETPAYDIST, EEBEN, ERTAX} (EARN has one row per paid employee); "earnings" must
-# rank EARN first, above deduction/tax codes such as DDUCT/EETAX.
-- id: bp-total-earnings-by-department
-  intent: Total earnings for a department, resolving the earnings register codes dynamically
-  slots_summary: department
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.payroll.employee_code
-    - dbpcm_warehouse.payroll.register_type
-    - dbpcm_warehouse.payroll.amount
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.department_name
-  slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
-  uses_rules:
-    - { id: gross_earnings, resolve_via: "resolveValues(register_type, 'earnings')", table: dbpcm_warehouse.payroll, binds: earn_codes }
-  result_grain: [ Department ]
-  sql_template: |
-    SELECT e.department_name AS department, SUM(p.amount) AS total_earnings
-    FROM dbpcm_warehouse.payroll AS p
-    JOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code
-    WHERE p.register_type IN {earn_codes}
-      AND e.department_name = {department}
-    GROUP BY e.department_name
-
-# Slice-C multi-node SCALAR-passing DAG (runblueprint-design §2.4/§Q7 Slice C):
-# node 0 computes the company-wide average as a SCALAR; node 1 consumes it as a
-# typed AST literal (F1/D10 — never interpolated) to select the departments above
-# it. No table intermediate (F2-clean); the declared result grain is department_name.
-- id: bp-departments-above-company-average-salary
-  intent: Departments whose average salary exceeds the company-wide average
-  slots_summary: ""
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.department_name
-    - dbpcm_warehouse.employee.annual_salary
-  result_grain: [ Department ]
-  composes:
-    - order: 0
-      output: { company_avg: scalar }
-      sql_template: |
-        SELECT AVG(annual_salary) AS company_avg
-        FROM dbpcm_warehouse.employee
-    - order: 1
-      feeds_from: [ 0 ]
-      consumes: { company_avg: "$0.company_avg" }
-      output: {}
-      sql_template: |
-        SELECT department_name AS department, AVG(annual_salary) AS dept_avg
-        FROM dbpcm_warehouse.employee
-        GROUP BY department_name
-        HAVING AVG(annual_salary) > {company_avg}
-
-# Table-intermediate DAG (table-intermediate-design §2.2/§Q2, Slice 2). Genuinely
-# NOT scalar-converging: node 0 produces a per-EMPLOYEE earnings TABLE (many rows,
-# one per employee), which node 1 ROW-JOINs against the warehouse `employee` table
-# to aggregate by department. A scalar pass cannot carry a per-employee table, so
-# this exercises the D93 materialize-and-join path — node 0's result is
-# materialized to `scratch.s_<sid>_bp_<uuid>` and node 1's `scratch.emp_earnings`
-# FROM token is AST-rewritten to it (runtime-controlled identifier, never model
-# text). The join key is CAST to a stable type (`toString(employee_code)` — matches
-# the String warehouse key) and the measure to `toFloat64` (§Q2/OQ-A). The scratch
-# columns are session-gated (excluded from `uses`, D69/OQ-4); the warehouse columns
-# stay ⊆ uses. The terminal grain (department_name) is D56-verified.
-- id: bp-earnings-by-department-via-scratch-join
-  intent: Total earnings by department, materializing per-employee earnings and joining departments
-  slots_summary: department
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.payroll.employee_code
-    - dbpcm_warehouse.payroll.register_type
-    - dbpcm_warehouse.payroll.amount
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.department_name
-  slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
-  result_grain: [ Department ]
-  composes:
-    - order: 0
-      output: { emp_earnings: table }
-      sql_template: |
-        SELECT toString(p.employee_code) AS employee_code,
-               toFloat64(SUM(p.amount)) AS earnings
-        FROM dbpcm_warehouse.payroll AS p
-        WHERE p.register_type = 'EARN'
-        GROUP BY p.employee_code
-    - order: 1
-      feeds_from: [ 0 ]
-      consumes: { emp_earnings: "$0" }
-      output: {}
-      sql_template: |
-        SELECT e.department_name AS department, SUM(x.earnings) AS total_earnings
-        FROM scratch.emp_earnings AS x
-        JOIN dbpcm_warehouse.employee AS e ON e.employee_code = x.employee_code
-        WHERE e.department_name = {department}
-        GROUP BY e.department_name
-
-# Windowed-period slot — `relative_window` (a trailing "last N months", D41/D49):
-# the runtime resolves the raw value to a BOUNDED integer and binds it as an
-# `INTERVAL {n} MONTH` NUMBER literal (F1/D10 — never interpolated). `min_value`/
-# `max_value` narrow the safety bounds (default 1..120); an out-of-range or
-# non-integer value → askUser, never an absurd `INTERVAL 999999 MONTH`.
-- id: bp-hires-per-month
-  intent: New hires per month over a trailing window of the last N months — counts by original hire date; rehires are not re-counted
-  slots_summary: window_months
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.hire_date
-    - dbpcm_warehouse.employee.employee_status
-  slots:
-    - { name: window_months, type: relative_window, required: true, min_value: 1, max_value: 36 }
-  result_grain: [ month ]
-  # J7 — DECLARE the anchor the template below actually uses. The window counts back from
-  # `max(hire_date)`, so on a warehouse whose latest hire is 2021 a "last 6 months" run
-  # answers about 2021, not about today. That is correct and deliberate (see the anchor
-  # note below), but it was UNSTATED: the model, which now has a grounded "today", read
-  # the 2021 rows as a broken result and re-derived the whole answer with its own
-  # calendar-anchored SQL. The declaration is surfaced by `getBlueprint` and on the run
-  # result, so the model presents "as of the latest data" instead of re-deriving.
-  window_anchor: data
-  # Anchor the trailing window on the DATA (the latest hire month present), not the
-  # wall clock — so the fixture doesn't decay to empty as real time passes. The
-  # window yields N whole months PLUS the current partial (latest) bucket (harmless
-  # here — this is a per-month listing, no division by N). exclude_not_hired_default:
-  # drop 'N' (pre-hire) records — in BOTH the outer WHERE and the anchor subquery, so
-  # a future-dated 'N' hire date can never become max() and drag the anchor. The
-  # `OR IS NULL` matters: employee_status is Nullable(String), a bare `!= 'N'` drops NULLs.
-  sql_template: |
-    SELECT toStartOfMonth(hire_date) AS month,
-           COUNT(DISTINCT employee_code) AS hires
-    FROM dbpcm_warehouse.employee
-    WHERE hire_date >= (
-            SELECT toStartOfMonth(max(hire_date))
-            FROM dbpcm_warehouse.employee
-            WHERE employee_status != 'N' OR employee_status IS NULL
-          ) - INTERVAL {window_months} MONTH
-      AND (employee_status != 'N' OR employee_status IS NULL)
-    GROUP BY toStartOfMonth(hire_date)
-
-# Windowed-period slot — `period_range` (an explicit {start, end}, D41/D49): the
-# ONE slot expands to TWO bind tokens `{hire_window_start}` / `{hire_window_end}`,
-# each bound as a TYPED string literal (F1/D10). BOTH tokens must be referenced or
-# the loader rejects the blueprint (a dropped bound is a dropped filter, the D56
-# wrong-answer class). The resolver does NO relative→concrete date math — an
-# explicit ISO {start,end} is required; a deictic word ("last month") → askUser.
-- id: bp-hires-in-range
-  intent: New hires per month within an explicit start/end date range — counts by original hire date; rehires are not re-counted
-  slots_summary: hire_window
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.hire_date
-    - dbpcm_warehouse.employee.employee_status
-  slots:
-    - { name: hire_window, type: period_range, required: true }
-  result_grain: [ month ]
-  # J7 — `calendar`, and the contrast with its two siblings is the reason to declare it
-  # rather than leave it silent. This blueprint has NO anchor of its own: both bounds are
-  # the explicit ISO dates the caller binds, so the window is exactly the calendar period
-  # asked for. That makes it the RIGHT blueprint for a calendar question ("hires in the
-  # last six months", "hires in Q1"), and the declaration is how the model can tell —
-  # otherwise the only signal is a `period_range` slot type, which says how to FILL it,
-  # not what the window means. The gloss is written to be true of this shape ("bound to
-  # the calendar dates you supply"), NOT as a claim that the window is anchored on today:
-  # nothing here reads the clock.
-  window_anchor: calendar
-  # exclude_not_hired_default: drop 'N' (pre-hire) records. `OR IS NULL` matters —
-  # employee_status is Nullable(String), a bare `!= 'N'` drops NULL rows.
-  sql_template: |
-    SELECT toStartOfMonth(hire_date) AS month,
-           COUNT(DISTINCT employee_code) AS hires
-    FROM dbpcm_warehouse.employee
-    WHERE hire_date >= {hire_window_start}
-      AND hire_date < {hire_window_end}
-      AND (employee_status != 'N' OR employee_status IS NULL)
-    GROUP BY toStartOfMonth(hire_date)
-
-# Second-order (D103/D104, second-order-analysis-design §2–§3): a run-rate PROJECTION.
-# The pivot away from a bespoke `projectSeries` tool — the projection math is plain
-# ClickHouse (sum-of-hires-in-window ÷ window_months × horizon_months), so it lives in
-# a VERIFIED blueprint that rides the existing D56-verify + provenance path, not a new
-# tool. A single-row aggregate (no GROUP BY / CTE / WITH FILL): `sum/N` counts zero-hire
-# months correctly BY CONSTRUCTION (a zero-hire month adds 0; the denominator is the
-# fixed window N), so the empty months never need materializing. `result_grain: []` → a
-# single-row aggregate, so D56 grain-verify is vacuously skipped.
-- id: bp-hires-projection
-  intent: Projected number of hires over the next N months at the current hiring pace (run-rate over a trailing window) — counts by original hire date; rehires are not re-counted
-  slots_summary: window_months, horizon_months
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.employee.employee_code
-    - dbpcm_warehouse.employee.hire_date
-    - dbpcm_warehouse.employee.employee_status
-  slots:
-    - { name: window_months,  type: relative_window, required: true, min_value: 2, max_value: 36 }
-    - { name: horizon_months, type: relative_window, required: true, min_value: 1, max_value: 24 }
-  result_grain: []
-  # J7 — `data`, same anchor and same reason as bp-hires-per-month (the trailing window
-  # counts back from `max(hire_date)`). It matters MORE here, not less: the output is a
-  # forward PROJECTION, so an unstated anchor means a run-rate measured over 2021 gets
-  # reported as "the next N months from today" with nothing in the result to contradict
-  # it. The declaration makes the base period sayable.
-  window_anchor: data
-  # Run-rate projection: avg monthly hires over the trailing window, projected forward.
-  # Denominator/span alignment: the anchor is shifted FORWARD one month (addMonths(...,1))
-  # before subtracting {window_months}, so the window spans EXACTLY N monthly buckets
-  # ending at the latest hire month — NOT N+1 (latest + N prior), which would divide N+1
-  # buckets' hires by N and bias the rate high (+50% at the min window). sum/N then counts
-  # zero-hire months correctly (a zero-hire month adds 0; denominator is the fixed N).
-  # Window anchored on the DATA (latest hire month), matching bp-hires-per-month, so it
-  # does not decay to empty as wall-clock time passes. exclude_not_hired_default: drop
-  # 'N' (pre-hire) records in BOTH the outer WHERE and the anchor subquery (a future-dated
-  # 'N' hire could otherwise become max() and drag the anchor). `OR IS NULL` matters —
-  # employee_status is Nullable(String), a bare `!= 'N'` drops NULL rows.
-  sql_template: |
-    SELECT
-      COUNT(DISTINCT employee_code) AS hires_in_window,
-      round(COUNT(DISTINCT employee_code) / {window_months}, 1) AS avg_monthly_hires,
-      round(COUNT(DISTINCT employee_code) / {window_months} * {horizon_months}) AS projected_next_n_hires
-    FROM dbpcm_warehouse.employee
-    WHERE hire_date >= addMonths((
-            SELECT toStartOfMonth(max(hire_date))
-            FROM dbpcm_warehouse.employee
-            WHERE employee_status != 'N' OR employee_status IS NULL
-          ), 1) - INTERVAL {window_months} MONTH
-      AND (employee_status != 'N' OR employee_status IS NULL)
-
-# Two-table-intermediate comparison DAG (table-intermediate-design §2.3, the
-# MULTI-table-consume case). Compares ONE employee's two paychecks at type_code
-# granularity across two pay periods, with per-line-item deltas. Two per-period
-# detail nodes each materialize a per-(register_type,type_code) TABLE to scratch;
-# the terminal node consumes BOTH via `feeds_from:[0,1]` + `consumes:{detail_a:"$0",
-# detail_b:"$1"}` and FULL OUTER JOINs them on (register_type, type_code) to compute
-# amount_a/amount_b/amount_delta + hours. Multi-table-consume is genuinely supported
-# by the executor: `_table_consumed_orders` collects EVERY `$N` table ref and
-# `_node_table_bindings` rewrites each `scratch.<placeholder>` FROM/JOIN token to its
-# materialized table — so a single consumer can join two upstream intermediates.
-#
-# Reads ONLY dbpcm_warehouse.payroll (client_code/proc_center are applied by RLS,
-# NEVER named here). The scratch columns are session-gated (excluded from `uses`,
-# D69/OQ-4); the warehouse columns stay ⊆ uses.
-#
-# result_grain [register_type, type_code]: one row per line-item. Each detail node
-# GROUPs BY (register_type, type_code) — with any(type_code_description) so the label
-# rides along WITHOUT widening the grain — so each key is UNIQUE per period by
-# construction; the FULL OUTER JOIN on that exact key then yields exactly one row per
-# distinct (register_type, type_code) in the union, so the D56 grain gate
-# (row_count == COUNT(DISTINCT register_type, type_code)) holds by construction.
-# The join keys are toString-CAST and the measures toFloat64-CAST (§Q2/OQ-A) so the
-# String keys match across scratch tables and the Decimal amounts materialize as a
-# native Float64 the terminal arithmetic (delta) can operate on.
-- id: bp-compare-employee-check-detail-two-periods
-  intent: Compare a single employee's two paychecks line-item by line-item across two pay periods, with per-item deltas
-  slots_summary: employee, period_a, period_b
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.payroll.employee_code
-    - dbpcm_warehouse.payroll.pay_period_end_date
-    - dbpcm_warehouse.payroll.register_type
-    - dbpcm_warehouse.payroll.type_code
-    - dbpcm_warehouse.payroll.type_code_description
-    - dbpcm_warehouse.payroll.amount
-    - dbpcm_warehouse.payroll.type_hours
-  slots:
-    - { name: employee, type: string, required: true, binds_to: dbpcm_warehouse.payroll.employee_code }
-    - { name: period_a, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
-    - { name: period_b, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
-  result_grain: [ register_type, type_code ]
-  # Nodes 0 and 1 REFERENCE bp-employee-check-detail-for-period (plan §2b) instead of
-  # repeating its SQL; `corpus_loader.resolve_blueprint_references` inlines that
-  # blueprint's template at load, renaming its `{period}` bind site per the `slots`
-  # map. `employee: employee` is spelled out because a reference never binds a slot
-  # implicitly — after inlining only THIS blueprint's slot declarations exist.
-  composes:
-    - order: 0
-      output: { detail_a: table }
-      ref:
-        blueprint: bp-employee-check-detail-for-period
-        slots: { employee: employee, period: period_a }
-    - order: 1
-      output: { detail_b: table }
-      ref:
-        blueprint: bp-employee-check-detail-for-period
-        slots: { employee: employee, period: period_b }
-    - order: 2
-      feeds_from: [ 0, 1 ]
-      consumes: { detail_a: "$0", detail_b: "$1" }
-      output: {}
-      sql_template: |
-        SELECT coalesce(a.register_type, b.register_type) AS register_type,
-               coalesce(a.type_code, b.type_code) AS type_code,
-               coalesce(a.type_code_description, b.type_code_description) AS type_code_description,
-               coalesce(a.amount, 0) AS amount_a,
-               coalesce(b.amount, 0) AS amount_b,
-               coalesce(b.amount, 0) - coalesce(a.amount, 0) AS amount_delta,
-               coalesce(a.hours, 0) AS hours_a,
-               coalesce(b.hours, 0) AS hours_b
-        FROM scratch.detail_a AS a
-        FULL OUTER JOIN scratch.detail_b AS b
-          ON a.register_type = b.register_type AND a.type_code = b.type_code
-        ORDER BY coalesce(a.register_type, b.register_type),
-                 coalesce(a.type_code, b.type_code)
-
-# The blueprint the composite above REFERENCES (plan §2b). Extracted verbatim from
-# what were its nodes 0 and 1, which differed only in the pay-period slot: authored
-# once, retrievable and runnable in its own right, and inlined into the composite at
-# corpus load so the executor is unchanged and no reference id reaches the model.
-- id: bp-employee-check-detail-for-period
-  intent: A single employee's paycheck line items for one pay period, with per-item amount and hours
-  slots_summary: employee, period
-  status: validated
-  drift_status: clean
-  catalog_sha: ""
-  uses:
-    - dbpcm_warehouse.payroll.employee_code
-    - dbpcm_warehouse.payroll.pay_period_end_date
-    - dbpcm_warehouse.payroll.register_type
-    - dbpcm_warehouse.payroll.type_code
-    - dbpcm_warehouse.payroll.type_code_description
-    - dbpcm_warehouse.payroll.amount
-    - dbpcm_warehouse.payroll.type_hours
-  slots:
-    - { name: employee, type: string, required: true, binds_to: dbpcm_warehouse.payroll.employee_code }
-    - { name: period, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
-  result_grain: [ register_type, type_code ]
-  sql_template: |
-    SELECT toString(register_type) AS register_type,
-           toString(type_code) AS type_code,
-           any(toString(type_code_description)) AS type_code_description,
-           toFloat64(SUM(amount)) AS amount,
-           toFloat64(SUM(type_hours)) AS hours
-    FROM dbpcm_warehouse.payroll
-    WHERE employee_code = {employee}
-      AND pay_period_end_date = {period}
-    GROUP BY register_type, type_code
-
-# SYNCED FROM THE CANON 2026-08-28 (`clickhouse-api` commit 3e1bfb9). The 12th blueprint —
-# this mirror had 11, and four drift-guard tests across two suites fired until it did not.
-# Copied field-for-field from
-# `clickhouse-api/app/corpus/data/blueprints/bp-average-annual-salary-by-status.yaml`; the
-# canon is the source of truth and this file follows it, per the header above.
-#
-# NOTE the shapes this one is the first to exercise here: an `enum` slot carrying
-# `enum_values`, and no `result_grain` (the template returns a single scalar row, so there is
-# no grain to declare).
+  sql_template: "SELECT\n    d.department_code AS department_code,\n    d.department_name AS department,\n    coalesce(e.active_count,\
+    \ 0) AS headcount\nFROM dbpcm_warehouse.department AS d\nLEFT JOIN (\n    SELECT department_code, uniqExact(employee_code)\
+    \ AS active_count\n    FROM dbpcm_warehouse.employee\n    WHERE employee_status = 'Active'\n    GROUP BY department_code\n\
+    ) AS e ON d.department_code = e.department_code\nWHERE d.department_name = {department}\nORDER BY headcount,\
+    \ department, department_code\n"
 - id: bp-average-annual-salary-by-status
   intent: Calculate the average annual salary per employee filtered by employee status.
   slots_summary: employee_status
   status: validated
   drift_status: clean
-  catalog_sha: ""
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
-    - dbpcm_warehouse.employee.annual_salary
-    - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: employee_status
+    type: enum
+    binds_to: dbpcm_warehouse.employee.employee_status
+    required: true
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+  sql_template: SELECT avg(annual_salary) AS average_annual_salary_per_employee FROM dbpcm_warehouse.employee WHERE
+    employee_status = {employee_status}
   resolves:
     average annual salary per employee: dbpcm_warehouse.employee.annual_salary
+- id: bp-average-salary-by-department
+  intent: Average annual salary and employee headcount by department; optional employee status and department; omitted
+    filters include all accessible employees. Average excludes NULL salaries; headcount includes them.
+  slots_summary: department, employee_status
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.employee_status
+  resolves:
+    salary: annual_salary
   slots:
-    - name: employee_status
-      type: enum
-      binds_to: dbpcm_warehouse.employee.employee_status
-      required: true
-      enum_values: [ A, D, I, R, T, V ]
-  sql_template: SELECT avg(annual_salary) AS average_annual_salary_per_employee FROM
-    dbpcm_warehouse.employee WHERE employee_status = {employee_status}
+  - name: department
+    type: string
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Department
+  sql_template: "SELECT department_name AS department,\n       AVG(annual_salary) AS avg_salary,\n       COUNT(DISTINCT\
+    \ employee_code) AS headcount\nFROM dbpcm_warehouse.employee\nWHERE department_name = {department}\n  AND employee_status\
+    \ = {employee_status}\nGROUP BY department_name\n"
+- id: bp-compare-employee-check-detail-two-periods
+  intent: Compare a single employee's two paychecks line-item by line-item across two pay periods, with per-item
+    deltas
+  slots_summary: employee, period_a, period_b
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.payroll.employee_code
+  - dbpcm_warehouse.payroll.pay_period_end_date
+  - dbpcm_warehouse.payroll.register_type
+  - dbpcm_warehouse.payroll.type_code
+  - dbpcm_warehouse.payroll.type_code_description
+  - dbpcm_warehouse.payroll.amount
+  - dbpcm_warehouse.payroll.type_hours
+  slots:
+  - name: employee
+    type: string
+    required: true
+    binds_to: dbpcm_warehouse.payroll.employee_code
+  - name: period_a
+    type: period
+    required: true
+    binds_to: dbpcm_warehouse.payroll.pay_period_end_date
+  - name: period_b
+    type: period
+    required: true
+    binds_to: dbpcm_warehouse.payroll.pay_period_end_date
+  result_grain:
+  - register_type
+  - type_code
+  composes:
+  - order: 0
+    output:
+      detail_a: table
+    ref:
+      blueprint: bp-employee-check-detail-for-period
+      slots:
+        employee: employee
+        period: period_a
+  - order: 1
+    output:
+      detail_b: table
+    ref:
+      blueprint: bp-employee-check-detail-for-period
+      slots:
+        employee: employee
+        period: period_b
+  - order: 2
+    feeds_from:
+    - 0
+    - 1
+    consumes:
+      detail_a: $0
+      detail_b: $1
+    output: {}
+    sql_template: "SELECT coalesce(a.register_type, b.register_type) AS register_type,\n       coalesce(a.type_code,\
+      \ b.type_code) AS type_code,\n       coalesce(a.type_code_description, b.type_code_description) AS type_code_description,\n\
+      \       coalesce(a.amount, 0) AS amount_a,\n       coalesce(b.amount, 0) AS amount_b,\n       coalesce(b.amount,\
+      \ 0) - coalesce(a.amount, 0) AS amount_delta,\n       coalesce(a.hours, 0) AS hours_a,\n       coalesce(b.hours,\
+      \ 0) AS hours_b\nFROM scratch.detail_a AS a\nFULL OUTER JOIN scratch.detail_b AS b\n  ON a.register_type =\
+      \ b.register_type AND a.type_code = b.type_code\nORDER BY coalesce(a.register_type, b.register_type),\n  \
+      \       coalesce(a.type_code, b.type_code)\n"
+- id: bp-departments-above-company-average-salary
+  intent: Departments whose average salary exceeds the company-wide average
+  slots_summary: ''
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.annual_salary
+  result_grain:
+  - Department
+  composes:
+  - order: 0
+    output:
+      company_avg: scalar
+    sql_template: 'SELECT AVG(annual_salary) AS company_avg
+
+      FROM dbpcm_warehouse.employee
+
+      '
+  - order: 1
+    feeds_from:
+    - 0
+    consumes:
+      company_avg: $0.company_avg
+    output: {}
+    sql_template: 'SELECT department_name AS department, AVG(annual_salary) AS dept_avg
+
+      FROM dbpcm_warehouse.employee
+
+      GROUP BY department_name
+
+      HAVING AVG(annual_salary) > {company_avg}
+
+      '
+- id: bp-earnings-by-department-via-scratch-join
+  intent: Total earnings by department, materializing per-employee earnings and joining departments
+  slots_summary: department
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.payroll.employee_code
+  - dbpcm_warehouse.payroll.register_type
+  - dbpcm_warehouse.payroll.amount
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  slots:
+  - name: department
+    type: string
+    required: true
+    binds_to: dbpcm_warehouse.employee.department_name
+  result_grain:
+  - Department
+  composes:
+  - order: 0
+    output:
+      emp_earnings: table
+    sql_template: "SELECT toString(p.employee_code) AS employee_code,\n       toFloat64(SUM(p.amount)) AS earnings\n\
+      FROM dbpcm_warehouse.payroll AS p\nWHERE p.register_type = 'EARN'\nGROUP BY p.employee_code\n"
+  - order: 1
+    feeds_from:
+    - 0
+    consumes:
+      emp_earnings: $0
+    output: {}
+    sql_template: 'SELECT e.department_name AS department, SUM(x.earnings) AS total_earnings
+
+      FROM scratch.emp_earnings AS x
+
+      JOIN dbpcm_warehouse.employee AS e ON e.employee_code = x.employee_code
+
+      WHERE e.department_name = {department}
+
+      GROUP BY e.department_name
+
+      '
+- id: bp-employee-check-detail-for-period
+  intent: A single employee's paycheck line items for one pay period, with per-item amount and hours
+  slots_summary: employee, period
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.payroll.employee_code
+  - dbpcm_warehouse.payroll.pay_period_end_date
+  - dbpcm_warehouse.payroll.register_type
+  - dbpcm_warehouse.payroll.type_code
+  - dbpcm_warehouse.payroll.type_code_description
+  - dbpcm_warehouse.payroll.amount
+  - dbpcm_warehouse.payroll.type_hours
+  slots:
+  - name: employee
+    type: string
+    required: true
+    binds_to: dbpcm_warehouse.payroll.employee_code
+  - name: period
+    type: period
+    required: true
+    binds_to: dbpcm_warehouse.payroll.pay_period_end_date
+  result_grain:
+  - register_type
+  - type_code
+  sql_template: "SELECT toString(register_type) AS register_type,\n       toString(type_code) AS type_code,\n  \
+    \     any(toString(type_code_description)) AS type_code_description,\n       toFloat64(SUM(amount)) AS amount,\n\
+    \       toFloat64(SUM(type_hours)) AS hours\nFROM dbpcm_warehouse.payroll\nWHERE employee_code = {employee}\n\
+    \  AND pay_period_end_date = {period}\nGROUP BY register_type, type_code\n"
+- id: bp-employee-date-summary
+  intent: Counts of distinct employees with recorded original hire, most recent hire or termination dates in an
+    explicit half-open period. Group by company, department, current status or event month. These are current employee
+    records, not a complete employment-event history or turnover rate. Current-status filter is optional and may
+    exclude rehired employees. No implicit active/terminated filter; no zero-filled months.
+  slots_summary: date_basis, group_by, period, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.hire_date
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.employee.termination_date
+  slots:
+  - name: date_basis
+    type: enum
+    required: true
+    enum_values:
+    - original_hire
+    - most_recent_hire
+    - termination
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - department
+    - status
+    - month
+  - name: period
+    type: period_range
+    required: true
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  sql_template: 'SELECT CASE {group_by} WHEN ''month'' THEN substring(toString(CASE {date_basis} WHEN ''most_recent_hire''
+    THEN e.most_recent_hire_date WHEN ''termination'' THEN e.termination_date ELSE e.hire_date END), 1, 7) WHEN
+    ''department'' THEN e.department_name WHEN ''status'' THEN e.employee_status ELSE ''Company'' END AS `Group`,
+    uniqExact(e.employee_code) AS `Employee Count`
+
+    FROM dbpcm_warehouse.employee e WHERE e.employee_status = {employee_status} AND e.department_name = {department}
+    AND e.employee_code = {employee} AND (CASE {date_basis} WHEN ''most_recent_hire'' THEN e.most_recent_hire_date
+    WHEN ''termination'' THEN e.termination_date ELSE e.hire_date END) >= toDate({period_start}) AND (CASE {date_basis}
+    WHEN ''most_recent_hire'' THEN e.most_recent_hire_date WHEN ''termination'' THEN e.termination_date ELSE e.hire_date
+    END) < toDate({period_end})
+
+    GROUP BY `Group` ORDER BY `Group`'
+- id: bp-employee-day-clock-span
+  intent: Employee-day first actual clock-in, last actual clock-out and matched-pair count, with paid hours. Clock
+    span may contain unpaid gaps; it is not hours worked, a single shift or a lateness finding. Days are assigned
+    by recorded punch_date; midnight ownership is not inferred. Optional punch-type filters restrict which pairs
+    contribute. Required half-open punch-date period and resolved table_source prevent accidental cross-source double
+    counting. FINAL deduplicates storage versions, not overlapping real-world events. Department means recorded
+    labor-allocation department code, not current home department. No scheduled shift, tardiness or overtime policy
+    is inferred. Observed first/last dates do not prove completeness; missing days/months are not zero-filled.
+  slots_summary: period, source, employee, department, hours_type, pay_class, in_type, out_type
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.punch_pair.department_code
+  - dbpcm_warehouse.punch_pair.earn_hours
+  - dbpcm_warehouse.punch_pair.employee_code
+  - dbpcm_warehouse.punch_pair.hours_type
+  - dbpcm_warehouse.punch_pair.in_punch_time
+  - dbpcm_warehouse.punch_pair.in_punch_type
+  - dbpcm_warehouse.punch_pair.out_punch_time
+  - dbpcm_warehouse.punch_pair.out_punch_type
+  - dbpcm_warehouse.punch_pair.pay_class_code
+  - dbpcm_warehouse.punch_pair.punch_date
+  - dbpcm_warehouse.punch_pair.table_source
+  slots:
+  - name: period
+    type: period_range
+    required: true
+  - name: source
+    type: entity
+    required: true
+    binds_to: dbpcm_warehouse.punch_pair.table_source
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.employee_code
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.department_code
+    optional_pattern: 'TRUE'
+  - name: hours_type
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.hours_type
+    optional_pattern: 'TRUE'
+  - name: pay_class
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.pay_class_code
+    optional_pattern: 'TRUE'
+  - name: in_type
+    type: enum
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.in_punch_type
+    optional_pattern: 'TRUE'
+    enum_values:
+    - ID
+    - IL
+    - IB
+    - IX
+  - name: out_type
+    type: enum
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.out_punch_type
+    optional_pattern: 'TRUE'
+    enum_values:
+    - OD
+    - OL
+    - OB
+    - OX
+  result_grain:
+  - Employee Code
+  - Punch Date
+  sql_template: 'SELECT employee_code AS `Employee Code`, punch_date AS `Punch Date`, min(in_punch_time) AS `First
+    Clock In`, max(out_punch_time) AS `Last Clock Out`, count(*) AS `Pair Count`, sum(earn_hours) AS `Paid Hours`
+
+    FROM dbpcm_warehouse.punch_pair FINAL
+
+    WHERE punch_date >= toDate({period_start}) AND punch_date < toDate({period_end}) AND table_source = {source}
+    AND employee_code = {employee} AND department_code = {department} AND hours_type = {hours_type} AND pay_class_code
+    = {pay_class} AND in_punch_type = {in_type} AND out_punch_type = {out_type}
+
+    GROUP BY employee_code, punch_date ORDER BY employee_code, punch_date'
+- id: bp-employee-summary
+  intent: Employee headcount, salary sum/average/minimum/maximum and known-salary count, grouped by company, department
+    or status. Optional status, department and employee filters; omit to include all. Salary statistics exclude
+    NULLs; no implicit active-only filter. One employee row per authorized employee is required. No date-period
+    or salary-threshold filter.
+  slots_summary: group_by, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.annual_salary
+  slots:
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - department
+    - status
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  sql_template: "SELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status\
+    \ ELSE 'Company' END AS `Group`,\n uniqExact(e.employee_code) AS `Employee Count`,\n count(e.annual_salary)\
+    \ AS `Known Salary Count`,\n sum(e.annual_salary) AS `Salary Sum`, avg(e.annual_salary) AS `Average Salary`,\n\
+    \ min(e.annual_salary) AS `Minimum Salary`, max(e.annual_salary) AS `Maximum Salary`\nFROM dbpcm_warehouse.employee\
+    \ e\nWHERE e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code =\
+    \ {employee}\nGROUP BY CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status\
+    \ ELSE 'Company' END\nORDER BY `Group`\n"
+- id: bp-employee-tenure-summary
+  intent: Elapsed years from original or most recent hire date to a supplied ISO YYYY-MM-DD reference_date, using
+    calendar days / 365.25. Company/department/current-status groups, average/min/max and valid-date count. Excludes
+    NULL, dates at/before 1900-01-01 and future hire dates. For employment tenure of current staff select Active;
+    all-status elapsed time does NOT stop at termination and is not historical active headcount. Date is explicit,
+    not inferred from today.
+  slots_summary: group_by, hire_basis, reference_date, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.hire_date
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  slots:
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - department
+    - status
+  - name: hire_basis
+    type: enum
+    required: true
+    enum_values:
+    - original_hire
+    - most_recent_hire
+  - name: reference_date
+    type: string
+    required: true
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  sql_template: "SELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status\
+    \ ELSE 'Company' END AS `Group`, count(*) AS `Valid Hire Date Count`,\n avg(dateDiff('day', CASE {hire_basis}\
+    \ WHEN 'most_recent_hire' THEN e.most_recent_hire_date ELSE e.hire_date END, toDate({reference_date})) / 365.25)\
+    \ AS `Average Elapsed Years`,\n min(dateDiff('day', CASE {hire_basis} WHEN 'most_recent_hire' THEN e.most_recent_hire_date\
+    \ ELSE e.hire_date END, toDate({reference_date})) / 365.25) AS `Minimum Elapsed Years`,\n max(dateDiff('day',\
+    \ CASE {hire_basis} WHEN 'most_recent_hire' THEN e.most_recent_hire_date ELSE e.hire_date END, toDate({reference_date}))\
+    \ / 365.25) AS `Maximum Elapsed Years`\nFROM dbpcm_warehouse.employee e WHERE e.employee_status = {employee_status}\
+    \ AND e.department_name = {department} AND e.employee_code = {employee} AND (CASE {hire_basis} WHEN 'most_recent_hire'\
+    \ THEN e.most_recent_hire_date ELSE e.hire_date END) > toDate('1900-01-01') AND (CASE {hire_basis} WHEN 'most_recent_hire'\
+    \ THEN e.most_recent_hire_date ELSE e.hire_date END) <= toDate({reference_date})\nGROUP BY CASE {group_by} WHEN\
+    \ 'department' THEN e.department_name WHEN 'status' THEN e.employee_status ELSE 'Company' END ORDER BY `Group`"
+- id: bp-hires-in-range
+  intent: "New hires per month within an explicit start/end date range \u2014 counts by original hire date; rehires\
+    \ are not re-counted"
+  slots_summary: hire_window
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.hire_date
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: hire_window
+    type: period_range
+    required: true
+  result_grain:
+  - month
+  window_anchor: calendar
+  sql_template: "SELECT toStartOfMonth(hire_date) AS month,\n       COUNT(DISTINCT employee_code) AS hires\nFROM\
+    \ dbpcm_warehouse.employee\nWHERE hire_date >= {hire_window_start}\n  AND hire_date < {hire_window_end}\n  AND\
+    \ (employee_status != 'N' OR employee_status IS NULL)\nGROUP BY toStartOfMonth(hire_date)\n"
+- id: bp-hires-per-month
+  intent: "New hires per month over a trailing window of the last N months \u2014 counts by original hire date;\
+    \ rehires are not re-counted"
+  slots_summary: window_months
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.hire_date
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: window_months
+    type: relative_window
+    required: true
+    min_value: 1
+    max_value: 36
+  result_grain:
+  - month
+  window_anchor: data
+  sql_template: "SELECT toStartOfMonth(hire_date) AS month,\n       COUNT(DISTINCT employee_code) AS hires\nFROM\
+    \ dbpcm_warehouse.employee\nWHERE hire_date >= (\n        SELECT toStartOfMonth(max(hire_date))\n        FROM\
+    \ dbpcm_warehouse.employee\n        WHERE employee_status != 'N' OR employee_status IS NULL\n      ) - INTERVAL\
+    \ {window_months} MONTH\n  AND (employee_status != 'N' OR employee_status IS NULL)\nGROUP BY toStartOfMonth(hire_date)\n"
+- id: bp-hires-projection
+  intent: "Projected number of hires over the next N months at the current hiring pace (run-rate over a trailing\
+    \ window) \u2014 counts by original hire date; rehires are not re-counted"
+  slots_summary: window_months, horizon_months
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.hire_date
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: window_months
+    type: relative_window
+    required: true
+    min_value: 2
+    max_value: 36
+  - name: horizon_months
+    type: relative_window
+    required: true
+    min_value: 1
+    max_value: 24
+  result_grain: []
+  window_anchor: data
+  sql_template: "SELECT\n  COUNT(DISTINCT employee_code) AS hires_in_window,\n  round(COUNT(DISTINCT employee_code)\
+    \ / {window_months}, 1) AS avg_monthly_hires,\n  round(COUNT(DISTINCT employee_code) / {window_months} * {horizon_months})\
+    \ AS projected_next_n_hires\nFROM dbpcm_warehouse.employee\nWHERE hire_date >= addMonths((\n        SELECT toStartOfMonth(max(hire_date))\n\
+    \        FROM dbpcm_warehouse.employee\n        WHERE employee_status != 'N' OR employee_status IS NULL\n  \
+    \    ), 1) - INTERVAL {window_months} MONTH\n  AND (employee_status != 'N' OR employee_status IS NULL)\n"
+- id: bp-overtime-by-department
+  intent: Earnings by department for a given pay period, filtered to a specific pay type (type_code) such as overtime
+  slots_summary: department, pay_period, type_code
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.payroll.employee_code
+  - dbpcm_warehouse.payroll.register_type
+  - dbpcm_warehouse.payroll.type_code
+  - dbpcm_warehouse.payroll.amount
+  - dbpcm_warehouse.payroll.pay_period_end_date
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  slots:
+  - name: department
+    type: string
+    required: true
+    binds_to: dbpcm_warehouse.employee.department_name
+  - name: pay_period
+    type: period
+    required: true
+    binds_to: dbpcm_warehouse.payroll.pay_period_end_date
+  - name: type_code
+    type: string
+    required: true
+    binds_to: dbpcm_warehouse.payroll.type_code
+  uses_rules:
+  - gross_earnings
+  result_grain:
+  - Department
+  sql_template: "SELECT e.department_name AS department, SUM(p.amount) AS earnings\nFROM dbpcm_warehouse.payroll\
+    \ AS p\nJOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code\nWHERE p.register_type = 'EARN'\n\
+    \  AND p.type_code = {type_code}\n  AND e.department_name = {department}\n  AND p.pay_period_end_date = {pay_period}\n\
+    GROUP BY e.department_name\n"
+- id: bp-payroll-summary
+  intent: Payroll amount, source line count and distinct employee count by company, department or pay-date month.
+    Required register_type enum and half-open pay-date period [start,end); select EARN for gross earnings. Optional
+    type_code, employee status, department and employee. Earnings represent finalized total_earning after period
+    close; use total_earning for in-progress earnings and never add both for the same covered earnings. Preaggregate
+    payroll per employee/month before LEFT JOIN; unmatched employees retained unless employee filters supplied.
+    Does not prove complete months or zero-fill missing months; no implicit earnings filter.
+  slots_summary: group_by, register_type, period, type_code, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.payroll.employee_code
+  - dbpcm_warehouse.payroll.pay_date
+  - dbpcm_warehouse.payroll.amount
+  - dbpcm_warehouse.payroll.register_type
+  - dbpcm_warehouse.payroll.type_code
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.department_name
+  slots:
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - department
+    - month
+  - name: register_type
+    type: enum
+    required: true
+    enum_values:
+    - EARN
+    - EETAX
+    - DDUCT
+    - NETPAYDIST
+    - EEBEN
+    - ERTAX
+    binds_to: dbpcm_warehouse.payroll.register_type
+  - name: period
+    type: period_range
+    required: true
+  - name: type_code
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.payroll.type_code
+    optional_pattern: 'TRUE'
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  sql_template: "WITH p AS (\n SELECT employee_code, substring(toString(pay_date), 1, 7) AS month,\n sum(amount)\
+    \ AS amount, count(*) AS line_count\n FROM dbpcm_warehouse.payroll\n WHERE register_type = {register_type} AND\
+    \ type_code = {type_code}\n AND toDate(pay_date) >= toDate({period_start}) AND toDate(pay_date) < toDate({period_end})\n\
+    \ GROUP BY employee_code, substring(toString(pay_date), 1, 7)\n)\nSELECT CASE {group_by} WHEN 'department' THEN\
+    \ e.department_name WHEN 'month' THEN toString(p.month) ELSE 'Company' END AS `Group`, sum(CAST(p.amount AS\
+    \ Nullable(Decimal(38, 2)))) AS `Payroll Amount`,\n sum(CAST(p.line_count AS Nullable(Decimal(20, 0)))) AS `Source\
+    \ Line Count`, uniqExact(p.employee_code) AS `Employee Count`\nFROM p LEFT JOIN dbpcm_warehouse.employee e ON\
+    \ p.employee_code = e.employee_code\nWHERE e.employee_status = {employee_status} AND e.department_name = {department}\
+    \ AND e.employee_code = {employee}\nGROUP BY CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'month'\
+    \ THEN toString(p.month) ELSE 'Company' END\nORDER BY `Group`\n"
+- id: bp-punch-pair-summary
+  intent: Matched punch-pair counts, distinct employees, observed days, paid hours and pair earning amount by company,
+    employee, allocated department, day, month or hours type. Did this employee have punches in the period? Paid
+    hours use earn_hours, not elapsed clock duration. Single-argument distinct counts. Required half-open punch-date
+    period and resolved table_source prevent accidental cross-source double counting. FINAL deduplicates storage
+    versions, not overlapping real-world events. Department means recorded labor-allocation department code, not
+    current home department. No scheduled shift, tardiness or overtime policy is inferred. Observed first/last dates
+    do not prove completeness; missing days/months are not zero-filled.
+  slots_summary: group_by, period, source, employee, department, hours_type, pay_class, in_type, out_type
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.punch_pair.department_code
+  - dbpcm_warehouse.punch_pair.earn_amount
+  - dbpcm_warehouse.punch_pair.earn_hours
+  - dbpcm_warehouse.punch_pair.employee_code
+  - dbpcm_warehouse.punch_pair.hours_type
+  - dbpcm_warehouse.punch_pair.in_punch_type
+  - dbpcm_warehouse.punch_pair.out_punch_type
+  - dbpcm_warehouse.punch_pair.pay_class_code
+  - dbpcm_warehouse.punch_pair.punch_date
+  - dbpcm_warehouse.punch_pair.table_source
+  slots:
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - employee
+    - department
+    - day
+    - month
+    - hours_type
+  - name: period
+    type: period_range
+    required: true
+  - name: source
+    type: entity
+    required: true
+    binds_to: dbpcm_warehouse.punch_pair.table_source
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.employee_code
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.department_code
+    optional_pattern: 'TRUE'
+  - name: hours_type
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.hours_type
+    optional_pattern: 'TRUE'
+  - name: pay_class
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.pay_class_code
+    optional_pattern: 'TRUE'
+  - name: in_type
+    type: enum
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.in_punch_type
+    optional_pattern: 'TRUE'
+    enum_values:
+    - ID
+    - IL
+    - IB
+    - IX
+  - name: out_type
+    type: enum
+    required: false
+    binds_to: dbpcm_warehouse.punch_pair.out_punch_type
+    optional_pattern: 'TRUE'
+    enum_values:
+    - OD
+    - OL
+    - OB
+    - OX
+  result_grain:
+  - Group
+  sql_template: "SELECT CASE {group_by} WHEN 'employee' THEN employee_code WHEN 'department' THEN department_code\
+    \ WHEN 'day' THEN toString(punch_date) WHEN 'month' THEN substring(toString(punch_date),1,7) WHEN 'hours_type'\
+    \ THEN hours_type ELSE 'Company' END AS `Group`,\ncount(*) AS `Pair Count`, count(DISTINCT employee_code) AS\
+    \ `Employee Count`, count(DISTINCT punch_date) AS `Observed Days`,\n sum(earn_hours) AS `Paid Hours`, sum(earn_amount)\
+    \ AS `Pair Earning Amount`, min(punch_date) AS `First Observed Date`, max(punch_date) AS `Last Observed Date`\n\
+    FROM dbpcm_warehouse.punch_pair FINAL\nWHERE punch_date >= toDate({period_start}) AND punch_date < toDate({period_end})\
+    \ AND table_source = {source} AND employee_code = {employee} AND department_code = {department} AND hours_type\
+    \ = {hours_type} AND pay_class_code = {pay_class} AND in_punch_type = {in_type} AND out_punch_type = {out_type}\n\
+    GROUP BY CASE {group_by} WHEN 'employee' THEN employee_code WHEN 'department' THEN department_code WHEN 'day'\
+    \ THEN toString(punch_date) WHEN 'month' THEN substring(toString(punch_date),1,7) WHEN 'hours_type' THEN hours_type\
+    \ ELSE 'Company' END ORDER BY `Group`"
+- id: bp-salary-distribution
+  intent: Annual salary distribution with configurable positive whole-currency band width. Lower bound inclusive,
+    upper bound exclusive; no formatted-label rounding. Counts and percentage denominator include only selected
+    recorded salaries, not employees missing salaries. Required population selects recorded or positive only. No
+    implicit active filter.
+  slots_summary: band_width, salary_population, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: band_width
+    type: positive_integer
+    required: true
+    min_value: 1
+    max_value: 10000000
+  - name: salary_population
+    type: enum
+    required: true
+    enum_values:
+    - recorded
+    - positive
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Lower Bound
+  sql_template: "SELECT intDiv(e.annual_salary, {band_width}) * {band_width} AS `Lower Bound`,\n (intDiv(e.annual_salary,\
+    \ {band_width}) + 1) * {band_width} AS `Upper Bound Exclusive`,\n count(*) AS `Employee Count`, 100.0 * count(*)\
+    \ / sum(count(*)) OVER () AS `Percent of Selected Recorded Salaries`\nFROM dbpcm_warehouse.employee e WHERE\
+    \ e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code = {employee}\
+    \ AND e.annual_salary IS NOT NULL\n AND ({salary_population} = 'recorded' OR e.annual_salary > 0)\nGROUP BY\
+    \ intDiv(e.annual_salary, {band_width}) ORDER BY `Lower Bound`"
+- id: bp-salary-exact-median
+  intent: Exact annual salary median (middle-pair mean), average, minimum, maximum and recorded-salary count by
+    company, department or current status. No approximation. Required salary_population chooses all recorded values
+    including zero, or positive salaries only. NULL salaries excluded; no implicit active filter. Does not compute
+    arbitrary percentiles.
+  slots_summary: group_by, salary_population, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - department
+    - status
+  - name: salary_population
+    type: enum
+    required: true
+    enum_values:
+    - recorded
+    - positive
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  sql_template: "SELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status\
+    \ ELSE 'Company' END AS `Group`, count(e.annual_salary) AS `Recorded Salary Count`,\n (quantileExactLow(0.5)(e.annual_salary)\
+    \ + quantileExactHigh(0.5)(e.annual_salary)) / 2 AS `Exact Median Salary`,\n avg(e.annual_salary) AS `Average\
+    \ Salary`, min(e.annual_salary) AS `Minimum Salary`, max(e.annual_salary) AS `Maximum Salary`\nFROM dbpcm_warehouse.employee\
+    \ e WHERE e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code = {employee}\n\
+    \ AND e.annual_salary IS NOT NULL AND ({salary_population} = 'recorded' OR e.annual_salary > 0)\nGROUP BY CASE\
+    \ {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status ELSE 'Company' END\
+    \ ORDER BY `Group`"
+- id: bp-salary-threshold-count
+  intent: How many employees make over a salary amount? Count employees earning above, below, at least or exactly
+    a specified annual salary. Returns one employee count, not an employee list. Count employees whose recorded
+    annual salary is above, at least, exactly equal to or below a whole-currency threshold. Optional current status,
+    department and employee. NULL salary never matches. Returns a scalar zero for no matches. Fractional-currency
+    thresholds require direct SQL.
+  slots_summary: comparison, salary, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: comparison
+    type: enum
+    required: true
+    enum_values:
+    - above
+    - at_least
+    - equal
+    - below
+  - name: salary
+    type: nonnegative_integer
+    required: true
+    min_value: 0
+    max_value: 1000000000
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain: []
+  sql_template: SELECT count(DISTINCT e.employee_code) AS `Employee Count` FROM dbpcm_warehouse.employee e WHERE
+    e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code = {employee}
+    AND (({comparison} = 'above' AND e.annual_salary > {salary}) OR ({comparison} = 'at_least' AND e.annual_salary
+    >= {salary}) OR ({comparison} = 'equal' AND e.annual_salary = {salary}) OR ({comparison} = 'below' AND e.annual_salary
+    < {salary}))
+- id: bp-salary-threshold-directory
+  intent: Show all employees who earn over a salary amount; list employees earning above, below or exactly a specified
+    annual salary. Top N highest paid employees. Returns employee records, not just a count. List employee codes,
+    department, current status and annual salary above/at least/equal/below a whole-currency threshold, ordered
+    by salary descending then employee code. Configurable result limit; top N uses a threshold of at least zero
+    and excludes missing salaries. Ties are broken by employee code; no within-department ranking. Result limit
+    is not a completeness guarantee.
+  slots_summary: comparison, salary, row_limit, employee_status, department, employee
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_status
+  slots:
+  - name: comparison
+    type: enum
+    required: true
+    enum_values:
+    - above
+    - at_least
+    - equal
+    - below
+  - name: salary
+    type: nonnegative_integer
+    required: true
+    min_value: 0
+    max_value: 1000000000
+  - name: row_limit
+    type: positive_integer
+    required: true
+    min_value: 1
+    max_value: 1000
+  - name: employee_status
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.department_name
+    optional_pattern: 'TRUE'
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.employee.employee_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Employee Code
+  sql_template: 'SELECT e.employee_code AS `Employee Code`, e.department_name AS `Department`, e.employee_status
+    AS `Status`, e.annual_salary AS `Annual Salary`
+
+    FROM dbpcm_warehouse.employee e WHERE e.employee_status = {employee_status} AND e.department_name = {department}
+    AND e.employee_code = {employee} AND (({comparison} = ''above'' AND e.annual_salary > {salary}) OR ({comparison}
+    = ''at_least'' AND e.annual_salary >= {salary}) OR ({comparison} = ''equal'' AND e.annual_salary = {salary})
+    OR ({comparison} = ''below'' AND e.annual_salary < {salary}))
+
+    ORDER BY e.annual_salary DESC, e.employee_code LIMIT {row_limit}'
+- id: bp-timecard-earnings-summary
+  intent: 'Total timecard earnings, paid hours, entry counts and employee counts by company, employee, allocated
+    department, day, month or earning code. Supports per-person hours and pay in a period and monthly labor-cost
+    trends. Uses daily total_earning entries: in-progress earnings finalized and moved to payroll after period close.
+    Use payroll earnings for finalized periods. Do not add both lifecycle stages for the same earnings. This template
+    does not infer period-close status or switch sources. Amount is not net pay, annual salary or proof of payment.
+    Optional earning_code is client-defined: resolve regular/overtime concepts, never hardcode a universal OT code.
+    No average-rate calculation across unlike earning codes. Required half-open punch-date period and resolved table_source
+    prevent accidental cross-source double counting. FINAL deduplicates storage versions, not overlapping real-world
+    events. Department means recorded labor-allocation department code, not current home department. No scheduled
+    shift, tardiness or overtime policy is inferred. Observed first/last dates do not prove completeness; missing
+    days/months are not zero-filled.'
+  slots_summary: group_by, period, source, employee, department, earning_code, pay_class
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.total_earning.department_code
+  - dbpcm_warehouse.total_earning.earn_amount
+  - dbpcm_warehouse.total_earning.earn_code
+  - dbpcm_warehouse.total_earning.earn_hours
+  - dbpcm_warehouse.total_earning.employee_code
+  - dbpcm_warehouse.total_earning.pay_class_code
+  - dbpcm_warehouse.total_earning.punch_date
+  - dbpcm_warehouse.total_earning.table_source
+  slots:
+  - name: group_by
+    type: enum
+    required: true
+    enum_values:
+    - company
+    - employee
+    - department
+    - day
+    - month
+    - earning_code
+  - name: period
+    type: period_range
+    required: true
+  - name: source
+    type: entity
+    required: true
+    binds_to: dbpcm_warehouse.total_earning.table_source
+  - name: employee
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.total_earning.employee_code
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.total_earning.department_code
+    optional_pattern: 'TRUE'
+  - name: earning_code
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.total_earning.earn_code
+    optional_pattern: 'TRUE'
+  - name: pay_class
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.total_earning.pay_class_code
+    optional_pattern: 'TRUE'
+  result_grain:
+  - Group
+  sql_template: 'SELECT CASE {group_by} WHEN ''employee'' THEN employee_code WHEN ''department'' THEN department_code
+    WHEN ''day'' THEN toString(punch_date) WHEN ''month'' THEN substring(toString(punch_date),1,7) WHEN ''earning_code''
+    THEN earn_code ELSE ''Company'' END AS `Group`,
+
+    sum(earn_amount) AS `Timecard Earning Amount`, sum(earn_hours) AS `Paid Hours`, count(*) AS `Entry Count`, count(DISTINCT
+    employee_code) AS `Employee Count`, count(DISTINCT punch_date) AS `Observed Days`, min(punch_date) AS `First
+    Observed Date`, max(punch_date) AS `Last Observed Date`
+
+    FROM dbpcm_warehouse.total_earning FINAL
+
+    WHERE punch_date >= toDate({period_start}) AND punch_date < toDate({period_end}) AND table_source = {source}
+    AND employee_code = {employee} AND department_code = {department} AND earn_code = {earning_code} AND pay_class_code
+    = {pay_class}
+
+    GROUP BY CASE {group_by} WHEN ''employee'' THEN employee_code WHEN ''department'' THEN department_code WHEN
+    ''day'' THEN toString(punch_date) WHEN ''month'' THEN substring(toString(punch_date),1,7) WHEN ''earning_code''
+    THEN earn_code ELSE ''Company'' END ORDER BY `Group`'
+- id: bp-total-earnings-by-department
+  intent: Total earnings for a department, resolving the earnings register codes dynamically
+  slots_summary: department
+  status: validated
+  drift_status: clean
+  catalog_sha: ''
+  uses:
+  - dbpcm_warehouse.payroll.employee_code
+  - dbpcm_warehouse.payroll.register_type
+  - dbpcm_warehouse.payroll.amount
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  slots:
+  - name: department
+    type: string
+    required: true
+    binds_to: dbpcm_warehouse.employee.department_name
+  uses_rules:
+  - id: gross_earnings
+    resolve_via: resolveValues(register_type, 'earnings')
+    table: dbpcm_warehouse.payroll
+    binds: earn_codes
+  result_grain:
+  - Department
+  sql_template: "SELECT e.department_name AS department, SUM(p.amount) AS total_earnings\nFROM dbpcm_warehouse.payroll\
+    \ AS p\nJOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code\nWHERE p.register_type IN {earn_codes}\n\
+    \  AND e.department_name = {department}\nGROUP BY e.department_name\n"

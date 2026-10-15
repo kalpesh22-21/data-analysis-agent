@@ -626,7 +626,7 @@ class BlueprintExecutor:
                 node_sql, self._tool_dispatcher, credentials, emit_progress=False
             )
             if aggregation_error:
-                return ExecFailed("AGGREGATION_RISK", aggregation_error, retryable=True)
+                return ExecFailed(aggregation_error.code, aggregation_error.denial_detail, retryable=aggregation_error.retryable)
             result = await self._tool_dispatcher.dispatch(
                 "runQuery",
                 {"sql": node_sql, "limit": self._query_limit},

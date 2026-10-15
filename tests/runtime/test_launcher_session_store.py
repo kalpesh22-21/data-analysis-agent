@@ -134,3 +134,19 @@ def test_the_derivation_is_not_vacuous() -> None:
     refactored out from under this module (methods that stopped being coroutines)."""
     assert _SURFACE, "no public coroutines were derived from the SessionStore Protocol"
     assert {"apply_analysis_state", "claim_finalization_block"} <= set(_SURFACE)
+
+
+@pytest.mark.parametrize("retrieval,help_center,enabled", [(False, False, False), (True, False, True), (False, True, True), (True, True, True)])
+def test_real_launcher_reranker_follows_either_retrieval_consumer(retrieval, help_center, enabled):
+    # Evaluate only the settings argument: importing this launcher contacts the model.
+    import ast
+    import os
+    from pathlib import Path
+
+    tree = ast.parse(Path("scripts/run_ui_runtime_real.py").read_text())
+    value = next(n.value for n in ast.walk(tree) if isinstance(n, ast.keyword) and n.arg == "reranker_api_url")
+    result = eval(compile(ast.Expression(value), "launcher-reranker", "eval"), {
+        "os": os, "_RERANKER_API_URL": "http://localhost/rerank",
+        "retrieval_on": retrieval, "help_center_on": help_center,
+    })
+    assert bool(result) is enabled

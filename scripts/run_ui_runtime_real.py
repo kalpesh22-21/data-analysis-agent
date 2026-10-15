@@ -214,7 +214,9 @@ def build_real_app():
         help_center_enabled=help_center_on,
         help_center_search_url=os.environ.get("HELP_CENTER_SEARCH_URL", ""),
         help_center_documents_url=os.environ.get("HELP_CENTER_DOCUMENTS_URL", ""),
-        reranker_api_url=_RERANKER_API_URL if help_center_on else "",
+        # Blueprint retrieval needs reranking independently of Help Center.
+        reranker_api_url=(os.environ.get("RERANKER_API_URL") or _RERANKER_API_URL)
+        if (retrieval_on or help_center_on) else "",
         capability_tools_enabled=capability_tools_on,
         capability_prefetch_enabled=capability_prefetch_on,
         capability_api_url=os.environ.get("CAPABILITY_API_URL", ""),

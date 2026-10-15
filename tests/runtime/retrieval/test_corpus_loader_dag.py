@@ -56,6 +56,21 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     blueprints = resolve_blueprint_references(blueprints)
     assert {b.id for b in blueprints} == {
+        "bp-employee-summary",
+        "bp-punch-pair-summary",
+        "bp-employee-day-clock-span",
+        "bp-timecard-earnings-summary",
+        "bp-salary-exact-median",
+        "bp-salary-distribution",
+        "bp-salary-threshold-count",
+        "bp-salary-threshold-directory",
+        "bp-employee-date-summary",
+        "bp-employee-tenure-summary",
+
+        "bp-payroll-summary",
+        "bp-accrual-balance-summary",
+        "bp-accrual-event-summary",
+
         "bp-overtime-by-department",
         "bp-active-headcount-by-department",
         # Registered in the canon 2026-08-28 (clickhouse-api 3e1bfb9) and mirrored into

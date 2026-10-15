@@ -216,7 +216,7 @@ async def test_run_good_period_builds_where_and_reaches_mcp() -> None:
     )
     assert tool_result.status == "ok"
     sql = mcp.calls[0].args["sql"]
-    assert "WHERE RequestDate >= '2026-01-01' AND RequestDate <= '2026-03-31'" in sql
+    assert "WHERE RequestDate >= CAST('2026-01-01' AS Nullable(DateTime64(6))) AND RequestDate <= CAST('2026-03-31' AS Nullable(DateTime64(6)))" in sql
 
 
 async def test_concept_with_sql_metacharacters_never_in_sql() -> None:
@@ -509,3 +509,12 @@ async def test_an_inner_denial_still_reports_under_the_composite_tool_name() -> 
         payload for event, payload in observer.events if event == "tool_dispatch_denied"
     ]
     assert [payload["tool_name"] for payload in denials] == [TOOL_NAME]
+
+
+async def test_structured_sql_diagnostic_survives_composite():
+    payload = {"version": 1, "code": "SQL_TYPE_MISMATCH", "message": "Type mismatch", "input_dialect": "clickhouse", "guidance": "Use typed date bounds.", "retry": "after_query_change"}
+    error = MCPToolError("SQL_TYPE_MISMATCH", "[SQL_TYPE_MISMATCH] " + json.dumps(payload))
+    composite, _ = _composite(scripted={"runQuery": [error]})
+    result = await composite.run({"table": _T, "column": "EarnCode", "concept": "leave"}, _credentials())
+    assert result.denial_detail is not None
+    assert "Use typed date bounds" in result.denial_detail

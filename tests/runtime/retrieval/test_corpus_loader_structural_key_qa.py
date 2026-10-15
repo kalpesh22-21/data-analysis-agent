@@ -367,7 +367,7 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
     class of silent mirror drift this file exists to catch. Measured: the composite's
     key is byte-identical before and after the extraction."""
     canon = _real_canon_docs()
-    assert len(canon) == 12
+    assert len(canon) == 25  # Includes timecard and punch templates.
 
     seeds, _ = corpus_seeds_from_export({"blueprints": canon})
     assert len(seeds) == len(canon), "the export projection dropped a canon blueprint"

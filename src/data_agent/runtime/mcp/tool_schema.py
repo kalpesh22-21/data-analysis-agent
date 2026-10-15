@@ -526,11 +526,11 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "name": "updateAnalysisState",
     "description": (
-        "Track distinct requested deliverables. First declare short descriptions; the runtime "
+        "Track distinct requested deliverables, not editorial repairs, assumption wording, unrequested categories or organization-wide completeness checks unless requested. Preserve completed evidence bindings during presentation repair. First declare short descriptions; the runtime "
         "returns IDs and freezes the list. Prefer declaring before work, but a late initial "
         "declaration is allowed. Tag each execution with serves_intents (one or several IDs). "
         "After receiving results, update intent_id and status, optionally binding a specific "
-        "result_id from this turn. Existing results can explicitly serve several intents; "
+        "result_id from this turn. For an earlier successful snapshot, explicitly set reuse_previous_result=true and result_id; use the returned evidence ID for finalization. Reuse is historical, not a live refresh; rerun queries when current data is requested. Existing results can explicitly serve several intents; "
         "the runtime never guesses which untagged execution you mean. Completion records "
         "evidence binding, not semantic correctness. Empty successful results can complete "
         "an intent with 'none found'. Blocked intents need distinct evidence establishing "
@@ -555,9 +555,13 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
                             "characters. Leave it empty on later calls — a "
                             "description cannot be changed once declared.",
                         },
+                        "reuse_previous_result": {
+                            "type": "boolean",
+                            "description": "Explicit historical snapshot reuse for completion only. Requires result_id, successful original execution and unchanged recorded scope. Never use to claim fresh/live results; false by default.",
+                        },
                         "result_id": {
                             "type": "string",
-                            "description": "Successful current-turn execution explicitly supporting completion. Required when the work was not tagged.",
+                            "description": "Successful execution explicitly supporting completion. Prior snapshots also require reuse_previous_result=true. Required when work was not tagged.",
                         },
                         "intent_id": {
                             "type": "string",

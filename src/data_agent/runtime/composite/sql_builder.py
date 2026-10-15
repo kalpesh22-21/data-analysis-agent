@@ -72,6 +72,7 @@ class ResolvedTarget:
     column: str
     description_col: str | None
     period_col: str | None
+    period_type: str | None = None
 
 
 def _candidate_description_columns(column: str) -> list[str]:
@@ -190,16 +191,28 @@ def resolve_target(
         column=column,
         description_col=description_col,
         period_col=period_col,
+        period_type=columns[period_col] if period_col else None,
     )
 
 
-def _period_predicate(period_col: str, period: Period) -> exp.Expression | None:
+def _period_predicate(period_col: str, period: Period, period_type: str | None = None) -> exp.Expression | None:
     col = exp.column(period_col)
+    def bound(value):
+        literal = exp.Literal.string(value)
+        dtype = (period_type or "").removeprefix("Nullable(")
+        if dtype.startswith("DateTime"):
+            # Retain catalog precision/timezone and inclusive boundaries.
+            return exp.Cast(this=literal, to=exp.DataType.build(period_type, dialect="clickhouse"))
+        if dtype.startswith("Date32"):
+            return exp.Anonymous(this="toDate32", expressions=[literal])
+        if dtype.startswith("Date"):
+            return exp.Anonymous(this="toDate", expressions=[literal])
+        return literal
     bounds: list[exp.Expression] = []
     if period.start is not None:
-        bounds.append(exp.GTE(this=col.copy(), expression=exp.Literal.string(period.start)))
+        bounds.append(exp.GTE(this=col.copy(), expression=bound(period.start)))
     if period.end is not None:
-        bounds.append(exp.LTE(this=col.copy(), expression=exp.Literal.string(period.end)))
+        bounds.append(exp.LTE(this=col.copy(), expression=bound(period.end)))
     if not bounds:
         return None
     predicate = bounds[0]
@@ -244,7 +257,7 @@ def build_sql(
     )
 
     if period is not None and target.period_col is not None:
-        predicate = _period_predicate(target.period_col, period)
+        predicate = _period_predicate(target.period_col, period, target.period_type)
         if predicate is not None:
             query = query.where(predicate)
 

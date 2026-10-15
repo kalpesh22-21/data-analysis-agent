@@ -135,3 +135,25 @@ async def test_receipt_cache_is_bound_to_credentials():
     await dispatcher.dispatch("runQuery", {"sql": sql}, credentials)
     await dispatcher.capture_sql_provenance(sql, replace(credentials, jwt="new-token"))
     assert [name for name, _args in client.calls] == ["runQuery", "explainQuery"]
+
+
+@pytest.mark.parametrize('code,retry,retryable', [
+    ('SQL_TYPE_MISMATCH','after_query_change',True),
+    ('EXECUTION_SERVICE_UNAVAILABLE','after_service_recovery',False),
+    ('EXECUTION_CONFIGURATION_ERROR','after_operator_action',False),
+])
+async def test_structured_error_survives_dispatch_without_backend_rediagnosis(code,retry,retryable):
+    import json
+    payload = dict(version=1,code=code,message='Authored diagnosis',input_dialect='clickhouse',
+                   guidance="Use toDate('2026-01-01')." if retryable else 'Wait for the service.',
+                   retry=retry,backend_private='must not reach the model')
+    result = await ToolDispatcher(
+        RawAPI([MCPToolError(code,json.dumps(payload))]),unavailable_catalog,
+    ).dispatch('runQuery',{'sql':'SELECT 1'},_credentials())
+    diagnostic = decode_diagnostic(result.denial_detail)
+    assert result.error_code == code and result.retryable is retryable
+    assert diagnostic['code'] == code and diagnostic['input_dialect'] == 'clickhouse'
+    assert diagnostic['guidance'] == payload['guidance']
+    assert diagnostic['retry'] == retry
+    assert 'engine_code' not in diagnostic and 'api_message' not in diagnostic
+    assert 'backend_private' not in diagnostic

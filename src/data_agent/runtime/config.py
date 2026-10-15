@@ -958,7 +958,7 @@ class RuntimeSettings(BaseSettings):
     )
 
     # --- Reranker client (D71 custom API — retrieval pipeline building block) ---
-    # Not wired into app.py yet; consumed by the upcoming retrieval brick.
+    # Wired into blueprint/knowledge retrieval when the endpoint is configured.
     reranker_api_url: str = Field(
         "", description="Custom reranker API endpoint (D71). Empty => unconfigured."
     )

@@ -132,14 +132,14 @@ def test_period_start_after_end_no_validation() -> None:
     target = resolve_target(CATALOG, table=_T, column="EarnCode", period=period)
     sql = build_sql(target, period=period, limit=200)
     # No start<=end validation — literals bound verbatim (design §2.4).
-    assert "RequestDate >= '2026-12-31' AND RequestDate <= '2026-01-01'" in sql
+    assert "RequestDate >= CAST('2026-12-31' AS Nullable(DateTime64(6))) AND RequestDate <= CAST('2026-01-01' AS Nullable(DateTime64(6)))" in sql
 
 
 def test_period_end_only_builds_lte_only() -> None:
     period = Period(column="RequestDate", start=None, end="2026-03-31")
     target = resolve_target(CATALOG, table=_T, column="EarnCode", period=period)
     sql = build_sql(target, period=period, limit=200)
-    assert "WHERE RequestDate <= '2026-03-31'" in sql
+    assert "WHERE RequestDate <= CAST('2026-03-31' AS Nullable(DateTime64(6)))" in sql
     assert ">=" not in sql
 
 
@@ -150,7 +150,7 @@ def test_period_backslash_bound_is_escaped_literal() -> None:
     # sqlglot renders it as a single-quoted literal; the DROP keyword lives
     # inside the literal, never as bare SQL.
     where = sql.split("WHERE", 1)[1]
-    assert where.strip().startswith("RequestDate >= '")
+    assert where.strip().startswith("RequestDate >= CAST('")
     assert "DROP" not in sql.split("'", 2)[0]  # nothing hostile before the literal
 
 

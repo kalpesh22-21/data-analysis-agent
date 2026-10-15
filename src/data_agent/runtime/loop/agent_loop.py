@@ -869,8 +869,12 @@ def _tool_trail_entry_to_canonical(
             "tool_call_id": tool_call_id,
             "content": json.dumps(content, default=str),
         }
-    if entry.get("model_response"):
-        assistant_message["_model_response"] = entry["model_response"]
+    response = entry.get("model_response")
+    # Historical reference receipts retain scope/source metadata but are not
+    # provider response batches. Keep their synthetic call/result pair intact;
+    # batch restoration requires an actual response ID.
+    if isinstance(response, dict) and isinstance(response.get("id"), str) and response["id"]:
+        assistant_message["_model_response"] = response
     return [assistant_message, tool_message]
 
 
@@ -3865,10 +3869,10 @@ class AgentLoop:
                         gate_refusal = ToolResult(
                             status="error",
                             tool_name=tool_call.name,
-                            error_code="AGGREGATION_RISK",
-                            retryable=True,
+                            error_code=detail.code,
+                            retryable=detail.retryable,
                             user_message=detail,
-                            denial_detail=detail,
+                            denial_detail=detail.denial_detail,
                             provenance=frozenset(),
                             result_preview=None,
                             result_full=None,

@@ -345,3 +345,53 @@ INSERT INTO dbpcm_warehouse.performance_discussions
 ('CLIENT_B','EMP003',3003,NULL,NULL,'cb.manager','2026-06-01 09:00:00','Corrective action - missed quota','cb.manager','Performance','Employee Approval','CB_CAF','Corrective Action Form - Performance',NULL,NULL,'Declined','2026-06-03 10:00:00',NULL,'Tier 1','3.0','Disputes the assessment','cb.manager','Employee statement','2026-06-03 12:00:00','cb.manager','Acknowledgment','2026-06-02 09:00:00','C. Manager','45','2026-07-16 00:00:00',NULL,NULL,'Employee'),
 ('CLIENT_B','EMP003',3003,NULL,NULL,'cb.manager','2026-06-01 09:00:00','Corrective action - missed quota','cb.manager','Performance','Employee Approval','CB_CAF','Corrective Action Form - Performance',NULL,NULL,'Declined','2026-06-03 10:00:00',NULL,'Tier 1','3.0','Manager to schedule follow-up','cb.manager','Next steps','2026-06-03 12:00:00','cb.manager','Acknowledgment','2026-06-02 09:00:00','C. Manager','45','2026-07-16 00:00:00',NULL,NULL,'Employee'),
 ('CLIENT_B','EMP004',3004,'Exit documented','hr.cb','hr.cb','2025-11-25 09:00:00','Voluntary exit interview','hr.cb','Offboarding','Archived','CB_EXIT','Exit Interview',NULL,NULL,'Acknowledgment','2025-11-26 10:00:00','David Lee',NULL,NULL,'Left for relocation','hr.cb','Reason for leaving','2025-11-26 11:00:00','hr.cb','Acknowledgment','2025-11-26 09:00:00','H. Manager',NULL,NULL,'2025-11-30 12:00:00',NULL,NULL);
+
+-- Synthetic balance surface for parameterized blueprint integration tests.
+-- Event hours are deliberately not a replacement for these recorded balances.
+CREATE TABLE IF NOT EXISTS dbpcm_warehouse.accrual_balances
+(
+    employee_code String,
+    accrual_code Nullable(String),
+    beginning_balance Nullable(Decimal(18, 6)),
+    accrued_amount Nullable(Decimal(18, 6)),
+    awarded_amount Nullable(Decimal(18, 6)),
+    taken_amount Nullable(Decimal(18, 6))
+) ENGINE = MergeTree ORDER BY employee_code;
+
+-- Synthetic time-attendance schemas for blueprint integration tests.
+CREATE TABLE IF NOT EXISTS dbpcm_warehouse.punch_pair (
+    employee_code FixedString(4),
+    id UInt64,
+    punch_date Date32,
+    in_punch_time DateTime64(6),
+    out_punch_time DateTime64(6),
+    hours_type LowCardinality(FixedString(2)),
+    earn_hours Decimal(19, 6),
+    earn_amount Decimal(12, 2),
+    pay_class_code FixedString(3),
+    in_punch_type FixedString(2),
+    out_punch_type FixedString(2),
+    department_code String,
+    supervisor_approval Nullable(String),
+    employee_approval Nullable(String),
+    table_source LowCardinality(String),
+    __version UInt64,
+    __deleted UInt8
+) ENGINE = ReplacingMergeTree(__version, __deleted) ORDER BY (table_source, id);
+CREATE TABLE IF NOT EXISTS dbpcm_warehouse.total_earning (
+    employee_code FixedString(4),
+    id UInt64,
+    punch_date Date32,
+    pay_period_start_date Date32,
+    pay_period_end_date Date32,
+    earn_code LowCardinality(String),
+    earn_code_description String,
+    earn_hours Decimal(19, 6),
+    earn_amount Decimal(12, 2),
+    earn_rate Decimal(19, 6),
+    pay_class_code FixedString(3),
+    department_code String,
+    table_source LowCardinality(String),
+    __version UInt64,
+    __deleted UInt8
+) ENGINE = ReplacingMergeTree(__version, __deleted) ORDER BY (table_source, id);

@@ -623,6 +623,35 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     ),
 }
 
+# Model-facing execution API contract: SQL authoring remains ClickHouse.
+MODEL_QUERY_ERROR_CODES = frozenset({
+    "SQL_TYPE_MISMATCH", "SQL_SYNTAX_ERROR", "SQL_UNKNOWN_COLUMN",
+    "SQL_UNSUPPORTED_FUNCTION", "SQL_AGGREGATION_ERROR", "SQL_UNSUPPORTED_CONSTRUCT",
+    "SQL_EXECUTION_ERROR", "QUERY_RESOURCE_LIMIT",
+})
+MODEL_SERVICE_ERROR_CODES = frozenset({
+    "EXECUTION_SERVICE_UNAVAILABLE", "EXECUTION_CONFIGURATION_ERROR", "EXECUTION_IDENTITY_REQUIRED",
+})
+for _code in MODEL_QUERY_ERROR_CODES:
+    _DENIAL_TABLE[_code] = DenialInfo(
+        code=_code, retryable=True, kind=DenialKind.WORK_JUDGED,
+        user_message="The query needs a correction or a supported execution approach. Follow the diagnostic guidance.",
+    )
+for _code in MODEL_SERVICE_ERROR_CODES:
+    _DENIAL_TABLE[_code] = DenialInfo(
+        code=_code, retryable=False, kind=DenialKind.INFRA_FAILED,
+        user_message="Execution requires service recovery, operator action, or a valid session. Changing SQL will not resolve this.",
+    )
+
+AGGREGATION_QUERY_CODES = frozenset({"AGGREGATION_UNVERIFIED", "AGGREGATION_DUPLICATE_KEYS", "AGGREGATION_CHECK_FAILED"})
+for _code in AGGREGATION_QUERY_CODES:
+    _DENIAL_TABLE[_code] = DenialInfo(code=_code, retryable=True,
+        kind=DenialKind.WORK_JUDGED if _code == "AGGREGATION_DUPLICATE_KEYS" else DenialKind.GATE,
+        user_message="Aggregation verification needs a specific correction. Follow the diagnostic; preserve the requested metric.")
+_DENIAL_TABLE["AGGREGATION_CHECK_UNAVAILABLE"] = DenialInfo(
+    code="AGGREGATION_CHECK_UNAVAILABLE", retryable=False, kind=DenialKind.INFRA_FAILED,
+    user_message="Aggregation verification is unavailable. Use supported results or disclose this limitation; ask the operator to investigate.")
+
 KNOWN_DENIAL_CODES = frozenset(_DENIAL_TABLE)
 
 # The enforcement half of the table, DERIVED. The offline learning loop's

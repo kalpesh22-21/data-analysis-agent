@@ -133,14 +133,14 @@ def test_build_sql_period_where_from_literals() -> None:
     period = Period(column="RequestDate", start="2026-01-01", end="2026-03-31")
     target = resolve_target(CATALOG, table=_T, column="EarnCode", period=period)
     sql = build_sql(target, period=period, limit=200)
-    assert "WHERE RequestDate >= '2026-01-01' AND RequestDate <= '2026-03-31'" in sql
+    assert "WHERE RequestDate >= CAST('2026-01-01' AS Nullable(DateTime64(6))) AND RequestDate <= CAST('2026-03-31' AS Nullable(DateTime64(6)))" in sql
 
 
 def test_build_sql_period_start_only() -> None:
     period = Period(column="RequestDate", start="2026-01-01", end=None)
     target = resolve_target(CATALOG, table=_T, column="EarnCode", period=period)
     sql = build_sql(target, period=period, limit=200)
-    assert "WHERE RequestDate >= '2026-01-01'" in sql
+    assert "WHERE RequestDate >= CAST('2026-01-01' AS Nullable(DateTime64(6)))" in sql
     assert "<=" not in sql
 
 
@@ -160,3 +160,12 @@ def test_build_sql_period_with_no_bounds_emits_no_where() -> None:
     target = resolve_target(CATALOG, table=_T, column="EarnCode", period=period)
     sql = build_sql(target, period=period, limit=200)
     assert "WHERE" not in sql
+
+
+def test_date_bounds_are_typed_and_inclusive():
+    catalog = CatalogHandle({_T: {"code": "String", "day": "Nullable(Date)"}})
+    period = Period(column="day", start="2026-01-01", end="2026-01-31")
+    target = resolve_target(catalog, table=_T, column="code", period=period)
+    sql = build_sql(target, period=period, limit=20)
+    assert "day >= toDate('2026-01-01')" in sql
+    assert "day <= toDate('2026-01-31')" in sql

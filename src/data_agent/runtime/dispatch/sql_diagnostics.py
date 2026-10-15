@@ -7,6 +7,12 @@ import re
 
 import sqlglot
 
+from .denial_mapping import (
+    AGGREGATION_QUERY_CODES,
+    MODEL_QUERY_ERROR_CODES,
+    MODEL_SERVICE_ERROR_CODES,
+)
+
 PREFIX = "sql_diagnostic:"
 FUNCTIONS = {
     name.lower(): name
@@ -37,6 +43,24 @@ MESSAGES = {
 
 
 def sql_diagnostic(message: str, sql: str) -> dict:
+    try:
+        payload = json.loads(message)
+    except (ValueError, TypeError):
+        payload = None
+    if (isinstance(payload, dict) and payload.get("version") == 1
+            and payload.get("code") in MODEL_QUERY_ERROR_CODES | MODEL_SERVICE_ERROR_CODES
+            and payload.get("input_dialect") == "clickhouse"):
+        # Closed fields; never copy backend metadata or arbitrary server fields.
+        result = {key: payload[key][:3000] for key in
+                  ("code", "message", "input_dialect", "guidance", "retry", "candidate_expression")
+                  if isinstance(payload.get(key), str)}
+        result["retryable"] = payload.get("retry") in {"after_query_change", "after_scope_or_capacity_change"}
+        return result
+    return _legacy_sql_diagnostic(message, sql)
+
+
+def _legacy_sql_diagnostic(message: str, sql: str) -> dict:
+    """Compatibility with older API deployments; new errors bypass regex diagnosis."""
     code = next((c for c in MESSAGES if re.search(r"\b" + c + r"\b", message)), "QUERY_ERROR")
     result = {
         "engine_code": code,
@@ -105,11 +129,53 @@ def sql_signature(sql: str) -> str:
         return sql.strip()
 
 
+def aggregation_signature(sql: str) -> str:
+    """Ignore cosmetic aliases/order only. Preserve filters, keys and measures.
+
+    CTE/derived-column alias changes remain conservative: without full lineage
+    resolution they must not accidentally merge different analytical queries.
+    """
+    try:
+        from sqlglot.optimizer.scope import traverse_scope
+        tree = sqlglot.parse_one(sql, dialect="clickhouse")
+        for scope in traverse_scope(tree):
+            aliases = {}
+            for index, (name, source) in enumerate(scope.sources.items()):
+                if isinstance(source, sqlglot.exp.Table):
+                    aliases[name] = f"_guard_{index}"
+                    source.set("alias", sqlglot.exp.TableAlias(this=sqlglot.exp.to_identifier(aliases[name])))
+            for column in scope.columns:
+                if column.table in aliases:
+                    column.set("table", sqlglot.exp.to_identifier(aliases[column.table]))
+            if isinstance(scope.expression, sqlglot.exp.Select) and scope is not None:
+                # Only remove output labels on the root projection, where they
+                # cannot rename a column consumed by another SQL scope.
+                if scope.expression is tree:
+                    tree.set("expressions", [x.unalias().copy() for x in tree.expressions])
+                    order = tree.args.get("order")
+                    if order is not None and not order.find(sqlglot.exp.AggFunc):
+                        tree.set("order", None)
+        return tree.sql(dialect="clickhouse", comments=False)
+    except Exception:
+        return sql_signature(sql)
+
+
 def repeated_sql_failure(
     sql: str, trail, turn_index: int, *, scope_hash: str | None = None
 ) -> bool:
     """Two identical failures stop a third execution; successful or changed SQL can proceed."""
     signature = sql_signature(sql)
+    guard_signature = aggregation_signature(sql)
+    guard_matches = [e for e in trail
+                     if e.turn_index == turn_index and e.tool_name == "runQuery"
+                     and (scope_hash is None or (e.model_response or {}).get("scope_hash") == scope_hash)
+                     and e.error_code in AGGREGATION_QUERY_CODES | {"AGGREGATION_RISK", "AGGREGATION_CHECK_UNAVAILABLE"}
+                     and aggregation_signature(str(e.args.get("sql", ""))) == guard_signature]
+    if any(e.error_code == "AGGREGATION_CHECK_UNAVAILABLE" for e in guard_matches):
+        return True
+    if any(sum(e.error_code == code for e in guard_matches) >= 2
+           for code in AGGREGATION_QUERY_CODES | {"AGGREGATION_RISK"}):
+        return True
     matches = [
         e
         for e in trail
@@ -129,7 +195,7 @@ def repeated_sql_failure(
         )
         for e in matches
         if e.error_code
-        in {
+        in MODEL_QUERY_ERROR_CODES | AGGREGATION_QUERY_CODES | {
             "CLICKHOUSE_QUERY_ERROR",
             "INVALID_COLUMN_REFERENCE",
             "DISALLOWED_KEYWORD",

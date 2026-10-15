@@ -57,11 +57,12 @@ def test_unrecognized_sql_error_keeps_api_message_and_generic_repair_hint():
     assert decode_diagnostic("sql_diagnostic:invalid") is None
 
 
-def test_retry_detection_is_current_turn_and_literal_preserving():
+@pytest.mark.parametrize("code", ["CLICKHOUSE_QUERY_ERROR", "SQL_TYPE_MISMATCH", "SQL_UNSUPPORTED_CONSTRUCT"])
+def test_retry_detection_is_current_turn_and_literal_preserving(code):
     a = replace(
         entry("a", "runQuery", status="denied"),
         args={"sql": "SELECT Salary FROM hr.employee WHERE Department='Sales'"},
-        error_code="CLICKHOUSE_QUERY_ERROR",
+        error_code=code,
     )
     b = replace(a, tool_call_id="b")
     assert repeated_sql_failure(a.args["sql"] + " -- comment", [a, b], 0)
@@ -271,7 +272,9 @@ async def test_window_join_duplicate_probe_blocks_execution_and_reports_probe_er
         CATALOG,
     )
     detail = await validate_join_cardinality(sql, broken, CREDS)
-    assert "UNKNOWN_IDENTIFIER secret-value" in detail
+    assert detail.code == "AGGREGATION_CHECK_FAILED"
+    assert decode_diagnostic(detail.denial_detail)["cause"]["engine_code"] == "UNKNOWN_IDENTIFIER"
+    assert "secret-value" not in detail.denial_detail
     assert "not proof of duplicate" in detail
 
 
@@ -336,3 +339,18 @@ async def test_preflight_parse_error_reports_safe_location_not_an_aggregation_cl
     )
     assert "SQL syntax" in detail and "No join-cardinality verdict" in detail
     assert "private-value" not in detail
+
+
+def test_structured_diagnostic_survives_saved_trail_and_context():
+    from data_agent.runtime.dispatch.sql_diagnostics import encode_diagnostic
+    payload = dict(version=1, code="SQL_TYPE_MISMATCH", input_dialect="clickhouse",
+                   message="Incompatible types", guidance="Use toDate for a Date literal.",
+                   retry="after_query_change")
+    receipt = replace(entry("neutral", "runQuery", status="denied", provenance=None),
+                      error_code="SQL_TYPE_MISMATCH", denial_detail=encode_diagnostic(json.dumps(payload), "SELECT 1"))
+    receipt = type(receipt).from_doc(receipt.to_doc())
+    rendered = render_entry(receipt, 5)
+    assert rendered["sql_diagnostic"]["guidance"] == payload["guidance"]
+    canonical = json.dumps(_tool_trail_entry_to_canonical(rendered))
+    assert 'SQL_TYPE_MISMATCH' in canonical and 'clickhouse' in canonical
+    assert 'engine_code' not in canonical and 'TRINO' not in canonical

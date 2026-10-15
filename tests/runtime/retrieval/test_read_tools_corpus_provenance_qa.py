@@ -85,8 +85,8 @@ def _tool(*records: dict[str, Any]) -> SearchBlueprintsTool:
             top_k_blueprints=50,
             top_k_knowledge=5,
         ),
-        default_k=20,
-        max_k=20,
+        default_k=50,
+        max_k=50,
     )
 
 
@@ -95,7 +95,7 @@ def _creds(scope: frozenset[str] = frozenset()) -> RuntimeCredentials:
 
 
 async def _provenance(*records: dict[str, Any]) -> Any:
-    result = await _tool(*records).run({"query": _Q, "k": 20}, _creds())
+    result = await _tool(*records).run({"query": _Q, "k": 50}, _creds())
     assert result.status == "ok"
     assert result.result_full["count"] == len(records)
     return result.provenance

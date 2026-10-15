@@ -1,0 +1,354 @@
+BLUEPRINT DISCOVERY AND EXECUTION AUDIT — 2026-10-14
+
+Status: read-only audit of saved traces and current source. No runtime,
+retrieval configuration, blueprint or deployment changes made by this audit.
+
+Main finding
+------------
+Low execution is not evidence that the agent simply refuses blueprints. The
+battery repeatedly retrieved a small set of often unsuitable templates without
+successful reranking. The only template executed has a confirmed status-value
+mismatch. Improve applicability and correctness before trying to increase usage.
+
+Scope and method
+----------------
+Same 68 first-pass synthetic cases as the tool-efficiency audit: original 36
+plus remote-derived 32, MySQL system.query through Trino and ClickHouse, with
+prefetch, agent and judge enabled. This is not a production-corpus coverage test.
+Only turn index 0 is included; follow-ups and recovery reruns are excluded.
+
+Evidence: /tmp/trino-agent-battery/full-refined-rerun/
+  case-*.json, spans.json, REPORT.txt
+  blueprint-audit-private.json: reconstructed tool calls and visible responses
+  blueprint-funnel-metrics.json: sanitized per-case inventory and totals
+Raw temporary artifacts are private and not committed. Do not copy private SQL,
+credentials, model reasoning, or native view bodies into this document.
+
+Method: map trace IDs through agent.turn to cases, deduplicate span IDs, extract
+model-authored calls from ChatCompletion output, and associate tool responses
+from subsequent ChatCompletion inputs using tool_call_id. The repeated inputs
+also expose the candidate cards the model actually received. Do not count each
+repeated appearance of a tool response as another retrieval.
+
+The funnel
+----------
+                                          Calls       Distinct cases
+Prefetched candidate context                —               68
+searchBlueprints attempts                   68               61
+Successful search responses                 67               —
+Search attempts blocked by read guard        1               —
+getBlueprint                               21               13
+runBlueprint                                4                4
+
+All 67 successful searches returned candidates and reported degraded=true.
+The one other search was READ_REFETCH_LIMIT in case 22, not an empty match set.
+Earlier shorthand describing 68 searches as one per question was inaccurate:
+seven questions made no authored search, and some made multiple searches.
+Prefetch can supply a blueprint without an authored search, so this is not a
+strict linear conversion funnel and 4/68 is not candidate conversion accuracy.
+
+Across search responses: 12 distinct blueprint IDs; across full fetches: 9.
+Across executions: one ID, bp-active-headcount-by-department, in cases 1, 8,
+37 and 44. Three executions returned status=ok with three zero headcounts.
+Case 37 returned RUN_BLUEPRINT_VERIFY_FAILED and directed raw-tool fallback.
+The response does not identify the failed verification check; its exact cause
+is unresolved and must not be attributed to the status mismatch without proof.
+The three successful calls are successful execution, not correct answers.
+
+Retrieval evidence
+------------------
+Captured first-pass retrieval spans show 138 blueprint recalls. Every one
+reports candidate_count=12 and dropped_by_scope_count=0. This establishes a
+12-candidate recalled set in this environment; it does not establish that a
+production store contains only 12 blueprints. Search and prefetch together
+exposed the same 12 distinct IDs in the saved model inputs.
+
+All 222 captured rerank spans (blueprint and knowledge combined) report
+reranked=false and an empty model label. Current pipeline code returns recall
+order when there is no reranker, when reranking fails, or when score cardinality
+does not match. Therefore reranking was not effective in this battery. The
+saved markers alone do not distinguish disabled configuration from failure;
+an empty model label is not proof that no reranker was configured.
+
+The current search path keeps candidates in recall order on degradation. A
+nonempty result therefore means nearby candidates exist, not that a template
+satisfies the requested metric. Examples: the headcount template appeared in
+51 successful search responses, the salary-by-status template in 49, and the
+scratch-join earnings template in 45. These counts include multi-deliverable
+search results, not distinct questions or independent relevance judgments.
+
+Confirmed applicability problems
+--------------------------------
+1. Stale active-status predicate — cases 1, 8, 37, 44
+   The fetched headcount definition filters employee_status='A', while this
+   fixture uses 'Active'. Cases 1, 8 and 44 returned zeros for all departments;
+   subsequent direct analysis recovered nonzero active headcounts. The current
+   canonical blueprint still contains 'A'. This is a real correctness defect
+   for the tested surface, not a reason to force execution more frequently.
+   Bind the active-employee rule to the catalog/backend contract, rather than
+   globally replacing every status code across all backends.
+
+2. Missing population restriction — cases 2 and 38
+   Question: active employees' average salary and headcount by department.
+   The salary blueprint has a department slot but no active-status restriction.
+   The other fetched blueprint supplies headcount, not a salary population
+   filter, and also has the status defect above. Neither is a complete safe
+   substitute for the requested calculation. Direct SQL is justified.
+
+3. Wrong time grouping and population — case 9
+   Question: active hires compared across two calendar years.
+   The fetched hires-in-range template groups monthly and excludes a not-hired
+   code; that does not restrict the population to active employees. A date-range
+   slot alone cannot express the requested measurement.
+
+4. Mandatory slots narrower than the request — cases 22, 24, 25 and 53
+   Monthly gross payroll received single-pay-period/department/pay-type and
+   single-employee check-detail candidates. Salary-versus-payroll comparison
+   received check-detail and two-pay-period comparison candidates, not the
+   requested comparison of salary/12 against payroll across active employees.
+   Department/pay-period templates cannot be treated as all-department monthly
+   templates merely because their descriptions mention earnings. Missing filters,
+   measures and grouping are semantic mismatches, not slot-filling chores.
+
+5. No suitable accrual template among inspected candidates — case 50
+   PTO taken and beginning balances received headcount and average-salary
+   definitions. These can provide employee context but do not compute either
+   requested accrual measure. Broader search results also offered payroll and
+   hire templates for accrual questions. This is evidence of poor applicability
+   in the returned set, not proof that no suitable blueprint exists anywhere.
+
+6. Empty-set question needs distinct scalar semantics — case 58
+   Requested: active headcount, salary sum and average for a nonexistent
+   department. Fetched grouped templates do not provide all three measures or
+   the requested one-row zero/NULL result. Falling back is appropriate.
+
+Why the agent skipped each particular candidate is not always explicitly
+recorded. The mismatches above are established by comparing request and fetched
+definition; they are audit findings, not claims about hidden model reasoning.
+For the 55 questions with no full fetch, the traces establish which cards were
+offered, but do not establish that every possible relevant blueprint was tested.
+
+Two additional design weaknesses
+-------------------------------
+Validation metadata is too reassuring:
+  All 21 fetched definitions reported status=validated, drift_status=clean and
+  catalog_sha=''. The headcount example demonstrates that those labels do not
+  establish compatibility with the active catalog's business value semantics.
+  Distinguish structural/template validation from current-catalog compatibility.
+  Record the verified contract version and revalidate on relevant changes.
+
+Composed-template applicability is hard to inspect:
+  getBlueprint intentionally hides its internal DAG and returns a step-count
+  annotation. In cases 24, 25 and 53, this omitted detailed composition while
+  the prompt asked the model to check its measurement. Keep execution atomic,
+  but provide a compact contract: metrics, population, period/date basis, fixed
+  filters, supported optional filters, output grain and units. Do not expose
+  orchestration steps or ask the model to execute the DAG itself. This is a
+  visibility weakness; the traces do not prove it caused a particular skip.
+
+Recommended order of work
+-------------------------
+P1 — Correct the headcount blueprint and catalog-version validation.
+  Test both supported status encodings through their own catalog contracts,
+  missing departments, zero-active departments, company totals and restricted
+  access. Require correct results, not merely status=ok or structural success.
+
+P1 — Establish why reranking was ineffective, then compare relevance.
+  Inspect configuration safely without logging credentials. Emit explicit
+  disabled/timeout/provider-error/score-mismatch reason codes. Compare the same
+  candidate set with healthy reranking. Measure applicability and latency;
+  reranking cannot invent a missing metric or repair incorrect SQL.
+
+P2 — Add or generalize templates for repeated, supported questions.
+  Priorities: active salary/headcount by department, monthly gross payroll,
+  employee-grain payroll-to-HR comparisons, accrual balances, and accrual event
+  counts/hours with explicit categories and statuses. Preserve the newly fixed
+  distinction between taken balances and approved request hours. Exact median
+  templates must remain exact. Prefer configurable contracts over many near-
+  duplicates and do not force users to supply unrequested optional filters.
+
+P2 — Make cards disclose applicability before a full fetch.
+  Show fixed population/filters, available dimensions, date basis and required
+  slots. For composed templates include the same semantic contract. Provide
+  an honest no-suitable-match indication rather than presenting every nearby
+  template as useful. Calibrate relevance separately from scope authorization.
+
+P2 — Avoid repeated discovery once mismatch is established.
+  Preserve the existing prefetch/search gate. Reuse visible results; after one
+  meaningful search with unsuitable candidates, proceed to supported direct SQL
+  unless a new deliverable or materially different discovery need arises. Case
+  22 made four search attempts; the fourth was correctly blocked by the read
+  guard. Do not add an extra model tool solely to log why candidates were skipped.
+
+P2 — Instrument skip and verification reasons without raw data.
+  Distinguish no matching template, filter/grain/period mismatch, missing slot,
+  stale catalog, authorization exclusion, execution failure and verifier failure.
+  Capture structured metadata in existing retrieval/execution/review paths,
+  not inferred certainty about the agent's private reasoning. Preserve detailed
+  verifier codes internally while keeping user-facing guidance actionable.
+
+Validation and success criteria
+-------------------------------
+Use the same named cases and fixtures; compare before/after with at most three
+concurrent requests and repeat matched questions to account for model variation.
+Track correct reusable executions, matching-candidate coverage, fallback cause,
+query count, tool-bearing model rounds and elapsed time. Report healthy and
+outage runs separately. Every executed blueprint must match its direct-query
+oracle for the requested grain, scope, null handling and period.
+
+Do not optimize raw execution percentage: a correct direct query is preferable
+to an unsuitable template. The useful target is fewer steps to a correct answer
+on questions for which a compatible reusable template actually exists.
+
+Code inspected
+--------------
+Agent: runtime/retrieval/tools.py, runtime/retrieval/pipeline.py,
+runtime/loop/blueprint_gate.py, runtime/blueprint/executor.py, runtime/prompts.py.
+MCP: app/corpus/data/blueprints/bp-active-headcount-by-department.yaml and
+app/corpus/data/blueprints/bp-average-salary-by-department.yaml.
+Related: agent-tool-efficiency-audit-2026-10-14.txt in this directory.
+
+IMPLEMENTATION FOLLOW-UP — flexible blueprint coverage and reranking
+
+Root cause confirmed: scripts/run_ui_runtime_real.py enabled reranker_api_url
+only when Help Center was on. REAL_RETRIEVAL alone therefore used recall order.
+The launcher now enables the existing local reranker when either retrieval or
+Help Center is enabled, and honors RERANKER_API_URL. Degradation spans distinguish
+not_configured, timeout, provider_error and score_count_mismatch without including
+query/provider payloads in logs. Recall fallback remains available.
+
+Canonical MCP corpus expanded from 12 to 16 templates:
+- employee-summary: company/department/status grouping; employee counts and
+  salary summaries. Optional status, department and employee filters.
+- payroll-summary: company/department/month grouping; required register type and
+  pay-date period; optional earning/type code and employee filters.
+- accrual-balance-summary: company/department/plan grouping, including taken_amount;
+  optional plan and employee filters. No implicit PTO or invented balance formula.
+- accrual-event-summary: company/department/status/event_type/month/department_status;
+  required requested-for-date period, optional status/type/earn-code/employee filters.
+  All event types are included when no type filter is supplied. Counts event-day rows,
+  not distinct multi-day requests. Event hours are not balance usage.
+
+Fixed-value categories use validated enum slots. Entities (department, employee,
+accrual code, event type, earn code) use column-bound string slots and the existing
+entity resolution path. Missing optional filters mean all values, never an implicit
+Active/PTO/Approved filter. Entity strings are bound as literals, not SQL fragments.
+Required periods are half-open [start,end). Supported grouping choices are explicit;
+these templates do not cover every metric, threshold, combined grouping or forecast.
+Direct SQL remains appropriate outside the declared template contract.
+
+Existing active-headcount blueprint now uses catalog status Active instead of A.
+Its active-only meaning is retained; general status questions use employee-summary.
+Salary-by-status now uses catalog enum values, and salary-by-department accepts an
+optional status. Canonical hashes and agent corpus fixture were regenerated.
+
+Live compatibility: explicit date casts, YYYY-MM string month keys and exact nullable
+Decimal casts avoid observed DATE/string, dateTrunc round-trip and outer-join type
+inference failures. Grain verification now groups keys before counting them, so a
+legitimate NULL department is retained while duplicate groups still fail verification.
+No RLS, authorization, scope, or refresh behavior was relaxed.
+
+Validation:
+- Agent retrieval/blueprint/launcher/prompt suite: 1,651 passed.
+- MCP corpus suite: 66 passed; corpus parity check passed.
+- Live synthetic MCP system.query execution + grain probes: 18 variants passed.
+  One initial employee/company service-unavailable response passed a targeted retry.
+  Evidence: /tmp/trino-agent-battery/blueprint-live-probes.json and blueprint-live-retry.json.
+- Real local reranker API contract tests: 3 passed.
+- Ranking all 16 intent descriptions for payroll, balances, events and employee-status
+  questions put the corresponding new blueprint first in each of four probes.
+  This is a reranker sanity check, not an end-to-end retrieval recall evaluation.
+- Nullable grain groups, duplicate groups and empty results were checked independently.
+
+Activation: source changes are implemented and tested. The currently running MCP image
+and agent were not rebuilt/restarted for this follow-up, and their retrieval corpus has
+not been reindexed with the four additions. Refresh MCP, reload/reindex the corpus, and
+restart the agent to activate them. Measure search -> fetch -> run and rerank degradation
+in a subsequent end-to-end battery; no new blueprint-usage-rate claim is made here.
+
+PRODUCTION QUESTION EXPANSION — six further templates (22 total)
+
+Evidence used: clickhouse-api/remote-dev.txt sections salary/comp, hires,
+terminations/turnover and tenure, plus /tmp/trino-agent-battery/questions.json.
+Production frequencies include automated replays and were not treated as independent
+organic demand. Template coverage maps to question meaning, not raw frequency.
+
+Question -> new template and variable slots:
+- "What's the median salary?" / exact median active versus terminated ->
+  bp-salary-exact-median: company/department/status, recorded versus positive salary.
+  Exact lower/upper middle-pair mean only; never approximate or pretend arbitrary
+  percentile support. Missing salaries are excluded; counts make denominator explicit.
+- "$25k buckets" / earlier salary_buckets -> bp-salary-distribution: positive integer
+  band_width, recorded/positive population. Numeric half-open boundaries; percentage
+  denominator is selected recorded salaries (not all active staff with missing salary).
+- "How many employees make over $300,000?" -> bp-salary-threshold-count:
+  above/at_least/equal/below and nonnegative whole-currency salary threshold.
+- "Show all employees who earn over $300k" / top-paid employees ->
+  bp-salary-threshold-directory: same comparisons plus bounded row_limit, deterministic
+  salary-descending/code tie-break. A capped directory is not proof of completeness;
+  fractional thresholds and within-department ranking remain direct SQL.
+- Average tenure company/department -> bp-employee-tenure-summary: original versus
+  most recent hire, explicit ISO reference_date, company/department/status grouping.
+  Calendar days/365.25; excludes NULL, sentinel and future dates. All-status elapsed
+  time does not stop at termination; select Active for current-staff tenure.
+- Hires by year / terminations this year -> bp-employee-date-summary: original hire,
+  most recent hire or recorded termination, half-open period, company/department/
+  current-status/month grouping. Dates do not imply current status, event completeness
+  or a turnover rate. Existing monthly hire templates remain distinct legacy options.
+
+Every addition has optional validated current-status enum and column-bound department
+and employee entity filters. Omission means no filter. No new physical/native views or
+private view SQL were included. Required columns are declared in uses for scope checks.
+
+Intentionally not templated in this expansion: unspecified seasonal forecasts,
+missing-history turnover rates, cross-fact spending scenarios without an agreed
+baseline, arbitrary location/title synonyms, and every top-N/window combination.
+The earlier payroll/accrual summaries already cover much of that battery's aggregates.
+Direct SQL is still appropriate when the declared slots cannot express the question.
+
+Validation: 1,576 agent retrieval/blueprint tests and 66 MCP corpus tests passed.
+Ten live synthetic system.query template/grain variants passed; two initial median
+service-unavailable results passed a targeted retry without changing their SQL.
+Evidence: /tmp/trino-agent-battery/blueprint-production-probes.json and
+blueprint-production-retry.json. Local reranker probes are recorded separately in
+blueprint-production-rankings.json; they are not a full agent battery.
+Source corpus hashes and agent fixture are synchronized. Running services/index still
+require the activation steps above; this change does not claim deployed coverage.
+
+Reranker follow-up: initial six-query sanity check selected intended first candidates
+for median, distribution, tenure and dated terminations but confused salary count/list
+asks. Added natural-language count-versus-list descriptions to those two intents,
+without hardcoding SQL values. Repeating both queries ranked threshold-count first for
+"How many employees make over $300,000?" and threshold-directory first for "Show all
+employees who earn over $300k". The JSON file records the initial, not the improved run.
+
+PUNCH PAIRS AND TIMECARD EARNINGS — three additions (25 total)
+
+Added bp-punch-pair-summary, bp-employee-day-clock-span and
+bp-timecard-earnings-summary. Based on remote-dev per-employee punches/hours/pay
+questions and monthly paid-hours/labor-cost trends. total_earning is the daily
+TIME-CARD source, not the payroll-register earnings table.
+
+All require an explicit half-open punch-date period and a resolved table_source.
+Required source prevents accidental combining of overlapping ingestion sources;
+FINAL removes stale/deleted storage versions but cannot deduplicate real-world events
+across sources. Optional employee, allocated-department and pay-class entities are
+bound literals. Punch in/out types are closed enums; hours_type and earn_code remain
+client-defined entities. Department codes refer to the recorded timecard allocation,
+not the employee's current home department. No new employee join is needed.
+
+Summaries expose employee/entry or pair counts, observed dates/days, paid hours and
+amount. Grouping supports company, employee, department, day, month and hours/earning
+code. Min/max observed dates are evidence only, not completeness guarantees; missing
+months are not zero-filled. Day clock span reports first/last actual timestamps and
+paid hours separately; it is neither a shift duration nor evidence of lateness.
+Schedules/grace periods and policy-specific overtime cannot be inferred here.
+
+Validation: 1,580 retrieval/blueprint tests, 66 MCP corpus tests. Four live direct
+ClickHouse executions using synthetic fixtures checked storage-version replacement,
+tombstones, cross-source overlap exclusion, half-open dates, paid hours differing from
+clock span, and a custom earning-code filter. Fixture database was removed afterward.
+Evidence: /tmp/time-blueprint-live.json; harness: /tmp/check_time_blueprints.py.
+These are direct engine checks, not a refreshed MCP/agent end-to-end battery.
+Synthetic integration schema now includes both tables; no proprietary view SQL added.
+Activation/reindexing of the running services remains pending as above.

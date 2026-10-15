@@ -3,13 +3,95 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from data_agent.runtime.dispatch.sql_diagnostics import decode_diagnostic
+from data_agent.runtime.dispatch.sql_diagnostics import PREFIX, decode_diagnostic
+
+logger = logging.getLogger(__name__)
+
+
+class AggregationIssue(str):
+    """Authored failure with explicit recovery policy; str compatibility for callers."""
+
+    def __new__(cls, message, *, code="AGGREGATION_UNVERIFIED", retryable=True, cause=None):
+        obj = super().__new__(cls, message)
+        obj.code, obj.retryable, obj.cause = code, retryable, cause
+        return obj
+
+    @property
+    def denial_detail(self):
+        payload = dict(
+            code=self.code,
+            message=str(self),
+            input_dialect="clickhouse",
+            retryable=self.retryable,
+            retry="after_query_change" if self.retryable else "after_operator_action",
+        )
+        if not self.retryable:
+            payload["guidance"] = (
+                "Use other successful evidence. If this blocks an intent, bind this failed result_id with EXECUTION_FAILED and disclose the verification limitation, not data absence."
+            )
+        if self.cause:
+            payload["cause"] = self.cause
+        return PREFIX + json.dumps(payload)
+
+
+def _unique_grouped_keys(scope, alias, keys):
+    """Only a direct grouped projection proves uniqueness; never data-cache it."""
+    source = scope.sources.get(alias) if scope else None
+    if not isinstance(source, Scope) or source.outer_columns:
+        return False
+    body = source.expression
+    if not isinstance(body, exp.Select) or body.find(exp.Explode):
+        return False
+    group = body.args.get("group")
+    if (
+        not group
+        or not group.expressions
+        or any(v for k, v in group.args.items() if k != "expressions")
+    ):
+        return False
+    outputs = [item.alias_or_name for item in body.expressions]
+    for key in group.expressions:
+        if not isinstance(key, exp.Column):
+            return False
+        names = {
+            item.alias_or_name
+            for item in body.expressions
+            if item.unalias() == key and outputs.count(item.alias_or_name) == 1
+        }
+        if not names.intersection(keys):
+            return False
+    return True
+
+
+def _nullable_count_column(aggregate, select, schema):
+    # A direct COUNT of a declared Nullable column ignores unmatched NULLs on
+    # both null-extending and default-filling routes. No inference for expressions.
+    if not isinstance(aggregate, exp.Count):
+        return False
+    value = aggregate.this
+    if isinstance(value, exp.Distinct) and len(value.expressions) == 1:
+        value = value.expressions[0]
+    if not isinstance(value, exp.Column) or not value.table:
+        return False
+    relation = next(
+        (
+            t
+            for t in select.find_all(exp.Table)
+            if t.alias_or_name == value.table and t.find_ancestor(exp.Select) is select
+        ),
+        None,
+    )
+    if relation is None:
+        return False
+    dtype = (schema or {}).get(f"{relation.db}.{relation.name}", {}).get(value.name, "")
+    return dtype.startswith("Nullable(")
 
 
 def _conjuncts(node):
@@ -124,33 +206,6 @@ def _grouped_join_preserves_source(select: exp.Select, scope: Scope) -> bool:
     if source is None:
         return False
     left, right = source.this.alias_or_name, join.this.alias_or_name
-    grouped = scope.sources.get(right)
-    if not isinstance(grouped, Scope) or grouped.outer_columns:
-        return False
-    body = grouped.expression
-    if not isinstance(body, exp.Select) or body.find(exp.Explode):
-        return False
-    group = body.args.get("group")
-    if (
-        not group
-        or not group.expressions
-        or any(value for key, value in group.args.items() if key != "expressions")
-    ):
-        return False
-    # Every grouping column must survive projection unchanged under a unique name.
-    outputs = [item.alias_or_name for item in body.expressions]
-    group_outputs = []
-    for key in group.expressions:
-        if not isinstance(key, exp.Column):
-            return False
-        names = {
-            item.alias_or_name
-            for item in body.expressions
-            if item.unalias() == key and outputs.count(item.alias_or_name) == 1
-        }
-        if not names:
-            return False
-        group_outputs.append(names)
     matched = set()
     if join.args.get("using"):
         matched.update(key.name for key in join.args["using"])
@@ -169,7 +224,7 @@ def _grouped_join_preserves_source(select: exp.Select, scope: Scope) -> bool:
                         matched.add(b.name)
                     elif b.table == left and a.table == right:
                         matched.add(a.name)
-    return all(names & matched for names in group_outputs)
+    return _unique_grouped_keys(scope, right, matched)
 
 
 def _validate_outer_join_counts(select: exp.Select, schema=None) -> None:
@@ -210,12 +265,19 @@ def _validate_outer_join_counts(select: exp.Select, schema=None) -> None:
         ):
             continue
         columns = list(aggregate.find_all(exp.Column))
+        if _nullable_count_column(aggregate, select, schema):
+            continue
         if not columns or any(not c.table or c.table in unmatched for c in columns):
             raise ValueError(
                 "Outer-join count can include unmatched default-filled rows as employees or "
                 "other entities, even with DISTINCT. Aggregate the counted source before "
                 "the outer join, then fill missing counts with zero. Qualify counted columns "
-                "when counting the preserved side."
+                "when counting the preserved side. "
+                f"Affected count columns: {', '.join(sorted({c.sql() for c in columns})) or 'row count'}; "
+                f"unmatched-side aliases: {', '.join(sorted(unmatched))}. "
+                "Write ClickHouse SQL, for example SELECT d.id, coalesce(c.n, 0) FROM departments d "
+                "LEFT JOIN (SELECT department_id, count() n FROM employees GROUP BY department_id) c "
+                "ON d.id=c.department_id. Use your logical catalog names and preserve original filters."
             )
 
 
@@ -381,6 +443,8 @@ def cardinality_probes(sql: str, *, schema=None) -> list[str]:
                     "Aggregate join cardinality cannot be established. Use a semijoin or aggregate each source at its intended grain."
                 )
             for key_set in dict.fromkeys(keys[alias]):
+                if _unique_grouped_keys(scopes.get(id(select)), alias, key_set):
+                    continue
                 relation = relations[alias]
                 body = ctes.get(relation.name) if isinstance(relation, exp.Table) else relation
                 lineage = [body] if body is not None else []
@@ -475,7 +539,7 @@ def cardinality_probes(sql: str, *, schema=None) -> list[str]:
 
 async def validate_join_cardinality(
     sql, dispatcher, credentials, *, emit_progress=True
-) -> str | None:
+) -> AggregationIssue | None:
     try:
         schema = None
         from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -488,39 +552,80 @@ async def validate_join_cardinality(
             result = await dispatcher.dispatch(
                 "runQuery", {"sql": statement}, credentials, emit_progress=emit_progress
             )
+            if result.status != "ok":
+                diagnostic = decode_diagnostic(result.denial_detail)
+                return AggregationIssue(
+                    "The join cardinality probe failed; this is not proof of duplicate rows. "
+                    "The main query was not executed. Follow the probe diagnostic in ClickHouse SQL "
+                    "or use other successful results and disclose the limitation.",
+                    code="AGGREGATION_CHECK_FAILED"
+                    if result.retryable
+                    else "AGGREGATION_CHECK_UNAVAILABLE",
+                    retryable=bool(result.retryable),
+                    cause=(
+                        {
+                            k: diagnostic[k]
+                            for k in (
+                                "code",
+                                "engine_code",
+                                "message",
+                                "guidance",
+                                "retry",
+                                "candidate_expression",
+                            )
+                            if k in diagnostic
+                        }
+                        if diagnostic
+                        else {
+                            "code": result.error_code or "QUERY_ERROR",
+                            "message": "Verification query failed; no cardinality conclusion is available.",
+                        }
+                    ),
+                )
             rows = (
                 result.result_full.get("rows", []) if isinstance(result.result_full, dict) else []
             )
-            if result.status != "ok":
-                diagnostic = decode_diagnostic(result.denial_detail)
-                return (
-                    "The join cardinality probe failed; this is not proof of duplicate rows. "
-                    + (
-                        json.dumps(diagnostic)
-                        if diagnostic
-                        else f"{result.error_code or 'QUERY_ERROR'}: "
-                        + (result.denial_detail or result.user_message or "Query validation failed.")
-                    )
-                    + (
-                        " Correct the underlying query or use the tested SQL procedure."
-                        if result.retryable
-                        else " Use other successful results or disclose this limitation."
-                    )
+            if (
+                len(rows) != 1
+                or len(rows[0]) != 2
+                or any(type(n) is not int or n < 0 for n in rows[0])
+                or rows[0][1] > rows[0][0]
+            ):
+                return AggregationIssue(
+                    "The cardinality check returned invalid counts; no duplication verdict is available. "
+                    "Ask the operator to inspect verification. Use supported evidence or disclose the limitation.",
+                    code="AGGREGATION_CHECK_UNAVAILABLE",
+                    retryable=False,
                 )
-            if not rows or len(rows[0]) < 2 or rows[0][0] != rows[0][1]:
-                return "The aggregate join can duplicate measured records, or its cardinality could not be checked. Aggregate each source to the intended grain or use a semijoin."
-    except ParseError as exc:
-        location = exc.errors[0] if exc.errors else {}
-        line, column = location.get("line"), location.get("col")
-        position = (
-            f" at line {line}, column {column}"
-            if isinstance(line, int) and isinstance(column, int)
-            else ""
-        )
-        return (
-            "SQL syntax could not be parsed"
-            + position
-            + ". Check missing whitespace before FROM, WHERE, JOIN, and ORDER BY, and ClickHouse syntax. No join-cardinality verdict was established."
+            if rows[0][0] != rows[0][1]:
+                probe = sqlglot.parse_one(statement, dialect="clickhouse")
+                keys = sorted(
+                    {c.sql(dialect="clickhouse") for c in probe.expressions[1].find_all(exp.Column)}
+                )
+                original = sqlglot.parse_one(sql, dialect="clickhouse")
+                measured_columns = sorted(
+                    {
+                        column.sql(dialect="clickhouse")
+                        for aggregate in original.find_all(exp.AggFunc)
+                        for column in _measure_columns(aggregate)
+                    }
+                )[:8]
+                return AggregationIssue(
+                    "Aggregate inputs: " + (", ".join(measured_columns) or "row count") + ". "
+                    "The check found duplicate matching keys in a join input: "
+                    + ", ".join(keys)
+                    + ". This can multiply measured rows, but does not prove the final total is wrong. "
+                    "Write ClickHouse SQL: if only membership is needed, use WHERE employee_code IN "
+                    "(SELECT employee_code FROM logical_fact). Otherwise aggregate the multiplying "
+                    "source to all required join keys before joining. Preserve tenant keys, filters, row grain "
+                    "and unmatched-row semantics; do not use DISTINCT on salary amounts or ANY JOIN as a shortcut.",
+                    code="AGGREGATION_DUPLICATE_KEYS",
+                )
+    except ParseError:
+        return AggregationIssue(
+            "SQL syntax could not be parsed. Correct ClickHouse quoting, parentheses and clause boundaries; "
+            "No join-cardinality verdict was established.",
+            code="SQL_SYNTAX_ERROR",
         )
     except ValueError as exc:
         if str(exc).startswith(
@@ -532,8 +637,23 @@ async def validate_join_cardinality(
                 "Outer-join count",
             )
         ):
-            return str(exc)
-        return "Aggregation safety could not be established. Use explicit join keys and aggregate each source to the intended grain."
+            return AggregationIssue(
+                str(exc) + " This shape is unverified, not proof of incorrect results. "
+                "Do not retry with cosmetic alias or formatting changes."
+            )
+        logger.error("Aggregation verification failed unexpectedly; no cardinality verdict")
+        return AggregationIssue(
+            "Aggregation verification failed internally. Ask the operator to investigate; "
+            "rewriting SQL is not a confirmed remedy.",
+            code="AGGREGATION_CHECK_UNAVAILABLE",
+            retryable=False,
+        )
     except Exception:
-        return "Aggregation safety could not be established. Use explicit join keys and aggregate each source to the intended grain."
+        logger.error("Aggregation verification failed unexpectedly; no cardinality verdict")
+        return AggregationIssue(
+            "Aggregation verification is unavailable. Ask the operator to investigate; "
+            "use successful evidence or disclose the limitation.",
+            code="AGGREGATION_CHECK_UNAVAILABLE",
+            retryable=False,
+        )
     return None

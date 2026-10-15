@@ -40,6 +40,9 @@ _CREATE_TABLE = re.compile(
 
 # The eleven tables the Layer-2 warehouse seed (both DDL migrations) creates.
 _EXPECTED_TABLES = {
+    "dbpcm_warehouse.punch_pair",
+    "dbpcm_warehouse.total_earning",
+    "dbpcm_warehouse.accrual_balances",
     "dbpcm_warehouse.employee",
     "dbpcm_warehouse.payroll",
     "dbpcm_warehouse.department",
@@ -124,14 +127,11 @@ def test_fixture_keys_are_case_sensitive_exact() -> None:
     assert "dbpcm_warehouse.employee.Department" not in all_keys
 
 
-def test_no_fixture_key_references_a_disallowed_payroll_date_column() -> None:
-    # payroll carries three date columns: pay_date, pay_period_start_date and
-    # pay_period_end_date. All three ARE seeded in the current warehouse, but the
-    # fixtures deliberately anchor every pay-period predicate on pay_period_end_date
-    # (the register's period-close date) for a single, consistent period grain.
-    # A fixture drifting to pay_date or pay_period_start_date would silently change
-    # that grain, so guard against it — this is a convention guard, not a
-    # "column is unseeded" guard.
+def test_payroll_date_basis_is_explicit_and_existing_period_templates_do_not_drift() -> None:
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
-    all_keys = {k for bp in blueprints for k in bp.uses}
-    assert not any(k.endswith(".pay_date") or "pay_period_start_date" in k for k in all_keys)
+    for bp in blueprints:
+        if bp.id == "bp-payroll-summary":
+            assert "dbpcm_warehouse.payroll.pay_date" in bp.uses
+            assert "pay-date" in bp.intent
+        else:
+            assert not any(k.endswith(".pay_date") or "pay_period_start_date" in k for k in bp.uses)

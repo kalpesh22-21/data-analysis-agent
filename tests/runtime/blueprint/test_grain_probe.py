@@ -37,7 +37,9 @@ def test_build_grain_probe_sql_shape() -> None:
     )
     low = sql.lower()
     assert "count(*)" in low  # the fan-out canary numerator
-    assert "count(distinct department)" in low
+    assert "group by" in low
+    assert "sum(__bp_group_n)" in low
+    assert "department" in low
     assert "__bp_n" in sql and "__bp_d" in sql  # the aliased count columns
     assert "__bp_sub" in sql  # the inner SQL is a structural subquery, not spliced
 
@@ -82,3 +84,19 @@ def test_unpack_grain_probe_fail_closed_on_surprises() -> None:
     assert unpack_grain_probe({"rows": []}) == (None, None)
     assert unpack_grain_probe({"rows": [[1]]}) == (None, None)  # < 2 columns
     assert unpack_grain_probe({"rows": [["x", "y"]]}) == (None, None)  # non-int cells
+
+
+def test_grain_probe_counts_null_groups_and_duplicate_rows():
+    import sqlite3
+    import sqlglot
+
+    con = sqlite3.connect(":memory:")
+    for inner, expected in [
+        ("SELECT NULL AS k UNION ALL SELECT 'HR' AS k", (2, 2)),
+        ("SELECT NULL AS k UNION ALL SELECT NULL AS k", (2, 1)),
+        ("SELECT NULL AS k WHERE FALSE", (0, 0)),
+    ]:
+        probe = build_grain_probe_sql(inner, ["k"])
+        sqlite_sql = sqlglot.transpile(probe, read="clickhouse", write="sqlite")[0]
+        assert con.execute(sqlite_sql).fetchone() == expected
+    con.close()

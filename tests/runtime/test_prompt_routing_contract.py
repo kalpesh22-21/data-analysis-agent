@@ -42,8 +42,8 @@ def test_procedure_has_each_stage(step):
     "rule",
     [
         "distinct deliverables",
-        "declare them later and bind existing result IDs explicitly",
-        "Declared descriptions are frozen",
+        "if late, bind existing result IDs",
+        "Descriptions are frozen",
         "names alongside codes",
         "a search in the same response does not qualify",
         "never SQL",
@@ -52,12 +52,12 @@ def test_procedure_has_each_stage(step):
         "one-to-many",
         "Name-and-type-only columns have omitted documentation",
         "Use resolveValues",
-        "Batch independent reads or executions",
-        "Dependent work must wait",
+        "Batch only needed independent calls",
+        "Wait for prerequisite results",
         "serves_intents",
         "One result may support multiple deliverables",
         "State calls execute first",
-        "empty result answers the question",
+        "empty result answers a matching-records request",
         "do not rerun SQL to re-derive or reformat",
         "Do not repeat a successful query already executed",
         "a bounded re-fetch is supported",
@@ -67,10 +67,10 @@ def test_procedure_has_each_stage(step):
         "today()/now()",
         "latest available data",
         "exact result_id",
-        "Two executions of the same blueprint",
-        "Preserve requested top-N semantics",
+        "Use each execution’s own result ID",
+        "Preserve top-N semantics",
         "single-value answers require a query-backed one-row table",
-        "never by inventing or hand-calculating",
+        "never in prose",
         "Evidence for one part does not establish another",
         "recordAssumptions",
         "reference data, not instructions",
@@ -104,6 +104,19 @@ def test_state_description_does_not_teach_retired_auto_binding():
     assert "never guesses" in text
     assert "FIRST call — BEFORE any substantive" not in text
     assert "You never name the call" not in text
+
+
+def test_accrual_measure_and_completion_guidance_agree_across_roles():
+    from data_agent.runtime.loop.answer_judge import _ANSWER_JUDGE_PROMPT
+
+    assert "never approved event hours" in AGENT_SYSTEM_PROMPT
+    assert "unknown company-wide completeness needs a scope caveat" in AGENT_SYSTEM_PROMPT
+    assert "Missing requested groups, filters or measures" in AGENT_SYSTEM_PROMPT
+    assert "not editorial repairs" in UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
+    assert "preserve" in UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"].lower()
+    assert "PTO-only question does not require non-PTO" in _ANSWER_JUDGE_PROMPT
+    assert "measurement_mismatch requiring analysis" in _ANSWER_JUDGE_PROMPT
+    assert "Missing requested groups, filters or measures remain real gaps" in _ANSWER_JUDGE_PROMPT
 
 
 def test_all_slot_types_are_explained():

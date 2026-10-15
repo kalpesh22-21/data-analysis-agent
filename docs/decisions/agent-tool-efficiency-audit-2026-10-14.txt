@@ -1,0 +1,219 @@
+AGENT TOOL EFFICIENCY AUDIT — 2026-10-14
+
+Status: evidence review and proposed backlog. No runtime changes made by this audit.
+
+Conclusion
+----------
+The 12-tool median warrants improvement, but it does not mean 12 database
+queries or 12 sequential model calls. Much of the overhead is discovery and
+local workflow management. Optimize these and avoid repeated recovery before
+restricting legitimate analytical validation. A hard tool cap would hide
+incomplete work rather than fix it.
+
+Evidence and limits
+-------------------
+Reviewed the saved 68-question first pass: 36 original questions and 32
+remote-dev-derived questions, not the entire 108-query production corpus.
+Environment: synthetic MySQL/ClickHouse, Trino 483, MySQL system.query mode,
+real agent/retrieval/MCP/judge, at most three concurrent requests.
+
+Private evidence directory:
+  /tmp/trino-agent-battery/full-refined-rerun/
+Files: case-01.json through case-68.json, spans.json, audited-results.json,
+REPORT.txt. Derived counts: tool-efficiency-audit-metrics.json in that directory.
+These temporary files are not a durable archive. This document preserves the
+sanitized findings; raw SQL, credentials, identities and private view bodies
+must not be added to the repository to preserve the evidence.
+
+Method: associate spans with cases through agent.turn trace IDs and session
+IDs; include only turn index 0; deduplicate span IDs; extract tool calls from
+ChatCompletion outputs, excluding the judge's record_judgement. Recovery and
+follow-up runs are excluded from the primary denominator.
+
+Reported calls: 922 / 68; mean 13.56, median 12, range 5–33.
+Captured model-authored calls: 924. Counts reconcile exactly for 66/68 cases;
+cases 17 and 26 each have one more captured call than their reported counter.
+That discrepancy remains unresolved; do not present the two totals as equal.
+Captured responses containing agent tool calls: 552; median 7 per question.
+This excludes prose-only model responses, judge calls and progress summaries.
+It is not the total model request count or a latency measurement.
+
+Tool inventory from the 924 captured authored calls:
+  Discovery / retrieval / value resolution                         371
+    getTableSchema 145; searchBlueprints 68; listTables 54;
+    listDatabases 49; getBlueprint 21; resolveValues 18;
+    searchKnowledge 16.
+  Query / sample / blueprint execution / explain                   307
+    runQuery 292; sampleRows 10; runBlueprint 4; explainQuery 1.
+  Local workflow / delivery / clarification                       246
+    updateAnalysisState 104; finalizeAnswer 76;
+    recordAssumptions 64; askUser 2.
+
+These categories describe authored tools, not physical backend requests.
+For example, resolveValues and runBlueprint can execute internal queries.
+The first-pass tool spans contain 319 runQuery calls, including internal
+calls, versus 292 authored runQuery calls. Export gaps and different tracing
+boundaries also prevent treating span totals as the runtime counter.
+The loop counter includes some calls stopped by local guards.
+
+The captured spans lack start/end timestamps and parent-span links. We cannot
+attribute total latency precisely to model inference, MCP, database, or judge.
+The first pass experienced service outages. Raw averages mix useful analysis,
+recovery and infrastructure failures. Larger budgets are not evidence that
+all extra time was caused by slow model calls.
+
+Representative successful cases
+-------------------------------
+Case  Question                    Authored tools  Tool-bearing responses
+01    Headcount by department           13                  6
+03    Exact salary median               7                  5
+59    Active employee percentage        7                  5
+60    Terminated employee count         9                  8
+61    Salary above a threshold         11                  8
+62    Latest hires                      8                  7
+
+03: One authored SQL query already combines the exact median, headcount and
+salary coverage checks. The other calls are blueprint search, schema lookup,
+two state updates, assumptions and finalization. Preserve the analytical
+query; simplify its surrounding workflow.
+
+59: One SQL query computes total, active count and percentage. Four discovery
+calls precede delivery: database listing, table listing, schema and blueprint
+search. An authorized, already-bound logical dataset should not need the
+same navigation every time.
+
+01: The selected headcount blueprint used status 'A', while this fixture uses
+'Active'. The agent recovered through value discovery and additional queries.
+There are five authored runQuery calls plus resolveValues and runBlueprint.
+This is a recipe-to-data contract issue, not proof that one status spelling
+is universally correct. Coverage and department reconciliation remain useful.
+
+60: Three SQL queries explore statuses/date coverage, count terminations and
+then refine the count using rehire information. The question only asks for
+terminated employees. A canonical definition of current terminated status
+versus historical termination would reduce unnecessary reinterpretation.
+
+61: Two schema requests (broad, then selected fields) and two SQL queries
+(threshold count, then salary/population checks). The second schema request
+is not automatically redundant: broad schema responses can trim descriptions.
+Request the relevant fields first. Compute count and justified coverage checks
+together when doing so preserves the metric's population and cost.
+
+62: Two queries retrieve the latest hires and inspect boundary-date ties.
+Tie handling is valid. A deterministic ordering contract, with a windowed tie
+count when needed, can avoid a separate validation query. Do not silently
+change “five employees” into “all employees tied for fifth.”
+
+Prioritized improvement backlog
+------------------------------
+P1. Validate blueprint value contracts before execution
+Owner: agent blueprint binding and MCP catalog semantics.
+Use documented/resolved status values within the current authorized scope;
+reuse that evidence for the turn. Version recipes against schema/value
+contracts. If a binding cannot be established, surface the mismatch before
+running the recipe. Do not replace every 'A' with 'Active'.
+Acceptance: case 01 works under both encodings without executing a known-wrong
+recipe or duplicating value discovery; totals and unmatched-row coverage agree.
+
+P1. Avoid repeated attempts against an unavailable source
+Owner: agent dispatch/recovery and MCP error classification.
+First-pass tool errors include 44 EXECUTION_SERVICE_UNAVAILABLE out of 81
+recorded errors. Separate source availability from SQL repair. A new query
+spelling is not a fix for the same unavailable backend. Add or extend a
+source-scoped bounded retry/cooldown using structured retryability; preserve
+access to healthy sources and already collected evidence.
+Acceptance: outage injection does not cause repeated schema/sample/query
+attempts against the same source; recovery after cooldown remains possible;
+the answer reports the blocked portion rather than inventing missing data.
+Existing SQL-repair and repeated-read guards must be reused, not duplicated.
+
+P2. Use existing retrieval prefetch and scoped catalog context effectively
+Owner: agent context assembly/prompt; MCP schema descriptions.
+The agent already has blueprint prefetch, a search gate and repeated-read
+protection. Improve their use rather than introducing another discovery layer.
+Supply bounded, authorized logical dataset bindings and relevant field
+contracts. Skip database/table enumeration when the binding is established.
+Use a prefetched suitable blueprint without another equivalent search.
+Acceptance: cases 59–62 avoid routine listing while still performing discovery
+for ambiguous datasets. Changed schema versions and missing descriptions
+permit a bounded refresh. Never cache permission decisions across queries.
+
+P2. Combine related analytical evidence in a single execution
+Owner: agent SQL authoring guidance and verified blueprints.
+Bundle threshold counts with justified coverage summaries, and grouped totals
+with reconciliation when grain and population are proven. Avoid checking the
+same successful result through another execution. Case 03 is a good pattern.
+Acceptance: cases 61–62 use fewer queries with equivalent counts, ties and
+coverage; missing departments and null values still receive correct treatment.
+Do not automatically merge queries when the combined scan is more expensive.
+
+P2. Make simple-turn bookkeeping atomic
+Owner: agent analysis state and finalization contract.
+246 captured calls are workflow/delivery/clarification. Not all are removable.
+Consider allowing finalization to submit assumptions and evidence-bound intent
+completion atomically, or deriving routine completion from validated receipts.
+Keep explicit state for multi-part work, blocking and clarification.
+Acceptance: case 03 needs fewer authored calls without bypassing aggregation
+checks, evidence provenance or answer review. A failed finalization must not
+persist a false completed state. Snapshot replay must remain query-free.
+
+P2. Clarify business meanings in the existing catalog
+Owner: MCP catalog semantics and agent prompts.
+Document current versus historical employee status, original versus latest
+hire date, salary population, accrual balance versus accrual activity, and
+whether a dataset proves complete period coverage. Include type, nullability,
+grain and supported aggregation meaning for relevant fields.
+Acceptance: terminated-count and accrual questions use the intended metric;
+material ambiguity triggers one useful clarification instead of exploratory
+queries followed by confident unsupported wording. Do not add overlapping
+user-facing views or expose internal trino_join_keys metadata.
+
+P2. Repair only the failed analysis or presentation component
+Owner: agent state diagnostics and judge feedback.
+The first pass records eight ANALYSIS_STATE_INVALID errors. Inspect the exact
+transition reasons before changing guards. Return the specific missing intent,
+receipt or evidence binding. Reuse successful SQL for presentation/state repair.
+Judge approval alone must not justify claims such as “complete history.”
+Acceptance: invalid-transition fixtures recover without replaying successful
+SQL; completeness claims require coverage evidence. Retain timeout fallback
+for the judge, but measure retries separately from agent tool calls.
+
+P2. Improve observability before setting a hard efficiency target
+Owner: agent tracing and test harness.
+Record distinct counters for authored attempts, rejected calls, dispatched
+tools, internal MCP/SQL calls, model rounds, judge retries and successful
+evidence-producing queries. Export timestamps, parent links and durations.
+Explain the case 17/26 counter discrepancy and check trace completeness.
+Acceptance: every first-pass case reconciles; latency can be split by component
+without storing sensitive SQL/rows in ordinary deployment logs.
+
+Validation plan
+---------------
+1. Preserve this baseline; use the same synthetic fixture and question IDs.
+2. Implement one change at a time. Test ordinary, nullable, empty, tied,
+   unmatched-join and permission-restricted cases before the full battery.
+3. Rerun matched questions more than once because model behavior varies.
+   Keep model, budgets, retrieval settings and fixture version fixed. At most
+   three concurrent requests. Report healthy runs separately from outages.
+4. Compare median/p90 tool-bearing rounds, authored calls, backend queries,
+   elapsed time, retries, deterministic result checks and completion coverage.
+5. Provisional target for simple questions: one main analytical SQL execution,
+   with only justified extra probes; explore 4–6 total authored tools after
+   workflow changes. This is an engineering target, not a measured saving or
+   a universal cap. Complex forecasting/cross-module work needs its own cohort.
+6. Accept an optimization only if answer correctness and security remain
+   intact. Preserve per-query permission freshness, exact quantiles, join-grain
+   validation, unsupported-function guidance and evidence-backed finalization.
+
+Implementation references
+-------------------------
+src/data_agent/runtime/prompts.py
+src/data_agent/runtime/loop/agent_loop.py
+src/data_agent/runtime/loop/read_guard.py
+src/data_agent/runtime/dispatch/sql_diagnostics.py
+src/data_agent/runtime/composite/analysis_state.py
+src/data_agent/runtime/blueprint/executor.py
+src/data_agent/runtime/loop/answer_judge.py
+
+No claimed call reduction is proven until the matched rerun. This audit does
+not recommend a new cache of permission lists or relaxing correctness guards.

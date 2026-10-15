@@ -84,6 +84,7 @@ class ResolveOutcome:
     user_message: str | None = None
     retryable: bool | None = None
     top_margin: float | None = None
+    denial_detail: str | None = None
 
 
 def parse_period(raw: Any) -> Period | None:
@@ -386,6 +387,7 @@ class ResolveValuesComposite:
                 error_code=inner.error_code,
                 user_message=inner.user_message,
                 retryable=inner.retryable,
+                denial_detail=inner.denial_detail,
             )
 
         rows = _extract_rows(inner.result_full, target)
@@ -456,6 +458,7 @@ class ResolveValuesComposite:
                 error_code=outcome.error_code,
                 retryable=outcome.retryable,
                 user_message=outcome.user_message,
+                denial_detail=outcome.denial_detail,
                 provenance=outcome.provenance,
                 result_preview=None,
                 result_full=None,

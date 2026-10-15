@@ -28,6 +28,8 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     _default_observer,
 )
 from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
+from data_agent.runtime.dispatch.denial_mapping import AGGREGATION_QUERY_CODES
+from data_agent.runtime.dispatch.sql_diagnostics import decode_diagnostic
 from data_agent.runtime.observability.redaction import tool_span_args
 
 from .executor import (
@@ -168,6 +170,9 @@ def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
             error_code=outcome.error_code,
             retryable=outcome.retryable,
             user_message=outcome.user_message,
+            denial_detail=(outcome.user_message if outcome.error_code in
+                           AGGREGATION_QUERY_CODES | {"AGGREGATION_CHECK_UNAVAILABLE", "SQL_SYNTAX_ERROR"}
+                           and decode_diagnostic(outcome.user_message) else None),
             provenance=outcome.provenance,
             result_preview=None,
             result_full=None,

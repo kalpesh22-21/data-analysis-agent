@@ -1,4 +1,4 @@
-"""Durable intent declarations and explicit bindings to current-turn evidence.
+"""Durable intents bound to current executions or explicitly referenced prior snapshots.
 
 Descriptions and assigned IDs remain frozen. An execution can serve multiple
 intents through serves_intents, and late declarations can bind an existing result_id.
@@ -8,8 +8,10 @@ checks semantic support. Legacy reason_code/evidence_tool_call_id inputs are ign
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
@@ -171,7 +173,7 @@ DERIVABLE_REASON_CODES: tuple[str, ...] = tuple(sorted(MODEL_REASON_CODES))
 
 # Only these fields are consumed. Legacy evidence/reason fields and other extra
 # metadata are ignored; the runtime derives evidence disposition from receipts.
-_KNOWN_ITEM_KEYS = frozenset({"description", "intent_id", "status", "result_id"})
+_KNOWN_ITEM_KEYS = frozenset({"description", "intent_id", "status", "result_id", "reuse_previous_result"})
 # `loop_analysis_state_rejected.reason` is an ENUM of rule names — never the
 # offending value (D25). Every rejection path below picks one of these.
 REJECTION_REASONS = frozenset(
@@ -265,7 +267,7 @@ def _missing_entry_reason(tool_call_id: str, trail: Sequence[TrailEntry], turn_i
     if any(entry.tool_call_id == tool_call_id for entry in trail):
         return (
             f"tool call '{tool_call_id}' belongs to an earlier turn, not this one. "
-            "Evidence must come from a call made while answering the current question."
+            "To reuse an earlier successful snapshot explicitly, set reuse_previous_result=true with its result_id. This does not refresh data; current/live requests require a new query."
         )
     return (
         f"no tool call '{tool_call_id}' has been dispatched yet on this turn. If you "
@@ -420,12 +422,13 @@ def validate_block_evidence(
 
     if reason_code == "EXECUTION_FAILED":
         if (
-            entry.tool_name == "runQuery"
-            and entry.status != "ok"
-            and entry.error_code == "SQL_REPAIR_EXHAUSTED"
+            entry.status != "ok"
+            and (entry.tool_name == "runQuery" and entry.error_code == "SQL_REPAIR_EXHAUSTED"
+                 or entry.tool_name in {"runQuery", "runBlueprint"}
+                 and entry.error_code == "AGGREGATION_CHECK_UNAVAILABLE")
         ):
             return None
-        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED receipt; one SQL error does not establish exhaustion."
+        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED or AGGREGATION_CHECK_UNAVAILABLE receipt; other SQL errors do not establish exhaustion."
 
     # REQUIRED_DATA_UNAVAILABLE — a SUCCESSFUL call that returned no rows.
     if entry.status != "ok":
@@ -817,10 +820,56 @@ def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "intent_id": intent_id,
                 "status": status,
                 "evidence_tool_call_id": item.get("result_id"),
+                "reuse_previous_result": item.get("reuse_previous_result", False),
                 "reason_code": None,
             }
         )
     return validated
+
+
+def _prepare_previous_result_reuse(updates, trail, turn_index, live, scope_hash):
+    """Create explicit current-turn references, never fabricated new executions.
+
+    Caller supplies the session's scope-filtered trail. Require an exact recorded
+    scope hash as well; legacy/unknown scope receipts cannot be promoted. Original
+    timestamps, query, full-result reference and provenance remain unchanged.
+    """
+    receipts = []
+    known_intents = {intent.intent_id for intent in live.intents}
+    for update in updates:
+        flag = update.get("reuse_previous_result", False)
+        if type(flag) is not bool:
+            raise _reject("unresolved_evidence", "reuse_previous_result must be a boolean.")
+        if not flag:
+            continue
+        if update["intent_id"] not in known_intents or update["status"] != "completed":
+            raise _reject("unresolved_evidence", "Prior snapshots may explicitly complete a declared intent; they cannot establish a current blocked condition.")
+        source_id = update.get("evidence_tool_call_id")
+        source = next((entry for entry in trail if entry.tool_call_id == source_id), None)
+        if (source is None or source.turn_index >= turn_index or source.status != "ok"
+                or source.error_code or source.tool_name not in {"runQuery", "runBlueprint"}
+                or source.provenance is None or not source.ts
+                or source.result_preview is None
+                or source.tool_name == "runBlueprint" and not source.authoritative
+                or not scope_hash or (source.model_response or {}).get("scope_hash") != scope_hash
+                or (source.model_response or {}).get("reused_from_result_id")
+                or any(table.startswith("scratch.") for table, _ in source.provenance)):
+            raise _reject("unresolved_evidence", "That prior result is not an eligible successful snapshot under the current scope. Use a fresh authorized query; failed, unknown-scope, scratch and unverified blueprint results cannot be reused.")
+        # Stable within this turn so repeating an explicit binding does not
+        # manufacture extra receipts or trigger another query.
+        reference_id = "reused_" + hashlib.sha256(f"{turn_index}:{source_id}".encode()).hexdigest()[:24]
+        existing = next((e for e in trail if e.tool_call_id == reference_id), None)
+        if existing is None and not any(e.tool_call_id == reference_id for e in receipts):
+            receipts.append(replace(
+                source, turn_index=turn_index, tool_call_id=reference_id,
+                serves_intent=None, serves_intents=(),
+                model_response={"scope_hash": scope_hash, "reused_from_result_id": source_id,
+                                "reused_from_turn": source.turn_index, "source_timestamp": source.ts},
+                window_note="Reused earlier result snapshot; not freshly executed. Original result: "
+                            + source_id + "; captured at " + source.ts + ". " + (source.window_note or ""),
+            ))
+        update["evidence_tool_call_id"] = reference_id
+    return receipts
 
 
 def _bind_evidence_against_trail(
@@ -1168,7 +1217,9 @@ class UpdateAnalysisStateTool(RuntimeToolBase):
 
         if live is None:
             return await self._initialize(session_id, turn_index, items, trail)
-        return await self._update(session_id, turn_index, items, trail, live)
+        from data_agent.runtime.context.scope_filter import compute_scope_hash
+        return await self._update(session_id, turn_index, items, trail, live,
+                                  scope_hash=compute_scope_hash(credentials.column_scope))
 
     async def _initialize(
         self,
@@ -1218,16 +1269,23 @@ class UpdateAnalysisStateTool(RuntimeToolBase):
         items: list[dict[str, Any]],
         trail: Sequence[TrailEntry],
         live: AnalysisState,
+        *,
+        scope_hash: str | None = None,
     ) -> ToolResult:
         """UPDATE — batched by design: several intents per call. Load-bearing, since one call
         per intent would reintroduce exactly the bookkeeping overhead this trim removes.
         """
         updates = _validate_update_items(items)
+        receipts = _prepare_previous_result_reuse(updates, trail, turn_index, live, scope_hash)
+        trail = [*trail, *receipts]
         # Resolves the evidence INTO `updates` (and refuses what cannot be bound),
         # so everything downstream — the merge, 04 §B.3's distinctness check, the
         # rendered state block, the telemetry — sees a real `tool_call_id` and a
         # derived `reason_code` regardless of which path established them.
         bindings = _bind_evidence_against_trail(updates, trail, turn_index, live)
+        for receipt in receipts:
+            await self._session_store.append_trail_entry(session_id, receipt)
+            self._observer("loop_previous_evidence_reused", {"turn_index": turn_index})
 
         # The BEFORE snapshot for the transition events is captured inside the
         # merge, not from the `live` read above: on a CAS retry the write is
@@ -1263,7 +1321,11 @@ class UpdateAnalysisStateTool(RuntimeToolBase):
         ):
             self._observer(ANALYSIS_STATE_AUTO_BOUND_EVENT, {"intent_id": intent_id})
         self._emit_transition_events(previous, state, trail, turn_index, bindings)
-        return _state_result(state)
+        result = _state_result(state)
+        if any(update.get("reuse_previous_result") for update in updates):
+            note = "Explicitly reused prior result snapshots. Use the returned evidence_tool_call_id; no fresh query or permission refresh was performed. Do not describe these results as current/live."
+            result = replace(result, window_note=note)
+        return result
 
     def _emit_transition_events(
         self,

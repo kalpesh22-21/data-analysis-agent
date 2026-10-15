@@ -1,7 +1,7 @@
 """blueprint/grain_probe.py — the SHARED D56 grain-probe builder (one oracle).
 
-The grain-integrity probe (`SELECT count(), count(DISTINCT <grain cols>)` over the final
-SQL) is the fan-out canary the D56 gate relies on, and it is needed in TWO places that MUST
+The grain-integrity probe (total rows versus grouped grain keys, including NULL, over
+the final SQL) is the fan-out canary the D56 gate relies on, and it is needed in TWO places that MUST
 stay byte-identical: the live `runBlueprint` fast path (`executor._verify`) and the offline
 golden-replay probe (`learning/promotion/warehouse_probe.py`). Any drift — a different
 grain-column mapping, probe shape or unpack — would let an offline replay pass while the
@@ -63,22 +63,30 @@ def map_grain_columns(
 
 
 def build_grain_probe_sql(final_sql: str, grain_output_cols: list[str]) -> str:
-    """Build the scope-enforceable `SELECT COUNT(*), COUNT(DISTINCT <grain>) FROM
-    (<final SQL>)` probe (§4.2) — the fan-out canary. Built via the AST so the
+    """Build the scope-enforceable total-row and unique-grain probe (§4.2).
+    NULL keys count as groups. Built via the AST so the
     inner SQL is embedded structurally, never string-spliced."""
     inner = sqlglot.parse_one(final_sql, dialect="clickhouse")
     assert_read_only_select(inner)  # defense-in-depth: the probe subquery is a read
     subquery = exp.Subquery(
         this=inner, alias=exp.TableAlias(this=exp.to_identifier("__bp_sub"))
     )
-    count_star = exp.Count(this=exp.Star())
-    distinct = exp.Count(
-        this=exp.Distinct(expressions=[exp.column(col) for col in grain_output_cols])
+    # GROUP BY retains NULL as a group; COUNT(DISTINCT key), including the
+    # single-element tuple form on ClickHouse, may discard it. Count each group
+    # once and sum its multiplicity to retain the duplicate-grain check.
+    groups = exp.select(
+        exp.alias_(exp.Count(this=exp.Star()), "__bp_group_n")
+    ).from_(subquery).group_by(
+        *[exp.column(col, quoted=True) for col in grain_output_cols]
     )
-    select = exp.select(
-        exp.alias_(count_star, "__bp_n"), exp.alias_(distinct, "__bp_d")
-    ).from_(subquery)
-    return select.sql(dialect="clickhouse")
+    grouped = exp.Subquery(this=groups, alias=exp.TableAlias(this=exp.to_identifier("__bp_groups")))
+    total = exp.Coalesce(
+        this=exp.Sum(this=exp.column("__bp_group_n")), expressions=[exp.Literal.number(0)]
+    )
+    return exp.select(
+        exp.alias_(total, "__bp_n"),
+        exp.alias_(exp.Count(this=exp.Star()), "__bp_d"),
+    ).from_(grouped).sql(dialect="clickhouse")
 
 
 def unpack_grain_probe(raw: Any) -> tuple[int | None, int | None]:

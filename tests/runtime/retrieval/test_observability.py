@@ -164,3 +164,38 @@ async def test_embedder_degrade_is_not_silent() -> None:
         assert "retrieval.degraded" in degrade_spans[0].attributes
         for value in degrade_spans[0].attributes.values():
             assert _Q not in str(value)
+
+
+async def test_rerank_degradation_reasons_are_distinct_and_data_free():
+    import httpx
+
+    class Failure:
+        def __init__(self, kind):
+            self.kind = kind
+
+        async def rerank(self, query, documents):
+            if self.kind == 'score_count_mismatch':
+                return []
+            if self.kind == 'timeout':
+                try:
+                    raise httpx.ReadTimeout('private query must not be logged')
+                except httpx.ReadTimeout as exc:
+                    raise RuntimeError('private wrapper') from exc
+            raise RuntimeError('private query must not be logged')
+
+    for reason in ['not_configured', 'timeout', 'provider_error', 'score_count_mismatch']:
+        provider, exporter = _provider()
+        pipeline = RetrievalPipeline(
+            embedding_client=FakeEmbeddingClient({_Q: _QVEC}),
+            reranker=None if reason == 'not_configured' else Failure(reason),
+            vector_index=_index(), user_memory=NullUserMemoryProvider(),
+            tracer=provider.get_tracer('test'), recall_k=10, top_k_blueprints=3, top_k_knowledge=3,
+        )
+        result = await pipeline.retrieve(question=_Q, column_scope=frozenset(), user_id=None)
+        assert result.thin_cards and not result.reranked
+        spans = [s for s in exporter.get_finished_spans() if s.name == 'rerank']
+        assert spans
+        assert all(s.attributes['reranker.degraded_reason'] == reason for s in spans)
+        assert all(_Q not in str(s.attributes) for s in spans)
+        assert all('private' not in str(s.attributes) for s in spans)
+        provider.shutdown()
