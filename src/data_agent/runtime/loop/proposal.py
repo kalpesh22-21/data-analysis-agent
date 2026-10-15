@@ -32,6 +32,7 @@ class ReviewState:
     intent_id: str = ""
     result_ids: tuple[str, ...] = ()
     repair_type: str = ""
+    repair_tables: tuple[dict[str, Any], ...] = ()
     approved_version: str = ""
     assumptions_before_refusal: tuple[str, ...] = ()
     excluded_components: tuple[dict[str, Any], ...] = ()
@@ -47,10 +48,12 @@ class ReviewState:
             return cls(scope_hash=scope_hash)
         state = cls(**{k: v for k, v in value.items() if k in cls.__dataclass_fields__})
         state.excluded_components = tuple(state.excluded_components)
+        state.repair_tables = tuple(state.repair_tables)
         state.result_ids = tuple(state.result_ids)
         state.assumptions_before_refusal = tuple(state.assumptions_before_refusal)
         state.calls = min(2, max(0, int(state.calls)))
         if state.scope_hash != scope_hash:
+            state.repair_tables = ()
             state.excluded_components = ()
             state.approved_version = ""
             state.delivery_version = ""
@@ -236,6 +239,22 @@ def assess_deliverable_evidence(state, args, trail) -> EvidenceAssessment:
     return EvidenceAssessment(
         rows, tuple(dict.fromkeys(refs)), tuple(errors), tuple(dict.fromkeys(extras))
     )
+
+
+def retain_cited_repair_tables(args: dict[str, Any], state: ReviewState) -> dict[str, Any]:
+    """A prose-only repair retains prior tables still cited as evidence.
+
+    References re-enter normal table resolution and exclusion checks. Never reuse
+    raw SQL, uncited results, or selections from a different scope.
+    """
+    if not (state.repaired and state.repair_type in {"prose", "presentation"}
+            and args.get("tables") == [] and isinstance(args.get("evidence"), list)):
+        return args
+    refs = {r for r in args["evidence"] if isinstance(r, str)}
+    tables = [dict(t) for t in state.repair_tables
+              if isinstance(t, dict) and isinstance(t.get("result_id"), str)
+              and t["result_id"] in refs]
+    return {**args, "tables": tables} if tables else args
 
 
 def normalize_proposal_args(args: dict[str, Any]) -> dict[str, Any]:

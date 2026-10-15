@@ -354,7 +354,8 @@ async def test_period_start_after_end_still_builds_valid_sql() -> None:
         _credentials(),
     )
     assert r.status == "ok"
-    assert "WHERE RequestDate >= '2026-12-31' AND RequestDate <= '2026-01-01'" in (
+    assert ("WHERE RequestDate >= CAST('2026-12-31' AS Nullable(DateTime64(6))) "
+            "AND RequestDate <= CAST('2026-01-01' AS Nullable(DateTime64(6)))") in (
         mcp.calls[0].args["sql"]
     )
 

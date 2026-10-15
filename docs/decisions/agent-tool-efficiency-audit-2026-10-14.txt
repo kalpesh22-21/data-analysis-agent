@@ -217,3 +217,14 @@ src/data_agent/runtime/loop/answer_judge.py
 
 No claimed call reduction is proven until the matched rerun. This audit does
 not recommend a new cache of permission lists or relaxing correctness guards.
+
+2026-10-15 follow-up: presentation-repair result preservation
+A prose/presentation-only judge retry could clear selected answer tables by sending
+an empty tables list while still citing the original result. Save result references
+in durable review state and restore only previously selected, still-cited tables for
+that repair type. Restored references pass normal resolution, exclusion and scope
+checks; a scope change clears them. Explicit replacement selections and uncited
+results are not overridden. No additional runQuery is issued. Regression checks cover
+live answer/history parity, one-query execution, exclusions and scope changes.
+The resolveValues reversed-date-bound regression now expects catalog-typed casts;
+its empty-range semantics are unchanged.

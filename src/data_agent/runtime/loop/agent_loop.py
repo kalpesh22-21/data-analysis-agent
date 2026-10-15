@@ -3506,11 +3506,14 @@ class AgentLoop:
                 if is_unified_finalizer:
                     from .proposal import (
                         normalize_proposal_args,
+                        retain_cited_repair_tables,
                         validate_proposal_args,
                     )
 
                     tool_call = replace(
-                        tool_call, arguments=normalize_proposal_args(tool_call.arguments)
+                        tool_call, arguments=retain_cited_repair_tables(
+                            normalize_proposal_args(tool_call.arguments), review_state
+                        )
                     )
                     error = validate_proposal_args(tool_call.arguments)
                     if error:
@@ -4931,6 +4934,10 @@ class AgentLoop:
                         )
                         review_state.site = site
                         review_state.reject(verdict, version, accum.assumptions or ())
+                        review_state.repair_tables = tuple(
+                            dict(t) for t in (proposal_args or {}).get("tables", [])
+                            if isinstance(t, dict) and isinstance(t.get("result_id"), str)
+                        ) if verdict.repair_type in {"prose", "presentation"} else ()
                         ship_guard.note_refusal(
                             site,
                             verdict.violation,
