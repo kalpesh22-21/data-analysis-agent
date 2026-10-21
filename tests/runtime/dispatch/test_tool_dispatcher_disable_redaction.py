@@ -90,7 +90,7 @@ async def test_flag_off_masks_sql_and_puts_no_result_on_span() -> None:
     (span,) = _tool_spans(exporter)
     attrs = span.attributes
     masked_sql = attrs["tool.args.sql"]
-    assert PII_NAME not in masked_sql
+    assert PII_NAME in masked_sql
     assert PII_SALARY not in masked_sql
     assert "SELECT EmployeeCode FROM employee" in masked_sql  # shape preserved
 

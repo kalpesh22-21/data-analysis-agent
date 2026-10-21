@@ -224,7 +224,7 @@ async def test_a_delete_racing_the_create_retries_instead_of_dereferencing_none(
             _FakeGetResult(base_doc.to_doc(), cas=9),
         ]
     )
-    sessions_collection.upsert = AsyncMock(return_value=None)
+    sessions_collection.insert = AsyncMock(return_value=None)
     sessions_collection.replace = AsyncMock(return_value=None)
 
     await store.append_message(
@@ -248,7 +248,7 @@ async def test_a_relentless_deleter_fails_loudly_rather_than_looping() -> None:
     from couchbase.exceptions import DocumentNotFoundException
 
     sessions_collection.get = AsyncMock(side_effect=DocumentNotFoundException("gone"))
-    sessions_collection.upsert = AsyncMock(return_value=None)
+    sessions_collection.insert = AsyncMock(return_value=None)
     sessions_collection.replace = AsyncMock(return_value=None)
 
     with pytest.raises(CASMismatchError):

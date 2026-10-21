@@ -620,6 +620,7 @@ class SessionDoc:
     # Written by 05's enforcement path; declared here as part of 03's schema work.
     finalization_blocks: dict[str, int] | None = None
     review_states: dict[str, Any] = field(default_factory=dict)
+    catalog_session: dict[str, Any] | None = field(default=None, repr=False)
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -634,6 +635,7 @@ class SessionDoc:
             "learning_content_hash": self.learning_content_hash,
             "analysis_state": (self.analysis_state.to_doc() if self.analysis_state else None),
             "review_states": self.review_states,
+            "catalog_session": self.catalog_session,
             "finalization_blocks": (
                 dict(self.finalization_blocks) if self.finalization_blocks is not None else None
             ),
@@ -658,6 +660,7 @@ class SessionDoc:
             analysis_state=AnalysisState.from_doc(as_doc) if as_doc else None,
             finalization_blocks=({str(k): int(v) for k, v in fb_doc.items()} if fb_doc else None),
             review_states=dict(doc.get("review_states") or {}),
+            catalog_session=doc.get("catalog_session"),
         )
 
 

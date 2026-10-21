@@ -38,9 +38,9 @@ _REDACTED_PLACEHOLDER = "<redacted>"
 def hash_scope(column_scope: frozenset[str]) -> str:
     """Stable hash of *column_scope* — never log the raw scope (D25).
 
-        `compute_scope_hash` is imported INSIDE the function on purpose: an eager import
-        creates the cycle `redaction -> context -> dispatch -> redaction`, which makes
-        `runtime.observability.tracing` un-importable as an entry point.
+    `compute_scope_hash` is imported INSIDE the function on purpose: an eager import
+    creates the cycle `redaction -> context -> dispatch -> redaction`, which makes
+    `runtime.observability.tracing` un-importable as an entry point.
     """
     from data_agent.runtime.context.scope_filter import compute_scope_hash
 
@@ -50,9 +50,9 @@ def hash_scope(column_scope: frozenset[str]) -> str:
 def mask_sql(sql: str) -> str:
     """Mask string and numeric literals in *sql* for the telemetry copy only.
 
-        Structurally equivalent output: string literal contents become `''`/`""`, numeric
-        literals become `0`. The un-redacted SQL is still what is dispatched to the MCP and
-        shown in the UI — only this masked copy may enter a span or progress attribute.
+    Structurally equivalent output: string literal contents become `''`/`""`, numeric
+    literals become `0`. The un-redacted SQL is still what is dispatched to the MCP and
+    shown in the UI — only this masked copy may enter a span or progress attribute.
     """
     masked = _SINGLE_QUOTED_STRING.sub("''", sql)
     masked = _DOUBLE_QUOTED_STRING.sub('""', masked)
@@ -63,8 +63,8 @@ def mask_sql(sql: str) -> str:
 def redact_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Return a telemetry-safe copy of *args* — SQL literals masked, the rest passed through.
 
-        Non-SQL arguments (`database`, `table`, `limit`, ...) are structural, not PII, and
-        are kept as-is for debuggability. Callers must never pass tool RESULTS here.
+    Non-SQL arguments (`database`, `table`, `limit`, ...) are structural, not PII, and
+    are kept as-is for debuggability. Callers must never pass tool RESULTS here.
     """
     redacted: dict[str, Any] = dict(args)
     for key in _SQL_ARG_KEYS:
@@ -99,16 +99,15 @@ def redact_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
 def tool_span_args(
     tool_name: str, args: dict[str, Any], *, disable_redaction: bool
 ) -> dict[str, Any]:
-    """The args a TOOL span should carry — the single seam for the access-controlled
-        `RuntimeSettings.otlp_disable_redaction` telemetry debug switch.
+    """Copy telemetry arguments, preserving text and optionally masking numbers.
 
-        Default is the D25 posture (the redacted copy); `disable_redaction=True` records the
-        REAL args so a debugging operator sees them in Phoenix. TELEMETRY-ONLY: every caller
-        passes the RAW args to the actual tool work regardless, so flipping the flag never
-        changes what executes or what scope the MCP enforces. Returns a shallow copy, so
-        span code can never mutate the caller's live args dict.
+    Actual tool execution receives the original arguments. Secrets are always removed.
     """
-    return dict(args) if disable_redaction else redact_tool_args(tool_name, args)
+    # Phoenix capture preserves readable text; SQL parser/audit callers retain
+    # the separate legacy mask_sql function unchanged.
+    from .phoenix_payloads import sanitize
+
+    return sanitize(args, redact=not disable_redaction)
 
 
 __all__ = ["hash_scope", "mask_sql", "redact_tool_args", "tool_span_args"]

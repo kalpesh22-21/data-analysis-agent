@@ -5,8 +5,8 @@ fakes): SAME `create_app` structure, SAME port (:8000), SAME real JWT-vs-l2-toke
 verification, but with the REAL components — an OpenAI model client (key from `.env`,
 model from `OPENAI_MODEL`, `DEMO_MODEL`, or a startup preflight), a `RealMCPClient` against the live
 l2-mcp, the real `CouchbaseSessionStore` (`REAL_SESSION_STORE=memory` falls back to the
-in-memory store), and the real `CatalogHandle` rebuilt from the frozen catalog-export
-snapshot (`CATALOG_FIXTURE_PATH` points at a live `/catalog/export` dump to refresh).
+in-memory store), and a catalog materialized per session by the backend and persisted
+with its scope token in the session store.
 Loop tunables are the PRODUCTION defaults, not the scripted demo's low caps.
 
 Retrieval (neo4j blueprint recall) is OFF by default: it needs the corpus seeded with an
@@ -54,7 +54,6 @@ from data_agent.runtime.session.memory_store import InMemorySessionStore
 # `python scripts/x.py` AND when the file is loaded by path (importlib
 # `spec_from_file_location`, e.g. tests).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _catalog import catalog_handle  # noqa: E402
 from _e2e_harness import load_openai_key, pick_openai_model  # noqa: E402
 
 # --- The live l2 stack (docker-compose.integration.yml), already running. We
@@ -272,7 +271,6 @@ def build_real_app():
             tool_choice=settings.model_tool_choice,
             api_mode=settings.model_api,
         ),
-        catalog=catalog_handle(),
     )
 
 

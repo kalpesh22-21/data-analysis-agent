@@ -8,14 +8,20 @@ freq}`), their embedding vectors, and the concept vector, produce the ranked, to
     lf_norm_i  = log1p(freq_i) / max_j(log1p(freq_j))      # -> [0, 1]
     score_i    = w * sim_norm_i + (1 - w) * lf_norm_i      # w = similarity weight
 
+Exact normalized code/description matches have score 1 and precede non-exact
+ties. Returned values are never normalized or rewritten. This is equality evidence,
+not a probability or proof that a description applies in another period.
+
 When embeddings are unavailable (degraded), `row_vectors`/`concept_vector` are `None` and
-the score collapses to `lf_norm_i` (w = 0). Rows sort by `score` desc, with `freq` desc then
-`value` asc as deterministic tiebreakers, truncated to `top_k`.
+non-exact scores collapse to `lf_norm_i` (w = 0); exact matches still score 1.
+Rows sort by score, exact-match precedence, frequency, value and description,
+truncated to `top_k`.
 """
 
 from __future__ import annotations
 
 import math
+import unicodedata
 from dataclasses import dataclass
 
 
@@ -29,22 +35,24 @@ class RowValue:
 
     def embedding_text(self) -> str:
         """The text embedded for semantic matching."""
-        if self.description:
-            return f"{self.value}: {self.description}"
-        return self.value
+        # Opaque client codes can distort the meaning of a useful description.
+        # Code identity is handled independently by exact matching below.
+        return " ".join((self.description or "").split()) or self.value.strip()
 
 
 @dataclass(frozen=True)
 class ResolvedValue:
-    """One ranked value returned to the model — the fixed contract shape."""
+    """One ranked value; match_type is additive evidence about how it matched."""
 
     value: str
     description: str | None
     score: float
     freq: int
+    match_type: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
+            **({"match_type": self.match_type} if self.match_type else {}),
             "value": self.value,
             "description": self.description,
             "score": self.score,
@@ -55,10 +63,10 @@ class ResolvedValue:
 def cosine(a: list[float], b: list[float]) -> float:
     """Cosine similarity of two vectors; 0.0 if either is zero.
 
-        Kept lenient (`strict=False`): a length mismatch yields a degenerate but finite,
-        non-crashing value rather than raising. The length-mismatch guard lives at the composite
-        level (`resolve_values._validate_embed_shape`), which degrades to freq-only ranking
-        BEFORE this is ever called on ragged input.
+    Kept lenient (`strict=False`): a length mismatch yields a degenerate but finite,
+    non-crashing value rather than raising. The length-mismatch guard lives at the composite
+    level (`resolve_values._validate_embed_shape`), which degrades to freq-only ranking
+    BEFORE this is ever called on ragged input.
     """
     dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
@@ -76,6 +84,22 @@ def _normalized_log_freqs(rows: list[RowValue]) -> list[float]:
     return [lf / max_lf for lf in log_freqs]
 
 
+def normalize_exact(text: str) -> str:
+    """Case/whitespace-insensitive equality, without merging distinct punctuation/codes."""
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def exact_match(row: RowValue, concept: str | None) -> str | None:
+    needle = normalize_exact(concept or "")
+    if not needle:
+        return None
+    if needle == normalize_exact(row.value):
+        return "exact_code"
+    if row.description and needle == normalize_exact(row.description):
+        return "exact_description"
+    return None
+
+
 def rank(
     *,
     rows: list[RowValue],
@@ -84,11 +108,12 @@ def rank(
     similarity_weight: float,
     top_k: int,
     score_ndigits: int = 4,
+    concept: str | None = None,
 ) -> list[ResolvedValue]:
     """Rank *rows* into the top-K `ResolvedValue` list.
 
-        Degraded (embeddings unavailable) when *row_vectors* or *concept_vector* is `None`: the
-        score is then frequency-only.
+    Degraded (embeddings unavailable) when *row_vectors* or *concept_vector* is `None`: the
+    non-exact score is then frequency-only; exact equality still takes priority.
     """
     degraded = row_vectors is None or concept_vector is None
     lf_norms = _normalized_log_freqs(rows)
@@ -96,11 +121,14 @@ def rank(
     scored: list[ResolvedValue] = []
     for index, row in enumerate(rows):
         lf_norm = lf_norms[index]
-        if degraded:
+        match = exact_match(row, concept)
+        if match:
+            score = 1.0
+        elif degraded:
             score = lf_norm
         else:
             assert row_vectors is not None and concept_vector is not None
-            sim_norm = max(0.0, cosine(concept_vector, row_vectors[index]))
+            sim_norm = min(1.0, max(0.0, cosine(concept_vector, row_vectors[index])))
             score = similarity_weight * sim_norm + (1.0 - similarity_weight) * lf_norm
         scored.append(
             ResolvedValue(
@@ -108,16 +136,28 @@ def rank(
                 description=row.description,
                 score=round(score, score_ndigits),
                 freq=row.freq,
+                match_type=(match or ("frequency" if degraded else "semantic"))
+                if concept is not None
+                else None,
             )
         )
 
-    scored.sort(key=lambda rv: (-rv.score, -rv.freq, rv.value))
+    priority = {"exact_code": 0, "exact_description": 1}
+    scored.sort(
+        key=lambda rv: (
+            -rv.score,
+            priority.get(rv.match_type, 2),
+            -rv.freq,
+            rv.value,
+            rv.description or "",
+        )
+    )
     return scored[:top_k]
 
 
 def top_margin(ranked: list[ResolvedValue]) -> float | None:
     """`score[0] - score[1]` — a cheap accept-vs-clarify hint. `None` when there are fewer
-        than two results.
+    than two results.
     """
     if len(ranked) < 2:
         return None

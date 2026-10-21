@@ -120,7 +120,8 @@ BLUEPRINT_NOT_SEARCHED_CODE = "BLUEPRINT_NOT_SEARCHED"
 BLUEPRINT_NOT_SEARCHED_MESSAGE = (
     "Blueprint-first check: no blueprint has been searched or used this turn. "
     "Call searchBlueprints to look for an expert-authored blueprint first. If nothing "
-    "fits or the corpus is unavailable, re-issue runQuery and it will proceed."
+    "covers a requested part, use it for that part: users prefer scoped, user-friendly blueprints. "
+    "Use runQuery only for uncovered work or when the corpus is unavailable. Do not force a semantic mismatch."
 )
 
 OUT_OF_SCOPE_REQUEST_CODE = "OUT_OF_SCOPE_REQUEST"

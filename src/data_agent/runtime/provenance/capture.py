@@ -18,8 +18,11 @@ def capture_provenance(tool_name: str, result: Any) -> frozenset[tuple[str, str]
     Missing/malformed metadata is an API contract failure, not a successful result
     with unknown provenance. Never infer dependencies from returned column labels.
     """
-    if tool_name in DATA_TOOLS:
-        receipt = result.get("provenance") if isinstance(result, dict) else None
+    has_context = tool_name == "getTableSchema" and isinstance(result, dict) and any(
+        isinstance(c, dict) and "context" in c for c in result.get("columns", ())
+    )
+    if tool_name in DATA_TOOLS or has_context:
+        receipt = result.get("context_provenance" if has_context else "provenance") if isinstance(result, dict) else None
         if (
             not isinstance(receipt, dict)
             or type(receipt.get("version")) is not int

@@ -61,9 +61,7 @@ def _composite(
         if observer is not None
         else ToolDispatcher(mcp, CATALOG)
     )
-    embedding_client = (
-        FakeEmbeddingClient(vectors, dim=2, fail=embed_fail) if embedding else None
-    )
+    embedding_client = FakeEmbeddingClient(vectors, dim=2, fail=embed_fail) if embedding else None
     kwargs: dict[str, Any] = {}
     if observer is not None:
         kwargs["observer"] = observer
@@ -89,8 +87,8 @@ async def test_run_happy_path_ranked_top_k_with_description() -> None:
     )
     vectors = {
         "paid leave": [1.0, 0.0],
-        "PTO: paid time off": [1.0, 0.0],
-        "OT: overtime": [0.0, 1.0],
+        "paid time off": [1.0, 0.0],
+        "overtime": [0.0, 1.0],
     }
     composite, mcp = _composite(scripted={"runQuery": [result]}, vectors=vectors)
 
@@ -103,7 +101,13 @@ async def test_run_happy_path_ranked_top_k_with_description() -> None:
     assert tool_result.tool_name == TOOL_NAME
     assert tool_result.result_full["values"][0]["value"] == "PTO"  # semantic winner
     assert tool_result.result_full["values"][1]["value"] == "OT"
-    assert set(tool_result.result_full["values"][0]) == {"value", "description", "score", "freq"}
+    assert set(tool_result.result_full["values"][0]) == {
+        "value",
+        "description",
+        "score",
+        "freq",
+        "match_type",
+    }
     # Inner runQuery actually fired with a built SQL, once.
     assert [c.tool_name for c in mcp.calls] == ["runQuery"]
     assert "EarnDescription" in mcp.calls[0].args["sql"]
@@ -216,16 +220,17 @@ async def test_run_good_period_builds_where_and_reaches_mcp() -> None:
     )
     assert tool_result.status == "ok"
     sql = mcp.calls[0].args["sql"]
-    assert "WHERE RequestDate >= CAST('2026-01-01' AS Nullable(DateTime64(6))) AND RequestDate <= CAST('2026-03-31' AS Nullable(DateTime64(6)))" in sql
+    assert (
+        "WHERE RequestDate >= CAST('2026-01-01' AS Nullable(DateTime64(6))) AND RequestDate <= CAST('2026-03-31' AS Nullable(DateTime64(6)))"
+        in sql
+    )
 
 
 async def test_concept_with_sql_metacharacters_never_in_sql() -> None:
     result = _run_query_result(["EarnCode", "EarnDescription", "freq"], [["PTO", "x", 3]])
     composite, mcp = _composite(scripted={"runQuery": [result]})
     nasty = "'; DROP TABLE accrual_events; --"
-    await composite.run(
-        {"table": _T, "column": "EarnCode", "concept": nasty}, _credentials()
-    )
+    await composite.run({"table": _T, "column": "EarnCode", "concept": nasty}, _credentials())
     assert "DROP TABLE" not in mcp.calls[0].args["sql"]
 
 
@@ -505,16 +510,23 @@ async def test_an_inner_denial_still_reports_under_the_composite_tool_name() -> 
     )
 
     assert tool_result.status == "denied"
-    denials = [
-        payload for event, payload in observer.events if event == "tool_dispatch_denied"
-    ]
+    denials = [payload for event, payload in observer.events if event == "tool_dispatch_denied"]
     assert [payload["tool_name"] for payload in denials] == [TOOL_NAME]
 
 
 async def test_structured_sql_diagnostic_survives_composite():
-    payload = {"version": 1, "code": "SQL_TYPE_MISMATCH", "message": "Type mismatch", "input_dialect": "clickhouse", "guidance": "Use typed date bounds.", "retry": "after_query_change"}
+    payload = {
+        "version": 1,
+        "code": "SQL_TYPE_MISMATCH",
+        "message": "Type mismatch",
+        "input_dialect": "clickhouse",
+        "guidance": "Use typed date bounds.",
+        "retry": "after_query_change",
+    }
     error = MCPToolError("SQL_TYPE_MISMATCH", "[SQL_TYPE_MISMATCH] " + json.dumps(payload))
     composite, _ = _composite(scripted={"runQuery": [error]})
-    result = await composite.run({"table": _T, "column": "EarnCode", "concept": "leave"}, _credentials())
+    result = await composite.run(
+        {"table": _T, "column": "EarnCode", "concept": "leave"}, _credentials()
+    )
     assert result.denial_detail is not None
     assert "Use typed date bounds" in result.denial_detail

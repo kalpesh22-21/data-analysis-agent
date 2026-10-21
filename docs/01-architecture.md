@@ -103,3 +103,61 @@ Split into **read** (used during a chat) and **write** (the learning loop, fully
 **Status:** Locked
 **Open questions:**
 - Full component diagram polish (this is the working version).
+
+## Session catalog lifecycle
+
+The live runtime initializes a catalog per user session through backend
+`POST /session/catalog`, using the verified user JWT and `X-Session-Id`. The backend
+calculates permissions once and returns a trimmed catalog and signed scope token.
+Both are stored together in `catalog_session` on the existing Couchbase
+`session::<session_id>` document; the user JWT is not stored there. Concurrent
+workers coordinate initialization with a CAS lease. A warm session reuses its
+snapshot without a permission lookup. There is no shared default catalog fallback
+in the live runtime; explicitly injected catalogs remain available for offline tests.
+
+Every MCP and scratch request sends `X-Catalog-Scope` alongside the JWT and session
+ID. The backend verifies the scope using its existing `MCP_SERVICE_KEY`; the agent
+does not mint tokens. The scope is bound to the user identity and session, and
+expires according to the backend TTL. Expired sessions refresh before use.
+`POST /session/catalog/refresh` explicitly replaces the saved snapshot and token
+together; both agent initialization endpoints require the user JWT and session ID
+and return metadata only. Backend catalog changes reject old tokens until refresh.
+Initialization failures fail closed. Column context SQL remains on demand.
+
+Successful column-context lookups include a backend provenance receipt for the
+owning column. The agent stores the result with its tool call, supplies the returned
+rows and documented population/time limits to answer review, and preserves exact
+returned business codes in prose. A narrower subsequent scope cannot replay that
+context. Lookup results support their documented facts; configuration alone does
+not establish historical usage or leave taken. Metadata questions can finish from
+this evidence without an additional query or value-resolution call.
+
+The agent prefers scoped blueprints, including for useful parts of a larger request,
+and uses SQL for the remaining gaps. Employee analysis defaults to Active + On Leave
+unless the user explicitly requests another population; whole-client configuration
+lookups retain their documented population. Final answers emphasize important findings
+and necessary caveats without repeating displayed tables. A bounded presentation
+guard nudges verbose or repeated row summaries to shorten using existing evidence;
+explicit requests for detailed explanations are exempt.
+
+### Phoenix payload storage
+
+Phoenix exports always compact payloads. Turn spans remain separate
+and share `session.id`; child LLM spans inherit that ID. The current user question and new messages retain Phoenix’s native message fields,
+including roles and tool-call details. Unchanged older history is omitted with an
+omission count; model outputs remain readable. Tool definitions are retained once
+with content-hash references in metadata. This bounded cache is local to each exporter process: restarts or eviction
+safely export content again. Failed exports do not establish deduplication entries.
+
+Compact exports omit SQL result cells (including JSON tool results and column
+context), retaining result IDs where present, columns, and row counts. Large values
+have explicit truncation markers. There is no separate payload-mode setting.
+
+`OTLP_DISABLE_REDACTION=false` masks business numbers while retaining readable
+questions, explanations, tool arguments and SQL structure. Structured SQL result
+cells are omitted even when their values are strings. Operational metrics remain
+visible. Credentials are always removed. `OTLP_DISABLE_REDACTION=true` preserves
+business numbers; compaction still applies. The existing redaction default is unchanged.
+
+These transformations affect telemetry copies only. Agent messages, returned
+answers, SQL execution, and session/catalog storage are unchanged.

@@ -62,10 +62,16 @@ RESOLVE_VALUES_TOOL_SCHEMA: dict[str, Any] = {
         "code spaces (e.g. earn_code, type_code, department codes) where the exact codes differ "
         "per client and drift over time — never hardcode such codes. This also covers stored department names, positions, work locations, and earn/type-code descriptions. Follow configured resolution targets. Preserve established exact values; never use popularity or fuzzy similarity alone to identify an employee. Prefer this over sampleRows "
         "when you need the values that mean a concept (e.g. 'PTO earn codes'), not a raw sample. "
+        "Exact code/description matches ignore case and whitespace and take priority within "
+        "the fetched candidates. Each value has match_type: exact_code, exact_description, "
+        "semantic, or frequency. Exact scores of 1 indicate normalized equality, not a "
+        "probability or a complete mapping of a broad concept. Semantic matching uses the "
+        "description when available. The candidate pool is frequency-capped, so rare values "
+        "may be absent; no separate reranker is used. "
         "Each result has a `score` (0-1); if the top scores are low or clustered (no clear "
         "winner), ask the user to confirm with askUser before filtering on a guessed value. "
         "The result also carries a `degraded` flag and a `ranking` mode: when `ranking` is "
-        "'freq_only' (semantic matching was unavailable), the scores reflect how COMMON each "
+        "'freq_only' (semantic matching was unavailable), non-exact scores reflect how COMMON each "
         "value is for this client, NOT how well it matches your concept — do not treat a high "
         "score as a concept match; prefer askUser to confirm. When `ranking` is 'semantic+freq' "
         "the scores blend concept similarity with frequency as normal. "
@@ -654,7 +660,7 @@ GET_CAPABILITY_TOOL_SCHEMA: dict[str, Any] = {
 FINALIZE_ANSWER_SCHEMA = {
     "type": "function",
     "name": "finalizeAnswer",
-    "description": "Send the complete final answer after all work and preparation finishes. This is the only finalization tool. Select existing result IDs for paginated tables, including one-row counts/totals, and prepared capability refs for UI options. Cite successful current-turn result IDs in evidence. Preserve supported parts and disclose gaps.",
+    "description": "Send the complete final answer after all work and preparation finishes. This is the only finalization tool. Select existing result IDs for paginated tables, including one-row counts/totals, and prepared capability refs for UI options. Cite successful current-turn result IDs in evidence. Preserve supported parts and disclose gaps. Be succinct: include only important findings and necessary caveats; do not rewrite values already displayed in tables. Column context from successful getTableSchema is valid evidence for its documented lookup scope.",
     "parameters": {
         "type": "object",
         "properties": {

@@ -57,6 +57,12 @@ class InMemorySessionStore:
         self._versions[session_id] = 0
         return doc
 
+    async def mutate_catalog_session(self, session_id, mutate):
+        doc = await self.get_or_create_session(session_id)
+        doc.catalog_session = copy.deepcopy(mutate(copy.deepcopy(doc.catalog_session)))
+        self._bump_version(session_id)
+        return copy.deepcopy(doc.catalog_session)
+
     async def load_trail(self, session_id: str) -> list[TrailEntry]:
         doc = self._docs.get(session_id)
         return list(doc.tool_trail) if doc is not None else []

@@ -136,11 +136,8 @@ async def test_concept_absent_from_every_span_and_progress_event() -> None:
     assert "resolveValues" in tool_names
     assert "runQuery" in tool_names  # nested inner query span
 
-    # (b) concept text (and the PII name it carries) never on ANY span attribute.
-    for span in spans:
-        for value in span.attributes.values():
-            assert PII_CONCEPT not in str(value)
-            assert PII_NAME not in str(value)
+    # Readable tool arguments are retained; result cells remain omitted.
+    assert any(PII_CONCEPT in str(dict(s.attributes)) for s in tool_spans)
 
     # (c) concept never on ANY progress-event payload either.
     assert events  # the loop/composite DID emit progress events
@@ -152,5 +149,5 @@ async def test_concept_absent_from_every_span_and_progress_event() -> None:
     # (d) sanity: the resolveValues span DID keep the structural identifiers
     # (table/column) — redaction is targeted at concept, not everything.
     rv_span = next(s for s in tool_spans if s.attributes.get("tool.name") == "resolveValues")
-    assert rv_span.attributes.get("tool.args.concept") == "<redacted>"
+    assert rv_span.attributes.get("tool.args.concept") == PII_CONCEPT
     assert rv_span.attributes.get("tool.args.column") == "EarnCode"

@@ -140,6 +140,8 @@ def configure_tracing(
     service_name: str,
     project_name: str | None = None,
     hide_llm_content: bool = False,
+    phoenix_export: bool = False,
+    selective_redaction: bool = False,
     span_exporter: SpanExporter | None = None,
     drop_span_names: Collection[str] = (),
     id_generator: IdGenerator | None = None,
@@ -174,6 +176,10 @@ def configure_tracing(
     def _filtered(exporter: SpanExporter) -> SpanExporter:
         # Wrap ONLY when there is something to drop, so the empty-denylist path
         # stays byte-identical (same processor count, same exporter object).
+        if phoenix_export:
+            from .phoenix_payloads import PhoenixPayloadExporter
+
+            exporter = PhoenixPayloadExporter(exporter, redact=selective_redaction)
         return _NameFilteringSpanExporter(exporter, drop_names) if drop_names else exporter
 
     resource = Resource.create(
@@ -197,7 +203,11 @@ def configure_tracing(
         provider = TracerProvider(resource=resource, span_limits=span_limits)
     # FIRST (see LLMExceptionEventScrubber docstring): must precede any synchronous
     # SimpleSpanProcessor export so the LLM `exception` event is scrubbed pre-export.
-    if hide_llm_content:
+    if phoenix_export:
+        from .phoenix_payloads import SessionTraceProcessor
+
+        provider.add_span_processor(SessionTraceProcessor())
+    if hide_llm_content and not phoenix_export:
         provider.add_span_processor(LLMExceptionEventScrubber())
     if otlp_endpoint:
         exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
@@ -377,19 +387,10 @@ def tool_span(
 ) -> Any:
     """Each tool call (`TOOL`).
 
-    DEFAULT (D25) posture: *args* are already SQL-literal-masked by the caller,
-    *result_preview* is `None`, and *reveal_complex_args* is False — tool RESULTS never
-    reach a span and nested dict/list args are skipped entirely.
-
-    DEBUG posture (`RuntimeSettings.otlp_disable_redaction=True`): the caller passes the
-    REAL args, a *result_preview*, and `reveal_complex_args=True`, which makes the
-    project ENTITY-BEARING and requires it to be access-controlled like the audit store.
-    This module does not itself redact; it forwards whatever the caller supplies.
-
-    *result_preview* columns/shape land as scalar attributes and its rows are
-    JSON-serialized onto `tool.result.preview_rows`, because a span attribute cannot
-    hold a ragged list-of-lists — the same reason *reveal_complex_args* JSON-serializes
-    each non-scalar arg value onto `tool.args.{key}`.
+    Arguments are copied and selectively masked by the caller. Nested arguments
+    are JSON-serialized to preserve readable structure. Phoenix's exporter removes
+    result values and repeated payloads on every export.
+    The reveal_complex_args parameter remains for compatibility with callers.
 
     *record_exception* is forwarded to `span` and every caller that WRAPS REAL WORK
     passes False (`dispatch/tool_envelope.py`). A tool crash-guard means an exception
@@ -406,11 +407,8 @@ def tool_span(
     for key, value in args.items():
         if isinstance(value, str | int | float | bool):
             attributes[f"tool.args.{key}"] = value
-        elif reveal_complex_args and value is not None:
-            # DEBUG-ONLY (otlp_disable_redaction): a non-scalar arg (dict/list —
-            # e.g. resolveValues.period, runBlueprint.slot_bindings) JSON-serialized
-            # so its REAL values show. NEVER reached in the default posture (the flag
-            # is off), so the default span is byte-identical (these keys absent).
+        elif value is not None:
+            # OpenTelemetry attributes cannot directly contain nested objects.
             attributes[f"tool.args.{key}"] = json.dumps(value, default=str)
     if result_preview is not None:
         # DEBUG-ONLY (otlp_disable_redaction): attach the tool RESULT so the full

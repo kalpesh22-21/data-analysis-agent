@@ -193,7 +193,7 @@ from .turn_accumulators import (
     capture_terminal_sql,
 )
 
-_ALTERNATIVE_ANSWER_EVIDENCE_TOOLS = frozenset({"getHelpCenterDocument"})
+_ALTERNATIVE_ANSWER_EVIDENCE_TOOLS = frozenset({"getHelpCenterDocument", "getTableSchema"})
 _TEXT_ANSWER_EVIDENCE_TOOLS = frozenset(
     {"runQuery", "runBlueprint", "getTableSchema", "getHelpCenterDocument"}
 )
@@ -1963,6 +1963,18 @@ class AgentLoop:
         except Exception:
             return APPROVED
 
+    async def _context_business_values(self, session_id, turn_index):
+        from .column_context import business_values, column_context_evidence
+        delivery = CURRENT_DELIVERY.get()
+        credentials = delivery.credentials if delivery else None
+        if credentials is None:
+            return frozenset()
+        doc = await self._session_store.get_or_create_session(session_id)
+        receipts = await column_context_evidence(
+            doc.tool_trail, turn_index=turn_index, session_id=session_id,
+            store=self._session_store, column_scope=credentials.column_scope)
+        return business_values(receipts)
+
     async def _judge_results(
         self,
         session_id: str,
@@ -2245,7 +2257,8 @@ class AgentLoop:
             assistant_text = "\n\n".join(
                 part for part in (assistant_text, completion_notice) if part
             )
-        assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance)
+        assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance,
+            business_values=await self._context_business_values(session_id, turn_index))
         if terminal_failure and not checkpoint:
             from .partial_answer import recover_partial
 
@@ -4550,6 +4563,7 @@ class AgentLoop:
                 final_text, proposal_redactions = scrub_answer_prose(
                     final_text,
                     provenance=await self._compute_turn_provenance_union(session_id, turn_index),
+                    business_values=await self._context_business_values(session_id, turn_index),
                 )
                 if proposal_redactions:
                     self._observer(
@@ -4664,6 +4678,8 @@ class AgentLoop:
                         or accum.has_answer_tables
                     ),
                     declined_clarification=declined_question,
+                    has_tables=accum.has_answer_tables,
+                    business_values=await self._context_business_values(session_id, turn_index),
                 )
                 if (
                     rule
@@ -4887,6 +4903,8 @@ class AgentLoop:
                                 or accum.has_answer_tables
                             ),
                             declined_clarification=declined_question,
+                            has_tables=accum.has_answer_tables,
+                            business_values=await self._context_business_values(session_id, turn_index),
                         )
                         if correction_error:
                             verdict = JudgeVerdict(

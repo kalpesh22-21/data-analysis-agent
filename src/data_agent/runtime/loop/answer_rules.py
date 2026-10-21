@@ -54,6 +54,8 @@ class AnswerRuleContext:
     has_alternative_evidence: bool = False
     question: str | None = None
     declined_clarification: bool = False
+    has_tables: bool = False
+    business_values: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -323,6 +325,12 @@ _PUBLIC_TEXT = re.compile(
 )
 
 
+def _without_business_values(text, values):
+    for value in sorted(values, key=len, reverse=True):
+        text = re.sub(r"(?<![\w.])`?" + re.escape(value) + r"`?(?![\w.])", "value", text)
+    return text
+
+
 def contains_schema_reference(prose: str) -> bool:
     # URLs, email and data-file names are legitimate product/reference text.
     text = _PUBLIC_TEXT.sub(" ", prose)
@@ -453,7 +461,7 @@ ANSWER_RULES: tuple[AnswerRule, ...] = (
     AnswerRule(
         name="schema_in_answer",
         charges_to="answer_shape",
-        applies=lambda ctx: contains_schema_reference(ctx.prose),
+        applies=lambda ctx: contains_schema_reference(_without_business_values(ctx.prose, ctx.business_values)),
         nudge=_schema_nudge,
     ),
     AnswerRule(
@@ -463,6 +471,16 @@ ANSWER_RULES: tuple[AnswerRule, ...] = (
         charges_to="answer_shape",
         applies=lambda ctx: has_markdown_table(ctx.prose),
         nudge=_markdown_table_nudge,
+    ),
+    AnswerRule(
+        name="verbose_answer",
+        charges_to="answer_shape",
+        applies=lambda ctx: (
+            not re.search(r"\b(detail(?:ed)?|thorough|comprehensive|explain|why|step.by.step)\b", ctx.question or "", re.I)
+            and (len(ctx.prose.split()) > (80 if ctx.has_tables else 120)
+                 or (ctx.has_tables and len(re.findall(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+.*\d", ctx.prose)) >= 4))
+        ),
+        nudge=lambda draft: "Keep the final answer succinct: one important takeaway and only necessary caveats. Do not repeat table rows, totals, or separately displayed assumptions. Preserve existing tables and evidence; do not rerun queries to shorten prose.",
     ),
     AnswerRule(
         name="no_evidence",
@@ -485,6 +503,8 @@ def first_match(
     *,
     declined_clarification: bool = False,
     has_alternative_evidence: bool = False,
+    has_tables: bool = False,
+    business_values: frozenset[str] = frozenset(),
 ) -> AnswerRule | None:
     """The first rule this finish trips, or `None`. Empty prose returns `None`: that is the
     empty-answer gate's complaint, and this must not pre-empt it."""
@@ -497,6 +517,8 @@ def first_match(
         has_alternative_evidence=has_alternative_evidence,
         question=question,
         declined_clarification=declined_clarification,
+        has_tables=has_tables,
+        business_values=business_values,
     )
     for rule in ANSWER_RULES:
         if rule.applies(ctx):

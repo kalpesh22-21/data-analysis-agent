@@ -24,6 +24,8 @@ def validate_correction(
     question,
     has_evidence,
     declined_clarification,
+    business_values=frozenset(),
+    has_tables=False,
 ):
     corrected = verdict.corrected_answer
     feedback = (
@@ -48,7 +50,7 @@ def validate_correction(
         return feedback
     if clean_answer_text(corrected) != corrected:
         return feedback
-    scrubbed, redactions = scrub_answer_prose(corrected, provenance=provenance)
+    scrubbed, redactions = scrub_answer_prose(corrected, provenance=provenance, business_values=business_values)
     if redactions or scrubbed != corrected:
         return feedback
     rule = first_match(
@@ -57,6 +59,7 @@ def validate_correction(
         question,
         has_alternative_evidence=has_evidence,
         declined_clarification=declined_clarification,
+        business_values=business_values, has_tables=has_tables,
     )
     # Same exception as the proposal path: the judge assesses evidence-free conversation.
     if rule and rule.name != "no_evidence":

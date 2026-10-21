@@ -270,6 +270,16 @@ async def enrich_brief(
     )
     current = {e.tool_call_id: e for e in trail if e.turn_index == turn_index and e.status == "ok"}
     results = [dict(r) for r in brief.results]
+    from .column_context import column_context_evidence
+    context_receipts = await column_context_evidence(
+        trail, turn_index=turn_index, session_id=session_id, store=store,
+        column_scope=credentials.column_scope)
+    for result in results:
+        receipts = [r for r in context_receipts if r['result_id'] == result.get('tool_call_id')]
+        if receipts:
+            result['result_preview'] = {'preview_rows': [[r] for r in receipts],
+                                       'row_count': len(receipts), 'truncated': False}
+
     sqls = []
     referenced = set(brief.referenced_result_ids) | set(brief.designated_tool_call_ids)
     referenced.update(c.get("result_id") for c in brief.selected_components)

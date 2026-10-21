@@ -78,6 +78,7 @@ class RealMCPClient:
             raise ValueError("max_response_bytes must be positive")
         self._mcp_url = mcp_url
         self._max_response_bytes = max_response_bytes
+        self.scope_token_provider = None
 
     @asynccontextmanager
     async def _session(self, headers: dict[str, str]):
@@ -107,6 +108,12 @@ class RealMCPClient:
         # one spelling of the header pair is the point.
         return side_channel_headers(jwt, session_id)
 
+    async def _scoped_headers(self, jwt, session_id):
+        headers = side_channel_headers(jwt, session_id)
+        if self.scope_token_provider is not None:
+            headers["X-Catalog-Scope"] = await self.scope_token_provider(jwt=jwt, session_id=session_id)
+        return headers
+
     async def call_tool(
         self,
         tool_name: str,
@@ -115,7 +122,7 @@ class RealMCPClient:
         jwt: str,
         session_id: str,
     ) -> dict[str, Any] | list[Any]:
-        headers = self._headers(jwt, session_id)
+        headers = await self._scoped_headers(jwt, session_id)
         async with self._session(headers) as session:
             result = await session.call_tool(tool_name, args)
 
@@ -133,7 +140,7 @@ class RealMCPClient:
         raise MCPToolError(None, "MCP tool returned no parseable content.")
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
-        headers = self._headers(jwt, session_id)
+        headers = await self._scoped_headers(jwt, session_id)
         async with self._session(headers) as session:
             result = await session.list_tools()
 

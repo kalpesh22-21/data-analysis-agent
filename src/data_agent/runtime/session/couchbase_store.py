@@ -169,8 +169,16 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
             return doc
         now = _now()
         new_doc = SessionDoc(session_id=session_id, created_at=now, last_activity=now)
-        await self._upsert_doc(session_id, new_doc)
-        return new_doc
+        from couchbase.exceptions import DocumentExistsException
+        from couchbase.options import InsertOptions
+        try:
+            await self._sessions.insert(_session_key(session_id), new_doc.to_doc(), InsertOptions(expiry=self._ttl))
+            return new_doc
+        except DocumentExistsException:
+            doc, _ = await self._get_doc(session_id)
+            if doc is None:
+                raise CASMismatchError("Session disappeared during initialization")
+            return doc
 
     async def get_or_create_session(self, session_id: str) -> SessionDoc:
         await self._ensure_connected()
@@ -178,6 +186,13 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         if doc is not None:
             return doc
         return await self._create_session(session_id)
+
+    async def mutate_catalog_session(self, session_id, mutate):
+        await self._ensure_connected()
+        def apply(doc):
+            doc.catalog_session = mutate(doc.catalog_session)
+        doc = await self._mutate_with_cas_retry(session_id, apply)
+        return doc.catalog_session
 
     async def load_trail(self, session_id: str) -> list[TrailEntry]:
         await self._ensure_connected()

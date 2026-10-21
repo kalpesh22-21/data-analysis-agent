@@ -122,9 +122,9 @@ async def test_resolve_values_off_redacts_concept_and_omits_period() -> None:
     """otlp-redaction-on-by-default: default resolveValues span redacts the
     concept and (period being a nested dict) never puts period on the span."""
     _result, span, _mcp = await _run_resolve_values(False)
-    assert span.attributes.get("tool.args.concept") == "<redacted>"
-    assert "tool.args.period" not in span.attributes  # dict skipped in default posture
-    assert PII_CONCEPT not in str(dict(span.attributes))
+    assert span.attributes.get("tool.args.concept") == PII_CONCEPT
+    assert "[number]" in span.attributes["tool.args.period"]
+    assert PII_CONCEPT in str(dict(span.attributes))
     assert "2023-01-01" not in str(dict(span.attributes))
 
 
@@ -198,9 +198,9 @@ async def _run_search_blueprints(disable_redaction: bool):  # noqa: ANN202
 async def test_search_blueprints_off_redacts_query() -> None:
     """otlp-redaction-on-by-default: default searchBlueprints span redacts query."""
     _result, span = await _run_search_blueprints(False)
-    assert span.attributes.get("tool.args.query") == "<redacted>"
+    assert span.attributes.get("tool.args.query") == PII_QUERY
     assert span.attributes.get("tool.args.k") == 5  # structural k kept
-    assert PII_QUERY not in str(dict(span.attributes))
+    assert PII_QUERY in str(dict(span.attributes))
 
 
 async def test_search_blueprints_on_reveals_query() -> None:
@@ -268,7 +268,7 @@ async def test_search_knowledge_off_redacts_query_on_reveals_it() -> None:
     """The searchKnowledge subclass (not only searchBlueprints) redacts `query`
     by default and reveals it when ON — the reveal actually reaches its span."""
     query = "knowledge about Jane Doe's overtime policy"
-    for disable_redaction, expected in ((False, "<redacted>"), (True, query)):
+    for disable_redaction, expected in ((False, query), (True, query)):
         tracer, exporter = _tracer_with_exporter()
         pipeline = RetrievalPipeline(
             embedding_client=FakeEmbeddingClient({query: [1.0, 0.0]}),
@@ -369,8 +369,8 @@ async def test_run_blueprint_off_redacts_slot_bindings() -> None:
     the span."""
     _result, span, _mcp = await _run_run_blueprint(False)
     assert span.attributes.get("tool.args.id") == _BID
-    assert "tool.args.slot_bindings" not in span.attributes  # dict skipped in default
-    assert PII_SLOT_VALUE not in str(dict(span.attributes))
+    assert json.loads(span.attributes["tool.args.slot_bindings"]) == {"department": PII_SLOT_VALUE}
+    assert PII_SLOT_VALUE in str(dict(span.attributes))
 
 
 async def test_run_blueprint_on_reveals_slot_bindings() -> None:

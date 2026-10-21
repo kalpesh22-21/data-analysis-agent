@@ -67,7 +67,15 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
             break
         provenance.update(columns)
     provenance = frozenset(provenance) if provenance is not None else None
-    scrubbed, redactions = scrub_answer_prose(text, provenance=provenance)
+    from .column_context import business_values
+    receipts = [row[0] for result in brief.results if result.get('tool_call_id') in part['evidence']
+                for row in (result.get('result_preview') or {}).get('preview_rows', [])
+                if isinstance(row, list) and len(row) == 1 and isinstance(row[0], dict)
+                and row[0].get('result_id') == result.get('tool_call_id')
+                and 'context_key' in row[0] and isinstance(row[0].get('rows'), list)
+                and all(isinstance(value, dict) for value in row[0]['rows'])]
+    values = business_values(receipts)
+    scrubbed, redactions = scrub_answer_prose(text, provenance=provenance, business_values=values)
     if (
         len(text) > 20000
         or clean_answer_text(text) != text
@@ -76,7 +84,7 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
         or any(ord(c) < 32 and c not in "\n\r\t" for c in text)
     ):
         return {}
-    rule = first_match(text, accum.sql_executed, brief.question, has_alternative_evidence=True)
+    rule = first_match(text, accum.sql_executed, brief.question, has_alternative_evidence=True, business_values=values)
     if rule and rule.name != "no_evidence":
         return {}
     tables, cards = [], []

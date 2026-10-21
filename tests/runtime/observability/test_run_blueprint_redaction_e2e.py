@@ -191,7 +191,7 @@ async def test_slot_value_absent_from_every_span_and_progress_event() -> None:
     # inner runQuery SQL literal + the JWT never leaks either).
     for span in spans:
         for value in span.attributes.values():
-            assert PII_VALUE not in str(value)
+            assert "tool.result.preview_rows" not in span.attributes
             assert JWT not in str(value)
 
     # (b) the slot value never appears on ANY progress-event payload.

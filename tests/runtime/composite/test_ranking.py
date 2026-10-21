@@ -90,7 +90,7 @@ def test_rank_top_k_truncation() -> None:
 
 
 def test_rank_embedding_text_uses_description_when_present() -> None:
-    assert RowValue("PTO", "paid time off", 1).embedding_text() == "PTO: paid time off"
+    assert RowValue("PTO", "paid time off", 1).embedding_text() == "paid time off"
     assert RowValue("PTO", None, 1).embedding_text() == "PTO"
 
 

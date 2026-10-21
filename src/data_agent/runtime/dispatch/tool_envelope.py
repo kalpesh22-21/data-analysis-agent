@@ -104,6 +104,7 @@ def _stamp[OutcomeT: SpanOutcome](
         span.set_attribute("tool.result.kind", "result")
         span.set_attribute("tool.result.row_count", preview.row_count)
         span.set_attribute("tool.result.column_count", len(preview.columns))
+        span.set_attribute("tool.result.columns", list(preview.columns))
         span.set_attribute("tool.result.truncated", preview.truncated)
         if reveal_result:
             encoded = json.dumps(preview.preview_rows, default=str)

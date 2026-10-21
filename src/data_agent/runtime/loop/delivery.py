@@ -390,6 +390,8 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
                     question=questions[0] if questions else "",
                     has_evidence=bool(results or accum.has_answer_tables or accum.capability_cards),
                     declined_clarification=False,
+                    has_tables=accum.has_answer_tables,
+                    business_values=await loop._context_business_values(session_id, turn_index),
                 )
                 if error:
                     from .answer_judge import JudgeVerdict

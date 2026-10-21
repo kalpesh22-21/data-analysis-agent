@@ -197,7 +197,8 @@ def _provenance_names(provenance: frozenset[tuple[str, str]] | None) -> frozense
 
 
 def scrub_answer_prose(
-    text: str | None, *, provenance: frozenset[tuple[str, str]] | None = None
+    text: str | None, *, provenance: frozenset[tuple[str, str]] | None = None,
+    business_values: frozenset[str] = frozenset()
 ) -> tuple[str | None, int]:
     """Redact identifier-shaped tokens from user-facing prose.
 
@@ -221,6 +222,11 @@ def scrub_answer_prose(
 
     def _replace(match: re.Match[str]) -> str:
         nonlocal count
+        # Exact returned business cells can resemble identifiers. This allowlist
+        # comes only from current authorized backend lookup results, never prose.
+        candidate = match.group("quoted") or match.group(0)
+        if candidate in business_values and match.group("corpus") is None:
+            return match.group(0)
         if match.group("corpus") is not None:
             count += 1
             return SAVED_ANALYSIS_MARKER

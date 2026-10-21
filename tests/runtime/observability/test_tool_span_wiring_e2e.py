@@ -105,7 +105,7 @@ async def test_tool_span_emitted_per_dispatched_call_with_sql_literal_masked() -
     assert attrs["tool.status"] == "ok"
 
     masked_sql = attrs["tool.args.sql"]
-    assert PII_NAME not in masked_sql
+    assert PII_NAME in masked_sql
     assert PII_SALARY not in masked_sql
     assert "SELECT EmployeeCode FROM employee" in masked_sql  # shape preserved
 

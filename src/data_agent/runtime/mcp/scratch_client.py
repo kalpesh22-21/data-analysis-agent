@@ -50,6 +50,13 @@ class ScratchClient:
         # base_url is the …/scratch/v1 base (no trailing slash).
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self.scope_token_provider = None
+
+    async def _headers(self, jwt, session_id):
+        headers = _headers(jwt, session_id)
+        if self.scope_token_provider is not None:
+            headers["X-Catalog-Scope"] = await self.scope_token_provider(jwt=jwt, session_id=session_id)
+        return headers
 
     async def materialize(
         self,
@@ -71,7 +78,7 @@ class ScratchClient:
             resp = await client.post(
                 f"{self._base_url}/materialize",
                 json=payload,
-                headers=_headers(jwt, session_id),
+                headers=await self._headers(jwt, session_id),
             )
         if resp.status_code >= 400:
             raise _error_from_response(resp)
@@ -89,7 +96,7 @@ class ScratchClient:
             resp = await client.post(
                 f"{self._base_url}/drop",
                 json={"table": table},
-                headers=_headers(jwt, session_id),
+                headers=await self._headers(jwt, session_id),
             )
         if resp.status_code >= 400:
             raise _error_from_response(resp)

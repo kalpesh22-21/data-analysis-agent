@@ -209,7 +209,9 @@ async def test_no_span_from_a_multi_intent_turn_carries_content() -> None:
     assert spans, "the scan proved nothing — no spans were exported"
     assert any(name.startswith("loop_analysis_state") for name, _ in events)
     blob = json.dumps([[span.name, dict(span.attributes or {})] for span in spans], default=str)
-    for canary in CANARIES:
+    # SQL structure and text literals are readable in Phoenix.
+    assert SQL in blob
+    for canary in (QUESTION, DESC_ONE, DESC_TWO, CELL_VALUE):
         assert canary not in blob, (
             f"{canary!r} reached a span attribute. Telemetry is shape-only (D25): "
             "counts, enums, tool names, runtime-assigned ids — never question text, "

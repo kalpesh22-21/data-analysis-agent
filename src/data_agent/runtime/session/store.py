@@ -43,6 +43,10 @@ class SessionStore(Protocol):
         """Load *session_id*, creating a fresh document if none exists yet."""
         ...
 
+    async def mutate_catalog_session(self, session_id: str, mutate: Callable[[dict | None], dict | None]) -> dict | None:
+        """Atomically update the private catalog snapshot/initialization lease."""
+        ...
+
     async def load_trail(self, session_id: str) -> list[TrailEntry]:
         """Return the `tool_trail` for *session_id* (empty list if none)."""
         ...

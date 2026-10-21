@@ -299,15 +299,15 @@ class RuntimeSettings(BaseSettings):
 
     # --- Semantic-catalog source (D75 Wave 1b — MCP as the single source of truth) ---
     # The runtime rebuilds its immutable CatalogHandle/SemanticCatalogHandle from the
-    # MCP's `GET /catalog/export` instead of a local `databaseSchemaDocs/` copy.
-    #   * "mcp"     (default) — fetch the export from the live MCP host, cached
-    #                 process-wide after the first successful fetch (CatalogCache).
+    # MCP's `POST /session/catalog` instead of a shared default catalog.
+    #   * "mcp"     (default) — materialize once per session, persisted with its
+    #                 signed scope token in the session store.
     #   * "fixture" — load the frozen `tests/fixtures/catalog_export.json` (or
     #                 `catalog_fixture_path`) from disk; used by the test suite and
     #                 fully-offline runs. No network.
     catalog_source: str = Field(
         "mcp",
-        description="Where the semantic catalog comes from: 'mcp' (live export) or 'fixture' (offline JSON).",
+        description="Where the semantic catalog comes from: 'mcp' (persisted session catalog) or 'fixture' (offline JSON).",
     )
     # The `/catalog/export` route rides the SAME MCP host as a plain authenticated
     # GET (not an MCP tool), like the scratch side-channel. When empty, the base is
@@ -590,17 +590,7 @@ class RuntimeSettings(BaseSettings):
         ),
     )
     otlp_hide_llm_content: bool = Field(
-        False,
-        description=(
-            "D25 amended 2026-07-15 (deliberate operator posture flip): the default is "
-            "now False (REVEAL) — the auto-instrumented OpenAI LLM span carries the raw "
-            "prompt + completion, so the runtime Phoenix project is ENTITY-BEARING BY "
-            "DEFAULT (raw question + query-derived answer land on the span) and MUST be "
-            "access-controlled like the audit/session store (D51). Set True to restore "
-            "the D25 shape-only telemetry posture (NO raw prompt/completion — only "
-            "shape/timing/model-name/token-counts). The redaction MECHANISM is unchanged; "
-            "only which posture is the default flipped. Mirrors LEARNING_TRACE_VERBOSE."
-        ),
+        False, description="Legacy redaction flag: selective masking in Phoenix when redaction is enabled; readable text is retained."
     )
     otlp_drop_span_names: list[str] = Field(
         default_factory=lambda: sorted(DEFAULT_DROP_SPAN_NAMES),
@@ -654,44 +644,7 @@ class RuntimeSettings(BaseSettings):
     )
     otlp_disable_redaction: bool = Field(
         True,
-        description=(
-            "MASTER TELEMETRY DEBUG SWITCH — default TRUE since 2026-08-10 (deliberate "
-            "operator posture flip; it defaulted False before). PLAIN ENGLISH FIRST, "
-            "because the field name is a double negative and flipping its default makes "
-            "the config read backwards: AT THE DEFAULT NOTHING IS REDACTED. Set it FALSE "
-            "to turn redaction back ON. "
-            "CONSEQUENCE, stated so nobody has to derive it from the mechanism: runtime "
-            "spans now carry the REAL tool arguments, hence real ENTITY VALUES — the "
-            "actual SQL WITH its literals, the real resolveValues concept/period values "
-            "— plus the tool RESULT preview (columns + preview rows + "
-            "row_count/truncated) attached to the TOOL span. Combined with "
-            "otlp_hide_llm_content (revealed by default since the 2026-07-15 D25 "
-            "amendment) the OpenAI LLM span also shows content + exception events (the "
-            "effective LLM hide is `otlp_hide_llm_content AND NOT "
-            "otlp_disable_redaction`). THE OTLP COLLECTOR IS THEREFORE AS SENSITIVE AS "
-            "THE SESSION STORE and must be access-controlled to the same standard (D51): "
-            "a Phoenix instance anyone on the network can reach is now a data egress. "
-            "That is the price of this default, and it is the thing to decide BEFORE "
-            "pointing OTLP_ENDPOINT at a shared collector. "
-            "Set FALSE to restore the D25 posture: TOOL/AGENT/CHAIN cell values (SQL "
-            "literals / result cells / bound slot values) masked byte-for-byte and no "
-            "result preview on any span. Even FALSE was never shape-only OVERALL, "
-            "because it does not govern the LLM-span content. "
-            "TELEMETRY-ONLY: this changes ONLY what Phoenix sees — it does NOT weaken "
-            "any actual scope/PII ENFORCEMENT (D5 credential injection + D57 column-"
-            "scope live in the MCP/injected-credentials path, not in the span "
-            "redactor). NOT everything is revealed even at the default: the askUser "
-            "question (dropped by the guardrail-observer allowlist), the "
-            "embedding/rerank/recall text (never an attribute), and the raw column_scope "
-            "(only its hash is ever emitted) STAY redacted — the LLM-span reveal (see "
-            "otlp_hide_llm_content) partially compensates by showing the model's Q/A. "
-            "NAME KEPT DELIBERATELY: `otlp_redact_tool_args=False` would read correctly "
-            "at this default, but model_config sets extra='ignore', so at a rename every "
-            "deployment carrying an explicit OTLP_DISABLE_REDACTION would have that "
-            "setting SILENTLY DROPPED — an operator's explicit choice turned into a "
-            "no-op with no error, which is worse than an awkward name. Same treatment "
-            "otlp_hide_llm_content got when its default flipped in 2026-07."
-        ),
+        description="Phoenix only: False masks business numbers and SQL result values while retaining readable text. True reveals content; compaction always omits result bodies and duplicate messages. Secrets are always excluded."
     )
 
     # --- Auth (JWKS verification, D5/D79/D80/D81/D82 — fields only until Pass B) ---

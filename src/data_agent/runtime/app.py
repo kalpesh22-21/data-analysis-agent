@@ -27,7 +27,7 @@ from typing import Any
 from uuid import uuid4
 
 import anyio
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.types import Send
@@ -460,14 +460,7 @@ def create_app(
             else model_client
         )
 
-    # The effective LLM-content hide (config.effective_llm_hide): normally
-    # `otlp_hide_llm_content` (D25 amended 2026-07-15 — now defaults FALSE, i.e.
-    # REVEAL), and the master TELEMETRY DEBUG switch `otlp_disable_redaction` also
-    # forces the reveal. So by default the whole turn's LLM Q/A + exception events are
-    # visible — the Phoenix project is entity-bearing BY DEFAULT and MUST be
-    # access-controlled; hiding is the explicit opt-OUT (`otlp_hide_llm_content=True`).
-    # Passed identically to configure_tracing (exception scrubber) AND instrument_openai
-    # (attribute TraceConfig) so both channels agree.
+    # Capture readable content; mask and compact only Phoenix export copies.
     hide_llm_content = effective_llm_hide(settings)
 
     tracer_provider = tracing.configure_tracing(
@@ -477,11 +470,9 @@ def create_app(
         # set the runtime's named project in code so a normal turn is findable in
         # the Phoenix UI (no OTEL_RESOURCE_ATTRIBUTES env hack).
         project_name=settings.otlp_project_name,
-        # D25: when hiding LLM content, also install the LLMExceptionEventScrubber
-        # (TraceConfig masks attributes, not the `exception` EVENT the OpenAI
-        # instrumentor records — which embeds the response error body). Same gate
-        # as instrument_openai's hide_content below.
-        hide_llm_content=hide_llm_content,
+        hide_llm_content=False,
+        phoenix_export=True,
+        selective_redaction=not settings.otlp_disable_redaction or hide_llm_content,
         # Test-only seam (D-L3-5): an injected in-memory exporter captures the
         # manual AGENT/TOOL/CHAIN/GUARDRAIL spans this provider's tracer emits,
         # so the Layer-3 D25 scenario can dump + assert them PII-clean without a
@@ -498,12 +489,8 @@ def create_app(
         batch_max_queue_size=settings.otlp_batch_max_queue_size,
         batch_max_export_size=settings.otlp_batch_max_export_size,
     )
-    # D25 amended 2026-07-15: the auto-instrumented OpenAI LLM span's raw prompt/
-    # completion is REVEALED by default (the online per-turn Phoenix project is
-    # entity-bearing BY DEFAULT — the completion embeds cell values / the query-derived
-    # answer — and MUST be access-controlled). Hiding is the explicit opt-OUT
-    # (`otlp_hide_llm_content=True`), mirroring the learning loop's verbose gate.
-    tracing.instrument_openai(tracer_provider, hide_content=hide_llm_content)
+    # Selective masking and compaction happen only on Phoenix export copies.
+    tracing.instrument_openai(tracer_provider, hide_content=False)
     tracer = tracing.get_tracer(tracer_provider)
 
     if settings.help_center_enabled and help_center_reranker is None:
@@ -601,39 +588,29 @@ def create_app(
     # RETRIEVAL_TOOL_UNAVAILABLE (Phase-0 parity, read-tools §6).
     active_retrieval = retrieval if settings.retrieval_enabled else None
 
-    # D75 Wave 1b: the runtime rebuilds its catalog handle from the MCP
-    # `/catalog/export` (via the process-wide `CatalogCache`) instead of a local
-    # `databaseSchemaDocs/` copy. An INJECTED `catalog` handle (tests / a fixed
-    # catalog) is honored verbatim and used as a fixed handle — no cache, no fetch.
-    # Otherwise a `CatalogCache` is built from settings (`catalog_source`: live 'mcp'
-    # export or the offline 'fixture' JSON) and exposed to the dispatcher/composite as
-    # an async provider that resolves the immutable handle from THIS turn's
-    # credentials. The cache is lazy (no fetch at construction — import/build-time
-    # safety preserved) and fetches exactly once (scope-independent, D5-safe:
-    # credentials authenticate the fetch only, never entering a handle).
-    #
-    # Reader-only runtime (singleton-hydrator redesign): the runtime NO LONGER seeds the
-    # neo4j graph on the request path — the independent `replicas:1` hydrator daemon
-    # (scripts/run_hydrator.py) owns ALL seeding + the nuke/rebuild. The catalog cache is
-    # KEPT for measurement checks and value resolution; query provenance now comes
-    # from the API response. There is NO `on_catalog_loaded` seed callback. The cache's
-    # HTTP client is built with `service_key=settings.mcp_service_key` (via
-    # `build_catalog_cache`), so the runtime's catalog-handle fetch uses the STATIC
-    # service key — a full decouple, no user JWT ever reaches the MCP export. The
-    # per-turn `get_catalog_handle(jwt=, session_id=)` still passes the request creds,
-    # but the service-key client ignores them (the export is scope-independent + cached).
+    # Live sessions own their persisted catalog. Explicit injection and fixture
+    # mode remain available for offline tests; neither is a live fallback.
+    session_catalog = None
     catalog_provider: CatalogHandle | CatalogProvider
     if catalog is not None:
         catalog_provider = catalog
-    else:
+    elif settings.catalog_source == "fixture":
+        # Explicit offline/test mode only.
         catalog_cache = build_catalog_cache(settings)
-
         async def _catalog_provider(credentials: RuntimeCredentials) -> CatalogHandle:
-            return await catalog_cache.get_catalog_handle(
-                jwt=credentials.jwt, session_id=credentials.session_id
-            )
-
+            return await catalog_cache.get_catalog_handle(jwt=credentials.jwt, session_id=credentials.session_id)
         catalog_provider = _catalog_provider
+    else:
+        from data_agent.runtime.catalog.session_catalog import SessionCatalog
+        session_catalog = SessionCatalog(settings, session_store)
+        catalog_provider = session_catalog.catalog_handle
+        if isinstance(mcp_client, RealMCPClient):
+            mcp_client.scope_token_provider = session_catalog.scope_token
+        if isinstance(scratch_client, ScratchClient):
+            scratch_client.scope_token_provider = session_catalog.scope_token
+
+    async def _session_credentials(credentials):
+        return await session_catalog.credentials(credentials) if session_catalog else credentials
 
     help_center_schemas = (
         (SEARCH_HELP_CENTER_TOOL_SCHEMA, GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA)
@@ -1065,6 +1042,19 @@ def create_app(
                 )
             return {"spans": dumped, "count": len(dumped)}
 
+    @app.post("/session/catalog")
+    @app.post("/session/catalog/refresh")
+    async def initialize_session_catalog(request: Request,
+        authorization: str | None = Header(default=None),
+        x_session_id: str | None = Header(default=None, alias="X-Session-Id")):
+        credentials = _extract_credentials(authorization=authorization, session_id=x_session_id, settings=settings)
+        if session_catalog is None:
+            raise HTTPException(409, detail="Live session catalogs are not enabled.")
+        snapshot = await session_catalog.ensure(jwt=credentials.jwt, session_id=credentials.session_id,
+                                                force=request.url.path.endswith("/refresh"))
+        return {"catalog_sha": snapshot["catalog_sha"], "expires_at": snapshot["expires_at"],
+                "table_count": len(snapshot["catalog"])}
+
     @app.post("/turn")
     async def turn(
         body: TurnRequest,
@@ -1074,6 +1064,7 @@ def create_app(
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
+        credentials = await _session_credentials(credentials)
         assert x_session_id is not None  # narrowed by _extract_credentials
         emitter = ProgressEmitter()
         agent_loop = _build_agent_loop(
@@ -1111,6 +1102,7 @@ def create_app(
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
+        credentials = await _session_credentials(credentials)
         assert x_session_id is not None  # narrowed by _extract_credentials
 
         # Cheap, non-consuming pre-check for a clean 409 (D45): a genuinely
@@ -1160,6 +1152,7 @@ def create_app(
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
+        credentials = await _session_credentials(credentials)
         assert x_session_id is not None  # narrowed by _extract_credentials
         doc = await session_store.get_or_create_session(x_session_id)
         # `blueprint_id -> terminal_sql` for every blueprint that ran successfully in
@@ -1251,6 +1244,7 @@ def create_app(
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
+        credentials = await _session_credentials(credentials)
         limit, offset = clamp_page_params(body.limit, body.offset)
         try:
             page_sql = build_page_sql(body.sql, limit=limit, offset=offset)

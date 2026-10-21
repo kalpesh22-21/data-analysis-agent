@@ -6,8 +6,9 @@ Model interface (fixed contract):
 Under the hood it issues ONE ordinary `runQuery` through the existing
 `ToolDispatcher.dispatch`, so D5 credential injection, D57 column-scope enforcement,
 provenance capture, denial mapping, preview building and the inner TOOL span all come for
-free and unchanged; the rows are then ranked by semantic similarity of `concept` (embedding
-client, D71) blended with `freq`.
+free and unchanged; exact code/description matches take precedence. Other rows are
+ranked by semantic similarity against descriptions (or codes without descriptions),
+blended with `freq`. No separate reranker is called.
 
 Key invariants:
   - `concept` NEVER touches SQL (D10) — it is only ever embedded and compared.
@@ -433,6 +434,7 @@ class ResolveValuesComposite:
             concept_vector=None if degraded else concept_vec,
             similarity_weight=self._similarity_weight,
             top_k=self._top_k,
+            concept=concept,
         )
         return ranked, degraded
 
@@ -507,7 +509,7 @@ def _validate_embed_shape(vectors: Any, *, expected: int) -> list[list[float]] |
             return None
         if any(not isinstance(x, int | float) or isinstance(x, bool) for x in vec):
             return None
-        if any(not math.isfinite(x) for x in vec):
+        if any(not math.isfinite(x) for x in vec) or not any(x != 0 for x in vec):
             return None
         if dim is None:
             dim = len(vec)
