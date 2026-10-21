@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -534,6 +535,7 @@ class ToolDispatcher:
         tool_name: str,
         model_args: dict[str, Any],
         *,
+        started_at_ns: int | None = None,
         status: str,
         error_code: str | None,
         result_preview: ResultPreview | None = None,
@@ -550,6 +552,7 @@ class ToolDispatcher:
         with tracing.tool_span(
             self._tracer,
             tool_name=tool_name,
+            started_at_ns=started_at_ns,
             args=tool_span_args(tool_name, model_args, disable_redaction=self._disable_redaction),
             status=status,
             error_code=error_code,
@@ -624,6 +627,7 @@ class ToolDispatcher:
 
             start_payload["fallback_summary"] = _static_line(tool_name, model_args)
         emit("tool_dispatch_start", start_payload)
+        started_at_ns = time.time_ns()
 
         try:
             raw_result = await self._mcp_client.call_tool(
@@ -702,7 +706,7 @@ class ToolDispatcher:
                 {"tool_name": tool_name, "error_code": denial.code, "tool_call_id": tool_call_id},
             )
             self._emit_tool_span(
-                tool_name, model_args, status="denied", error_code=denial.code,
+                tool_name, model_args, started_at_ns=started_at_ns, status="denied", error_code=denial.code,
                 denial_detail=denial_detail, tool_call_id=tool_call_id,
             )
             return ToolResult(
@@ -736,7 +740,7 @@ class ToolDispatcher:
                 },
             )
             self._emit_tool_span(
-                tool_name, model_args, status="error", error_code=INTERNAL_TRANSPORT_ERROR_CODE
+                tool_name, model_args, started_at_ns=started_at_ns, status="error", error_code=INTERNAL_TRANSPORT_ERROR_CODE
             )
             return ToolResult(
                 status="error",
@@ -761,7 +765,7 @@ class ToolDispatcher:
 
         emit("tool_dispatch_ok", {"tool_name": tool_name, "tool_call_id": tool_call_id})
         self._emit_tool_span(
-            tool_name, model_args, status="ok", error_code=None, result_preview=preview
+            tool_name, model_args, started_at_ns=started_at_ns, status="ok", error_code=None, result_preview=preview
         )
         return ToolResult(
             status="ok",

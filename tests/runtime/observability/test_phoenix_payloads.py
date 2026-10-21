@@ -20,6 +20,7 @@ def make_span(request, *, session="session-a", span_id=1):
         context=SpanContext(1, span_id, False),
         attributes={
             "session.id": session,
+            "openinference.span.kind": "LLM",
             "input.value": json.dumps(request),
             "llm.token_count.total": 123,
         },

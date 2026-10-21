@@ -161,3 +161,19 @@ business numbers; compaction still applies. The existing redaction default is un
 
 These transformations affect telemetry copies only. Agent messages, returned
 answers, SQL execution, and session/catalog storage are unchanged.
+
+The root `agent.turn` span records the current user question as `input.value`, the
+final answer (or clarification question) as `output.value`, and the already-verified
+request context in Phoenix `metadata`: `session_id`, `jti`, `clientcode`,
+`proc_center`, `sub`, `user_name`, `iss`, and `aud` when available, plus `turn_index`,
+`scope_hash`, and the persisted session's `catalog_sha` when available. Session ID
+comes from the active request, not an untrusted session claim. Child LLM and tool
+spans inherit this metadata. JWTs, scope tokens, raw permission lists, and other
+unlisted claims are never copied to metadata.
+Resume spans record the user's clarification response as their input.
+
+Tool spans expose their inputs and `tool.duration_ms`; MCP spans use the start of
+execution for their native timeline duration too. Query tools expose the SQL sent
+to MCP as `input.value` and `db.statement`, with the existing redaction setting
+applied. Physical SQL rewrites inside the backend are not returned to the agent.
+Tool result rows and output bodies are omitted from Phoenix exports.

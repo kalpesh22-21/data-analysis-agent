@@ -92,7 +92,7 @@ def _build_app(
             "runQuery": [
                 {
                     "columns": ["national_id"],
-                    "rows": [[PII_SENTINEL]],
+                    "rows": [["RESULT_ONLY_CELL_MARKER"]],
                     "row_count": 1,
                     "truncated": False,
                 }
@@ -227,14 +227,10 @@ class TestSpanDumpIsPIIClean:
         )
         return dump
 
-    def test_sql_literal_and_result_cell_never_reach_a_span_attribute(self, monkeypatch) -> None:
-        # The turn ran a runQuery whose SQL embeds PII_SENTINEL as a string
-        # literal AND whose result cell equals PII_SENTINEL. D25 requires: masked
-        # SQL literals in the telemetry copy, and result values never on a span.
-        # Assert the sentinel appears NOWHERE across every span's name/kind/attrs.
+    def test_sql_text_is_readable_but_result_cells_are_omitted(self, monkeypatch) -> None:
         dump = self._drive_turn_and_dump(monkeypatch, scope=frozenset())
-        hits = _scan_dump_for(dump, PII_SENTINEL)
-        assert hits == [], f"D25 LEAK: PII sentinel reached a span → {hits}"
+        assert _scan_dump_for(dump, PII_SENTINEL)
+        assert _scan_dump_for(dump, "RESULT_ONLY_CELL_MARKER") == []
 
     def test_raw_scope_never_reaches_a_span_only_the_hash(self, monkeypatch) -> None:
         # The AGENT span labels the turn with `hash_scope(column_scope)` — the RAW

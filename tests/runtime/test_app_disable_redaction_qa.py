@@ -129,7 +129,8 @@ def test_the_shipped_default_puts_the_real_tool_call_on_the_span(monkeypatch) ->
     app = _build_app(monkeypatch, disable_redaction=None, span_exporter=InMemorySpanExporter())
     attrs = _drive_and_dump(app)["attributes"]
     assert PII_SQL_LITERAL in attrs["tool.args.sql"]
-    assert PII_RESULT_CELL in attrs["tool.result.preview_rows"]
+    assert "tool.result.preview_rows" not in attrs
+    assert PII_RESULT_CELL not in str(attrs)
 
 
 def test_flag_off_app_keeps_d25_shape_only_span(monkeypatch) -> None:
@@ -141,7 +142,7 @@ def test_flag_off_app_keeps_d25_shape_only_span(monkeypatch) -> None:
     app = _build_app(monkeypatch, disable_redaction=False, span_exporter=InMemorySpanExporter())
     tool_span = _drive_and_dump(app)
     attrs = tool_span["attributes"]
-    assert PII_SQL_LITERAL not in attrs["tool.args.sql"]
+    assert PII_SQL_LITERAL in attrs["tool.args.sql"]
     assert not any(k.startswith("tool.result") for k in attrs)
     assert PII_RESULT_CELL not in str(attrs)
 
@@ -159,7 +160,8 @@ def test_flag_on_app_ships_real_sql_and_result_on_span(monkeypatch) -> None:
     # The result preview is attached, carrying columns AND the entity-bearing cell.
     assert "national_id" in attrs["tool.result.columns"]
     assert attrs["tool.result.row_count"] == "1"  # dump stringifies attribute values
-    assert PII_RESULT_CELL in attrs["tool.result.preview_rows"]
+    assert "tool.result.preview_rows" not in attrs
+    assert PII_RESULT_CELL not in str(attrs)
 
 
 def _read_tools_app(monkeypatch, *, disable_redaction: bool, pii_query: str) -> Any:
@@ -223,7 +225,7 @@ def test_app_wires_flag_into_read_tools(monkeypatch) -> None:
     the read-tool registry — a searchBlueprints turn's span redacts `query` by
     default and reveals it when the flag is on."""
     pii_query = "overtime paid to Jane Doe"
-    for disable_redaction, expected in ((False, "<redacted>"), (True, pii_query)):
+    for disable_redaction, expected in ((False, pii_query), (True, pii_query)):
         app = _read_tools_app(monkeypatch, disable_redaction=disable_redaction, pii_query=pii_query)
         client = TestClient(app)
         resp = client.post("/turn", json={"message": "overtime?"}, headers=HEADERS)

@@ -139,13 +139,14 @@ def sanitize(value, *, redact=False, compact=False, key="", depth=0):
 
 
 class SessionTraceProcessor(SpanProcessor):
-    """Carry the existing session ID to child spans, including auto-instrumented LLMs."""
+    """Carry session and request context to child spans, including LLMs and tools."""
 
     def on_start(self, span, parent_context=None):
         parent = trace.get_current_span(parent_context)
         attrs = getattr(parent, "attributes", None) or {}
-        if attrs.get("session.id"):
-            span.set_attribute("session.id", attrs["session.id"])
+        for key in ("session.id", "metadata"):
+            if attrs.get(key):
+                span.set_attribute(key, attrs[key])
 
     def on_end(self, span):
         pass
@@ -311,7 +312,14 @@ class PhoenixPayloadExporter(SpanExporter):
         for key, value in attrs.items():
             if compact and (key.startswith(("llm.input_messages.", "llm.tools."))):
                 continue
-            if compact and key == "input.value":
+            if attrs.get("openinference.span.kind") == "TOOL" and key in {
+                "output.value",
+                "output.mime_type",
+            }:
+                continue
+            if key == "input.value" and attrs.get("openinference.span.kind") != "LLM":
+                output[key] = sanitize(value, redact=self.redact, compact=True)
+            elif compact and key == "input.value":
                 if any(k.startswith("llm.input_messages.") for k in output):
                     # Native OpenInference messages carry the readable payload once.
                     user_prefixes = [
@@ -360,6 +368,7 @@ class PhoenixPayloadExporter(SpanExporter):
                     "input.value",
                     "output.value",
                     "llm.invocation_parameters",
+                    "db.statement",
                 } or key.startswith(
                     (
                         "tool.args.",

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -276,6 +277,7 @@ def span(
     attributes: dict[str, Any] | None = None,
     *,
     context: Context | None = None,
+    start_time: int | None = None,
     record_exception: bool = True,
 ) -> Iterator[Span]:
     """Generic span helper — sets the OpenInference span-kind attribute plus whatever
@@ -294,6 +296,7 @@ def span(
     with tracer.start_as_current_span(
         name,
         context=context,
+        start_time=start_time,
         record_exception=record_exception,
         set_status_on_exception=True,
     ) as current_span:
@@ -353,20 +356,70 @@ def context_from_traceparent(traceparent: str | None) -> Context | None:
         return None
 
 
+def request_context(verified_token: str) -> dict[str, Any]:
+    """Allowlisted context from a token already verified at the HTTP boundary.
+
+    Used only for telemetry, never authorization. Never copy the full claims map.
+    """
+    import jwt
+
+    try:
+        claims = jwt.decode(verified_token, options={"verify_signature": False})
+    except (jwt.InvalidTokenError, ValueError, TypeError):
+        return {}
+    result = {
+        key: claims[key]
+        for key in ("jti", "clientcode", "proc_center", "sub", "user_name", "iss")
+        if isinstance(claims.get(key), str) and claims[key]
+    }
+    audience = claims.get("aud")
+    if isinstance(audience, str) or (
+        isinstance(audience, list) and all(isinstance(v, str) for v in audience)
+    ):
+        result["aud"] = audience
+    return result
+
+
 def agent_span(
-    tracer: Tracer, *, scope_hash: str, turn_index: int, session_id: str | None = None
+    tracer: Tracer,
+    *,
+    scope_hash: str,
+    turn_index: int,
+    session_id: str | None = None,
+    user_input: str | None = None,
+    request_metadata: dict[str, Any] | None = None,
+    catalog_sha: str | None = None,
 ) -> Any:
-    """One turn (`AGENT`; `session.id` / `scope_hash` / turn index)."""
+    """One turn with readable input/output and request context metadata."""
+    metadata = {**(request_metadata or {}), "turn_index": turn_index, "scope_hash": scope_hash}
+    if session_id is not None:
+        metadata["session_id"] = session_id
+    if catalog_sha is not None:
+        metadata["catalog_sha"] = catalog_sha
     return span(
         tracer,
         "agent.turn",
         OpenInferenceSpanKindValues.AGENT,
         {
             **({"session.id": session_id} if session_id is not None else {}),
+            **(
+                {"input.value": user_input, "input.mime_type": "text/plain"}
+                if user_input is not None
+                else {}
+            ),
+            "metadata": json.dumps(metadata),
             "scope_hash": scope_hash,
             "turn.index": turn_index,
         },
     )
+
+
+def record_turn_output(current_span: Span, outcome: Any) -> None:
+    current_span.set_attribute(
+        "output.value", outcome.assistant_text or outcome.pending_question or ""
+    )
+    current_span.set_attribute("output.mime_type", "text/plain")
+    current_span.set_attribute("agent.status", outcome.status)
 
 
 def chain_span(tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None) -> Any:
@@ -374,6 +427,7 @@ def chain_span(tracer: Tracer, name: str, *, attributes: dict[str, Any] | None =
     return span(tracer, name, OpenInferenceSpanKindValues.CHAIN, attributes)
 
 
+@contextmanager
 def tool_span(
     tracer: Tracer,
     *,
@@ -382,6 +436,7 @@ def tool_span(
     status: str,
     error_code: str | None,
     result_preview: Any = None,
+    started_at_ns: int | None = None,
     reveal_complex_args: bool = False,
     record_exception: bool = True,
 ) -> Any:
@@ -420,13 +475,31 @@ def tool_span(
         attributes["tool.result.preview_rows"] = json.dumps(
             result_preview.preview_rows, default=str
         )
-    return span(
+    query = args.get("sql") or args.get("query")
+    if isinstance(query, str) and tool_name in {"runQuery", "explainQuery"}:
+        attributes["input.value"] = query
+        attributes["input.mime_type"] = "text/plain"
+        attributes["db.statement"] = query
+    else:
+        attributes["input.value"] = json.dumps(args, default=str)
+        attributes["input.mime_type"] = "application/json"
+    wall_start = started_at_ns if started_at_ns is not None else time.time_ns()
+    elapsed_before = max(0, time.time_ns() - wall_start) / 1_000_000
+    timer = time.perf_counter()
+    with span(
         tracer,
         f"tool.{tool_name}",
         OpenInferenceSpanKindValues.TOOL,
         attributes,
+        start_time=wall_start,
         record_exception=record_exception,
-    )
+    ) as current_span:
+        try:
+            yield current_span
+        finally:
+            current_span.set_attribute(
+                "tool.duration_ms", elapsed_before + (time.perf_counter() - timer) * 1000
+            )
 
 
 def guardrail_span(tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None) -> Any:

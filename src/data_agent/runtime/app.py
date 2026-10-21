@@ -1083,10 +1083,15 @@ def create_app(
                 session_id=x_session_id,
                 scope_hash=hash_scope(credentials.column_scope),
                 turn_index=turn_index_hint,
-            ):
-                return await agent_loop.run(
+                user_input=body.message,
+                request_metadata=tracing.request_context(credentials.jwt),
+                catalog_sha=(peek_doc.catalog_session or {}).get("catalog_sha"),
+            ) as turn_span:
+                outcome = await agent_loop.run(
                     session_id=x_session_id, credentials=credentials, user_message=body.message
                 )
+                tracing.record_turn_output(turn_span, outcome)
+                return outcome
 
         return _TurnStreamingResponse(
             _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled),
@@ -1124,10 +1129,15 @@ def create_app(
                 session_id=x_session_id,
                 scope_hash=hash_scope(credentials.column_scope),
                 turn_index=turn_index_hint,
-            ):
-                return await agent_loop.resume(
+                user_input=body.answer,
+                request_metadata=tracing.request_context(credentials.jwt),
+                catalog_sha=(doc.catalog_session or {}).get("catalog_sha"),
+            ) as turn_span:
+                outcome = await agent_loop.resume(
                     session_id=x_session_id, credentials=credentials, answer=body.answer
                 )
+                tracing.record_turn_output(turn_span, outcome)
+                return outcome
 
         return _TurnStreamingResponse(
             _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled),
