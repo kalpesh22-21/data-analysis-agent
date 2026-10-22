@@ -88,7 +88,10 @@ async def test_mixed_request_finishes_supported_intent_and_blocks_only_scope_par
             ),
             batch(
                 call(
-                    "declineOutOfScope", "scope", request="weather in Paris", serves_intents=["i2"]
+                    "declineOutOfScope",
+                    "scope",
+                    request="weather  in\nParis",
+                    serves_intents=["i2"],
                 )
             ),
             discovery(),
@@ -120,6 +123,9 @@ async def test_mixed_request_finishes_supported_intent_and_blocks_only_scope_par
         and "scope" in result.assistant_text
     )
     doc = await store.get_or_create_session(CREDS.session_id)
+    receipt = next(e for e in doc.tool_trail if e.tool_call_id == "scope")
+    assert receipt.serves_intents == ("i2",)
+    assert receipt.error_code == "OUT_OF_SCOPE_REQUEST"
     assert [(i.status, i.reason_code) for i in doc.analysis_state.intents] == [
         ("completed", None),
         ("blocked", "OUT_OF_SCOPE_REQUEST"),
@@ -180,7 +186,7 @@ async def test_scope_channel_rejects_invented_request_without_scope_event():
 
 def test_scope_classification_and_shape_only_telemetry():
     info = classify_denial("OUT_OF_SCOPE_REQUEST")
-    assert info.kind is DenialKind.GATE and info.retryable and info.enforcement
+    assert info.kind is DenialKind.GATE and not info.retryable and info.enforcement
     assert info.code in ENFORCEMENT_ERROR_CODES
     payload = {"rule": SCOPE_RULE, "site": "agent_scope_declaration", "request": "SECRET"}
     attributes = _observed_attributes(SCOPE_EVENT, payload)
@@ -188,3 +194,24 @@ def test_scope_classification_and_shape_only_telemetry():
     for shape in (attributes, progress.shape):
         assert shape["rule"] == SCOPE_RULE and shape["site"] == "agent_scope_declaration"
         assert "SECRET" not in json.dumps(shape)
+
+
+@pytest.mark.parametrize("tags", [[], ["i2"], ["i1", "i2"]])
+async def test_direct_scope_call_accepts_schema_tags_and_whitespace(tags):
+    tool = DeclineOutOfScopeTool()
+    args = {"request": "weather in Paris", "serves_intents": tags}
+    result = await tool.run(args, CREDS, TurnContext(0, "Count employees; WEATHER\n in   Paris"))
+    assert result.error_code == "OUT_OF_SCOPE_REQUEST"
+    assert result.retryable is False
+    assert args == {"request": "weather in Paris", "serves_intents": tags}
+
+
+@pytest.mark.parametrize(
+    "extra", [{"serves_intents": "i2"}, {"serves_intents": [3]}, {"unknown": 1}]
+)
+async def test_scope_call_rejects_malformed_optional_or_unknown_args(extra):
+    result = await DeclineOutOfScopeTool().run(
+        {"request": "weather", **extra}, CREDS, TurnContext(0, "weather")
+    )
+    assert result.error_code == "INVALID_TOOL_ARGUMENTS"
+    assert result.retryable is True  # Correct malformed arguments; do not retry a valid refusal.

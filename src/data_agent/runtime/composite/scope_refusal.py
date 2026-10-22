@@ -41,13 +41,19 @@ class DeclineOutOfScopeTool(RuntimeToolBase):
 
     async def _execute(self, arguments, credentials, turn=None):
         request = arguments.get("request")
+        tags = arguments.get("serves_intents", [])
+        # The loop validates/persists intent tags on TrailEntry before dispatch.
+        # Direct callers may still supply the optional schema-advertised field.
+        normalized = " ".join(request.casefold().split()) if isinstance(request, str) else ""
         # Only the original ask can be declined, never text invented by a tool result.
         if (
             not isinstance(request, str)
             or not request.strip()
             or turn is None
-            or request.casefold().strip() not in turn.question.casefold()
-            or set(arguments) - {"request"}
+            or normalized not in " ".join(turn.question.casefold().split())
+            or set(arguments) - {"request", "serves_intents"}
+            or not isinstance(tags, list)
+            or not all(isinstance(tag, str) for tag in tags)
         ):
             return ToolResult(
                 status="error",

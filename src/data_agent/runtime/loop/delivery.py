@@ -239,42 +239,7 @@ def partial_delivery_text(doc, turn_index, accum):
 
 async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint):
     """Review the exact delivered content; primary approved proposals reuse their receipt."""
-    context = CURRENT_DELIVERY.get()
-    if context is None or loop._answer_judge is None:
-        return {"status": "disabled"}, False
-    if not getattr(loop._answer_judge, "enabled", True):
-        return {"status": "disabled"}, True
-    from data_agent.runtime.context.scope_filter import compute_scope_hash
-    from data_agent.runtime.session.models import live_analysis_state
-
-    doc = await loop._session_store.get_or_create_session(session_id)
-    state = ReviewState.restore(
-        doc.review_states.get(str(turn_index)), compute_scope_hash(context.credentials.column_scope)
-    )
     pending = checkpoint.pending_question if checkpoint else None
-    version = delivery_version(text, accum, pending)
-    if (
-        pending
-        and state.delivery_version == version
-        and state.delivery_status in {"approved", "rejected", "exhausted"}
-    ):
-        # The question already passed the askUser repair gate. Re-reviewing it at
-        # finish time cannot re-round and used to turn a pause into a generic decline.
-        return {"status": state.delivery_status}, False
-    if (
-        state.delivery_version == version
-        and state.delivery_status == "approved"
-        and (not state.violation or pending and state.site != "ask_user")
-    ):
-        return {"status": "approved"}, False
-    if (
-        not pending
-        and state.delivery_version == version
-        and state.delivery_status == "exhausted"
-        and not state.violation
-    ):
-        loop._observer("loop_delivery_review", {"status": "exhausted", "calls": 0})
-        return {"status": "exhausted"}, False
     site = (
         "ask_user"
         if pending
@@ -284,6 +249,50 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
         if accum.has_answer_tables
         else "exit_prose"
     )
+
+    def envelope(status, attempts=0, violation=""):
+        result = {"status": status, "attempts": attempts, "site": site}
+        if status == "rejected" and violation:
+            from .judge_ship_guard import ship_decline_text
+
+            result.update(violation=violation, reason=ship_decline_text(violation))
+        return result
+
+    context = CURRENT_DELIVERY.get()
+    if context is None or loop._answer_judge is None:
+        return envelope("disabled"), False
+    if not getattr(loop._answer_judge, "enabled", True):
+        return envelope("disabled"), True
+    from data_agent.runtime.context.scope_filter import compute_scope_hash
+    from data_agent.runtime.session.models import live_analysis_state
+
+    doc = await loop._session_store.get_or_create_session(session_id)
+    state = ReviewState.restore(
+        doc.review_states.get(str(turn_index)), compute_scope_hash(context.credentials.column_scope)
+    )
+    version = delivery_version(text, accum, pending)
+    if (
+        pending
+        and state.delivery_version == version
+        and state.delivery_status in {"approved", "rejected", "exhausted"}
+    ):
+        # The question already passed the askUser repair gate. Re-reviewing it at
+        # finish time cannot re-round and used to turn a pause into a generic decline.
+        return envelope(state.delivery_status, violation=state.violation), False
+    if (
+        state.delivery_version == version
+        and state.delivery_status == "approved"
+        and (not state.violation or pending and state.site != "ask_user")
+    ):
+        return envelope("approved"), False
+    if (
+        not pending
+        and state.delivery_version == version
+        and state.delivery_status == "exhausted"
+        and not state.violation
+    ):
+        loop._observer("loop_delivery_review", {"status": "exhausted", "calls": 0})
+        return envelope("exhausted"), False
     questions = [m.content for m in doc.messages if m.role == "user" and m.turn_index == turn_index]
     calls = 0
     question_version = fingerprint(
@@ -301,15 +310,15 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
         loop._observer(
             "loop_delivery_review", {"site": site, "status": state.delivery_status, "calls": 1}
         )
-        return {"status": state.delivery_status, "attempts": 1}, False
+        return envelope(state.delivery_status, 1, state.violation), False
     if outstanding:
         loop._observer("loop_delivery_review", {"site": site, "status": "rejected", "calls": 0})
-        return {"status": "rejected"}, True
+        return envelope("rejected", violation=state.violation), True
     if context.resilient_exit and not pending:
         # Salvage already got its bounded opportunity. Do not start another full
         # review of the fallback, or turn unavailable review into an approval.
         loop._observer("loop_delivery_review", {"site": site, "status": "exhausted", "calls": 0})
-        return {"status": "exhausted", "attempts": 0}, False
+        return envelope("exhausted"), False
     status = "rejected" if outstanding or bool(pending and state.question_refusals) else "exhausted"
     if context.review_seconds > 0:
         calls = 1
@@ -420,4 +429,4 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
     )
     await loop._session_store.write_review_state(session_id, turn_index, state.to_doc())
     loop._observer("loop_delivery_review", {"site": site, "status": status, "calls": calls})
-    return {"status": status, "attempts": calls}, status == "rejected"
+    return envelope(status, calls, state.violation), status == "rejected"

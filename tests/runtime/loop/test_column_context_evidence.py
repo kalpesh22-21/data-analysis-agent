@@ -184,11 +184,11 @@ def test_behavior_instructions_and_guard_agree():
     from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
     assert (
-        "Active + On Leave unless the user explicitly requests another population"
+        "explicit user scope overrides defaults"
         in AGENT_SYSTEM_PROMPT
     )
     assert (
-        "defaults to active and on leave unless the user explicitly requests another population"
+        "applicable catalog defaults"
         in _ANSWER_JUDGE_PROMPT
     )
     assert "useful part of the request" in AGENT_SYSTEM_PROMPT

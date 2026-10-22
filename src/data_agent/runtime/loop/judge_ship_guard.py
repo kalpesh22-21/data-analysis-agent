@@ -13,6 +13,12 @@ EVIDENTIAL_TABLE_VIOLATIONS = frozenset(
     {"contradicts_result", "unexplained_gap", "unrecorded_assumption", "unsupported_by_evidence"}
 )
 _REASONS = {
+    "measurement_mismatch": "The calculation did not measure the requested quantity or population.",
+    "unrequested_employee_status_filter": "The calculation included only active and on-leave employees' records, rather than all records in the requested scope.",
+    "aggregation_risk": "The calculation may duplicate or omit records, so its totals are not reliable.",
+    "leaks_sql_or_schema": "The answer included internal database details that cannot be shared.",
+    "answers_inappropriate_request": "That part of the request is outside the supported HR, payroll, and product-usage scope.",
+    "internal_process_narration": "The answer described internal processing instead of answering your question.",
     "unrecorded_assumption": "I could not settle which interpretation to rely on.",
     "unexplained_gap": "I could not verify every part of what you asked for.",
     "contradicts_result": "I could not verify the explanation against the results.",

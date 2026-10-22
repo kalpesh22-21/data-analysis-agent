@@ -107,7 +107,7 @@ async def test_p08_composed_repair_and_reviewed_partial_delivery(table):
     out = await run(loop, "Show compensation history and department headcount.")
     assert {c["name"] for c in out.capability_cards or []} == set(NAMES)
     assert bool(out.answer_tables) == table
-    assert out.review == {"status": "approved", "attempts": 1}
+    assert out.review == {"status": "approved", "attempts": 1, "site": "exit_capability"}
     assert all(f"{label}: The prepared view is included." in out.assistant_text for label in LABELS)
     assert "could not be verified" in out.assistant_text
     repair = [

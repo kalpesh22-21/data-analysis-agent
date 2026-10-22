@@ -2294,7 +2294,9 @@ class AgentLoop:
                 completion_notice = None
                 ship_disposition = None
                 retained_assumption_count = 0
-                review, withheld = {"status": "approved"}, False
+                review, withheld = {**review, "status": "approved"}, False
+                review.pop("violation", None)
+                review.pop("reason", None)
         if partial_recovered:
             review = {**review, "completion": "partial"}
         # A resilient exit has already applied the ship guard and rendered its
@@ -2312,7 +2314,7 @@ class AgentLoop:
             capability_cards = None
             ship_disposition = "decline_only"
             retained_assumption_count = 0
-            assistant_text = "I don't have enough verified information to answer your question."
+            assistant_text = review.get("reason") or "I don't have enough verified information to answer your question."
             if completion_notice:
                 assistant_text += "\n\n" + completion_notice
             provenance = frozenset()

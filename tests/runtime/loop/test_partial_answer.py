@@ -66,7 +66,7 @@ async def test_terminal_review_delivers_partial_and_history_omits_unapproved_tab
     loop, store, model, mcp, _ = build([discovery(), query(), final(), final()], judge)
     out = await run(loop, "Give me headcount and leave ranking.")
     assert out.assistant_text == TEXT
-    assert out.review == {"status": "approved", "completion": "partial"}
+    assert out.review == {"status": "approved", "completion": "partial", "attempts": 0, "site": "exit_prose"}
     assert not out.answer_tables and not out.assumptions
     assert [r["result_id"] for r in out.extra_evidence] == ["q"]
     assert len(judge.briefs) == 3

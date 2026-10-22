@@ -147,7 +147,7 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
 
     OUT_OF_SCOPE_REQUEST_CODE: DenialInfo(
         code=OUT_OF_SCOPE_REQUEST_CODE,
-        retryable=True,
+        retryable=False,
         kind=DenialKind.GATE,
         user_message="That request is outside HR, payroll, and product-usage scope. I can help with those topics instead.",
     ),

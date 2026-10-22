@@ -133,9 +133,14 @@ not establish historical usage or leave taken. Metadata questions can finish fro
 this evidence without an additional query or value-resolution call.
 
 The agent prefers scoped blueprints, including for useful parts of a larger request,
-and uses SQL for the remaining gaps. Employee analysis defaults to Active + On Leave
-unless the user explicitly requests another population; whole-client configuration
-lookups retain their documented population. Final answers emphasize important findings
+and uses SQL for the remaining gaps. The employee schema catalog owns the Active + On Leave default for employee-population
+questions unless overridden. Agent and judge use catalog applicability and user scope,
+without a hardcoded status default in either prompt. Employee-detail requests across modules (including accrual balances and expense or payroll
+listings) use the catalog default even with a period filter. Period fact totals and other
+aggregates use all accessible records unless an explicit population is requested, including
+when grouped by employee or department. Mixed requests apply scope per result. Module
+catalog rules expose this distinction without requiring prior employee-schema discovery.
+Whole-client configuration lookups retain their documented population. Final answers emphasize important findings
 and necessary caveats without repeating displayed tables. A bounded presentation
 guard nudges verbose or repeated row summaries to shorten using existing evidence;
 explicit requests for detailed explanations are exempt.
@@ -177,3 +182,14 @@ execution for their native timeline duration too. Query tools expose the SQL sen
 to MCP as `input.value` and `db.statement`, with the existing redaction setting
 applied. Physical SQL rewrites inside the backend are not returned to the agent.
 Tool result rows and output bodies are omitted from Phoenix exports.
+
+Scope-refusal tools accept `request` plus optional `serves_intents`; the loop validates
+and persists intent tags on the receipt. Matching the original request ignores case
+and whitespace differences, but does not accept invented request text. A valid scope
+refusal is non-retryable; malformed arguments remain correctable.
+
+Delivery reviews consistently include `status`, `attempts` (delivery-review attempts),
+and `site`. Rejections with an identified violation also include its slug and authored
+public reason, which final delivery preserves. This does not add review or repair rounds.
+Unrequested Active/On Leave restrictions on fact-record aggregates are rejected as
+`unrequested_employee_status_filter`; explicit status requests remain valid.
