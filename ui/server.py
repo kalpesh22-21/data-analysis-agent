@@ -109,12 +109,7 @@ TENANT_CLIENT_CODE = os.environ.get("TENANT_CLIENT_CODE", "CLIENT_A")
 TENANT_PROC_CENTER = os.environ.get("TENANT_PROC_CENTER", "PC01")
 TENANT_JTI = os.environ.get("TENANT_JTI", "TESTJTI001")
 
-# Upload BFF wiring (UI Slice 4, §4). The scratch upload routes live on the MCP /
-# clickhouse-api host, NOT the runtime — so they get their own base env, MCP_URL
-# (matching the runtime's own default, runtime/config.py:35). The `/scratch/v1`
-# base is DERIVED from it by swapping the path (see `_scratch_base`), the same
-# derivation the runtime does at runtime/config.py:362-374.
-MCP_URL = os.environ.get("MCP_URL", "http://localhost:18090/mcp")
+# Uploads pass through the runtime, which attaches the persisted session scope.
 
 # Cheap front-door reject: short-circuit an obviously-oversized upload on its
 # declared `Content-Length` BEFORE buffering the body. The authoritative byte cap
@@ -883,17 +878,8 @@ async def inbox_action(
 # --- upload BFF (UI Slice 4, §4) ---------------------------------------------
 
 
-def _scratch_base() -> str:
-    """Derive the `/scratch/v1` base URL from `MCP_URL` by keeping its scheme + netloc
-    and swapping the path — the identical derivation `runtime/config.py` does. The
-    scratch upload routes are custom HTTP routes on the MCP host (`clickhouse-api`), NOT
-    on `RUNTIME_URL`. E.g. `http://localhost:18090/mcp` -> `http://localhost:18090/scratch/v1`."""
-    parts = urllib.parse.urlsplit(MCP_URL)
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/scratch/v1", "", ""))
-
-
 async def _proxy_upload(path: str, session_id: str, request: Request) -> JSONResponse:
-    """RAW-BODY multipart passthrough to a clickhouse-api scratch route (§4).
+    """RAW-BODY multipart passthrough to the scoped runtime upload route (§4).
 
     The BFF must NOT parse the form — that would pull `python-multipart` into this
     package's deps, which the contract forbids — so it reads the raw body bytes and
@@ -939,10 +925,10 @@ async def _proxy_upload(path: str, session_id: str, request: Request) -> JSONRes
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            resp = await client.post(f"{_scratch_base()}{path}", headers=headers, content=body)
+            resp = await client.post(f"{RUNTIME_URL}/upload{'/analyze' if path == '/analyze' else ''}", headers=headers, content=body)
         except httpx.HTTPError as exc:
             raise HTTPException(
-                status_code=502, detail=f"clickhouse-api unreachable: {exc}"
+                status_code=502, detail=f"Upload runtime unreachable: {exc}"
             ) from exc
     try:
         content = resp.json()
@@ -953,7 +939,7 @@ async def _proxy_upload(path: str, session_id: str, request: Request) -> JSONRes
 
 @app.post("/api/upload/analyze")
 async def upload_analyze(session_id: str, request: Request) -> JSONResponse:
-    """Preview a CSV/XLSX upload: raw-body proxy to `POST /scratch/v1/analyze`
+    """Preview a CSV/XLSX upload through the runtime session-scope proxy
     (parse + column/type/sample preview, no materialize). `session_id` is a query
     param; the file rides in the raw multipart body."""
     return await _proxy_upload("/analyze", session_id, request)
@@ -961,7 +947,7 @@ async def upload_analyze(session_id: str, request: Request) -> JSONResponse:
 
 @app.post("/api/upload")
 async def upload(session_id: str, request: Request) -> JSONResponse:
-    """Materialize a mapped upload: raw-body proxy to `POST /scratch/v1/upload`
+    """Materialize a mapped upload through the runtime session-scope proxy
     (parse + rename + materialize the session-scoped scratch table). `session_id`
     is a query param; the file + `mapping` field ride in the raw multipart body."""
     return await _proxy_upload("/upload", session_id, request)

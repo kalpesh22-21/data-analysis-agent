@@ -28,7 +28,7 @@ def rig(monkeypatch):
         await asyncio.sleep(.01)
         user = request.headers['Authorization'].split()[1]
         snapshot = load_catalog_export()
-        snapshot.update(owner=identity_hash({'sub':user,'clientcode':user}),
+        snapshot.update(scratch_database='tenant_uploads', owner=identity_hash({'sub':user,'clientcode':user}),
                         session_id=request.headers['X-Session-Id'], scope_token=f'signed-{len(calls)}',
                         expires_at=int(time.time())+3600, columns=['dbpcm_warehouse.employee.employee_code'])
         return httpx.Response(200, json=snapshot)
@@ -128,3 +128,28 @@ async def test_empty_session_catalog_is_deny_all(rig):
     credentials = await manager.credentials(RuntimeCredentials('s','alice',frozenset()))
     assert credentials.column_scope == frozenset({'__no_catalog_access__'})
     assert (await manager.catalog_handle(credentials)).schema == {}
+
+
+async def test_credentials_restore_api_namespace_from_cached_snapshot(rig):
+    from data_agent.sqlparse.scratch_namespace import bind_scratch_database, reset_scratch_database, scratch_databases
+    store, settings, calls, transport = rig
+    manager = SessionCatalog(settings, store, transport=transport)
+    await manager.ensure(jwt='alice', session_id='s')
+    token = bind_scratch_database(None)
+    try:
+        credentials = RuntimeCredentials(session_id='s', jwt='alice', column_scope=frozenset())
+        await manager.credentials(credentials)
+        assert scratch_databases() == frozenset({'scratch', 'tenant_uploads'})
+        assert len(calls) == 1
+    finally:
+        reset_scratch_database(token)
+
+
+async def test_old_cached_snapshot_is_refreshed_to_discover_namespace(rig):
+    store, settings, calls, transport = rig
+    manager = SessionCatalog(settings, store, transport=transport)
+    await manager.ensure(jwt='alice', session_id='s')
+    del store._docs['s'].catalog_session['scratch_database']
+    snapshot = await manager.ensure(jwt='alice', session_id='s')
+    assert snapshot['scratch_database'] == 'tenant_uploads'
+    assert len(calls) == 2

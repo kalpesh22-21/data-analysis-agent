@@ -92,13 +92,6 @@ def _post_upload(client: TestClient, path: str) -> object:
     )
 
 
-def test_scratch_base_swaps_mcp_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    # `_scratch_base()` keeps scheme+netloc, swaps the path for `/scratch/v1` — the
-    # same derivation the runtime does; the scratch routes live on the MCP host.
-    monkeypatch.setattr(server, "MCP_URL", "http://mcp-host:18090/mcp")
-    assert server._scratch_base() == "http://mcp-host:18090/scratch/v1"
-
-
 @pytest.mark.parametrize(
     ("api_path", "upstream_path"),
     [("/api/upload/analyze", "/analyze"), ("/api/upload", "/upload")],
@@ -112,7 +105,7 @@ def test_upload_proxy_attaches_creds_and_forwards_raw_body(
     assert len(fake_httpx) == 1
     hop = fake_httpx[0]
     # Hops to the scratch base on the MCP host, at the right sub-path.
-    assert hop["url"] == f"{server._scratch_base()}{upstream_path}"
+    assert hop["url"] == f"{server.RUNTIME_URL}/upload{'/analyze' if upstream_path == '/analyze' else ''}"
     # JWT + session-id are attached server-side — the browser sent only the
     # session_id query param, never the JWT.
     assert hop["headers"]["Authorization"] == f"Bearer {_JWT}"

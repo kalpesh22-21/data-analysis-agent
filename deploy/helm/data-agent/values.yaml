@@ -107,11 +107,11 @@ config:
   # -- URL of the MCP (clickhouse-api) service. EXTERNAL.
   MCP_URL: "http://clickhouse-api:8000/mcp"
   MCP_MAX_RESPONSE_BYTES: "16777216"
-  # -- Where the semantic catalog is sourced from: "mcp" (live GET
-  #    /catalog/export off the MCP host) or "fixture" (offline JSON on disk).
+  # -- "mcp" initializes a persisted, scoped catalog once per session;
+  #    "fixture" is for offline runs.
   CATALOG_SOURCE: "mcp"
-  # -- Explicit base URL of the MCP catalog export (…/catalog; /export is
-  #    appended). Empty = derive scheme+host from MCP_URL. SET THIS when the MCP
+  # -- Service catalog export URL for corpus hydration (not session catalogs).
+  #    Empty = derive scheme+host from MCP_URL. SET THIS when the MCP
   #    is behind a path-routed ingress (e.g. https://host/prefix/mcp), because
   #    the derivation DISCARDS the path prefix and would otherwise target
   #    https://host/catalog.

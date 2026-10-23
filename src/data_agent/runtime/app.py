@@ -27,6 +27,7 @@ from typing import Any
 from uuid import uuid4
 
 import anyio
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -1044,6 +1045,38 @@ def create_app(
                     }
                 )
             return {"spans": dumped, "count": len(dumped)}
+
+    @app.post("/upload/analyze")
+    @app.post("/upload")
+    async def upload_dataset(request: Request,
+        authorization: str | None = Header(default=None),
+        x_session_id: str | None = Header(default=None, alias="X-Session-Id")):
+        credentials = _extract_credentials(authorization=authorization, session_id=x_session_id, settings=settings)
+        if not settings.scratch_enabled or session_catalog is None:
+            raise HTTPException(409, detail="Session uploads are not enabled.")
+        chunks = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > settings.upload_max_bytes + 65536:
+                raise HTTPException(413, detail="Upload exceeds the maximum allowed size.")
+            chunks.append(chunk)
+        scope = await session_catalog.scope_token(jwt=credentials.jwt, session_id=credentials.session_id)
+        action = "analyze" if request.url.path.endswith("/analyze") else "upload"
+        headers = {"Authorization": f"Bearer {credentials.jwt}",
+                   "X-Session-Id": credentials.session_id, "X-Catalog-Scope": scope,
+                   "Content-Type": request.headers.get("content-type", "application/octet-stream")}
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(f"{settings.scratch_api_base()}/{action}",
+                                            headers=headers, content=b"".join(chunks))
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, detail="Upload backend unavailable.") from exc
+        try:
+            body = response.json()
+        except ValueError:
+            body = {"detail": "Upload backend returned an invalid response."}
+        return JSONResponse(status_code=response.status_code, content=body)
 
     @app.post("/session/catalog")
     @app.post("/session/catalog/refresh")

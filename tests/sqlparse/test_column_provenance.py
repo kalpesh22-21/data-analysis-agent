@@ -1344,3 +1344,13 @@ def test_the_default_is_unchanged_fail_closed_behaviour() -> None:
         extract_column_provenance(sql, schema, session_id="bob")  # cross-session
     # And the owner still resolves.
     assert extract_column_provenance(sql, schema, session_id="alice")
+
+
+@pytest.mark.parametrize("session", ["session", "foreign", None])
+def test_materialized_scratch_database_uses_session_ownership(session, api_scratch_namespace):
+    sql = "SELECT count(*) FROM tenant_uploads.s_session_bp_123"
+    if session == "session":
+        extract_column_provenance(sql, {}, session_id=session)
+    else:
+        with pytest.raises(ScratchSessionError):
+            extract_column_provenance(sql, {}, session_id=session)

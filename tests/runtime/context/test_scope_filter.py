@@ -334,3 +334,13 @@ def test_filter_messages_preserves_order_and_drops_out_of_scope() -> None:
     scope = frozenset({f"{_E}.Department"})
     filtered = filter_messages(messages, scope)
     assert [m.content for m in filtered] == ["u1", "a1_in_scope", "u2"]
+
+
+def test_physical_scratch_namespace_keeps_warehouse_scope_checks(api_scratch_namespace):
+    from data_agent.runtime.context.scope_filter import is_provenance_in_scope
+    upload = ("tenant_uploads.s_session_upload_123", "bonus")
+    allowed = ("dbpcm_warehouse.employee", "employee_code")
+    forbidden = ("dbpcm_warehouse.employee", "date_of_birth")
+    scope = frozenset({"dbpcm_warehouse.employee.employee_code"})
+    assert is_provenance_in_scope(frozenset({upload, allowed}), scope)
+    assert not is_provenance_in_scope(frozenset({upload, forbidden}), scope)

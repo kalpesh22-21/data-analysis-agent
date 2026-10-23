@@ -8,6 +8,8 @@ checks semantic support. Legacy reason_code/evidence_tool_call_id inputs are ign
 
 from __future__ import annotations
 
+from data_agent.sqlparse.scratch_namespace import scratch_databases
+
 import hashlib
 import logging
 from collections.abc import Sequence
@@ -853,7 +855,7 @@ def _prepare_previous_result_reuse(updates, trail, turn_index, live, scope_hash)
                 or source.tool_name == "runBlueprint" and not source.authoritative
                 or not scope_hash or (source.model_response or {}).get("scope_hash") != scope_hash
                 or (source.model_response or {}).get("reused_from_result_id")
-                or any(table.startswith("scratch.") for table, _ in source.provenance)):
+                or any(table.split(".", 1)[0] in scratch_databases() for table, _ in source.provenance)):
             raise _reject("unresolved_evidence", "That prior result is not an eligible successful snapshot under the current scope. Use a fresh authorized query; failed, unknown-scope, scratch and unverified blueprint results cannot be reused.")
         # Stable within this turn so repeating an explicit binding does not
         # manufacture extra receipts or trigger another query.

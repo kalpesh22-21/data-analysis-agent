@@ -44,7 +44,7 @@ class SessionCatalog:
         baseline_token = baseline.get('scope_token') if baseline else None
         if baseline and baseline.get('owner') != owner:
             raise HTTPException(403, detail='Session belongs to a different identity.')
-        if baseline and not force and baseline.get('scope_token') and baseline.get('expires_at', 0) > time.time() + 30:
+        if baseline and not force and 'scratch_database' in baseline and baseline.get('scope_token') and baseline.get('expires_at', 0) > time.time() + 30:
             return baseline
         while time.monotonic() < deadline:
             now = time.time()
@@ -52,7 +52,7 @@ class SessionCatalog:
                 old = old or {}
                 if old.get('owner') not in (None, owner):
                     raise HTTPException(403, detail='Session belongs to a different identity.')
-                valid = old.get('scope_token') and old.get('expires_at', 0) > now + 30
+                valid = 'scratch_database' in old and old.get('scope_token') and old.get('expires_at', 0) > now + 30
                 refreshed = old.get('scope_token') != baseline_token
                 if valid and (not force or refreshed):
                     return old
@@ -98,6 +98,8 @@ class SessionCatalog:
         snapshot = await self.ensure(jwt=credentials.jwt, session_id=credentials.session_id)
         # Existing replay code uses empty=unrestricted. A non-column sentinel
         # represents deny-all, so an empty scoped catalog can never widen access.
+        from data_agent.sqlparse.scratch_namespace import bind_scratch_database
+        bind_scratch_database(snapshot.get('scratch_database'))
         scope = frozenset(snapshot['columns']) or frozenset({'__no_catalog_access__'})
         return replace(credentials, column_scope=scope)
 
@@ -106,4 +108,6 @@ class SessionCatalog:
 
     async def catalog_handle(self, credentials):
         snapshot = await self.ensure(jwt=credentials.jwt, session_id=credentials.session_id)
+        from data_agent.sqlparse.scratch_namespace import bind_scratch_database
+        bind_scratch_database(snapshot.get('scratch_database'))
         return load_catalog_handles_from_export(snapshot)[0]

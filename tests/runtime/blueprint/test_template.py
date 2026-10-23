@@ -139,3 +139,12 @@ def test_contains_star_detects_top_level_and_subquery() -> None:
     assert contains_star(parse_template("SELECT * FROM t"))
     assert contains_star(parse_template("SELECT a FROM (SELECT * FROM t) x"))
     assert not contains_star(parse_template("SELECT a, b FROM t"))
+
+
+def test_scratch_binding_preserves_materializer_database(api_scratch_namespace):
+    sql = bind_template("SELECT x.amount FROM scratch.staged x", {},
+                        table_bindings={"staged": "tenant_uploads.s_session_bp_123"})
+    table = sqlglot.parse_one(sql, dialect="clickhouse").find(sqlglot.exp.Table)
+    assert table.db == "tenant_uploads"
+    assert table.name == "s_session_bp_123"
+    assert table.alias == "x"

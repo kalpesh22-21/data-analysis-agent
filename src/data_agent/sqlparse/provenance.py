@@ -64,6 +64,8 @@ Algorithm
 
 from __future__ import annotations
 
+from data_agent.sqlparse.scratch_namespace import scratch_databases
+
 import re
 
 import sqlglot
@@ -221,7 +223,7 @@ def _build_alias_map(
             continue
 
         # Handle scratch tables
-        if tbl_db == _SCRATCH_DB:
+        if tbl_db in scratch_databases():
             # A DECLARED placeholder is not a session read. `scratch.emp_earnings` in a
             # blueprint TEMPLATE names an intermediate the blueprint itself produces one node
             # earlier; it is not `s_<sid>_<suffix>`, has no owning session, and nothing has been
@@ -522,7 +524,7 @@ def _references_only_scratch_sources(col_node: exp.Column) -> bool:
     for tbl in direct_tables:
         db_node = tbl.args.get("db")
         tbl_db = db_node.name if db_node else ""
-        if tbl_db != _SCRATCH_DB:
+        if tbl_db not in scratch_databases():
             return False
     return True
 
@@ -1018,7 +1020,7 @@ def _infer_default_db(catalog_schema: dict[str, dict[str, str]]) -> str:
             # own scratch registration silently changed how its SIBLING nodes' bare warehouse
             # names qualified, and a single-database catalog that is not `dbpcm_warehouse` sent
             # the whole candidate to review. The default db is a fact about the WAREHOUSE.
-            if db == _SCRATCH_DB:
+            if db in scratch_databases():
                 continue
             databases.add(db)
     if len(databases) == 1:

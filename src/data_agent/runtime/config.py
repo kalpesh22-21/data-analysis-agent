@@ -282,6 +282,8 @@ class RuntimeSettings(BaseSettings):
             "(clean raw-loop degrade)."
         ),
     )
+    upload_max_bytes: int = Field(8 * 1024 * 1024, ge=1, description="Maximum uploaded file bytes; multipart overhead is bounded separately.")
+
     scratch_max_rows: int = Field(
         10_000,
         ge=1,

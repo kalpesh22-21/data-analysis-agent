@@ -47,3 +47,14 @@ def catalog_handle() -> CatalogHandle:
 def semantic_catalog_handle() -> SemanticCatalogHandle:
     """The immutable `SemanticCatalogHandle` built from the export fixture."""
     return fixture_semantic_catalog_handle()
+
+
+@pytest.fixture
+def api_scratch_namespace():
+    from data_agent.sqlparse.scratch_namespace import bind_scratch_database, reset_scratch_database
+    name = "tenant_uploads"
+    token = bind_scratch_database(name)
+    try:
+        yield name
+    finally:
+        reset_scratch_database(token)

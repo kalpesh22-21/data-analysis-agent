@@ -11,6 +11,14 @@ Makes buildable `docs/08-ui.md` § "Upload → join" and the last open prerequis
 `docs/08-ui.md` § "Backend surface prerequisites" (File-upload + column-mapping loader), and closes
 `docs/07-external-data.md:66` (open question: ingestion side-channel formats/size caps).
 
+**Integration update (2026-10-23):** The BFF now forwards uploads to runtime
+`/upload` and `/upload/analyze`. The runtime attaches the cached session catalog
+scope token before forwarding to MCP, keeping that token out of the browser.
+New uploads use `dbpcm_scratch.s_<session>_upload_<uuid>` and are discoverable;
+blueprint `bp_*` intermediates stay hidden. Both remain session-owned. The physical
+scratch namespace comes from the API session catalog’s `scratch_database` field;
+the agent does not configure it. `scratch.<output>` remains an authoring placeholder.
+
 ---
 
 ## 0. Architectural decision — **the front door is analyze → map → upload, and `upload` re-parses the file**

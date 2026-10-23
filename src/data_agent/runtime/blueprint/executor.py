@@ -46,6 +46,7 @@ from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
 from data_agent.runtime.retrieval.scope_filter import is_blueprint_in_scope
 from data_agent.runtime.session.models import ResultPreview
 from data_agent.sqlparse import is_own_session_scratch_table
+from data_agent.sqlparse.scratch_namespace import scratch_databases
 
 from .grain_probe import (
     build_grain_probe_sql,
@@ -80,7 +81,6 @@ from .slots import (
     slot_token_names,
 )
 from .template import (
-    SCRATCH_DB,
     TemplateBindError,
     assert_read_only_select,
     bind_template,
@@ -1600,7 +1600,7 @@ def _union_provenance(
     for prov in provenances:
         if prov is None:
             return None
-        acc.update(pair for pair in prov if not pair[0].startswith("scratch."))
+        acc.update(pair for pair in prov if pair[0].split(".", 1)[0] not in scratch_databases())
     return frozenset(acc)
 
 
@@ -1673,8 +1673,8 @@ def _table_consumed_orders(nodes: tuple[Node, ...]) -> set[int]:
 def _node_table_bindings(
     node: Node, materialized: dict[int, str]
 ) -> tuple[dict[str, str], ExecFailed | None]:
-    """Map each TABLE consume `{placeholder: "$N"}` to the BARE materialized scratch
-    table name (`s_<sid>_bp_<uuid>`) for the AST JOIN rewrite (§2.2 step 3). An
+    """Map each TABLE consume `{placeholder: "$N"}` to the qualified materialized scratch
+    table name for the AST JOIN rewrite (§2.2 step 3). An
     upstream node not (yet) materialized → SLOT_INVALID (fail-closed — never a JOIN
     against a non-existent scratch table). Scalar consumes are ignored here (they
     are value bindings, handled by `_node_bindings`).
@@ -1694,7 +1694,7 @@ def _node_table_bindings(
         full = materialized.get(order)
         if full is None:
             return {}, ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
-        bindings[placeholder] = full.split(".", 1)[1] if "." in full else full
+        bindings[placeholder] = full
     return bindings, None
 
 
@@ -1983,10 +1983,10 @@ def _is_own_session_scratch_table(full_table: str, session_id: str | None) -> bo
     before it is bound into a JOIN (D64).
 
     Two independent conditions, both fail-closed:
-      1. exactly `<db>.<name>` with `db == SCRATCH_DB`. Exactly two dot-parts, so a
+      1. exactly `<db>.<name>` with `db in scratch_databases()`. Exactly two dot-parts, so a
          crafted `scratch.s_<sid>_bp_1.something` (which sqlglot would happily emit
          as ONE quoted identifier) is rejected, as is any other database — the
-         producer only ever writes to `scratch`;
+         producer writes to a supported scratch database;
       2. `<name>` passes the shared D64 ownership rule for this session.
 
     The rule in (2) is NOT re-implemented here: it is `sqlparse`'s
@@ -1996,7 +1996,7 @@ def _is_own_session_scratch_table(full_table: str, session_id: str | None) -> bo
     a second copy would have kept the loose form alive.
     """
     parts = full_table.split(".")
-    if len(parts) != 2 or parts[0] != SCRATCH_DB:
+    if len(parts) != 2 or parts[0] not in scratch_databases():
         return False
     return is_own_session_scratch_table(parts[1], session_id)
 

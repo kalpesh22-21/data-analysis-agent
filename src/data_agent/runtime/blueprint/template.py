@@ -31,6 +31,8 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
+from data_agent.sqlparse.scratch_namespace import scratch_databases
+
 # A slot bind-site token: `{name}` where name is an identifier. Deliberately
 # strict — a `{` followed by anything non-identifier is NOT treated as a slot
 # (so a stray brace fails the parse loudly rather than binding silently).
@@ -238,10 +240,10 @@ def _rewrite_scratch_tables(
     """Rewrite every `scratch.<placeholder>` table token to its materialized name.
 
         *table_bindings* maps a placeholder table name as it appears in the consumer's FROM/JOIN
-        to the BARE runtime-controlled scratch table the producing node materialized to. The
+        to the qualified runtime-controlled scratch table the producing node materialized to. The
         replacement is purely STRUCTURAL — a new `exp.Identifier` the runtime built, never model
-        text and never a result cell — so no injection surface is opened (D10). The `scratch`
-        database and any table alias are preserved, so the consumer's aliased column references
+        text and never a result cell — so no injection surface is opened (D10). The returned
+        database and original alias are preserved, so the consumer's aliased column references
         stay valid.
 
         Fail-closed WITHIN its binding map, which is narrower than it sounds: a
@@ -268,7 +270,12 @@ def _rewrite_scratch_tables(
                         "binding — the upstream table intermediate was not produced"
                     )
                 new_table = node.copy()
-                new_table.set("this", exp.to_identifier(table_bindings[placeholder]))
+                target = table_bindings[placeholder].split(".")
+                if len(target) == 2 and target[0] in scratch_databases():
+                    new_table.set("db", exp.to_identifier(target[0]))
+                elif len(target) != 1:
+                    raise TemplateBindError("invalid materialized scratch table")
+                new_table.set("this", exp.to_identifier(target[-1]))
                 return new_table
         return node
 
@@ -499,7 +506,7 @@ def bind_template(
         binding (a key the template never references), or an unbindable value. The slot value
         NEVER touches SQL as a string — it is a typed literal in the regenerated AST (D10).
 
-        *table_bindings* maps a `scratch.<placeholder>` table token to the BARE materialized
+        *table_bindings* maps a `scratch.<placeholder>` table token to the qualified materialized
         scratch table name, applied as an AST identifier rewrite BEFORE the literal binding. Table
         placeholders are NOT `{slot}` tokens, so they are invisible to the missing/extra slot
         checks and the two mechanisms compose cleanly.

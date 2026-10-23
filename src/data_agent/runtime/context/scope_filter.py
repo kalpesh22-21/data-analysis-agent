@@ -30,7 +30,7 @@ from collections.abc import Sequence
 
 from data_agent.runtime.session.models import TrailEntry, TurnMessage
 
-_SCRATCH_PREFIX = "scratch."
+from data_agent.sqlparse.scratch_namespace import scratch_databases
 
 
 def is_provenance_in_scope(
@@ -47,7 +47,7 @@ def is_provenance_in_scope(
         return True
 
     for db_table, column in provenance:
-        if db_table.startswith(_SCRATCH_PREFIX):
+        if db_table.split(".", 1)[0] in scratch_databases():
             continue
         if f"{db_table}.{column}" not in column_scope:
             return False
