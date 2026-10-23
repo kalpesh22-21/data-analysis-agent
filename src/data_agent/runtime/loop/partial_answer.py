@@ -14,18 +14,44 @@ from .turn_accumulators import TurnAccumulators
 
 
 def evidence_version(trail, turn_index):
-    # Conservative invalidation: any new successful evidence needs fresh review,
-    # including evidence that could contradict a previously approved finding.
+    # Detect evidence changes before deciding whether an approval can be reused.
     return fingerprint(
         [e.to_doc() for e in trail if e.turn_index == turn_index and evidence_kind(e)]
     )
 
 
-def capture_partial(verdict, brief, accum, trail, turn_index):
-    """Validate structure/provenance; the judge is responsible for factual support."""
-    part = verdict.partial_answer
-    if not brief.allow_partial_answer or not verdict.reviewed or verdict.approved:
+def capture_partial(verdict, brief, accum, trail, turn_index, *, observer=None):
+    if not brief.allow_partial_answer or not verdict.reviewed or verdict.approved or verdict.partial_answer is None:
         return {}
+    return _validate_response(
+        verdict.partial_answer,
+        brief,
+        accum,
+        trail,
+        turn_index,
+        original_violation=verdict.violation,
+        observer=observer,
+    )
+
+
+def _validate_response(
+    part,
+    brief,
+    accum,
+    trail,
+    turn_index,
+    *,
+    outcome="partial",
+    original_violation="",
+    observer=None,
+):
+    """Validate structure/provenance; the judge is responsible for factual support."""
+
+    def invalid(reason):
+        if observer:
+            observer("loop_recovery_validation_failed", {"reason": reason})
+        return {}
+
     if not isinstance(part, dict) or set(part) != {
         "answer",
         "evidence",
@@ -33,10 +59,10 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
         "capability_refs",
         "unfinished",
     }:
-        return {}
+        return invalid("invalid_partial_shape")
     answer = part["answer"]
     if not isinstance(answer, str) or not answer.strip():
-        return {}
+        return invalid("empty_answer")
     for key in ("evidence", "table_result_ids", "capability_refs", "unfinished"):
         value = part[key]
         if (
@@ -44,21 +70,28 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
             or len(value) > 100
             or any(not isinstance(x, str) or not x.strip() for x in value)
         ):
-            return {}
-    if not part["evidence"] or not part["unfinished"]:
-        return {}
+            return invalid("invalid_reference_list")
+    if (
+        outcome != "none"
+        and not part["evidence"]
+        or outcome == "partial"
+        and not part["unfinished"]
+    ):
+        return invalid("missing_evidence_or_unfinished")
     known = {e.tool_call_id: e for e in trail if e.turn_index == turn_index}
     if not set(part["evidence"]) <= known.keys():
-        return {}
+        return invalid("unknown_evidence_id")
     eligible = {ref: e for ref, e in known.items() if evidence_kind(e)}
     # Match finalization's extra-citation policy: known control/failed receipts
     # are ignored, but do not substitute for successful affirmative support.
     part = {**part, "evidence": list(dict.fromkeys(r for r in part["evidence"] if r in eligible))}
     # References must have been available to the judge, not merely in storage.
     visible = {r.get("tool_call_id") for r in brief.results}
-    if not part["evidence"] or not set(part["evidence"]) <= visible:
-        return {}
-    text = answer + "\n\nUnfinished: " + " ".join(part["unfinished"])
+    if (outcome != "none" and not part["evidence"]) or not set(part["evidence"]) <= visible:
+        return invalid("evidence_not_visible")
+    text = answer + (
+        "\n\nUnfinished: " + " ".join(part["unfinished"]) if part["unfinished"] else ""
+    )
     provenance = set()
     for ref in part["evidence"]:
         columns = eligible[ref].provenance
@@ -68,12 +101,20 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
         provenance.update(columns)
     provenance = frozenset(provenance) if provenance is not None else None
     from .column_context import business_values
-    receipts = [row[0] for result in brief.results if result.get('tool_call_id') in part['evidence']
-                for row in (result.get('result_preview') or {}).get('preview_rows', [])
-                if isinstance(row, list) and len(row) == 1 and isinstance(row[0], dict)
-                and row[0].get('result_id') == result.get('tool_call_id')
-                and 'context_key' in row[0] and isinstance(row[0].get('rows'), list)
-                and all(isinstance(value, dict) for value in row[0]['rows'])]
+
+    receipts = [
+        row[0]
+        for result in brief.results
+        if result.get("tool_call_id") in part["evidence"]
+        for row in (result.get("result_preview") or {}).get("preview_rows", [])
+        if isinstance(row, list)
+        and len(row) == 1
+        and isinstance(row[0], dict)
+        and row[0].get("result_id") == result.get("tool_call_id")
+        and "context_key" in row[0]
+        and isinstance(row[0].get("rows"), list)
+        and all(isinstance(value, dict) for value in row[0]["rows"])
+    ]
     values = business_values(receipts)
     scrubbed, redactions = scrub_answer_prose(text, provenance=provenance, business_values=values)
     if (
@@ -83,10 +124,18 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
         or scrubbed != text
         or any(ord(c) < 32 and c not in "\n\r\t" for c in text)
     ):
-        return {}
-    rule = first_match(text, accum.sql_executed, brief.question, has_alternative_evidence=True, business_values=values)
-    if rule and rule.name != "no_evidence":
-        return {}
+        return invalid("unsafe_answer_text")
+    rule = first_match(
+        text,
+        accum.sql_executed,
+        brief.question,
+        has_alternative_evidence=True,
+        business_values=values,
+        has_tables=bool(part["table_result_ids"]),
+    )
+    # Verbosity is a judge signal, never a reason to discard an approved answer.
+    if rule and rule.name not in {"no_evidence", "verbose_answer"}:
+        return invalid("answer_guard")
     tables, cards = [], []
     for ref in dict.fromkeys(part["table_result_ids"]):
         matches = [
@@ -95,10 +144,10 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
             if c.get("kind") == "table" and c.get("result_id") == ref
         ]
         if len(matches) != 1 or ref not in part["evidence"]:
-            return {}
+            return invalid("invalid_table_reference")
         found = [t for t in accum.answer_tables if t.sql == matches[0].get("sql")]
         if len(found) != 1:
-            return {}
+            return invalid("table_candidate_missing")
         tables.append(found[0].to_doc())
     for name in dict.fromkeys(part["capability_refs"]):
         matches = [
@@ -108,17 +157,27 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
         ]
         found = [c for c in accum.capability_cards or () if c.get("name") == name]
         if len(matches) != 1 or len(found) != 1 or matches[0]["result_id"] not in part["evidence"]:
-            return {}
+            return invalid("invalid_capability_reference")
         cards.append(dict(found[0]))
     return deepcopy(
         {
             "answer": text,
+            "completion": outcome,
+            "request_context": [brief.question, *brief.clarification_answers],
+            "evidence_receipts": {
+                e.tool_call_id: fingerprint(e.to_doc())
+                for e in trail
+                if e.turn_index == turn_index and evidence_kind(e)
+            },
             "tables": tables,
             "cards": cards,
             "extra_evidence": extra_evidence(
-                part["evidence"], list(eligible.values()),
-                selected=part["table_result_ids"] + [
-                    c["result_id"] for c in brief.selected_components
+                part["evidence"],
+                list(eligible.values()),
+                selected=part["table_result_ids"]
+                + [
+                    c["result_id"]
+                    for c in brief.selected_components
                     if c.get("capability_ref") in part["capability_refs"]
                 ],
                 sql_by_id={
@@ -130,7 +189,7 @@ def capture_partial(verdict, brief, accum, trail, turn_index):
             "unfinished": part["unfinished"],
             "evidence_version": evidence_version(trail, turn_index),
             "provenance": sorted(provenance) if provenance is not None else None,
-            "original_violation": verdict.violation,
+            "original_violation": original_violation,
         }
     )
 
@@ -147,11 +206,7 @@ def restore_partial(snapshot):
     return snapshot["answer"], accum, provenance
 
 
-# Do not start a new exit review without a realistic admission window.
-MIN_EXIT_REVIEW_SECONDS = 30.0
-
-
-async def recover_partial(loop, session_id, turn_index, accum, draft, *, allow_review=True):
+async def recover_partial(loop, session_id, turn_index, accum, draft):
     import asyncio
 
     from .delivery import CURRENT_DELIVERY
@@ -160,12 +215,10 @@ async def recover_partial(loop, session_id, turn_index, accum, draft, *, allow_r
     if context:
         context.resilient_exit = True
     timeout = getattr(loop._answer_judge, "timeout_seconds", 30.0)
-    if context and context.review_seconds >= MIN_EXIT_REVIEW_SECONDS:
-        timeout = min(timeout, context.review_seconds)
     try:
         return await asyncio.wait_for(
-            _recover_partial(loop, session_id, turn_index, accum, draft, allow_review=allow_review),
-            timeout=timeout,
+            _recover_partial(loop, session_id, turn_index, accum, draft),
+            timeout=2 * timeout,
         )
     except TimeoutError:
         if context:
@@ -174,9 +227,9 @@ async def recover_partial(loop, session_id, turn_index, accum, draft, *, allow_r
         return None
 
 
-async def _recover_partial(loop, session_id, turn_index, accum, draft, *, allow_review=True):
+async def _recover_partial(loop, session_id, turn_index, accum, draft):
     """One terminal review using existing evidence, or reuse an unchanged approval."""
-    from .delivery import CURRENT_DELIVERY, delivery_version, review_once
+    from .delivery import CURRENT_DELIVERY, delivery_version
     from .judge_evidence import enrich_brief
 
     context = CURRENT_DELIVERY.get()
@@ -186,9 +239,6 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft, *, allow_
     state = ReviewState.restore(
         doc.review_states.get(str(turn_index)), compute_scope_hash(context.credentials.column_scope)
     )
-    if not allow_review and not state.approved_partial:
-        loop._observer("loop_partial_answer_failed", {"reason": "no_approved_partial"})
-        return None
     try:
         results, anchor, trail = await loop._judge_results(
             session_id,
@@ -197,26 +247,43 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft, *, allow_
             exclude_result_ids=frozenset(c["result_id"] for c in state.excluded_components),
         )
         current = [e for e in trail if e.turn_index == turn_index]
+        # All candidates come from successful scoped executions, never judge-authored SQL.
+        for entry in current:
+            if evidence_kind(entry) != "warehouse" or entry.provenance is None:
+                continue
+            sql = accum.result_sql_by_call_id.get(entry.tool_call_id) or entry.args.get("sql")
+            if sql:
+                accum.result_sql_by_call_id[entry.tool_call_id] = sql
+                if not any(t.sql == sql for t in accum.answer_tables):
+                    accum._answer_tables.append(AnswerTable(sql=sql, provenance=entry.provenance))
+
         snapshot = state.approved_partial
-        if snapshot and snapshot.get("evidence_version") != evidence_version(current, turn_index):
-            snapshot = state.approved_partial = {}
+        questions = [
+            m.content for m in doc.messages if m.role == "user" and m.turn_index == turn_index
+        ]
+        if snapshot:
+            receipts = {
+                e.tool_call_id: fingerprint(e.to_doc()) for e in current if evidence_kind(e)
+            }
+            old = snapshot.get("evidence_receipts", {})
+            changed = snapshot.get("evidence_version") != evidence_version(current, turn_index)
+            changed = changed or snapshot.get("request_context", questions) != questions
+            # Mutated or removed support invalidates the approval without an LLM decision.
+            if old and any(receipts.get(ref) != old.get(ref) for ref in snapshot["evidence"]):
+                snapshot = {}
+            elif changed:
+                try:
+                    impact = await loop._answer_judge.partial_relevance(
+                        snapshot, results, questions
+                    )
+                except Exception:
+                    impact = "unclear"
+                loop._observer("loop_partial_relevance", {"reason": impact})
+                if impact != "unrelated":
+                    snapshot = {}
         if not snapshot:
-            # No queries, no model-agent turn, and at most one judge call here.
-            reason = (
-                "no_approved_partial"
-                if not allow_review
-                else "no_evidence"
-                if not any(evidence_kind(e) for e in current)
-                else "insufficient_review_budget"
-                if context.review_seconds < MIN_EXIT_REVIEW_SECONDS
-                else "already_attempted"
-                if context.partial_review_attempted
-                else "review_unavailable"
-                if context.review_unavailable
-                else ""
-            )
-            if reason:
-                loop._observer("loop_partial_answer_failed", {"reason": reason})
+            if context.partial_review_attempted:
+                loop._observer("loop_partial_answer_failed", {"reason": "already_attempted"})
                 return None
             context.partial_review_attempted = True
             brief = loop._judge_brief(
@@ -277,22 +344,50 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft, *, allow_
                 credentials=context.credentials,
                 analysis_state=live_analysis_state(doc, turn_index),
             )
-            context.terminal_review_version = delivery_version(draft, accum)
-            context.terminal_review_status = "exhausted"
-            verdict = await review_once(loop, brief, terminal=True)
-            if verdict.reviewed:
-                if verdict.approved and not state.violation:
-                    context.terminal_review_status = "approved"
-                elif not verdict.approved:
-                    state.reject(verdict, context.terminal_review_version, accum.assumptions or ())
-                    await loop._session_store.write_review_state(
-                        session_id, turn_index, state.to_doc()
+            response = await loop._answer_judge.salvage(brief)
+            outcome = response.pop("outcome")
+            captions = response.pop("captions", [])
+            for caption in captions:
+                ref, text = caption["result_id"], caption["caption"]
+                if ref not in response["table_result_ids"]:
+                    raise ValueError("caption_not_selected")
+                entry = next(e for e in current if e.tool_call_id == ref)
+                clean, count = scrub_answer_prose(text, provenance=entry.provenance)
+                if (
+                    count
+                    or clean != text
+                    or first_match(
+                        text, accum.sql_executed, brief.question, has_alternative_evidence=True
                     )
-            snapshot = capture_partial(verdict, brief, accum, current, turn_index)
+                ):
+                    raise ValueError("invalid_caption")
+                accum._answer_tables = [
+                    replace(t, caption=text) if t.sql == accum.result_sql_by_call_id.get(ref) else t
+                    for t in accum.answer_tables
+                ]
+            if (
+                outcome == "full"
+                and response["unfinished"]
+                or outcome == "none"
+                and any(response[k] for k in ("evidence", "table_result_ids", "capability_refs"))
+            ):
+                loop._observer("loop_partial_answer_failed", {"reason": "invalid_salvage_outcome"})
+                return None
+            loop._observer("loop_salvage_approved", {"status": outcome})
+            snapshot = _validate_response(
+                response,
+                brief,
+                accum,
+                current,
+                turn_index,
+                outcome=outcome,
+                observer=loop._observer,
+            )
         if not snapshot:
-            loop._observer("loop_partial_answer_failed", {"reason": "no_valid_partial"})
-            return None
+            return None  # Validation already emitted the precise reason.
         text, recovered, provenance = restore_partial(snapshot)
+        context.recovery_completion = snapshot.get("completion", "partial")
+        loop._observer("loop_recovery_validated", {"status": "approved"})
         state.approved_partial = snapshot
         # This receipt approves ONLY the exact subset. Archive the rejected full
         # answer's reason in the snapshot, never treat it as approval of that answer.
@@ -311,6 +406,9 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft, *, allow_
             },
         )
         return text, recovered, provenance
-    except Exception:
-        loop._observer("loop_partial_answer_failed", {"reason": "review_unavailable"})
+    except Exception as exc:
+        loop._observer(
+            "loop_partial_answer_failed",
+            {"reason": "exit_deadline" if isinstance(exc, TimeoutError) else "review_unavailable"},
+        )
         return None

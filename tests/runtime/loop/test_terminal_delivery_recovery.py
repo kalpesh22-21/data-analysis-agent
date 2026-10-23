@@ -32,7 +32,7 @@ async def assert_history(store, result):
     return doc
 
 
-async def test_timed_out_proposal_ships_once_as_exhausted_with_table_and_history():
+async def test_timed_out_proposal_and_failed_salvage_ship_limitation_once():
     class TimeoutJudge(Judge):
         timeout_seconds = 0.02
 
@@ -46,9 +46,9 @@ async def test_timed_out_proposal_ships_once_as_exhausted_with_table_and_history
     loop, store, model, _, _ = build([discovery(), query(), final()], judge)
     result = await stream_result(loop)
     assert result["review"]["status"] == "exhausted"
-    assert result["assistant_text"] == "There are 120 employees. The leave ranking is shown."
-    assert len(result["answer_tables"]) == 1
-    assert len(judge.briefs) == 1 and model.calls_made == 3
+    assert "couldn't verify" in result["assistant_text"]
+    assert not result["answer_tables"]
+    assert len(judge.briefs) == 2 and model.calls_made == 3
     doc = await assert_history(store, result)
     assert doc.review_states["0"]["delivery_reason"] == "timeout"
 
@@ -96,7 +96,7 @@ async def test_finish_applies_only_validated_exact_prose_correction(valid):
     loop, store, model, _, _ = build([discovery(), query(), final()], judge)
     change_delivery_before_finish(loop)
     result = await stream_result(loop)
-    assert len(judge.briefs) == 2 and model.calls_made == 3
+    assert len(judge.briefs) == (2 if valid else 3) and model.calls_made == 3
     if valid:
         assert result["assistant_text"] == corrected
         assert len(result["answer_tables"]) == 1
@@ -122,16 +122,28 @@ async def test_timeout_does_not_override_an_outstanding_rejection():
     assert result["review"]["status"] == "rejected"
     assert "The leave ranking is shown" not in result["assistant_text"]
     assert not result["answer_tables"]
-    assert len(judge.briefs) == 2
+    assert len(judge.briefs) == 3
 
 
-async def test_finish_rejects_partial_with_missing_evidence_without_more_review():
+async def test_finish_rejects_invalid_partial_and_attempts_salvage():
     judge = Judge([JudgeVerdict(True, reviewed=True), reject({**PART, "evidence": ["missing"]})])
     loop, store, model, _, events = build([discovery(), query(), final()], judge)
     change_delivery_before_finish(loop)
     result = await stream_result(loop)
     assert result["review"]["status"] == "rejected"
     assert result["assistant_text"] != TEXT
-    assert len(judge.briefs) == 2 and model.calls_made == 3
-    assert ("loop_partial_answer_failed", {"reason": "no_approved_partial"}) in events
+    assert len(judge.briefs) == 3 and model.calls_made == 3
+    assert ("loop_recovery_validation_failed", {"reason": "unknown_evidence_id"}) in events
     await assert_history(store, result)
+
+
+async def test_response_emission_is_recorded_after_persistence():
+    judge = Judge([JudgeVerdict(True, reviewed=True)])
+    loop, _, _, _, events = build([discovery(), query(), final()], judge)
+    frames = [frame async for frame in _stream_turn(
+        lambda: run(loop), ProgressEmitter(),
+        delivery_observer=lambda name, payload: events.append((name, payload)),
+    )]
+    assert sum(frame.startswith("event: result\n") for frame in frames) == 1
+    names = [name for name, _ in events]
+    assert names.index("loop_response_persisted") < names.index("loop_response_emitted")

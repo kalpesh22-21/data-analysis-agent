@@ -2170,6 +2170,11 @@ class AgentLoop:
         # and `answer_tables` keep naming exactly what ran. Prose is the agent's
         # voice; those fields are the audit surface.
         await cancellation_checkpoint("finish")
+        from copy import deepcopy
+        context = CURRENT_DELIVERY.get()
+        recovery_accum = context.recovery_accum if context and context.recovery_accum is not None else deepcopy(accum)
+        recovery_draft = context.recovery_draft if context and context.recovery_accum is not None else assistant_text
+        recovery_attempted = False
         partial_recovered = False
         terminal_failure = False
         if CURRENT_DELIVERY.get():
@@ -2260,9 +2265,10 @@ class AgentLoop:
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance,
             business_values=await self._context_business_values(session_id, turn_index))
         if terminal_failure and not checkpoint:
+            recovery_attempted = True
             from .partial_answer import recover_partial
 
-            recovered = await recover_partial(self, session_id, turn_index, accum, assistant_text)
+            recovered = await recover_partial(self, session_id, turn_index, recovery_accum, recovery_draft)
             if recovered:
                 assistant_text, accum, provenance = recovered
                 partial_recovered = True
@@ -2278,13 +2284,12 @@ class AgentLoop:
         if delivery_context and delivery_context.corrected_answer is not None:
             assistant_text = delivery_context.corrected_answer
             delivery_context.corrected_answer = None
-        if withheld and review.get("status") == "rejected" and not checkpoint and not partial_recovered:
-            # Finish has no agent repair round. Reuse only a validated subset
-            # already supplied by a judge; never start another review here.
+        if (withheld or review.get("status") == "exhausted") and not checkpoint and not recovery_attempted:
+            # No agent repair remains; reuse a valid subset or salvage independently.
             from .partial_answer import recover_partial
 
             recovered = await recover_partial(
-                self, session_id, turn_index, accum, assistant_text, allow_review=False
+                self, session_id, turn_index, recovery_accum, recovery_draft
             )
             if recovered:
                 assistant_text, accum, provenance = recovered
@@ -2297,8 +2302,11 @@ class AgentLoop:
                 review, withheld = {**review, "status": "approved"}, False
                 review.pop("violation", None)
                 review.pop("reason", None)
+        if not partial_recovered and not checkpoint and review.get("status") == "exhausted":
+            withheld = True
+            review = {**review, "reason": "I couldn't verify the answer before review ended. Please try again."}
         if partial_recovered:
-            review = {**review, "completion": "partial"}
+            review = {**review, "completion": context.recovery_completion if context else "partial"}
         # A resilient exit has already applied the ship guard and rendered its
         # rationale. Preserve that safe disposition instead of replacing it with
         # a generic decline merely because another review was unavailable.
@@ -2348,6 +2356,7 @@ class AgentLoop:
                     else None,
                 ),
             )
+            self._observer("loop_response_persisted", {"status": review.get("status", "")})
         # AFTER every fold and `commit_round` of the round — this is called at the
         # exit, never hoisted, so the envelope describes the window as it ends.
         envelope = accum.envelope()
@@ -2456,7 +2465,7 @@ class AgentLoop:
             tool_calls_made=tool_calls_made,
             accum=accum,
             checkpoint=checkpoint,
-            event=("loop_paused_ask_user", {"question": pending_question.get("question", "")}),
+            event=("loop_paused_ask_user", {"question": pending_question.get("question", ""), "options": pending_question.get("options", [])}),
         )
 
     async def _resume_blueprint(
@@ -4557,7 +4566,7 @@ class AgentLoop:
                     tool_calls_made=tool_calls_made,
                     accum=accum,
                     checkpoint=checkpoint,
-                    event=("loop_paused_ask_user", {"question": question}),
+                    event=("loop_paused_ask_user", {"question": question, "options": options}),
                 )
 
             if proposal_args is not None:
@@ -4692,6 +4701,11 @@ class AgentLoop:
                     # Conversational text needs no warehouse receipt. The judge checks
                     # whether an evidence-free answer makes unsupported substantive claims.
                     rule = None
+                editorial_findings = ()
+                if (rule and rule.name in {"verbose_answer", "markdown_table", "sql_in_answer", "schema_in_answer"}
+                    and self._answer_judge is not None and getattr(self._answer_judge, "enabled", True)):
+                    editorial_findings = (rule.name,)
+                    rule = None
                 evidence_error = "\n\n".join(evidence_complaints)
                 feedback = evidence_error
                 kind = "ungrounded_answer"
@@ -4727,6 +4741,10 @@ class AgentLoop:
                         f"You drafted: {echo}\n\nThe turn is NOT over. Use finalizeAnswer.tables with the result IDs for the requested breakdown. Disclose any missing part and include the complete answer in finalizeAnswer.answer.",
                         "answer_shape",
                     )
+                if (kind == "answer_shape" and not rule and feedback and not evidence_error
+                    and self._answer_judge is not None and getattr(self._answer_judge, "enabled", True)):
+                    editorial_findings += ("missing_result_selection",)
+                    feedback = ""
                 rule_feedback = rule is not None and feedback == rule.nudge(final_text)
                 # Preserve the existing gate precedence, but show all evidence/prep
                 # complaints with its nudge so one repair can address them together.
@@ -4791,6 +4809,11 @@ class AgentLoop:
                     enabled = self._answer_judge is not None and getattr(
                         self._answer_judge, "enabled", True
                     )
+                    from copy import deepcopy
+                    delivery_context = CURRENT_DELIVERY.get()
+                    if delivery_context:
+                        delivery_context.recovery_accum = deepcopy(accum)
+                        delivery_context.recovery_draft = final_text
                     verdict = APPROVED
                     remaining = guard.usage().max_wall_clock_seconds - guard.usage().elapsed_seconds
                     if enabled and review_state.calls < 2 and remaining > 0:
@@ -4827,6 +4850,7 @@ class AgentLoop:
                             brief = replace(
                                 brief,
                                 allow_prose_correction=True,
+                                guard_findings=editorial_findings,
                                 allow_partial_answer=True,
                                 previous_rejection=review_state.feedback or review_state.violation,
                                 deliverables=tuple(deliverables),
@@ -4884,9 +4908,11 @@ class AgentLoop:
                     if verdict.reviewed:
                         from .partial_answer import capture_partial
 
-                        review_state.approved_partial = capture_partial(
-                            verdict, brief, accum, in_scope, turn_index
-                        )
+                        snapshot = capture_partial(verdict, brief, accum, in_scope, turn_index, observer=self._observer)
+                        if snapshot:
+                            review_state.approved_partial = snapshot
+                    if editorial_findings and verdict.reviewed and verdict.approved and verdict.corrected_answer is None:
+                        verdict = replace(verdict, corrected_answer=final_text, repair_type="prose")
                     if verdict.corrected_answer is not None:
                         from .prose_correction import validate_correction
 
@@ -4963,7 +4989,8 @@ class AgentLoop:
                             verdict.violation,
                             assumptions=review_state.assumptions_before_refusal,
                         )
-                        if not review_state.repaired and review_state.calls < 2 and remaining > 0:
+                        if (not review_state.repaired and review_state.calls < 2 and remaining > 0
+                            and verdict.repair_type not in {"prose", "presentation"}):
                             review_state.repaired = True
                             feedback = verdict.feedback
                             finalization_nudge = answer_judge_nudge_text(final_text, feedback)
@@ -4981,16 +5008,6 @@ class AgentLoop:
                                 ).lstrip()
                             elif verdict.repair_type == "omit_component":
                                 finalization_nudge += " The omission target was invalid or ambiguous; no component was automatically removed. Correct the answer using accessible evidence."
-                            if verdict.repair_type in {"prose", "presentation"}:
-                                finalization_nudge += " Preserve the existing results. No additional warehouse query is needed."
-                                if accum.capability_cards:
-                                    finalization_nudge += (
-                                        " The selected UI options are already prepared. Repair "
-                                        "finalizeAnswer using the existing capability_refs and "
-                                        "evidence result IDs; do not reload or prepare them again, "
-                                        "or add filters to repair prose. Unresolved selection "
-                                        "does not establish how many employees matched."
-                                    )
                     await self._session_store.write_review_state(
                         session_id, turn_index, review_state.to_doc()
                     )

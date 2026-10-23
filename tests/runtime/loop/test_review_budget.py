@@ -125,7 +125,7 @@ async def test_failed_repair_charges_budget_and_preserves_rejection(monkeypatch)
     assert out.review["status"] == "rejected"
     assert not out.answer_tables
     assert contexts[0].review_seconds == 60.0
-    assert len(contexts) == 1  # Do not retry an unavailable judge on the exit path.
+    assert len(contexts) == 2  # The independent salvage does not consume normal review time.
     assert contexts[0].repair_reserve_seconds == 0.0
     assert contexts[0].terminal_reserve_seconds == 30.0
     assert (await store.get_or_create_session(CREDS.session_id)).review_states["0"]["violation"]
@@ -176,10 +176,10 @@ async def test_terminal_reserve_survives_exhausted_proposal_and_repair(monkeypat
 @pytest.mark.parametrize("total,initial_timeout", [(180.0, 60.0), (90.0, 30.0)])
 @pytest.mark.parametrize("final_result", ["approved", "rejected", "timeout"])
 @pytest.mark.parametrize("changed_delivery", [False, True])
-async def test_final_delivery_reuses_timeout_unless_delivery_changed(
+async def test_timeout_recovery_has_independent_salvage_budget(
     monkeypatch, total, initial_timeout, final_result, changed_delivery
 ):
-    """An unchanged timeout is final; a changed delivery can use the reserve."""
+    """A timeout permits one independent salvage; changed delivery can use normal review first."""
     now = [0.0]
     deadlines = []
     contexts = []
@@ -225,23 +225,16 @@ async def test_final_delivery_reuses_timeout_unless_delivery_changed(
 
         loop._finish = changed_finish
     out = await run(loop)
-    if not changed_delivery:
-        assert deadlines == [initial_timeout]
-        assert len(judge.briefs) == 1
-        assert out.review["status"] == "exhausted"
-        assert "120" in out.assistant_text
-        assert contexts[-1].review_seconds == total - initial_timeout
-        return
-    assert deadlines[:2] == [initial_timeout, 60.0]
-    assert (
-        out.review["status"]
-        == {"approved": "approved", "rejected": "rejected", "timeout": "exhausted"}[final_result]
-    )
-    assert len(judge.briefs) == 2
+    assert deadlines[0] == initial_timeout
+    expected_calls = 2 if not changed_delivery or final_result == "approved" else 3
+    assert len(judge.briefs) == expected_calls
+    expected_status = ("exhausted" if not changed_delivery else
+                       {"approved": "approved", "rejected": "rejected", "timeout": "exhausted"}[final_result])
+    assert out.review["status"] == expected_status
     assert contexts[-1].review_seconds >= 0
-    assert now[0] <= total
-    if final_result == "timeout":
-        assert contexts[-1].review_seconds == max(0, total - initial_timeout - 60)
-    if final_result == "rejected":
+    if not changed_delivery:
+        # Salvage has its own time allowance and does not consume the normal budget.
+        assert contexts[-1].review_seconds == total - initial_timeout
+    if expected_status != "approved":
         assert "120" not in out.assistant_text
         assert not out.answer_tables

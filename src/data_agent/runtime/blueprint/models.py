@@ -256,6 +256,7 @@ class SlotSpec:
     # an absurd `INTERVAL 999999 MONTH` can't be authored or bound).
     min_value: int | None = None
     max_value: int | None = None
+    temporal_type: str | None = None  # date or datetime; no arbitrary SQL types
 
     @classmethod
     def parse(cls, raw: Any) -> SlotSpec:
@@ -305,6 +306,12 @@ class SlotSpec:
         optional_pattern = raw.get("optional_pattern")
         if optional_pattern is not None and not isinstance(optional_pattern, str):
             raise BlueprintParseError(f"slot {name!r} 'optional_pattern' must be a string")
+        temporal_type = raw.get("temporal_type")
+        if temporal_type is not None and (
+            not isinstance(temporal_type, str) or temporal_type not in {"date", "datetime"}
+            or type_ not in {"period_range", "period", "as_of_date", "string"}
+        ):
+            raise BlueprintParseError(f"slot {name!r} has an invalid temporal_type")
         # `min_value`/`max_value` — ints when present (only meaningful for
         # integer slots; carried but unused for nonnumeric types). A bool is an int
         # subclass, so reject it explicitly (a `true` bound is an authoring bug).
@@ -336,6 +343,7 @@ class SlotSpec:
             optional_pattern=optional_pattern,
             min_value=min_value,
             max_value=max_value,
+            temporal_type=temporal_type,
         )
 
 

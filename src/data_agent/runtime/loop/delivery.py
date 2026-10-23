@@ -28,6 +28,9 @@ class DeliveryContext:
     review_failure_reason: str = ""
     resilient_exit: bool = False
     corrected_answer: str | None = None
+    recovery_accum: object = None
+    recovery_draft: str = ""
+    recovery_completion: str = "partial"
 
 
 CURRENT_DELIVERY: ContextVar[DeliveryContext | None] = ContextVar("delivery", default=None)
@@ -384,7 +387,7 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
             if not pending and verdict.reviewed:
                 from .partial_answer import capture_partial
 
-                snapshot = capture_partial(verdict, brief, accum, current_trail, turn_index)
+                snapshot = capture_partial(verdict, brief, accum, current_trail, turn_index, observer=loop._observer)
                 if snapshot:
                     state.approved_partial = snapshot
             if not pending and verdict.corrected_answer is not None:

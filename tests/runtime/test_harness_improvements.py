@@ -95,6 +95,15 @@ class Judge:
         self.briefs.append(brief)
         return self.verdicts.pop(0) if self.verdicts else JudgeVerdict(True, reviewed=True)
 
+    async def salvage(self, brief):
+        verdict = await self.review(brief)
+        if verdict.reviewed and verdict.partial_answer:
+            return {**verdict.partial_answer, "outcome": "partial", "captions": []}
+        raise ValueError("No scripted salvage response")
+
+    async def partial_relevance(self, snapshot, current, questions):
+        return "potentially_relevant"
+
 
 def build(steps, judge=None, extra=None, rows=None, store=None):
     store = store or InMemorySessionStore()
@@ -159,7 +168,7 @@ async def run(loop, question="How many employees by department?"):
 async def test_corrected_answer_gets_final_validation():
     judge = Judge(
         [
-            JudgeVerdict(False, "contradicts_result", "Use 120.", True, repair_type="prose"),
+            JudgeVerdict(False, "contradicts_result", "Use 120.", True, repair_type="analysis"),
             JudgeVerdict(True, reviewed=True),
         ]
     )
@@ -1001,14 +1010,14 @@ async def test_final_judge_receives_the_users_clarification_answer():
 async def test_presentation_repair_keeps_cited_query_in_live_answer_and_history():
     from data_agent.runtime.session_history import project_history
 
-    judge = Judge([JudgeVerdict(False, "unexplained_gap", "Make the prose concise.", True, repair_type="presentation")])
+    judge = Judge([JudgeVerdict(True, reviewed=True, repair_type="prose", corrected_answer="There are 120 employees.")])
     initial = call("finalizeAnswer", "first", answer="There are 120 employees.", tables=[{"result_id": "q"}], capability_refs=[], evidence=["q"])
     loop, store, _, mcp, _ = build([discovery(), query(), batch(initial), batch(finish())], judge)
     outcome = await run(loop, "How many employees?")
     assert outcome.status == "done"
     assert outcome.answer_tables[0]["sql"] == SQL
     assert len([c for c in mcp.calls if c.tool_name == "runQuery"]) == 1
-    assert len(judge.briefs) == 2 and judge.briefs[-1].designated_tables
+    assert len(judge.briefs) == 1 and judge.briefs[-1].designated_tables
     doc = await store.get_or_create_session(CREDS.session_id)
     history = project_history(doc.messages, doc.tool_trail, frozenset(), None)
     assert history["turns"][0]["answer_tables"] == outcome.answer_tables
@@ -1042,5 +1051,5 @@ async def test_data_display_allows_no_verdict_exhaustion_without_claiming_approv
     )
     outcome = await run(loop, "Show the employee profile.")
     assert outcome.status == "done"
-    assert outcome.capability_cards
+    assert bool(outcome.capability_cards) == reviewed
     assert outcome.review["status"] == ("approved" if reviewed else "exhausted")

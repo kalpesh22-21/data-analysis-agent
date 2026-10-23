@@ -36,7 +36,7 @@ _DEICTIC_PERIOD_TOKENS: frozenset[str] = frozenset(
 _RELATIVE_WINDOW_MIN = RELATIVE_WINDOW_FLOOR
 _RELATIVE_WINDOW_MAX = RELATIVE_WINDOW_CEILING
 # A `period_range` bound — an ISO calendar date, optionally with a `T`-time. Bound
-# as a TYPED string literal (F1/D10), never date-arithmeticed here (resolver-pure,
+# as a temporal literal (F1/D10), never date-arithmeticed here (resolver-pure,
 # consistent with `_resolve_period`). `\A…\Z`-anchored (L1) so a trailing newline
 # can never slip past the fence; calendar validity is checked separately (L2).
 _ISO_DATE = re.compile(r"\A\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?\Z")
@@ -154,6 +154,10 @@ def resolve_slot(
         return _resolve_integer(raw, spec)
     if spec.type == "period_range":
         return _resolve_period_range(raw, spec)
+
+    if spec.temporal_type and not _matches_temporal_type(_normalize(raw), spec.temporal_type):
+        return AskUser(slot=spec.name, reason="invalid",
+                       question=f"'{spec.name}' requires an explicit {spec.temporal_type} value.")
 
     if spec.type in ("string", "entity"):
         # A CONTAINER (list/dict/tuple) handed to a scalar slot is not a value —
@@ -346,9 +350,15 @@ def _resolve_integer(raw: Any, spec: SlotSpec) -> SlotResolution:
     return SlotBinding(name=spec.name, value=n, resolved_from="direct")
 
 
+def _matches_temporal_type(value, temporal_type):
+    return (isinstance(value, str) and bool(_ISO_DATE.fullmatch(value))
+            and _is_valid_iso_calendar(value)
+            and ("T" in value) == (temporal_type == "datetime"))
+
+
 def _resolve_period_range(raw: Any, spec: SlotSpec) -> SlotResolution:
     """An explicit `{start, end}` window, resolved to a `PeriodRange`; the executor expands it to
-        `{name}_start`/`{name}_end` TYPED string literals (D10). Pure — NO relative-to-concrete
+        `{name}_start`/`{name}_end` temporal literals (D10). Pure — NO relative-to-concrete
         date arithmetic, since a deictic word asks, consistently with `_resolve_period`.
 
         Accepts a dict with string `start`/`end` keys, or a 2-element `[start, end]` list/tuple.
@@ -388,24 +398,12 @@ def _resolve_period_range(raw: Any, spec: SlotSpec) -> SlotResolution:
                 "(e.g. 2026-01-01), not relative words."
             ),
         )
-    # L2: the regex proves the SHAPE, not calendar validity — "2026-13-99" matches
-    # `\d{4}-\d{2}-\d{2}` but is not a real date. `fromisoformat` parses (and REJECTS)
-    # it; this is VALIDATION, not date arithmetic, so the resolver stays pure (no
-    # relative→concrete math). A ValueError → ask rather than bind an impossible date.
-    if not _is_valid_iso_calendar(start) or not _is_valid_iso_calendar(end):
-        return AskUser(
-            slot=spec.name,
-            reason="invalid",
-            question=f"'{spec.name}' start/end must be real calendar dates (e.g. 2026-01-31).",
-        )
-    # A string compare is a valid ordering ONLY for same-shaped ISO strings; if one
-    # bound carries a `T`-time and the other does not, the compare is unsound → ask.
-    if ("T" in start) != ("T" in end):
-        return AskUser(
-            slot=spec.name,
-            reason="invalid",
-            question=f"'{spec.name}' start and end must be the same date shape (both date, or both datetime).",
-        )
+    # One contract check covers calendar validity and endpoint precision.
+    # Legacy ranges have a fixed date default, never format-based inference.
+    temporal_type = spec.temporal_type or "date"
+    if not all(_matches_temporal_type(v, temporal_type) for v in (start, end)):
+        return AskUser(slot=spec.name, reason="invalid",
+                       question=f"'{spec.name}' requires valid {temporal_type} endpoints.")
     if not (start < end):
         return AskUser(
             slot=spec.name,
@@ -428,12 +426,16 @@ def slot_token_names(spec: SlotSpec) -> set[str]:
 def expand_binding(spec: SlotSpec, value: Any) -> dict[str, Any]:
     """Expand a resolved slot *value* into its `{token}: value` bind map — the
     companion to `slot_token_names`. A `period_range` (value is a `PeriodRange`)
-    expands to both bounds as separate string bindings; every other type binds its
-    single value under `{name}`. The executor calls this so a `PeriodRange` NEVER
-    reaches `bind_template` (which only knows str/number/bool/list literals)."""
-    if spec.type == "period_range" and isinstance(value, PeriodRange):
-        return {f"{spec.name}_start": value.start, f"{spec.name}_end": value.end}
-    return {spec.name: value}
+    expands to date/datetime bindings; every other type binds its single value
+    under `{name}`. Preserve the validated temporal type at the SQL boundary."""
+    is_range = spec.type == "period_range" and isinstance(value, PeriodRange)
+    bindings = ({f"{spec.name}_start": value.start, f"{spec.name}_end": value.end}
+                if is_range else {spec.name: value})
+    if is_range or spec.temporal_type:
+        temporal = _dt.datetime.fromisoformat if spec.temporal_type == "datetime" else _dt.date.fromisoformat
+        return {name: temporal(bound) for name, bound in bindings.items()}
+    return bindings
+
 
 
 __all__ = [

@@ -192,3 +192,25 @@ def test_native_messages_keep_new_tool_results_and_drop_repeated_history():
     assert "Alice" not in result["llm.input_messages.1.message.content"]
     assert result["phoenix.history.omitted_messages"] == 1
     assert not any("Detailed rules" in str(v) for v in result.values())
+
+
+@pytest.mark.parametrize("redact", [True, False])
+def test_ask_user_pause_exports_question_and_options(redact):
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    sink = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(PhoenixPayloadExporter(sink, redact=redact)))
+    tracer = tracing.get_tracer(provider)
+    tracing.guardrail_observer(tracer)("loop_paused_ask_user", {
+        "question": "Use expenses above 500?",
+        "options": ["Above 500", "All expenses"],
+    })
+    span = next(s for s in sink.get_finished_spans() if s.name == "tool.askUser")
+    payload = json.loads(span.attributes["input.value"])
+    assert payload["question"] == ("Use expenses above [number]?" if redact else "Use expenses above 500?")
+    assert payload["options"] == (["Above [number]", "All expenses"] if redact else ["Above 500", "All expenses"])
+    assert span.attributes["tool.status"] == "paused_ask_user"
+    assert "output.value" not in span.attributes
+    provider.shutdown()

@@ -190,7 +190,7 @@ async def test_dag_relative_window_binds_number_interval() -> None:
 # ===========================================================================
 
 
-async def test_single_node_period_range_binds_two_string_literals() -> None:
+async def test_single_node_period_range_binds_two_date_literals() -> None:
     detail = _single_detail(sql_template=_RANGE_SQL, slots=[_RANGE_SLOT])
     mcp = FakeMCPClient(scripted={"runQuery": [_rq(["month", "hires"], [["2026-01-01", 3]])]})
     outcome = await _executor(mcp, detail).execute(
@@ -200,14 +200,17 @@ async def test_single_node_period_range_binds_two_string_literals() -> None:
     )
     assert isinstance(outcome, ExecCompleted), outcome
     node_sql = mcp.calls[0].args["sql"]
-    # Both bounds bind as quoted STRING literals; the single token expanded to two.
-    assert "'2026-01-01'" in node_sql
-    assert "'2026-03-31'" in node_sql
+    assert "CAST('2026-01-01' AS DATE)" in node_sql
+    assert "CAST('2026-03-31' AS DATE)" in node_sql
     assert "{hire_window_start}" not in node_sql
     assert "{hire_window_end}" not in node_sql
+    import json
+    receipt = json.loads(json.dumps(outcome.result_full))
+    assert receipt["bound_slots"]["hire_window_start"] == "2026-01-01"
+    assert "hire_window" not in receipt["omitted_slots"]
 
 
-async def test_dag_period_range_binds_two_string_literals() -> None:
+async def test_dag_period_range_binds_two_date_literals() -> None:
     detail = _dag_detail(node_sql=_RANGE_SQL, slots=[_RANGE_SLOT])
     mcp = FakeMCPClient(scripted={"runQuery": [_rq(["month", "hires"], [["2026-01-01", 3]])]})
     outcome = await _executor(mcp, detail).execute(

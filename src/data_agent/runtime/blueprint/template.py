@@ -10,6 +10,7 @@ template is parsed under the ClickHouse dialect (D62), and every placeholder nod
 with a typed literal built from the resolved binding:
 
   - str            -> `exp.Literal.string(...)`   (ClickHouse-escaped: `'` -> `''`)
+  - date/datetime  -> explicit Date/DateTime64 cast of an escaped ISO literal
   - bool           -> `exp.Boolean(...)`
   - int/float      -> `exp.Literal.number(...)`
   - list/tuple     -> `exp.Tuple(...)` of per-element literals  (for `IN {codes}`)
@@ -22,6 +23,7 @@ the executor never emits half-bound SQL.
 from __future__ import annotations
 
 import math
+import datetime as dt
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -193,6 +195,14 @@ def _to_literal(name: str, value: Any) -> exp.Expression:
     node, so `.sql()` renders it ClickHouse-escaped, never concatenated (D10).
     """
     # `bool` before `int` (bool is an int subclass) so True/False bind as booleans.
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is not None:
+            raise TemplateBindError(f"slot {name!r} requires an explicit timezone contract")
+        return exp.Cast(this=exp.Literal.string(value.isoformat(sep=" ")),
+                        to=exp.DataType.build("DateTime64(6)", dialect="clickhouse"))
+    if isinstance(value, dt.date):
+        return exp.Cast(this=exp.Literal.string(value.isoformat()),
+                        to=exp.DataType.build("Date", dialect="clickhouse"))
     if isinstance(value, bool):
         return exp.Boolean(this=value)
     if isinstance(value, float) and not math.isfinite(value):
@@ -547,7 +557,19 @@ def bind_template(
                 # Defensive: a placeholder the substitution produced but with no
                 # binding (should be impossible given the checks above).
                 raise TemplateBindError(f"unbound placeholder {name!r} in template")
-            return _to_literal(name, bindings[name])
+            value = bindings[name]
+            literal = _to_literal(name, value)
+            parent = node.parent
+            if isinstance(value, dt.date) and (
+                (isinstance(parent, exp.Anonymous)
+                 and parent.name.lower() in {"todate", "todate32", "todatetime", "todatetime64"})
+                or (isinstance(parent, exp.Cast)
+                    and parent.args["to"].this.value in {"DATE", "DATE32", "DATETIME", "DATETIME64", "TIMESTAMP"})
+            ):
+                # An authored temporal conversion already supplies the type.
+                # Preserve it, including its precision/timezone arguments.
+                return literal.this
+            return literal
         return node
 
     bound = tree.transform(_replace)

@@ -161,17 +161,17 @@ async def test_explicit_rejection_cannot_be_bypassed_by_redundant_citations(prio
     assert not out.answer_tables
     assert out.assistant_text != DRAFT
     assert out.review["status"] == "rejected"
-    assert len(judge.briefs) == 3  # one bounded partial-answer review
+    assert len(judge.briefs) == 2  # one bounded partial-answer review
     assert judge.briefs[-1].allow_partial_answer
     assert all(b.draft == DRAFT for b in judge.briefs if not b.terminal_partial_review)
 
 
-async def test_unavailable_review_can_fail_open_without_fabricating_approval():
+async def test_unavailable_review_and_salvage_withhold_unapproved_components():
     judge = Judge([JudgeVerdict(True)] * 4)
     loop, _, _, _, _ = setup(judge)
     out = await run(loop)
-    assert out.assistant_text == DRAFT
-    assert out.answer_tables
+    assert "couldn't verify" in out.assistant_text
+    assert not out.answer_tables
     assert out.review["status"] != "approved"
 
 
@@ -324,9 +324,9 @@ async def test_empty_support_after_dropping_control_receipts_still_reaches_judge
     )
     out = await run(loop)
     assert out.review["status"] == "rejected"
-    assert len(judge.briefs) == 2
+    assert len(judge.briefs) == 3
     assert all(b.referenced_result_ids == () for b in judge.briefs)
-    assert all(b.deliverables[0]["evidence"] == [] for b in judge.briefs)
+    assert all(b.deliverables[0]["evidence"] == [] for b in judge.briefs if not b.terminal_partial_review)
 
 
 async def test_completed_state_update_ignores_extras_and_preserves_bound_work():

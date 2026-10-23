@@ -21,7 +21,8 @@ ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
         "Offer no more than five choices. Put every choice in `options`; never embed a "
         "choice list in `question`. Consolidate choices when more than five exist. Never "
         "offer a bare code or ID: pair every code with its human-readable label, such as "
-        "employee name plus employee code or department name plus department code."
+        "employee name plus employee code or department name plus department code. "
+        "Offer only plausible matches supported by evidence; omit options when none match."
     ),
     "parameters": {
         "type": "object",

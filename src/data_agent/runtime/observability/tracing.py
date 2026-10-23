@@ -415,10 +415,10 @@ def agent_span(
 
 
 def record_turn_output(current_span: Span, outcome: Any) -> None:
-    current_span.set_attribute(
-        "output.value", outcome.assistant_text or outcome.pending_question or ""
-    )
-    current_span.set_attribute("output.mime_type", "text/plain")
+    output = outcome.assistant_text or outcome.pending_question or ""
+    structured = isinstance(output, dict)
+    current_span.set_attribute("output.value", json.dumps(output) if structured else output)
+    current_span.set_attribute("output.mime_type", "application/json" if structured else "text/plain")
     current_span.set_attribute("agent.status", outcome.status)
 
 
@@ -790,6 +790,15 @@ def guardrail_observer(tracer: Tracer) -> Callable[[str, dict[str, Any]], None]:
     def _observe(event: str, payload: dict[str, Any]) -> None:
         if not event.startswith("loop_"):
             return
+        if event == "loop_paused_ask_user":
+            # askUser bypasses the dispatcher; record the delivered clarification.
+            with tool_span(
+                tracer, tool_name="askUser",
+                args={"question": payload.get("question", ""),
+                      "options": payload.get("options", [])},
+                status="paused_ask_user", error_code=None,
+            ):
+                pass
         attributes = {
             key: payload[key]
             for key in _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST

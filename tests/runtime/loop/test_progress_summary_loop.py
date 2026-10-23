@@ -337,7 +337,7 @@ async def test_finalization_summary_and_progress_follow_review(review):
                 "contradicts_result",
                 "Correct the explanation.",
                 reviewed=True,
-                repair_type="prose",
+                repair_type="analysis",
             ),
             JudgeVerdict(True, reviewed=True),
         ],

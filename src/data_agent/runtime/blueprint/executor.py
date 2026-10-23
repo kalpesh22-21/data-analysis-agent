@@ -926,10 +926,13 @@ class BlueprintExecutor:
             # a concrete pageable query WITHOUT re-running the blueprint (see
             # `composite/answer_with_table.py`).
             "terminal_sql": terminal_sql,
-            "bound_slots": dict(bound_slots or {}),
+            "bound_slots": {
+                key: value.isoformat() if isinstance(value, (date, datetime)) else value
+                for key, value in (bound_slots or {}).items()
+            },
             "uses_rules": list(blueprint.uses_rules),
             "resolved_rule_bindings": dict(resolved_rule_bindings or {}),
-            "omitted_slots": [s.name for s in blueprint.slots if s.name not in (bound_slots or {})],
+            "omitted_slots": [s.name for s in blueprint.slots if not slot_token_names(s) <= (bound_slots or {}).keys()],
             "verify": _verify_block(verify_out, row_count),
         }
         _stamp_window_anchor(

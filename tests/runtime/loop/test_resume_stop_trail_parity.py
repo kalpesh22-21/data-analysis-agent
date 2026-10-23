@@ -278,7 +278,7 @@ async def test_the_stop_exit_still_emits_nothing_and_makes_no_extra_round_trip()
 
     assert stopped.tool_calls_made == 0
     assert stopped.assistant_text == ("Stopping here — here is what I found before the budget cap.")
-    assert [name for name, _p in events[before:]] == []
+    assert [name for name, _p in events[before:]] == ["loop_response_persisted"]
 
 
 async def test_stop_persists_the_reviewed_terminal_message() -> None:

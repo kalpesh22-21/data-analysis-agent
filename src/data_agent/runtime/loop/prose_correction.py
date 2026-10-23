@@ -1,8 +1,8 @@
 """Structural guards for exact, judge-approved prose replacements.
 
 The judge assesses meaning and evidence; these checks prevent a correction from
-changing numeric tokens or bypassing the normal prose gates. Never rewrite the
-replacement after approval: reject it for agent repair if it needs transformation.
+introducing numeric tokens or bypassing the normal prose gates. Never rewrite the
+replacement after approval: invalid corrections go to terminal salvage.
 """
 
 import re
@@ -44,13 +44,17 @@ def validate_correction(
         or any(ord(c) < 32 and c not in "\n\t\r" for c in corrected)
     ):
         return feedback
-    # Keep dates, IDs, signed quantities, percentages and their multiplicities intact.
+    # Keep every distinct date, ID, signed quantity and percentage; repetitions may shrink.
     numeric = r"[-+]?\d+(?:[.,:/-]\d+)*(?:%)?"
-    if Counter(re.findall(numeric, original)) != Counter(re.findall(numeric, corrected)):
+    if Counter(re.findall(numeric, corrected)) - Counter(re.findall(numeric, original)) or set(
+        re.findall(numeric, corrected)
+    ) != set(re.findall(numeric, original)):
         return feedback
     if clean_answer_text(corrected) != corrected:
         return feedback
-    scrubbed, redactions = scrub_answer_prose(corrected, provenance=provenance, business_values=business_values)
+    scrubbed, redactions = scrub_answer_prose(
+        corrected, provenance=provenance, business_values=business_values
+    )
     if redactions or scrubbed != corrected:
         return feedback
     rule = first_match(
@@ -59,9 +63,11 @@ def validate_correction(
         question,
         has_alternative_evidence=has_evidence,
         declined_clarification=declined_clarification,
-        business_values=business_values, has_tables=has_tables,
+        business_values=business_values,
+        has_tables=has_tables,
     )
     # Same exception as the proposal path: the judge assesses evidence-free conversation.
-    if rule and rule.name != "no_evidence":
+    # Verbosity is a judge signal, never a reason to discard an approved answer.
+    if rule and rule.name not in {"no_evidence", "verbose_answer"}:
         return feedback
     return ""

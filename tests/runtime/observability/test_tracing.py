@@ -141,8 +141,8 @@ def _observed_attributes(event: str, payload: dict) -> dict:
     tracer = tracing.get_tracer(provider)
     tracing.guardrail_observer(tracer)(event, payload)
     spans = exporter.get_finished_spans()
-    assert [s.name for s in spans] == [event]
-    return dict(spans[0].attributes)
+    assert [s.name for s in spans] == (["tool.askUser", event] if event == "loop_paused_ask_user" else [event])
+    return dict(spans[-1].attributes)
 
 
 def test_analysis_state_events_reach_phoenix_with_their_attributes() -> None:
@@ -304,3 +304,16 @@ def test_partial_recovery_span_exports_shape_without_payload():
     for name, value in {"evidence_count": 2, "text_length": 100, "table_count": 1, "card_count": 0}.items():
         assert attributes[name] == value
     assert "PRIVATE" not in str(attributes)
+
+
+def test_clarification_is_serializable_turn_output():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import json
+    from data_agent.runtime.observability.tracing import record_turn_output
+    span = Mock()
+    question = {"question": "Which period?", "options": ["This year", "Last year"]}
+    record_turn_output(span, SimpleNamespace(assistant_text=None, pending_question=question, status="paused_ask_user"))
+    attrs = dict(call.args for call in span.set_attribute.call_args_list)
+    assert json.loads(attrs["output.value"]) == question
+    assert attrs["output.mime_type"] == "application/json"

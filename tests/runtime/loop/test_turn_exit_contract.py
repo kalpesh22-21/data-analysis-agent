@@ -160,7 +160,7 @@ async def test_the_resume_stop_exit_returns_done_and_emits_no_loop_turn_done() -
     assert "loop_turn_done" not in _names(events)
     # And nothing else sneaks in either — the only events this resume may emit are
     # the force-block ones, which fire only when an intent is pending (none here).
-    assert _names(events[before:]) == []
+    assert _names(events[before:]) == ["loop_response_persisted"]
 
 
 async def test_the_two_in_body_done_exits_do_emit_loop_turn_done() -> None:
@@ -433,5 +433,5 @@ async def test_a_done_exit_persists_its_answer_before_it_announces_it() -> None:
     done = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert done.status == "done"
-    tail = [name for name, _p in events][-2:]
-    assert tail == ["store:append_message", "loop_turn_done"]
+    tail = [name for name, _p in events][-3:]
+    assert tail == ["store:append_message", "loop_response_persisted", "loop_turn_done"]

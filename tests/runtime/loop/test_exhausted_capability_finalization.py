@@ -17,6 +17,16 @@ from tests.runtime.test_harness_improvements import (
     run,
 )
 
+class ApprovingSalvage(Judge):
+    async def salvage(self, brief):
+        self.briefs.append(brief)
+        return {"outcome": "partial", "answer": "\n".join(f"{c['description']}: The prepared view is included." for c in brief.capability_presented), "captions": [],
+                "evidence": [c["result_id"] for c in brief.selected_components],
+                "table_result_ids": [c["result_id"] for c in brief.selected_components if c["kind"] == "table"],
+                "capability_refs": [c["capability_ref"] for c in brief.selected_components if c["kind"] == "capability"],
+                "unfinished": ["Other requested parts could not be verified."]}
+
+
 NAMES = ("employees", "headcount", "compensation")
 LABELS = ("Employees in position", "Department headcount", "Compensation history")
 
@@ -102,12 +112,13 @@ def setup(
 
 @pytest.mark.parametrize("table", [False, True])
 async def test_p08_composed_repair_and_reviewed_partial_delivery(table):
-    judge = Judge()
+    judge = ApprovingSalvage()
     loop, store, model, events = setup(judge, table=table)
     out = await run(loop, "Show compensation history and department headcount.")
     assert {c["name"] for c in out.capability_cards or []} == set(NAMES)
     assert bool(out.answer_tables) == table
-    assert out.review == {"status": "approved", "attempts": 1, "site": "exit_capability"}
+    assert out.review["status"] == "approved"
+    assert out.review["completion"] == "partial"
     assert all(f"{label}: The prepared view is included." in out.assistant_text for label in LABELS)
     assert "could not be verified" in out.assistant_text
     repair = [
@@ -133,18 +144,18 @@ async def test_p08_composed_repair_and_reviewed_partial_delivery(table):
     assert brief.evidence_package["assignment_mode"] == "single_request_without_ledger"
     doc = await store.get_or_create_session(CREDS.session_id)
     assert doc.messages[-1].content == out.assistant_text
-    assert any(e == "loop_delivery_review" and a["site"] == "exit_capability" for e, a in events)
+    assert any(e == "loop_recovery_validated" and a["status"] == "approved" for e, a in events)
 
 
 async def test_missing_preparation_does_not_get_promoted_on_exhaustion():
-    loop, _, _, _ = setup(Judge(), leave_missing=True)
+    loop, _, _, _ = setup(ApprovingSalvage(), leave_missing=True)
     out = await run(loop)
     assert {c["name"] for c in out.capability_cards} == set(NAMES[:2])
     assert "Compensation history: The prepared view is included." not in out.assistant_text
 
 
 async def test_unselected_preparation_does_not_get_promoted_on_exhaustion():
-    loop, _, _, _ = setup(Judge(), refs=NAMES[:2])
+    loop, _, _, _ = setup(ApprovingSalvage(), refs=NAMES[:2])
     out = await run(loop)
     assert {c["name"] for c in out.capability_cards} == set(NAMES[:2])
 
@@ -157,15 +168,15 @@ async def test_explicit_rejection_remains_binding(prior_rejection):
     loop, _, _, _ = setup(judge, prior_rejection=prior_rejection)
     out = await run(loop)
     assert not out.capability_cards and not out.answer_tables
-    assert out.review["status"] == "rejected"
+    assert out.review["status"] == ("rejected" if prior_rejection else "exhausted")
     assert len(judge.briefs) == 1 + int(prior_rejection)
 
 
-async def test_no_verdict_exhaustion_can_deliver_retained_components():
+async def test_failed_salvage_withholds_unapproved_components():
     judge = Judge([APPROVED, APPROVED])
     loop, _, _, _ = setup(judge)
     out = await run(loop)
-    assert len(out.capability_cards) == 3
+    assert not out.capability_cards
     assert out.review["status"] == "exhausted"
 
 

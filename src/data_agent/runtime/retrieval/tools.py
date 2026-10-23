@@ -227,7 +227,7 @@ def _enrich_slot(raw: Any) -> dict[str, Any]:
         "requirement": "required" if required else "optional",
         "note": note,
     }
-    for key in ("binds_to", "enum_values", "min_value", "max_value"):
+    for key in ("binds_to", "enum_values", "min_value", "max_value", "temporal_type"):
         if slot.get(key) is not None:
             enriched[key] = slot[key]
     return enriched

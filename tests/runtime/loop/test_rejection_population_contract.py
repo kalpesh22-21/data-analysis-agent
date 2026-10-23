@@ -48,7 +48,7 @@ async def test_exhausted_population_rejection_has_envelope_and_specific_decline(
     assert result.review["violation"] == "unrequested_employee_status_filter"
     assert result.assistant_text == ship_decline_text("unrequested_employee_status_filter")
     assert "only active and on-leave employees' records" in result.assistant_text
-    assert len(judge.briefs) == 2
+    assert len(judge.briefs) == 3
     assert model.calls_made == 4  # The first refusal still grants its existing repair.
 
 

@@ -131,3 +131,32 @@ async def test_transformed_key_collisions_still_reject():
     dispatcher.dispatch.return_value = SimpleNamespace(status="ok", result_full={"rows": [[2, 1]]})
     sql = "SELECT sum(e.salary) FROM hr.employee e JOIN hr.department d ON lower(e.department_code)=lower(d.department_code)"
     assert "duplicate" in await validate_join_cardinality(sql, dispatcher, object())
+
+
+@pytest.mark.parametrize("aggregate", ["sumIf", "SUMIf", "SUMIF", "avgIf", "AVGIf"])
+async def test_payroll_measure_checks_employee_lookup_not_payroll_grain(aggregate):
+    sql = (
+        f"SELECT p.employee_code, any(e.employee_name), {aggregate}(p.amount, p.register_type='EARN') "
+        "FROM hr.payroll p JOIN hr.employee e ON e.employee_code=p.employee_code "
+        "GROUP BY p.employee_code"
+    )
+    (probe,) = cardinality_probes(sql)
+    assert "FROM hr.employee AS e" in probe
+    assert "uniqExact((e.employee_code))" in probe
+    dispatcher = AsyncMock()
+    dispatcher.dispatch.return_value = SimpleNamespace(
+        status="ok", result_full={"rows": [[45789, 45789]]}
+    )
+    assert await validate_join_cardinality(sql, dispatcher, object()) is None
+    dispatcher.dispatch.return_value = SimpleNamespace(
+        status="ok", result_full={"rows": [[45790, 45789]]}
+    )
+    assert "duplicate" in await validate_join_cardinality(sql, dispatcher, object())
+
+
+def test_employee_measure_still_checks_payroll_multiplicity():
+    (probe,) = cardinality_probes(
+        "SELECT sum(e.salary), any(p.register_type) FROM hr.payroll p "
+        "JOIN hr.employee e ON e.employee_code=p.employee_code"
+    )
+    assert "FROM hr.payroll AS p" in probe

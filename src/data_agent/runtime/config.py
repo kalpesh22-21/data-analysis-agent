@@ -514,10 +514,11 @@ class RuntimeSettings(BaseSettings):
         gt=0,
         allow_inf_nan=False,
         description=(
-            "Total judge-call wall time per run/resume request. Unset uses three times "
-            "the per-call timeout. Repair and terminal recovery each reserve one per-call "
+            "Normal judge-call wall time per run/resume request. Unset uses three times "
+            "the per-call timeout. Repair and final delivery each reserve one per-call "
             "timeout, capped at one third of the total. Final delivery can use all remaining time. "
-            "Provider queue time counts; agent generation has a separate execution budget."
+            "Provider queue time counts; agent generation has a separate execution budget. "
+            "Terminal salvage and relevance checks each have an independent per-call timeout."
         ),
     )
     answer_judge_min_headroom_seconds: float = Field(

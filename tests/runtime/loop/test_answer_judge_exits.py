@@ -242,7 +242,7 @@ async def test_a_disabled_judge_does_no_store_io_at_a_terminal_exit() -> None:
     assert reads == [], "a disabled judge must not read a single full result"
 
 
-async def test_a_brief_that_cannot_be_built_approves_instead_of_aborting_the_turn() -> None:
+async def test_unavailable_brief_returns_limitation_without_aborting() -> None:
     """FAIL-OPEN AT THE CALL SITE, not only inside `review`. `_judge_results` reads the
     session document, and a transient store error there would otherwise propagate out of
     `_run_loop_body` and abort a turn whose answer was already in hand."""
@@ -288,7 +288,7 @@ async def test_a_brief_that_cannot_be_built_approves_instead_of_aborting_the_tur
     )
     assert original is not None
     assert outcome.status == "done", "the turn must not abort"
-    assert outcome.assistant_text == "I don't have any information to answer your question."
+    assert "couldn't verify" in outcome.assistant_text
     assert judge.calls_made == 0
     assert ("loop_answer_judge_failed", {"reason": "brief_failed"}) in events
 
@@ -390,9 +390,8 @@ def _store_of(loop: AgentLoop) -> Any:
     return loop._session_store  # noqa: SLF001
 
 
-async def test_a_cheaper_rule_wins_the_round_and_the_judge_is_not_paid_for() -> None:
-    """`not refused_finalization`: the judge is the only check here that costs a model
-    call, so a pasted markdown table must cost ZERO judge tokens."""
+async def test_editorial_rule_is_a_judge_signal_not_an_agent_retry() -> None:
+    """Editorial failures reach the judge without spending an agent repair allowance."""
     judge = _ScriptedJudge()
     loop, store, events, _model = _build(
         [
@@ -402,9 +401,9 @@ async def test_a_cheaper_rule_wins_the_round_and_the_judge_is_not_paid_for() -> 
         judge,
     )
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="by department?")
-    assert _events(events, ANSWER_RULE_REFUSED_EVENT) == [{"rule": "markdown_table"}]
-    assert judge.calls_made == 1, "the SECOND, clean finish is judged; the refused one is not"
-    assert store.claims == ["answer_shape"]
+    assert _events(events, ANSWER_RULE_REFUSED_EVENT) == []
+    assert judge.calls_made == 1, "the original draft reaches the judge"
+    assert store.claims == []
 
 
 async def test_a_silent_finish_never_reaches_the_judge() -> None:
@@ -839,7 +838,7 @@ async def test_the_two_exits_share_one_allowance() -> None:
     )
     assert outcome.status == "done"
     assert store.claims.count("answer_judge") == 0
-    assert judge.calls_made == 3  # two proposals, one terminal partial review
+    assert judge.calls_made == 2  # two normal proposals; this fake has no salvage transport
     assert [p["site"] for p in _events(events, ANSWER_JUDGE_REFUSED_EVENT)] == [
         "exit_prose",
         "exit_table",

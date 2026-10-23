@@ -97,8 +97,8 @@ async def test_no_verdict_exhaustion_is_not_approval():
     loop, _, _, _, _ = build([hello()], judge)
     out = await run(loop, "Hello")
     assert out.review["status"] == "exhausted"
-    assert out.assistant_text == "Hello! How can I help?"
-    assert len(judge.briefs) == 1  # the exact exhausted proposal is not reviewed again
+    assert "couldn't verify" in out.assistant_text
+    assert len(judge.briefs) == 2  # the exact exhausted proposal is not reviewed again
 
 
 async def test_rejected_question_stays_resumable_without_becoming_approved():

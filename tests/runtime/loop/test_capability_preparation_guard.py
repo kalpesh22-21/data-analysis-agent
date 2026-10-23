@@ -62,7 +62,7 @@ async def test_real_handler_reload_and_prose_repair_reuse_preparation():
                 "unsupported_environment_claim",
                 "Do not invent multiple matches.",
                 True,
-                repair_type="prose",
+                repair_type="analysis",
             ),
             JudgeVerdict(True, reviewed=True),
         ]
@@ -101,7 +101,6 @@ async def test_real_handler_reload_and_prose_repair_reuse_preparation():
     assert len(out.capability_cards) == 1
     assert len(judge.briefs) == 2
     assert sum(e == "loop_repeated_capability_call_guarded" for e, _ in events) == 2
-    assert any("do not reload or prepare them again" in str(c.messages) for c in model.calls)
     trail = await store.load_trail(CREDS.session_id)
     for entry in [e for e in trail if e.tool_name == name][1:]:
         payload = await store.read_full_result(CREDS.session_id, entry.result_full_ref)

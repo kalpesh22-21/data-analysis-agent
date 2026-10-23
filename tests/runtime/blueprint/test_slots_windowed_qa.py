@@ -157,7 +157,7 @@ def test_period_range_valid_list_binds_periodrange() -> None:
 def test_period_range_valid_datetime_shape_binds() -> None:
     out = resolve_slot(
         {"start": "2026-01-01T00:00:00", "end": "2026-03-31T23:59:59"},
-        _spec("period_range"),
+        _spec("period_range", temporal_type="datetime"),
     )
     assert isinstance(out, SlotBinding)
     assert out.value.start == "2026-01-01T00:00:00"
@@ -258,11 +258,12 @@ def test_expand_binding_string_scalar() -> None:
 
 
 def test_expand_binding_period_range_expands_both_bounds() -> None:
+    from datetime import date
     spec = _spec("period_range", name="hw")
     pr = PeriodRange("2026-01-01", "2026-03-31")
     assert expand_binding(spec, pr) == {
-        "hw_start": "2026-01-01",
-        "hw_end": "2026-03-31",
+        "hw_start": date(2026, 1, 1),
+        "hw_end": date(2026, 3, 31),
     }
 
 

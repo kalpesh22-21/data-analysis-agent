@@ -149,11 +149,8 @@ async def test_tool_span_emitted_for_denied_and_error_dispatches_too() -> None:
     assert "connection reset by peer" not in blob
 
 
-async def test_ask_user_question_never_appears_in_any_span_attribute() -> None:
-    """(c) the askUser question text never reaches any span attribute — the
-    loop's own GUARDRAIL-observer wiring (`tracing.guardrail_observer`, the
-    exact function `app.py` wires in) must strip it, not merely the tool
-    spans (askUser never reaches ToolDispatcher at all)."""
+async def test_ask_user_question_is_only_in_tool_payload_not_guardrail_attributes() -> None:
+    """askUser has a tool payload; guardrail events retain shape-only metadata."""
     tracer, exporter = _tracer_with_memory_exporter()
     guardrail_observer = tracing.guardrail_observer(tracer)
 
@@ -188,11 +185,14 @@ async def test_ask_user_question_never_appears_in_any_span_attribute() -> None:
         session_id=SESSION_ID, credentials=_credentials(), user_message="Show me payroll."
     )
     assert outcome.status == "paused_ask_user"
-    assert outcome.pending_question["question"] == PII_QUESTION  # UI DOES get it (not telemetry)
+    assert outcome.pending_question["question"] == PII_QUESTION  # UI and the configured tool trace carry the question
 
     spans = exporter.get_finished_spans()
     assert len(spans) >= 1  # at least the loop_paused_ask_user GUARDRAIL span fired
     for finished_span in spans:
+        if finished_span.name == "tool.askUser":
+            assert finished_span.attributes["tool.args.question"] == PII_QUESTION
+            continue
         for value in finished_span.attributes.values():
             assert PII_NAME not in str(value)
             assert PII_SALARY not in str(value)
@@ -379,6 +379,9 @@ async def test_explicit_binding_emits_completion_without_auto_binding() -> None:
     # D25, on the same pass: `description` is model-authored from the user's
     # question and reaches no span attribute on any of these events.
     for finished_span in spans:
+        if finished_span.name == "tool.askUser":
+            assert finished_span.attributes["tool.args.question"] == PII_QUESTION
+            continue
         for value in finished_span.attributes.values():
             assert secret not in str(value)
 
@@ -470,6 +473,9 @@ async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> 
     # D25: the gate reads row counts and emits a count. No SQL, no cell value, no
     # question text reaches any span this turn.
     for finished_span in spans:
+        if finished_span.name == "tool.askUser":
+            assert finished_span.attributes["tool.args.question"] == PII_QUESTION
+            continue
         for value in finished_span.attributes.values():
             assert "headcount by department" not in str(value)
 
@@ -536,6 +542,9 @@ async def test_the_empty_answer_events_survive_the_real_guardrail_observer() -> 
     # D25: a provider status word and nothing else. The user's question never
     # reaches a span on this turn.
     for finished_span in spans:
+        if finished_span.name == "tool.askUser":
+            assert finished_span.attributes["tool.args.question"] == PII_QUESTION
+            continue
         for value in finished_span.attributes.values():
             assert "headcount by department" not in str(value)
 
@@ -595,6 +604,9 @@ async def test_the_answer_rule_events_survive_the_real_guardrail_observer() -> N
     # D25: a runtime-authored rule slug and nothing else. Neither the user's question
     # nor the refused prose reaches a span.
     for finished_span in spans:
+        if finished_span.name == "tool.askUser":
+            assert finished_span.attributes["tool.args.question"] == PII_QUESTION
+            continue
         for value in finished_span.attributes.values():
             assert "headcount by department" not in str(value)
             assert "9,184" not in str(value)
@@ -650,6 +662,9 @@ async def test_the_answer_prose_scrub_event_survives_the_observer_without_its_to
     assert attributes["exit"] == "answer_with_text"
     # The point: what the answer withheld, the telemetry withholds too.
     for finished_span in spans:
+        if finished_span.name == "tool.askUser":
+            assert finished_span.attributes["tool.args.question"] == PII_QUESTION
+            continue
         for value in finished_span.attributes.values():
             assert "employee_master" not in str(value)
             assert _E not in str(value)

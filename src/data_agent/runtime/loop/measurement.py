@@ -290,6 +290,12 @@ def cardinality_probes(sql: str, *, schema=None) -> list[str]:
     All generated reads still pass through the scoped dispatcher.
     """
     tree = sqlglot.parse_one(sql, dialect="clickhouse")
+    # sqlglot recognizes sumIf/avgIf only with canonical casing. Routed SQL
+    # can contain SUMIf, so retain its measure in the cardinality analysis.
+    for function in list(tree.find_all(exp.Anonymous)):
+        canonical = {"sumif": "sumIf", "avgif": "avgIf"}.get(function.name.lower())
+        if canonical and len(function.expressions) == 2:
+            function.replace(exp.CombinedAggFunc(this=canonical, expressions=function.expressions))
     scopes = {id(scope.expression): scope for scope in traverse_scope(tree)}
     if schema:
         # Resolve only unambiguous physical columns. Unknown derived outputs and
@@ -329,7 +335,9 @@ def cardinality_probes(sql: str, *, schema=None) -> list[str]:
             a
             for a in select.find_all(exp.AggFunc)
             if a.find_ancestor(exp.Select) is select
-            and not isinstance(a, (exp.Min, exp.Max, exp.Rank, exp.DenseRank, exp.RowNumber))
+            and not isinstance(
+                a, (exp.Min, exp.Max, exp.AnyValue, exp.Rank, exp.DenseRank, exp.RowNumber)
+            )
             and not isinstance(a.this, exp.Distinct)
         ]
         joins = [

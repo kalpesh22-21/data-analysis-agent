@@ -245,6 +245,7 @@ async def _stream_turn(
     emitter: ProgressEmitter,
     *,
     data_as_of_enabled: bool = True,
+    delivery_observer=None,
 ) -> AsyncIterator[str]:
     """Drive one `AgentLoop.run`/`resume` call as a background task while
     streaming its `ProgressEmitter` output as SSE `progress` events, then a
@@ -279,6 +280,8 @@ async def _stream_turn(
         yield _format_sse(
             "result", _outcome_to_dict(outcome, data_as_of_enabled=data_as_of_enabled)
         )
+        if delivery_observer:
+            delivery_observer("loop_response_emitted", {"status": outcome.status})
     finally:
         # The request owns this worker. Retrieve its result even when the consumer
         # closes between events, and shield cleanup from Starlette's disconnect
@@ -1094,7 +1097,7 @@ def create_app(
                 return outcome
 
         return _TurnStreamingResponse(
-            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled),
+            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled, delivery_observer=_tracing_observer),
             media_type="text/event-stream",
         )
 
@@ -1140,7 +1143,7 @@ def create_app(
                 return outcome
 
         return _TurnStreamingResponse(
-            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled),
+            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled, delivery_observer=_tracing_observer),
             media_type="text/event-stream",
         )
 
