@@ -28,9 +28,74 @@ async def test_salvage_has_explicit_outcome_and_non_reasoning_transport(outcome)
 
 
 async def test_invalid_salvage_response_is_not_approval():
-    judge = AnswerJudge(RecoveryClient([batch(call("salvageAnswer", "s", outcome="full"))]), 10000)
+    events = []
+    judge = AnswerJudge(RecoveryClient([batch(call("salvageAnswer", "s", outcome="full"))]), 10000,
+                        observer=lambda name, payload: events.append((name, payload)))
     with pytest.raises(ValidationError):
         await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
+    assert ("loop_recovery_call_failed", {"reason": "schema_validation"}) in events
+
+
+async def test_missing_salvage_tool_call_reports_response_contract_failure():
+    events = []
+    judge = AnswerJudge(RecoveryClient([batch()]), 10000,
+                        observer=lambda name, payload: events.append((name, payload)))
+    with pytest.raises(ValueError, match="invalid_recovery_response"):
+        await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
+    assert ("loop_recovery_call_failed", {"reason": "response_contract"}) in events
+
+
+async def test_salvage_preserves_full_provider_result_id_through_caption_and_delivery():
+    ref = "chatcmpl-tool-9050b364e4783be2"
+    caption = "Employee count by department, all accessible records"
+
+    class SalvageJudge(Judge):
+        async def salvage(self, brief):
+            assert ref in {r["tool_call_id"] for r in brief.results}
+            assert ref in {c["result_id"] for c in brief.selected_components}
+            return {
+                **PART, "outcome": "full", "unfinished": [],
+                "evidence": [ref], "table_result_ids": [ref],
+                "captions": [{"result_id": ref, "caption": caption}],
+            }
+
+    execution = batch(call("runQuery", ref, **query().tool_calls[0].arguments))
+    proposal = final()
+    proposal.tool_calls[0].arguments["evidence"] = [ref]
+    proposal.tool_calls[0].arguments["tables"][0]["result_id"] = ref
+    judge = SalvageJudge([JudgeVerdict(
+        False, "unsupported_by_evidence", "Repair prose.",
+        reviewed=True, repair_type="prose",
+    )])
+    loop, _, _, _, events = build([discovery(), execution, proposal], judge)
+    out = await run(loop)
+    assert out.review["status"] == "approved"
+    assert out.answer_tables[0]["caption"] == caption
+    assert not any(name == "loop_recovery_validation_failed" for name, _ in events)
+
+
+async def test_guard_rejected_salvage_is_not_logged_as_approved():
+    class SalvageJudge(Judge):
+        async def salvage(self, brief):
+            return {
+                **PART,
+                "answer": "| Department | Employees |\n|---|---|\n| Sales | 120 |",
+                "outcome": "full",
+                "unfinished": [],
+                "captions": [],
+            }
+
+    judge = SalvageJudge([JudgeVerdict(
+        False, "unsupported_by_evidence", "Repair prose.",
+        reviewed=True, repair_type="prose",
+    )])
+    loop, _, _, _, events = build([discovery(), query(), final()], judge)
+    out = await run(loop)
+    assert out.review["status"] != "approved"
+    assert not any(name == "loop_salvage_approved" for name, _ in events)
+    assert ("loop_recovery_validation_failed", {
+        "reason": "answer_guard", "rule": "markdown_table",
+    }) in events
 
 
 async def test_salvage_delivers_full_answer_and_repairs_caption_after_zero_budget():
@@ -189,3 +254,35 @@ async def test_approved_salvage_is_not_dropped_by_advisory_word_limit():
     assert out.review["status"] == "approved"
     assert out.assistant_text == text.strip()
     assert out.answer_tables
+
+
+async def test_salvage_accepts_schema_valid_json_content_without_tool_wrapper():
+    import json
+    from data_agent.runtime.model.client import ModelTurnResult
+    response = {**PART, "outcome": "full", "unfinished": [], "captions": []}
+    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))]), 10000)
+    assert await judge.salvage(JudgeBrief("exit_prose", "Headcount?")) == response
+
+
+async def test_json_content_still_requires_complete_salvage_schema():
+    from data_agent.runtime.model.client import ModelTurnResult
+    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text='{"outcome":"full"}')]), 10000)
+    with pytest.raises(ValidationError):
+        await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
+
+
+async def test_invalid_caption_does_not_discard_supported_salvage_table():
+    class SalvageJudge(Judge):
+        async def salvage(self, brief):
+            return {
+                **PART, "outcome": "full", "unfinished": [], "table_result_ids": ["q"],
+                "captions": [{"result_id": "q", "caption": "SELECT * FROM hr.employee"}],
+            }
+    judge = SalvageJudge([JudgeVerdict(False, "unsupported_by_evidence", "Repair prose.",
+                                      reviewed=True, repair_type="prose")])
+    loop, _, _, _, events = build([discovery(), query(), final()], judge)
+    out = await run(loop)
+    assert out.review["status"] == "approved"
+    assert out.assistant_text == PART["answer"]
+    assert out.answer_tables and not out.answer_tables[0].get("caption")
+    assert ("loop_salvage_caption_omitted", {"reason": "invalid_caption"}) in events

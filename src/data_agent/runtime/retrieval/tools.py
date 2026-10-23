@@ -183,13 +183,7 @@ def _uses_to_provenance(uses: frozenset[str]) -> frozenset[tuple[str, str]] | No
     return frozenset(tuples)
 
 
-# Per-slot notes the model reads to understand the required/optional contract:
-# a REQUIRED slot omitted PAUSES the run to ask; an OPTIONAL slot omitted runs
-# UNFILTERED on that dimension ("all values") — but ONLY when it carries an
-# `optional_pattern` (the executor substitutes it on omission). A pattern-less
-# optional slot omitted fails closed to the raw loop, so we do NOT promise "all
-# values" for it (the load gate forbids a referenced pattern-less optional, but
-# this note stays honest even if that gate is later relaxed). See _enrich_slot.
+# Omission applies the authored predicate; only TRUE means no filter.
 _REQUIRED_SLOT_NOTE = "Must be provided; if omitted the run pauses to ask the user."
 _OPTIONAL_ALL_VALUES_NOTE = (
     "May be omitted; omitting means no filter on this dimension (all values)."
@@ -204,10 +198,7 @@ def _enrich_slot(raw: Any) -> dict[str, Any]:
     `type` gets the generic gloss and a missing or invalid `required` defaults to True — the
     slot is never dropped.
 
-    The optional note only promises "no filter (all values)" when the slot carries an
-    `optional_pattern`, which the executor substitutes on omission. Without one, omission
-    fails closed to the raw loop, so the note softens to a neutral "May be omitted." rather
-    than overclaim.
+    Optional slots expose their actual omission predicate, not an assumed no-filter default.
     """
     slot = raw if isinstance(raw, dict) else {}
     type_ = slot.get("type")
@@ -216,10 +207,15 @@ def _enrich_slot(raw: Any) -> dict[str, Any]:
         required = True
     if required:
         note = _REQUIRED_SLOT_NOTE
-    elif slot.get("optional_pattern"):
-        note = _OPTIONAL_ALL_VALUES_NOTE
+    elif isinstance(pattern := slot.get("optional_pattern"), str) and pattern.strip():
+        note = (
+            _OPTIONAL_ALL_VALUES_NOTE if pattern.strip().upper() == "TRUE"
+            else f"If omitted, applies the default predicate: {pattern}. A supplied value replaces this default."
+        )
     else:
         note = _OPTIONAL_PLAIN_NOTE
+    if isinstance(description := slot.get("description"), str) and description.strip():
+        note += " " + description.strip()
     enriched: dict[str, Any] = {
         "name": slot.get("name"),
         "type": type_,

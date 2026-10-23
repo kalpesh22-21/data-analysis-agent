@@ -313,3 +313,19 @@ async def test_neo4j_get_blueprint_round_trips_dag_via_run_seam() -> None:
     assert detail is not None
     assert detail.resolves == {"salary": "AnnualSalary"}
     assert detail.result_grain == ["Department"]
+
+
+def test_filtered_optional_slot_explains_default_and_override():
+    from data_agent.runtime.retrieval.tools import _enrich_slot
+
+    slot = _enrich_slot({
+        "name": "employee_status", "type": "enum", "required": False,
+        "enum_values": ["Active", "On Leave", "All"],
+        "optional_pattern": "e.employee_status IN ('Active', 'On Leave')",
+        "description": "Use All to remove the status filter.",
+    })
+    assert "If omitted, applies the default predicate:" in slot["note"]
+    assert "'Active', 'On Leave'" in slot["note"]
+    assert "A supplied value replaces this default." in slot["note"]
+    assert "Use All to remove the status filter." in slot["note"]
+    assert "omitting means no filter" not in slot["note"]

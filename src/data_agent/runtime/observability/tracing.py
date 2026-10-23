@@ -655,6 +655,7 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "from_status",
     "to_status",
     "reason_code",
+    "exception_type",  # Exception class only; messages may contain scoped data.
     "evidence_tool_name",
     # HOW the evidence binding was established — `tagged` (the model named the
     # intent on the call, call-time tagging) or `auto_bound` (the model named

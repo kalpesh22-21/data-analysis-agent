@@ -110,7 +110,8 @@ def test_dag_less_card_renders_exactly_as_before_enrichment() -> None:
         "Candidate blueprints (analysis templates you can run):\n"
         "- bp-1: sales overtime [slots: dept, period]\n"
         "These are the closest recalled matches. If none clearly fits, call searchBlueprints "
-        "before writing raw SQL; the corpus may contain additional blueprints."
+        "before writing raw SQL; the corpus may contain additional blueprints.\n"
+        "Knowledge shown here is a selection, not the full corpus. If a definition, business rule, or source choice remains unclear, use searchKnowledge with a focused query; more relevant guidance may be available."
     )
 
 
@@ -157,7 +158,7 @@ def test_enrichment_fields_are_structurally_sanitised() -> None:
     assert "\n## System" not in body  # ...but never as its own line
     assert "\x00" not in content
     # Exactly the header line + the bullet + the three sub-lines: no forged rows.
-    assert len(body.splitlines()) == 5  # Includes the fixed retrieval advisory.
+    assert len(body.splitlines()) == 6  # Includes both fixed retrieval advisories.
 
 
 def test_enrichment_fields_are_length_capped_like_existing_card_fields() -> None:

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from copy import deepcopy
 
 from jsonschema import Draft202012Validator
@@ -25,13 +26,36 @@ async def _call(judge, messages, name, schema):
     with judge._span("exit_prose") as span:
         if span is not None:
             span.set_attribute("review_mode", name)
-        result = await asyncio.wait_for(client.send_turn(messages, [tool]), judge.timeout_seconds)
-    calls = result.tool_calls
-    if len(calls) != 1 or calls[0].name != name:
-        raise ValueError("invalid_recovery_response")
-    args = calls[0].arguments
-    Draft202012Validator(schema).validate(args)
-    return args
+        started = time.monotonic()
+        stage = "model_call"
+        try:
+            result = await asyncio.wait_for(client.send_turn(messages, [tool]), judge.timeout_seconds)
+            stage = "response_contract"
+            calls = result.tool_calls
+            if not calls and isinstance(result.assistant_text, str) and result.assistant_text.strip():
+                # Some providers return the requested object as content despite
+                # the response tool. Accept only a complete JSON document, then
+                # enforce the identical schema and downstream evidence checks.
+                stage = "json_parse"
+                args = json.loads(result.assistant_text)
+            elif len(calls) == 1 and calls[0].name == name:
+                args = calls[0].arguments
+            else:
+                raise ValueError("invalid_recovery_response")
+            stage = "schema_validation"
+            Draft202012Validator(schema).validate(args)
+            if span is not None:
+                span.set_attribute("outcome", args.get("outcome", args.get("impact", "")))
+            return args
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else stage
+            judge._emit("loop_recovery_call_failed", {"reason": reason})
+            if span is not None:
+                span.set_attribute("failure_stage", reason)
+            raise
+        finally:
+            if span is not None:
+                span.set_attribute("duration_ms", (time.monotonic() - started) * 1000)
 
 
 async def salvage(judge, brief):

@@ -138,6 +138,9 @@ def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None
     lines.append(
         "These are the closest recalled matches. If none clearly fits, call searchBlueprints before writing raw SQL; the corpus may contain additional blueprints."
     )
+    lines.append(
+        "Knowledge shown here is a selection, not the full corpus. If a definition, business rule, or source choice remains unclear, use searchKnowledge with a focused query; more relevant guidance may be available."
+    )
     return {"role": "user", "content": _USER_CONTEXT_PREFIX + "\n".join(lines)}
 
 

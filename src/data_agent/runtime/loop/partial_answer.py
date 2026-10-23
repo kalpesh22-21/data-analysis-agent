@@ -47,9 +47,9 @@ def _validate_response(
 ):
     """Validate structure/provenance; the judge is responsible for factual support."""
 
-    def invalid(reason):
+    def invalid(reason, **details):
         if observer:
-            observer("loop_recovery_validation_failed", {"reason": reason})
+            observer("loop_recovery_validation_failed", {"reason": reason, **details})
         return {}
 
     if not isinstance(part, dict) or set(part) != {
@@ -135,7 +135,7 @@ def _validate_response(
     )
     # Verbosity is a judge signal, never a reason to discard an approved answer.
     if rule and rule.name not in {"no_evidence", "verbose_answer"}:
-        return invalid("answer_guard")
+        return invalid("answer_guard", rule=rule.name)
     tables, cards = [], []
     for ref in dict.fromkeys(part["table_result_ids"]):
         matches = [
@@ -350,8 +350,11 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
             for caption in captions:
                 ref, text = caption["result_id"], caption["caption"]
                 if ref not in response["table_result_ids"]:
-                    raise ValueError("caption_not_selected")
-                entry = next(e for e in current if e.tool_call_id == ref)
+                    loop._observer("loop_salvage_caption_omitted", {"reason": "caption_not_selected"})
+                    continue
+                entry = next((e for e in current if e.tool_call_id == ref), None)
+                if entry is None:
+                    continue  # The mandatory reference validator below rejects it.
                 clean, count = scrub_answer_prose(text, provenance=entry.provenance)
                 if (
                     count
@@ -360,7 +363,8 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                         text, accum.sql_executed, brief.question, has_alternative_evidence=True
                     )
                 ):
-                    raise ValueError("invalid_caption")
+                    loop._observer("loop_salvage_caption_omitted", {"reason": "invalid_caption"})
+                    text = None
                 accum._answer_tables = [
                     replace(t, caption=text) if t.sql == accum.result_sql_by_call_id.get(ref) else t
                     for t in accum.answer_tables
@@ -373,7 +377,6 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
             ):
                 loop._observer("loop_partial_answer_failed", {"reason": "invalid_salvage_outcome"})
                 return None
-            loop._observer("loop_salvage_approved", {"status": outcome})
             snapshot = _validate_response(
                 response,
                 brief,
@@ -383,6 +386,8 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                 outcome=outcome,
                 observer=loop._observer,
             )
+            if snapshot:
+                loop._observer("loop_salvage_approved", {"status": outcome})
         if not snapshot:
             return None  # Validation already emitted the precise reason.
         text, recovered, provenance = restore_partial(snapshot)
@@ -407,8 +412,20 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
         )
         return text, recovered, provenance
     except Exception as exc:
+        from jsonschema import ValidationError
+
+        reason = "review_unavailable"
+        if isinstance(exc, TimeoutError):
+            reason = "exit_deadline"
+        elif isinstance(exc, ValidationError):
+            reason = "schema_validation"
+        elif isinstance(exc, ValueError) and exc.args and exc.args[0] in {
+            "recovery_evidence_budget", "non_reasoning_transport_unavailable",
+            "invalid_recovery_response", "caption_not_selected", "invalid_caption",
+        }:
+            reason = exc.args[0]
         loop._observer(
             "loop_partial_answer_failed",
-            {"reason": "exit_deadline" if isinstance(exc, TimeoutError) else "review_unavailable"},
+            {"reason": reason, "exception_type": type(exc).__name__},
         )
         return None
