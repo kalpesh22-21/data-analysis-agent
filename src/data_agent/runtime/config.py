@@ -270,6 +270,14 @@ class RuntimeSettings(BaseSettings):
     # from `mcp_url` (host root + `/scratch/v1`), so a Layer-2 deploy that sets
     # only `MCP_URL` wires the scratch surface automatically. Set explicitly to
     # point the runtime at a different scratch host.
+    clickhouse_api_rest_base_url: str = Field(
+        "",
+        description="Explicit host root for snapshot REST proxy. Empty returns 501 EXPORT_NOT_CONFIGURED; not derived from MCP URL.",
+    )
+
+    def clickhouse_api_rest_base(self) -> str:
+        return self.clickhouse_api_rest_base_url.rstrip("/")
+
     scratch_api_url: str = Field(
         "",
         description="Base URL of the MCP scratch side-channel (…/scratch/v1). Empty → derived from mcp_url.",

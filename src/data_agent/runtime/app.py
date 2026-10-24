@@ -67,6 +67,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
 )
+from data_agent.runtime.export_proxy import export_router
 from data_agent.runtime.help_center.client import HelpCenterClient, HttpHelpCenterClient
 from data_agent.runtime.help_center.tools import (
     GetHelpCenterDocumentTool,
@@ -1006,6 +1007,8 @@ def create_app(
                 await asyncio.to_thread(tracing.shutdown_tracing, tracer_provider)
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
+    app.include_router(export_router(settings, _extract_credentials, session_catalog))
+
 
     # Readiness gate (singleton-hydrator redesign): an UNAUTHENTICATED probe the runtime
     # pod exposes so it stays out of the Service until the hydrator has seeded the graph.
