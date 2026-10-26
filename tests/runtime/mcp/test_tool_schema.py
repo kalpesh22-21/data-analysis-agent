@@ -246,7 +246,7 @@ def test_update_analysis_state_description_teaches_the_one_binding_path() -> Non
     assert "until the next response" in description
 
 
-def test_update_analysis_state_schema_declares_exactly_three_item_properties() -> None:
+def test_update_analysis_state_schema_declares_supported_item_properties() -> None:
     """01a §14: `{description}` on the first call, `{intent_id, status}` on later
     ones, and NOTHING ELSE.
 
@@ -259,7 +259,7 @@ def test_update_analysis_state_schema_declares_exactly_three_item_properties() -
     citation path stayed alive for as long as it did.
     """
     items = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["parameters"]["properties"]["intents"]["items"]
-    assert set(items["properties"]) == {"description", "intent_id", "status", "result_id"}
+    assert set(items["properties"]) == {"description", "intent_id", "status", "result_id", "reuse_previous_result"}
     description = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
     for retired in (
         "evidence_tool_call_id",

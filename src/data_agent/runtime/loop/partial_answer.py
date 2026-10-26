@@ -3,12 +3,11 @@
 from copy import deepcopy
 from dataclasses import replace
 
-from data_agent.runtime.answer_scrub import scrub_answer_prose
-from data_agent.runtime.composite.answer_with_table import AnswerTable, clean_answer_text
+from data_agent.runtime.composite.answer_with_table import AnswerTable
 from data_agent.runtime.context.scope_filter import compute_scope_hash
 from data_agent.runtime.session.models import live_analysis_state
 
-from .answer_rules import first_match
+from .approved_answer import normalize_approved_text
 from .proposal import ReviewState, evidence_kind, extra_evidence, fingerprint, selected_components
 from .turn_accumulators import TurnAccumulators
 
@@ -116,26 +115,13 @@ def _validate_response(
         and all(isinstance(value, dict) for value in row[0]["rows"])
     ]
     values = business_values(receipts)
-    scrubbed, redactions = scrub_answer_prose(text, provenance=provenance, business_values=values)
-    if (
-        len(text) > 20000
-        or clean_answer_text(text) != text
-        or redactions
-        or scrubbed != text
-        or any(ord(c) < 32 and c not in "\n\r\t" for c in text)
-    ):
-        return invalid("unsafe_answer_text")
-    rule = first_match(
-        text,
-        accum.sql_executed,
-        brief.question,
-        has_alternative_evidence=True,
-        business_values=values,
-        has_tables=bool(part["table_result_ids"]),
-    )
-    # Verbosity is a judge signal, never a reason to discard an approved answer.
-    if rule and rule.name not in {"no_evidence", "verbose_answer"}:
-        return invalid("answer_guard", rule=rule.name)
+    from .answer_rules import contains_sql
+
+    if contains_sql(text):
+        return invalid("sql_in_prose")
+    text = normalize_approved_text(text, provenance=provenance, business_values=values, has_tables=bool(part["table_result_ids"]))
+    if not text:
+        return invalid("empty_answer")
     tables, cards = [], []
     for ref in dict.fromkeys(part["table_result_ids"]):
         matches = [
@@ -209,11 +195,6 @@ def restore_partial(snapshot):
 async def recover_partial(loop, session_id, turn_index, accum, draft):
     import asyncio
 
-    from .delivery import CURRENT_DELIVERY
-
-    context = CURRENT_DELIVERY.get()
-    if context:
-        context.resilient_exit = True
     timeout = getattr(loop._answer_judge, "timeout_seconds", 30.0)
     try:
         return await asyncio.wait_for(
@@ -221,15 +202,14 @@ async def recover_partial(loop, session_id, turn_index, accum, draft):
             timeout=2 * timeout,
         )
     except TimeoutError:
-        if context:
-            context.review_unavailable = True
         loop._observer("loop_partial_answer_failed", {"reason": "exit_deadline"})
         return None
 
 
 async def _recover_partial(loop, session_id, turn_index, accum, draft):
     """One terminal review using existing evidence, or reuse an unchanged approval."""
-    from .delivery import CURRENT_DELIVERY, delivery_version
+    from .approved_answer import approve_answer
+    from .delivery import CURRENT_DELIVERY
     from .judge_evidence import enrich_brief
 
     context = CURRENT_DELIVERY.get()
@@ -355,14 +335,10 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                 entry = next((e for e in current if e.tool_call_id == ref), None)
                 if entry is None:
                     continue  # The mandatory reference validator below rejects it.
-                clean, count = scrub_answer_prose(text, provenance=entry.provenance)
-                if (
-                    count
-                    or clean != text
-                    or first_match(
-                        text, accum.sql_executed, brief.question, has_alternative_evidence=True
-                    )
-                ):
+                from .answer_rules import contains_sql
+
+                text = normalize_approved_text(text, provenance=entry.provenance)
+                if not text or contains_sql(text):
                     loop._observer("loop_salvage_caption_omitted", {"reason": "invalid_caption"})
                     text = None
                 accum._answer_tables = [
@@ -396,10 +372,7 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
         state.approved_partial = snapshot
         # This receipt approves ONLY the exact subset. Archive the rejected full
         # answer's reason in the snapshot, never treat it as approval of that answer.
-        state.violation = ""
-        state.delivery_version = delivery_version(text, recovered)
-        state.delivery_status = "approved"
-        state.delivery_reason = ""
+        approve_answer(state, text, recovered, current, turn_index)
         await loop._session_store.write_review_state(session_id, turn_index, state.to_doc())
         loop._observer(
             "loop_partial_answer_recovered",

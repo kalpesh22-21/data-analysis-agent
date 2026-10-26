@@ -5,7 +5,7 @@ import json
 import time
 from copy import deepcopy
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 
 from .answer_judge import _estimate_tokens, begin_turn_client, build_judge_tool
 
@@ -43,15 +43,43 @@ async def _call(judge, messages, name, schema):
             else:
                 raise ValueError("invalid_recovery_response")
             stage = "schema_validation"
+            if name == "salvageAnswer" and isinstance(args, dict):
+                # Unknown top-level annotations have no authority. Discard them;
+                # do not repair missing keys, values, types or nested contracts.
+                unknown = args.keys() - schema["properties"].keys()
+                if unknown:
+                    args = {key: value for key, value in args.items() if key in schema["properties"]}
+                    judge._emit("loop_recovery_fields_omitted", {"removed_count": len(unknown)})
+                    if span is not None:
+                        span.set_attribute("recovery_fields_omitted", len(unknown))
             Draft202012Validator(schema).validate(args)
             if span is not None:
                 span.set_attribute("outcome", args.get("outcome", args.get("impact", "")))
             return args
         except Exception as exc:
             reason = "timeout" if isinstance(exc, TimeoutError) else stage
-            judge._emit("loop_recovery_call_failed", {"reason": reason})
+            diagnostic = {"reason": reason, "exception_type": type(exc).__name__}
+            if isinstance(exc, ValidationError):
+                # Raw ValidationError text embeds the response (possibly scoped
+                # rows). Report trusted schema coordinates, never response values.
+                diagnostic["schema_keyword"] = str(exc.validator)
+                diagnostic["schema_path"] = "/" + "/".join(map(str, exc.absolute_schema_path))
+                if exc.validator == "required" and isinstance(exc.instance, dict):
+                    diagnostic["missing_fields"] = ", ".join(key for key in exc.validator_value if key not in exc.instance)
+                if span is not None:
+                    span.set_attribute("schema_keyword", diagnostic["schema_keyword"])
+                    span.set_attribute("schema_path", diagnostic["schema_path"])
+            judge._emit("loop_recovery_call_failed", diagnostic)
             if span is not None:
                 span.set_attribute("failure_stage", reason)
+            if isinstance(exc, ValidationError):
+                # The surrounding tracing context records escaping exceptions.
+                # Preserve the error class, but not jsonschema's embedded payload.
+                raise ValidationError(
+                    f"Recovery response failed {diagnostic['schema_keyword']} at {diagnostic['schema_path']}",
+                    validator=exc.validator,
+                    schema_path=exc.absolute_schema_path,
+                ) from None
             raise
         finally:
             if span is not None:
@@ -93,7 +121,8 @@ async def salvage(judge, brief):
         "limitation, not factual findings. Distinguish unavailable data, failed execution and "
         "ambiguity only when established; otherwise say it could not be verified. Do not invent "
         "reasons. Select only components that support the answer. Your response must satisfy all "
-        "the original judge evidence, scope and ranking rules."
+        "the original judge evidence, scope and ranking rules. Return only the declared fields; "
+        "do not add outcome_notes or other commentary fields."
     )
     return await _call(judge, messages, "salvageAnswer", schema)
 

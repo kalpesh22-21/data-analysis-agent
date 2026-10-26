@@ -758,6 +758,18 @@ class BlueprintExecutor:
                 domain = None
             outcome = resolve_slot(raw, spec, domain=domain)
             if isinstance(outcome, AskUser):
+                if spec.type == "entity" and outcome.reason == "no_match":
+                    # An exact-value miss is a discovery gap, not necessarily
+                    # user ambiguity (e.g. an abbreviation or an empty department).
+                    return bound, omitted_patterns, ExecFailed(
+                        "BLUEPRINT_ENTITY_NOT_FOUND",
+                        "The supplied entity was not found by an exact scoped lookup. "
+                        "Resolve it against the scoped directory before retrying; do not repeat "
+                        "unchanged bindings or substitute a different business concept. "
+                        "A resolved entity with no matching facts is a valid empty result. "
+                        "Ask the user only if discovery leaves no match or multiple plausible matches.",
+                        retryable=True,
+                    )
                 return (
                     bound,
                     omitted_patterns,

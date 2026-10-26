@@ -179,7 +179,7 @@ async def test_terminal_reserve_survives_exhausted_proposal_and_repair(monkeypat
 async def test_timeout_recovery_has_independent_salvage_budget(
     monkeypatch, total, initial_timeout, final_result, changed_delivery
 ):
-    """A timeout permits one independent salvage; changed delivery can use normal review first."""
+    """A timeout permits one independent salvage, even when delivery changed."""
     now = [0.0]
     deadlines = []
     contexts = []
@@ -226,15 +226,14 @@ async def test_timeout_recovery_has_independent_salvage_budget(
         loop._finish = changed_finish
     out = await run(loop)
     assert deadlines[0] == initial_timeout
-    expected_calls = 2 if not changed_delivery or final_result == "approved" else 3
-    assert len(judge.briefs) == expected_calls
-    expected_status = ("exhausted" if not changed_delivery else
-                       {"approved": "approved", "rejected": "rejected", "timeout": "exhausted"}[final_result])
+    assert len(judge.briefs) == 2
+    # The scripted salvage returns no candidate, so neither a bare approval nor
+    # a rejection of a nonexistent candidate can be delivered as an answer.
+    expected_status = "exhausted"
     assert out.review["status"] == expected_status
     assert contexts[-1].review_seconds >= 0
-    if not changed_delivery:
-        # Salvage has its own time allowance and does not consume the normal budget.
-        assert contexts[-1].review_seconds == total - initial_timeout
+    # Salvage has its own time allowance and does not consume the normal budget.
+    assert contexts[-1].review_seconds == total - initial_timeout
     if expected_status != "approved":
         assert "120" not in out.assistant_text
         assert not out.answer_tables

@@ -176,6 +176,7 @@ from .judge_ship_guard import (
     capability_hedge_text,
     coherent_capability_ship_text,
     ship_decline_text,
+    PROSE_CORRECTION_REJECTED,
     table_hedge_text,
 )
 from .loop_safety import (
@@ -2174,7 +2175,6 @@ class AgentLoop:
         context = CURRENT_DELIVERY.get()
         recovery_accum = context.recovery_accum if context and context.recovery_accum is not None else deepcopy(accum)
         recovery_draft = context.recovery_draft if context and context.recovery_accum is not None else assistant_text
-        recovery_attempted = False
         partial_recovered = False
         terminal_failure = False
         if CURRENT_DELIVERY.get():
@@ -2194,7 +2194,9 @@ class AgentLoop:
                 if ship_guard is None:
                     ship_guard = JudgeShipGuard()
                     ship_guard.note_refusal(
-                        saved_review.get("site", "exit_prose"), saved_review["violation"]
+                        saved_review.get("site", "exit_prose"), saved_review["violation"],
+                        measured_population=saved_review.get("measured_population", ""),
+                        required_population=saved_review.get("required_population", "")
                     )
         ship_disposition = ship_guard.disposition(judge_site) if ship_guard is not None else None
         if (
@@ -2219,7 +2221,7 @@ class AgentLoop:
                 "ship_tables_with_hedge": table_hedge_text,
                 "ship_cards_with_hedge": capability_hedge_text,
             }[ship_disposition]
-            assistant_text = builder(violation)
+            assistant_text = builder(violation, ship_guard.measured_population, ship_guard.required_population)
             persist_text = assistant_text
             self._observer(
                 "loop_answer_judge_ship_guarded",
@@ -2264,27 +2266,10 @@ class AgentLoop:
             )
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance,
             business_values=await self._context_business_values(session_id, turn_index))
-        if terminal_failure and not checkpoint:
-            recovery_attempted = True
-            from .partial_answer import recover_partial
-
-            recovered = await recover_partial(self, session_id, turn_index, recovery_accum, recovery_draft)
-            if recovered:
-                assistant_text, accum, provenance = recovered
-                partial_recovered = True
-                persist_text = assistant_text
-                completion_notice = None
-                capability_cards = accum.capability_cards
-                ship_disposition = None
-                retained_assumption_count = 0
         review, withheld = await review_delivery(
             self, session_id, turn_index, assistant_text, accum, checkpoint
         )
-        delivery_context = CURRENT_DELIVERY.get()
-        if delivery_context and delivery_context.corrected_answer is not None:
-            assistant_text = delivery_context.corrected_answer
-            delivery_context.corrected_answer = None
-        if (withheld or review.get("status") == "exhausted") and not checkpoint and not recovery_attempted:
+        if (withheld or review.get("status") == "exhausted") and not checkpoint:
             # No agent repair remains; reuse a valid subset or salvage independently.
             from .partial_answer import recover_partial
 
@@ -2299,12 +2284,13 @@ class AgentLoop:
                 completion_notice = None
                 ship_disposition = None
                 retained_assumption_count = 0
-                review, withheld = {**review, "status": "approved"}, False
-                review.pop("violation", None)
-                review.pop("reason", None)
+                review, withheld = await review_delivery(
+                    self, session_id, turn_index, assistant_text, accum, checkpoint
+                )
+                partial_recovered = review.get("status") == "approved" and not withheld
         if not partial_recovered and not checkpoint and review.get("status") == "exhausted":
             withheld = True
-            review = {**review, "reason": "I couldn't verify the answer before review ended. Please try again."}
+            review = {**review, "reason": "I couldn't verify a reliable answer from the available results."}
         if partial_recovered:
             review = {**review, "completion": context.recovery_completion if context else "partial"}
         # A resilient exit has already applied the ship guard and rendered its
@@ -2317,7 +2303,7 @@ class AgentLoop:
         # checkpoint and truthful review disposition so the user can still continue.
         if withheld and checkpoint is not None:
             withheld = False
-        if withheld and not (terminal_failure and ship_disposition):
+        if withheld and ship_disposition != "decline_only":
             accum.apply_ship_disposition("decline_only", ())
             capability_cards = None
             ship_disposition = "decline_only"
@@ -3160,6 +3146,8 @@ class AgentLoop:
                 review_state.site,
                 review_state.violation,
                 assumptions=review_state.assumptions_before_refusal,
+                measured_population=review_state.measured_population,
+                required_population=review_state.required_population,
             )
             if review_state.feedback:
                 finalization_nudge = answer_judge_nudge_text("", review_state.feedback)
@@ -4420,7 +4408,7 @@ class AgentLoop:
                         else ()
                     ),
                 ) -> JudgeBrief:
-                    results, anchor, _ = await self._judge_results(
+                    results, anchor, trail = await self._judge_results(
                         session_id,
                         turn_index,
                         credentials.column_scope,
@@ -4438,18 +4426,22 @@ class AgentLoop:
                         pending_options=_options,
                     )
 
-                    from .judge_evidence import recent_conversation
+                    from .judge_evidence import enrich_brief
 
-                    return replace(
+                    brief = replace(
                         brief,
-                        recent_conversation=recent_conversation(
-                            session_doc.messages, credentials.column_scope, turn_index
-                        ),
                         clarification_answers=tuple(
                             m.content
                             for m in session_doc.messages
                             if m.role == "user" and m.turn_index == turn_index
                         )[1:],
+                    )
+
+                    return await enrich_brief(
+                        brief, trail=trail, turn_index=turn_index,
+                        session_id=session_id, store=self._session_store,
+                        catalog_provider=self._judge_catalog, credentials=credentials,
+                        analysis_state=_state,
                     )
 
                 ask_verdict = await self._judge(
@@ -4911,33 +4903,29 @@ class AgentLoop:
                         snapshot = capture_partial(verdict, brief, accum, in_scope, turn_index, observer=self._observer)
                         if snapshot:
                             review_state.approved_partial = snapshot
-                    if editorial_findings and verdict.reviewed and verdict.approved and verdict.corrected_answer is None:
-                        verdict = replace(verdict, corrected_answer=final_text, repair_type="prose")
-                    if verdict.corrected_answer is not None:
-                        from .prose_correction import validate_correction
+                    if verdict.approved and verdict.reviewed:
+                        from .answer_rules import contains_sql
 
-                        correction_error = validate_correction(
-                            verdict,
-                            original=final_text,
-                            provenance=await self._compute_turn_provenance_union(
-                                session_id, turn_index
-                            ),
-                            turn_sql=accum.sql_executed,
-                            assumptions=accum.assumptions or (),
-                            question=question,
-                            has_evidence=bool(
-                                any(d["evidence"] for d in deliverables)
-                                or accum.capability_cards
-                                or accum.has_answer_tables
-                            ),
-                            declined_clarification=declined_question,
+                        if contains_sql(verdict.corrected_answer if verdict.corrected_answer is not None else final_text):
+                            verdict = JudgeVerdict(
+                                False, "leaks_sql_or_schema",
+                                "Remove SQL from the answer prose; preserve supported findings and selected results.",
+                                reviewed=True, repair_type="prose",
+                            )
+                    if verdict.corrected_answer is not None:
+                        from .approved_answer import normalize_approved_text, validate_correction
+
+                        verdict = replace(verdict, corrected_answer=normalize_approved_text(
+                            verdict.corrected_answer,
                             has_tables=accum.has_answer_tables,
+                            provenance=await self._compute_turn_provenance_union(session_id, turn_index),
                             business_values=await self._context_business_values(session_id, turn_index),
-                        )
+                        ))
+                        correction_error = validate_correction(verdict)
                         if correction_error:
                             verdict = JudgeVerdict(
                                 False,
-                                "unsupported_by_evidence",
+                                PROSE_CORRECTION_REJECTED,
                                 correction_error,
                                 reviewed=True,
                                 repair_type="prose",
@@ -4957,12 +4945,26 @@ class AgentLoop:
                             proposal_args = {**proposal_args, "answer": final_text}
                             self._observer("loop_answer_judge_prose_corrected", {"site": site})
                     if verdict.approved and verdict.reviewed:
+                        from .approved_answer import normalize_approved_text
+
+                        final_text = normalize_approved_text(
+                            final_text,
+                            has_tables=accum.has_answer_tables,
+                            provenance=await self._compute_turn_provenance_union(session_id, turn_index),
+                            business_values=await self._context_business_values(session_id, turn_index),
+                        )
+                        complete = {**complete, "answer": final_text}
+                        version = fingerprint(complete)
+                        proposal_args = {**proposal_args, "answer": final_text}
+                        if review_state.prose_correction:
+                            review_state.prose_correction.update(corrected_answer=final_text, corrected_version=version)
+                        review_state.answer_version = version
                         review_state.approved_version = version
                         review_state.violation = ""
                         ship_guard.note_approval()
-                        review_state.delivery_version = delivery_version(final_text, accum)
-                        review_state.delivery_status = "approved"
-                        review_state.delivery_reason = ""
+                        from .approved_answer import approve_answer
+
+                        approve_answer(review_state, final_text, accum, in_scope, turn_index)
                     elif verdict.approved:
                         # An unavailable review is a disposition, never an approval.
                         # Reuse it only for this exact delivery and without overriding
@@ -4988,6 +4990,8 @@ class AgentLoop:
                             site,
                             verdict.violation,
                             assumptions=review_state.assumptions_before_refusal,
+                            measured_population=review_state.measured_population,
+                            required_population=review_state.required_population,
                         )
                         if (not review_state.repaired and review_state.calls < 2 and remaining > 0
                             and verdict.repair_type not in {"prose", "presentation"}):
@@ -5128,6 +5132,9 @@ class AgentLoop:
                 )
             if loop_safety.stagnant_rounds == self._max_no_progress_rounds - 1:
                 finalization_nudge = (finalization_nudge or "") + "\n" + NO_PROGRESS_COACH
+            progress_coach = loop_safety.progress_checkpoint(guard.usage().elapsed_seconds)
+            if progress_coach:
+                finalization_nudge = (finalization_nudge or "") + "\n" + progress_coach
 
             if guard.exceeded:
                 if window_count >= self._max_budget_windows:

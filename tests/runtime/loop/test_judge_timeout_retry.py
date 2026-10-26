@@ -42,7 +42,7 @@ async def test_timeout_retries_once_and_honors_verdict(approved):
     assert verdict.approved == approved and verdict.reviewed
     assert client.cancelled and client.retry_calls == 1
     assert context.review_seconds < .3
-    assert not context.review_unavailable
+    assert not context.review_failure_reason
     assert events == ["loop_answer_judge_timeout_retry"]
 
 

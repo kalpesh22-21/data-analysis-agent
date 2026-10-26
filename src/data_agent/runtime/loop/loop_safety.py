@@ -58,6 +58,8 @@ class LoopSafety:
         self.stagnant_rounds = 0
         self._seen: set[str] = set()
         self._round_progress = False
+        self.data_attempts = 0
+        self._progress_checkpoints = 0
 
     def begin_round(self):
         self._round_progress = False
@@ -88,8 +90,24 @@ class LoopSafety:
         return None
 
     def record_attempt(self, name: str):
+        if name in {"runQuery", "runBlueprint", "resolveValues"}:
+            self.data_attempts += 1
         if name in IDEMPOTENT_READ_TOOLS:
             self.read_attempts[name] += 1
+
+    def progress_checkpoint(self, elapsed_seconds: float) -> str:
+        milestone = max(self.data_attempts // 8, int(elapsed_seconds // 45))
+        if milestone <= self._progress_checkpoints:
+            return ""
+        self._progress_checkpoints = milestone
+        self.observer("loop_progress_checkpoint", {"attempts": self.data_attempts})
+        return (
+            "You have spent several calls or substantial time on this request. Identify any gap still unresolved. "
+            "If new evidence gives a concrete next step toward resolving it, continue. Otherwise use existing "
+            "results to answer supported parts, ask a focused clarification, or explain the limitation. "
+            "Do not repeat broad searches or runQuery exploration without a new lead. An unresolved person "
+            "must be clarified before querying their pay or punches. Do not repeat this reminder to the user."
+        )
 
     def observe_help(self, name: str, error_code: str | None, *, emit=True):
         if name not in HELP_TOOLS or self.help_open:

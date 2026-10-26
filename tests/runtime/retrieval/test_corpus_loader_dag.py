@@ -57,6 +57,10 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
     blueprints = resolve_blueprint_references(blueprints)
     assert {b.id for b in blueprints} == {
         "bp-employee-summary",
+        "bp-latest-hired-employees",
+        "bp-termination-family",
+        "bp-compensation-ranking",
+        "bp-approved-timeoff-ranking",
         "bp-punch-pair-summary",
         "bp-employee-day-clock-span",
         "bp-timecard-earnings-summary",
@@ -108,6 +112,8 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
             if bp.id == "bp-active-headcount-by-department"
             else ["Department"]
         )
+        if bp.id in {"bp-average-salary-by-department", "bp-departments-above-company-average-salary"}:
+            expected_grain.append("Pay Type")
         assert json.loads(props["result_grain_json"]) == expected_grain
         # Single-node seeds carry a top-level {department}-parameterized template;
         # the Slice-C multi-node seed stores its SQL per-node in composes instead.

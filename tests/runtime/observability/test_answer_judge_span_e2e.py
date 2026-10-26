@@ -265,3 +265,41 @@ async def test_failed_judge_stays_nested_and_restores_agent_context() -> None:
     assert review.attributes["outcome"] == "provider_error"
     assert review.context.trace_id == agent.get_span_context().trace_id
     assert not review.events
+
+
+async def test_salvage_schema_failure_records_diagnostics_without_response_values():
+    import json
+    import pytest
+    from jsonschema import ValidationError
+    from data_agent.runtime.model.client import ModelTurnResult
+    from tests.runtime.loop.test_salvage_contract import RecoveryClient
+    from tests.runtime.loop.test_partial_answer import PART
+
+    tracer, exporter = _tracer_with_memory_exporter()
+    response = {**PART, 'outcome': 'full', 'captions': [],
+                'answer': ['PRIVATE_RESPONSE_PAYLOAD']}
+    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))]),
+                        token_budget=100000, tracer=tracer,
+                        observer=tracing.guardrail_observer(tracer))
+    with pytest.raises(ValidationError):
+        await judge.salvage(JudgeBrief('exit_prose', 'Headcount?'))
+    spans = exporter.get_finished_spans()
+    dumped = str([(s.attributes, s.events, s.status) for s in spans])
+    assert 'PRIVATE_RESPONSE_PAYLOAD' not in dumped
+    judge_span = next(s for s in spans if s.name == 'answer_judge')
+    assert judge_span.attributes['schema_keyword'] == 'type'
+    assert judge_span.attributes['schema_path'] == '/properties/answer/type'
+
+
+def test_recovery_schema_coordinates_survive_guardrail_allowlist():
+    tracer, exporter = _tracer_with_memory_exporter()
+    tracing.guardrail_observer(tracer)('loop_recovery_call_failed', {
+        'reason': 'schema_validation', 'exception_type': 'ValidationError',
+        'schema_keyword': 'required', 'schema_path': '/required',
+        'missing_fields': 'answer, evidence', 'response': SECRET_DRAFT,
+    })
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes['missing_fields'] == 'answer, evidence'
+    assert span.attributes['schema_keyword'] == 'required'
+    assert span.attributes['schema_path'] == '/required'
+    assert SECRET_DRAFT not in _all_attribute_text(exporter)

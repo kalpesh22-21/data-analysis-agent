@@ -13,6 +13,7 @@ from typing import Any
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from data_agent.runtime.dispatch.tool_dispatcher import resolve_catalog
 
@@ -68,42 +69,52 @@ def recent_conversation(messages, column_scope, turn_index):
     )
 
 
-def catalog_context(catalog, executions, column_scope):
+def catalog_context(catalog, executions, column_scope, *, include_defaults=False):
     """All authorized table rules, even when the SQL omitted their predicates.
 
     Catalog exports are scope independent. Omit a section referencing a denied column
     rather than accidentally publishing that column via a rule or join description.
     Explicit omission markers distinguish access restrictions from absent documentation.
     """
-    dependencies: dict[str, set[str]] = {}
+    dependencies: dict[str, set[str]] = (
+        {key: set() for key in catalog.schema} if include_defaults else {}
+    )
     missing = []
     for sql in executions:
         try:
             tree = sqlglot.parse_one(sql, dialect="clickhouse")
-            ctes = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
-            for table in tree.find_all(exp.Table):
-                if not table.db and table.name in ctes:
-                    continue
-                candidates = [
-                    key
-                    for key in catalog.schema
-                    if key == f"{table.db}.{table.name}"
-                    or (not table.db and key.rsplit(".", 1)[-1] == table.name)
-                ]
-                if len(candidates) != 1:
-                    missing.append("table_documentation_unresolved")
-                    continue
-                key = candidates[0]
-                names = dependencies.setdefault(key, set())
-                names.update(
-                    c.name for c in tree.find_all(exp.Column) if c.name in catalog.schema[key]
-                )
-                if any(
-                    isinstance(e, exp.Star) or (isinstance(e, exp.Column) and e.is_star)
-                    for select in tree.find_all(exp.Select)
-                    for e in select.expressions
-                ):
-                    names.update(catalog.schema[key])
+            # Resolve physical relations per SQL scope; a CTE name in one scope
+            # must not hide a real table with the same name in another scope.
+            for scope in traverse_scope(tree):
+                for _, source in scope.selected_sources.values():
+                    if not isinstance(source, exp.Table):
+                        continue
+                    table = source
+                    if table.catalog:
+                        missing.append("table_documentation_unresolved")
+                        continue
+                    exact = f"{table.db}.{table.name}"
+                    candidates = [exact] if exact in catalog.schema else []
+                    if not candidates:
+                        aliases = {"dbpcm_warehouse", "dbpcm_datawarehouse"}
+                        candidates = [
+                            key for key in catalog.schema
+                            if key.rsplit(".", 1)[-1] == table.name
+                            and (not table.db or (
+                                table.db in aliases and key.rsplit(".", 1)[0] in aliases
+                            ))
+                        ]
+                    if len(candidates) != 1:
+                        missing.append("table_documentation_unresolved")
+                        continue
+                    key = candidates[0]
+                    names = dependencies.setdefault(key, set())
+                    names.update(c.name for c in scope.columns if c.name in catalog.schema[key])
+                    if any(
+                        isinstance(e, exp.Star) or (isinstance(e, exp.Column) and e.is_star)
+                        for e in scope.expression.selects
+                    ):
+                        names.update(catalog.schema[key])
         except (sqlglot.errors.ParseError, ValueError):
             missing.append("sql_dependencies_unresolved")
     tables = []
@@ -144,7 +155,7 @@ def catalog_context(catalog, executions, column_scope):
             if value is None or name == "schema_notes":
                 continue
             if name in {"join_keys", "ambiguities", "measures"} and isinstance(value, list):
-                value = [item for item in value if relevant(item)]
+                value = [item for item in value if relevant(item) or (include_defaults and name == "ambiguities")]
             if name == "rules" and isinstance(value, list):
                 result[name] = []
                 for rule in value:
@@ -342,11 +353,14 @@ async def enrich_brief(
     try:
         catalog = (
             await resolve_catalog(catalog_provider, credentials)
-            if catalog_provider is not None and sqls
+            if catalog_provider is not None and (sqls or brief.site == "ask_user")
             else None
         )
         package["catalog"] = (
-            catalog_context(catalog, sqls, credentials.column_scope)
+            catalog_context(
+                catalog, sqls, credentials.column_scope,
+                include_defaults=brief.site == "ask_user",
+            )
             if catalog
             else {"unavailable": True}
         )

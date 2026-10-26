@@ -76,7 +76,6 @@ MAX_ANSWER_TABLES = MAX_INTENTS
 # runtime does not second-guess model text, it only stops a pathological payload
 # being stored verbatim.
 _MAX_SQL_LEN = 20_000
-_MAX_ANSWER_LEN = 20_000
 
 
 def clean_answer_sql(raw: Any) -> str | None:
@@ -94,12 +93,11 @@ def clean_answer_sql(raw: Any) -> str | None:
 
 
 def clean_answer_text(raw: Any) -> str | None:
-    """Normalize the model's final prose. Same rules as `clean_answer_sql`; kept a
-    separate function so the two caps can diverge without a shared-helper edit."""
+    """Normalize final prose without truncating supported content for its length."""
     if not isinstance(raw, str):
         return None
     text = raw.strip()
-    return text[:_MAX_ANSWER_LEN] if text else None
+    return text if text else None
 
 
 def clean_blueprint_id(raw: Any) -> str | None:

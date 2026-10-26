@@ -524,3 +524,18 @@ def first_match(
         if rule.applies(ctx):
             return rule
     return None
+
+
+def strip_markdown_tables(text: str) -> str:
+    """Remove Markdown grids, retaining surrounding narrative."""
+    lines = text.splitlines()
+    kept, i = [], 0
+    while i < len(lines):
+        if i + 1 < len(lines) and has_markdown_table("\n".join(lines[i:i + 2])):
+            i += 2
+            while i < len(lines) and "|" in lines[i]:
+                i += 1
+        else:
+            kept.append(lines[i])
+            i += 1
+    return "\n".join(kept).strip()

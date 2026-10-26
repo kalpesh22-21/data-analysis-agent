@@ -49,19 +49,20 @@ def db():
     con.create_aggregate('UNIQEXACT', 1, DistinctCount)
     con.create_function('DATETRUNC', 2, lambda unit, value: value[:7] + '-01' if value else None)
     con.create_function('TOSTRING', 1, lambda value: str(value) if value is not None else None)
+    con.create_function('NOW', 0, lambda: '2026-10-26')
     con.create_function('TODATE', 1, lambda value: value[:10] if value else None)
     con.execute("ATTACH DATABASE ':memory:' AS dbpcm_warehouse")
     con.executescript('''
-    CREATE TABLE dbpcm_warehouse.employee(employee_code TEXT, department_code TEXT, department_name TEXT, employee_status TEXT, annual_salary REAL);
-    INSERT INTO dbpcm_warehouse.employee VALUES ('E1','D1','Engineering','Active',100),('E2','D2','HR','Active',200),('E3','D1','Engineering','Terminated',300);
+    CREATE TABLE dbpcm_warehouse.employee(employee_code TEXT, department_code TEXT, department_name TEXT, employee_status TEXT, annual_salary REAL, employee_pay_type TEXT, hourly_salary REAL);
+    INSERT INTO dbpcm_warehouse.employee VALUES ('E1','D1','Engineering','Active',100,'Salary',NULL),('E2','D2','HR','Active',200,'Salary',NULL),('E3','D1','Engineering','Terminated',300,'Salary',NULL);
     CREATE TABLE dbpcm_warehouse.department(department_code TEXT, department_name TEXT);
     INSERT INTO dbpcm_warehouse.department VALUES ('D1','Engineering'),('D2','HR'),('D3','Empty');
     CREATE TABLE dbpcm_warehouse.payroll(employee_code TEXT, pay_date TEXT, amount REAL, register_type TEXT, type_code TEXT);
     INSERT INTO dbpcm_warehouse.payroll VALUES ('E1','2026-09-01',100,'EARN','REG'),('E1','2026-09-01',50,'EARN','OT'),('E2','2026-09-01',200,'EARN','REG'),('E3','2026-09-01',300,'EARN','REG'),('E9','2026-09-01',25,'EARN','REG'),('E1','2026-10-01',900,'EARN','REG'),('E1','2026-09-01',40,'EETAX','TAX');
-    CREATE TABLE dbpcm_warehouse.accrual_balances(employee_code TEXT, accrual_code TEXT, beginning_balance REAL, accrued_amount REAL, awarded_amount REAL, taken_amount REAL);
-    INSERT INTO dbpcm_warehouse.accrual_balances VALUES ('E1','PTO',10,1,0,2),('E1','PTO',20,2,0,3),('E2','PTO',40,4,0,7),('E1','SICK',99,0,0,1);
-    CREATE TABLE dbpcm_warehouse.accrual_events(employee_code TEXT, status TEXT, event_type TEXT, earn_code TEXT, request_date TEXT, hours REAL);
-    INSERT INTO dbpcm_warehouse.accrual_events VALUES ('E1','Approved','Time Off Request','PTO','2026-09-01',8),('E1','Requested','Time Off Request','PTO','2026-09-02',4),('E2','Denied','Time Off Request','SICK','2026-09-03',6),('E9','Approved','Payout Request','PTO','2026-09-04',5),('E1','Approved','Time Off Request','PTO','2026-10-01',90);
+    CREATE TABLE dbpcm_warehouse.timeoff_balances(employee_code TEXT, accrual_code TEXT, beginning_balance REAL, accrued_amount REAL, awarded_amount REAL, taken_amount REAL);
+    INSERT INTO dbpcm_warehouse.timeoff_balances VALUES ('E1','PTO',10,1,0,2),('E1','PTO',20,2,0,3),('E2','PTO',40,4,0,7),('E1','SICK',99,0,0,1);
+    CREATE TABLE dbpcm_warehouse.timeoff_requests(employee_code TEXT, status TEXT, event_type TEXT, earn_code TEXT, request_date TEXT, hours REAL);
+    INSERT INTO dbpcm_warehouse.timeoff_requests VALUES ('E1','Approved','Time Off Request','PTO','2026-09-01',8),('E1','Requested','Time Off Request','PTO','2026-09-02',4),('E2','Denied','Time Off Request','SICK','2026-09-03',6),('E9','Approved','Payout Request','PTO','2026-09-04',5),('E1','Approved','Time Off Request','PTO','2026-10-01',90);
     ''')
     yield con
     con.close()
@@ -81,20 +82,20 @@ def test_fixed_active_blueprint_retains_zero_departments(db):
     assert {r[1]: r[2] for r in rows} == {'Engineering': 1, 'HR': 1, 'Empty': 0}
 
 
-@pytest.mark.parametrize('status,count,total', [(None,3,600),('Active',2,300),('Terminated',1,300)])
+@pytest.mark.parametrize('status,count,total', [(None,2,300),('All',3,600),('Active',2,300),('Terminated',1,300)])
 def test_employee_status_filter_is_optional_and_parameterized(db, status, count, total):
     row = execute(db, 'bp-employee-summary', group_by='company', employee_status=status)[0]
-    assert row[1:4] == (count,count,total)
+    assert row[3:6] == (count,count,total)
 
 
 def test_department_and_entity_filters(db):
-    assert execute(db, 'bp-employee-summary', group_by='department', department='Engineering', employee='E1')[0][1] == 1
+    assert execute(db, 'bp-employee-summary', group_by='department', department='Engineering', employee='E1')[0][3] == 1
     assert execute(db, 'bp-employee-summary', group_by='department', department="x' OR 1=1 --") == []
 
 
 def test_salary_template_can_filter_status(db):
     rows = execute(db, 'bp-average-salary-by-department', employee_status='Active')
-    assert {r[0]:r[1:] for r in rows} == {'Engineering':(100,1),'HR':(200,1)}
+    assert {r[2]:r[3:] for r in rows} == {'Engineering':(100,1,None),'HR':(200,1,None)}
 
 
 def test_payroll_period_register_filters_and_unmatched_employee(db):
@@ -131,12 +132,13 @@ def test_fixed_enums_reject_unsupported_values(bid, slot, bad):
 
 @pytest.mark.parametrize('comparison,threshold,expected', [('above',200,1),('at_least',200,2),('equal',200,1),('below',200,1),('above',1000,0)])
 def test_salary_threshold_comparisons_and_empty_zero(db, comparison, threshold, expected):
-    assert execute(db, 'bp-salary-threshold-count', comparison=comparison, salary=threshold) == [(expected,)]
+    rows = execute(db, 'bp-salary-threshold-count', comparison=comparison, salary=threshold, employee_status='All')
+    assert sum(row[-1] for row in rows) == expected
 
 
 def test_salary_directory_limit_and_status_are_explicit(db):
     rows = execute(db, 'bp-salary-threshold-directory', comparison='at_least', salary=0, row_limit=1, employee_status='Active')
-    assert rows == [('E2','HR','Active',200)]
+    assert rows == [('Salary','Recorded annual salary','E2','HR','Active',200,None)]
 
 
 def test_date_basis_does_not_imply_current_status(db):
@@ -183,3 +185,49 @@ def test_punch_types_are_enums_but_hours_codes_are_entities():
     assert "hours_type = 'XY'" in sql and "in_punch_type = 'IL'" in sql
     with pytest.raises(AssertionError):
         bound_sql('bp-punch-pair-summary',group_by='employee',period=PERIOD,source='one',in_type='made-up')
+
+
+def test_latest_hires_uses_most_recent_date_and_current_population(db):
+    db.executescript('''
+    ALTER TABLE dbpcm_warehouse.employee ADD COLUMN employee_name TEXT;
+    ALTER TABLE dbpcm_warehouse.employee ADD COLUMN most_recent_hire_date TEXT;
+    UPDATE dbpcm_warehouse.employee SET employee_name=employee_code;
+    UPDATE dbpcm_warehouse.employee SET most_recent_hire_date='2020-01-01' WHERE employee_code='E1';
+    UPDATE dbpcm_warehouse.employee SET most_recent_hire_date='2021-01-01' WHERE employee_code='E2';
+    UPDATE dbpcm_warehouse.employee SET most_recent_hire_date='2022-01-01' WHERE employee_code='E3';
+    ''')
+    assert [r[0] for r in execute(db,'bp-latest-hired-employees',row_limit=2)] == ['E2','E1']
+    assert [r[0] for r in execute(db,'bp-latest-hired-employees',row_limit=1,employee_status='All')] == ['E3']
+    db.execute("UPDATE dbpcm_warehouse.employee SET most_recent_hire_date='2099-01-01' WHERE employee_code='E2'")
+    assert [r[0] for r in execute(db,'bp-latest-hired-employees',row_limit=2)] == ['E1']
+
+
+def test_termination_directory_keeps_recorded_events_and_counts_before_limit(db):
+    db.executescript('''
+    ALTER TABLE dbpcm_warehouse.employee ADD COLUMN employee_name TEXT;
+    ALTER TABLE dbpcm_warehouse.employee ADD COLUMN termination_date TEXT;
+    ALTER TABLE dbpcm_warehouse.employee ADD COLUMN most_recent_hire_date TEXT;
+    UPDATE dbpcm_warehouse.employee SET employee_name=employee_code, termination_date='2026-09-15',most_recent_hire_date='2026-10-01';
+    ''')
+    rows = execute(db,'bp-termination-family',period=PERIOD,row_limit=1)
+    assert len(rows) == 1 and rows[0][-1] == 3
+    assert len(execute(db,'bp-termination-family',period=PERIOD,row_limit=20,employee_status='Terminated')) == 1
+
+
+def test_compensation_rankings_keep_top_n_per_pay_type(db):
+    db.execute('ALTER TABLE dbpcm_warehouse.employee ADD COLUMN employee_name TEXT')
+    db.execute("UPDATE dbpcm_warehouse.employee SET employee_name=employee_code")
+    db.execute("INSERT INTO dbpcm_warehouse.employee VALUES ('H1','D1','Engineering','Active',0,'Hourly',25,'Hourly One')")
+    rows = execute(db,'bp-compensation-ranking',top_n=1)
+    assert {r[0]: (r[2],r[5]) for r in rows} == {'Salary':('E2',200),'Hourly':('H1',52000)}
+
+
+def test_timeoff_ranking_retains_ties_and_excludes_payouts_unapproved_and_outside_period(db):
+    db.executescript("""
+    INSERT INTO dbpcm_warehouse.timeoff_requests VALUES
+    ('E3','Approved','Time Off Request','PTO','2026-09-05',8),
+    ('E3','Approved','Time Off Request','SICK','2026-09-05',0),
+    ('E2','Approved','Time Off Request','PTO','2026-09-06',4);
+    """)
+    rows = execute(db, 'bp-approved-timeoff-ranking', period=PERIOD, top_n=1)
+    assert rows == [('E1',8,1,1),('E3',8,1,1)]

@@ -458,3 +458,18 @@ async def test_the_scrub_still_runs_on_an_approved_question() -> None:
     assert outcome.pending_question is not None
     assert _E not in outcome.pending_question["question"]
     assert _events(events, "loop_answer_prose_redacted")
+
+
+async def test_prequery_clarification_receives_authoritative_catalog_defaults():
+    from tests.runtime.loop.test_judge_evidence import catalog
+
+    judge = _ScriptedJudge([APPROVED])
+    loop, _, _, _ = _build([_turn(_ask(_HUMAN_QUESTION))], judge)
+    loop._judge_catalog = catalog()
+    await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="average salary"
+    )
+    brief = judge.briefs[0]
+    assert brief.sql_executed == ()
+    table = brief.evidence_package["catalog"]["tables"][0]
+    assert table["rules"][0]["predicate"] == "status = 'A'"

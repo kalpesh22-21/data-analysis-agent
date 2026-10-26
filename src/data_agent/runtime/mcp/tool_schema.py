@@ -268,13 +268,17 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
         "Fill `slot_bindings` "
         "with the raw values from the conversation and the user's own words (use the "
         "blueprint's `slots` and `resolves` to know what each slot means) — the runtime "
-        "validates and binds them safely; you never write SQL or codes. An OPTIONAL slot "
+        "validates and binds them safely; do not pass SQL fragments. Use exact allowed enum values "
+        "and the documented name/ID contract for entities. period_range is a nested object "
+        "such as {start: 2025-01-01, end: 2026-01-01}, not two top-level slots. An OPTIONAL slot "
         "may be omitted to apply its declared default; omission does not always mean all values. "
         "Read each slot note: a supplied value overrides the default. Use an explicit all-values "
         "option only when the blueprint declares one and the request requires it. If a required "
         "slot is missing or a value is ambiguous, the run pauses to ask the user. Every "
-        "result is verified before you see it; if verification fails, answer from the raw "
-        "tools instead. The client/tenant is applied automatically — do not pass any "
+        "result receives structural verification; this does not establish that its metric or "
+        "scope matches the question. Check scope before execution; correct through declared "
+        "slots, or choose another blueprint/targeted query if hard-coded SQL conflicts. "
+        "Execute a composed blueprint once; never pass its internal outputs as slots. The client/tenant is applied automatically — do not pass any "
         "client identifier."
     ),
     "parameters": {
@@ -288,7 +292,7 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "description": "A flat map of {slot_name: raw_value} — the model's best "
                 "natural-language read of each slot (a string, number, boolean, or a list "
-                "for IN/enum-list slots). The runtime resolves each to a concrete, "
+                "for IN/enum-list slots; a {start,end} object for period_range). The runtime resolves each to a concrete, "
                 "scope-safe value. Omit a slot to leave it unfilled (a required one will "
                 "pause to ask).",
             },

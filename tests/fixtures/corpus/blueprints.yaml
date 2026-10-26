@@ -9,15 +9,16 @@
   drift_status: clean
   catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
-  - dbpcm_warehouse.accrual_balances.employee_code
-  - dbpcm_warehouse.accrual_balances.accrual_code
-  - dbpcm_warehouse.accrual_balances.beginning_balance
-  - dbpcm_warehouse.accrual_balances.accrued_amount
-  - dbpcm_warehouse.accrual_balances.awarded_amount
-  - dbpcm_warehouse.accrual_balances.taken_amount
+  - dbpcm_warehouse.timeoff_balances.employee_code
+  - dbpcm_warehouse.timeoff_balances.accrual_code
+  - dbpcm_warehouse.timeoff_balances.beginning_balance
+  - dbpcm_warehouse.timeoff_balances.accrued_amount
+  - dbpcm_warehouse.timeoff_balances.awarded_amount
+  - dbpcm_warehouse.timeoff_balances.taken_amount
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: group_by
     type: enum
@@ -29,7 +30,7 @@
   - name: accrual_code
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.accrual_balances.accrual_code
+    binds_to: dbpcm_warehouse.timeoff_balances.accrual_code
     optional_pattern: 'TRUE'
   - name: employee_status
     type: enum
@@ -49,8 +50,10 @@
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -60,7 +63,7 @@
   - Group
   sql_template: "WITH b AS (\n SELECT employee_code, accrual_code, sum(beginning_balance) AS beginning,\n sum(accrued_amount)\
     \ AS accrued, sum(awarded_amount) AS awarded,\n sum(taken_amount) AS taken, count(*) AS balance_rows\n FROM\
-    \ dbpcm_warehouse.accrual_balances WHERE accrual_code = {accrual_code}\n GROUP BY employee_code, accrual_code\n\
+    \ dbpcm_warehouse.timeoff_balances WHERE accrual_code = {accrual_code}\n GROUP BY employee_code, accrual_code\n\
     )\nSELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'plan' THEN b.accrual_code ELSE 'Company'\
     \ END AS `Group`, sum(CAST(b.beginning AS Nullable(Decimal(38, 6)))) AS `Beginning Balance`,\n sum(CAST(b.accrued\
     \ AS Nullable(Decimal(38, 6)))) AS `Accrued Amount`, sum(CAST(b.awarded AS Nullable(Decimal(38, 6)))) AS `Awarded\
@@ -76,21 +79,24 @@
     workflow status enum, resolved event_type and earn_code strings, employee status, department and employee. No
     implicit Approved or PTO filter. COUNT counts event/day rows, not distinct multi-day requests. Approved hours
     are not taken balance usage. LEFT JOIN preserves unmatched events unless employee filters supplied; does not
-    zero-fill periods or prove full coverage.
+    zero-fill periods or prove full coverage. For time-off-taken questions bind event_status=Approved and event_type=Time
+    Off Request, plus the requested category/date scope; assume these requests were taken and disclose it. Offer
+    a separate payroll-paid-hours check without executing it unless requested.
   slots_summary: group_by, period, event_status, event_type, earn_code, employee_status, department, employee
   status: validated
   drift_status: clean
   catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
-  - dbpcm_warehouse.accrual_events.employee_code
-  - dbpcm_warehouse.accrual_events.status
-  - dbpcm_warehouse.accrual_events.event_type
-  - dbpcm_warehouse.accrual_events.earn_code
-  - dbpcm_warehouse.accrual_events.request_date
-  - dbpcm_warehouse.accrual_events.hours
+  - dbpcm_warehouse.timeoff_requests.employee_code
+  - dbpcm_warehouse.timeoff_requests.status
+  - dbpcm_warehouse.timeoff_requests.event_type
+  - dbpcm_warehouse.timeoff_requests.earn_code
+  - dbpcm_warehouse.timeoff_requests.request_date
+  - dbpcm_warehouse.timeoff_requests.hours
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: group_by
     type: enum
@@ -104,6 +110,7 @@
     - department_status
   - name: period
     type: period_range
+    temporal_type: date
     required: true
   - name: event_status
     type: enum
@@ -114,17 +121,17 @@
     - Denied
     - Removed
     - Calendar Only
-    binds_to: dbpcm_warehouse.accrual_events.status
+    binds_to: dbpcm_warehouse.timeoff_requests.status
     optional_pattern: 'TRUE'
   - name: event_type
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.accrual_events.event_type
+    binds_to: dbpcm_warehouse.timeoff_requests.event_type
     optional_pattern: 'TRUE'
   - name: earn_code
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.accrual_events.earn_code
+    binds_to: dbpcm_warehouse.timeoff_requests.earn_code
     optional_pattern: 'TRUE'
   - name: employee_status
     type: enum
@@ -144,8 +151,10 @@
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -155,7 +164,7 @@
   - Group
   - Event Status
   sql_template: "WITH a AS (\n SELECT employee_code, status, event_type, substring(toString(request_date), 1, 7)\
-    \ AS month,\n count(*) AS event_rows, sum(hours) AS hours\n FROM dbpcm_warehouse.accrual_events\n WHERE status\
+    \ AS month,\n count(*) AS event_rows, sum(hours) AS hours\n FROM dbpcm_warehouse.timeoff_requests\n WHERE status\
     \ = {event_status} AND event_type = {event_type} AND earn_code = {earn_code}\n AND toDate(request_date) >= toDate({period_start})\
     \ AND toDate(request_date) < toDate({period_end})\n GROUP BY employee_code, status, event_type, substring(toString(request_date),\
     \ 1, 7)\n)\nSELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'department_status' THEN e.department_name\
@@ -169,9 +178,9 @@
     \ THEN a.event_type WHEN 'month' THEN toString(a.month) ELSE 'Company' END\n, CASE WHEN {group_by} = 'department_status'\
     \ THEN a.status ELSE 'All selected statuses' END\nORDER BY `Group`, `Event Status`\n"
 - id: bp-active-headcount-by-department
-  intent: Active employee headcount by department, including departments with no active employees (active-only;
-    for other/all statuses use bp-employee-summary)
-  slots_summary: department
+  intent: Employee headcount by department, including departments with no matching employees. Defaults to Active
+    + On Leave; employee_status selects another status or All to remove the filter.
+  slots_summary: department, employee_status
   status: validated
   drift_status: clean
   catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
@@ -187,29 +196,11 @@
     required: false
     binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
-  uses_rules:
-  - active_employee
-  result_grain:
-  - department_code
-  sql_template: "SELECT\n    d.department_code AS department_code,\n    d.department_name AS department,\n    coalesce(e.active_count,\
-    \ 0) AS headcount\nFROM dbpcm_warehouse.department AS d\nLEFT JOIN (\n    SELECT department_code, uniqExact(employee_code)\
-    \ AS active_count\n    FROM dbpcm_warehouse.employee\n    WHERE employee_status = 'Active'\n    GROUP BY department_code\n\
-    ) AS e ON d.department_code = e.department_code\nWHERE d.department_name = {department}\nORDER BY headcount,\
-    \ department, department_code\n"
-- id: bp-average-annual-salary-by-status
-  intent: Calculate the average annual salary per employee filtered by employee status.
-  slots_summary: employee_status
-  status: validated
-  drift_status: clean
-  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
-  uses:
-  - dbpcm_warehouse.employee.annual_salary
-  - dbpcm_warehouse.employee.employee_status
-  slots:
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     binds_to: dbpcm_warehouse.employee.employee_status
-    required: true
+    required: false
     enum_values:
     - Active
     - Deceased
@@ -220,13 +211,115 @@
     - Not Hired
     - Prehire
     - Unknown
-  sql_template: SELECT avg(annual_salary) AS average_annual_salary_per_employee FROM dbpcm_warehouse.employee WHERE
-    employee_status = {employee_status}
-  resolves:
-    average annual salary per employee: dbpcm_warehouse.employee.annual_salary
+    - All
+    optional_pattern: employee_status IN ('Active', 'On Leave')
+  uses_rules:
+  - default_employee_population
+  result_grain:
+  - department_code
+  sql_template: "SELECT\n    d.department_code AS department_code,\n    d.department_name AS department,\n    coalesce(e.active_count,\
+    \ 0) AS headcount\nFROM dbpcm_warehouse.department AS d\nLEFT JOIN (\n    SELECT department_code, uniqExact(employee_code)\
+    \ AS active_count\n    FROM dbpcm_warehouse.employee\n    WHERE (employee_status = {employee_status} OR {employee_status}\
+    \ = 'All')\n    GROUP BY department_code\n) AS e ON d.department_code = e.department_code\nWHERE d.department_name\
+    \ = {department}\nORDER BY headcount, department, department_code\n"
+- id: bp-approved-timeoff-ranking
+  intent: Rank employees by approved time-off request hours in a half-open requested-for-date period. Assume approved
+    requests were taken and disclose that assumption. Include all accessible request records, retain ties at the
+    requested rank, and offer a separate payroll-paid-hours check. Days are distinct requested calendar dates, not
+    punch days.
+  slots_summary: period, top_n
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.timeoff_requests.employee_code
+  - dbpcm_warehouse.timeoff_requests.hours
+  - dbpcm_warehouse.timeoff_requests.request_date
+  - dbpcm_warehouse.timeoff_requests.status
+  - dbpcm_warehouse.timeoff_requests.event_type
+  slots:
+  - name: period
+    type: period_range
+    temporal_type: date
+    required: true
+  - name: top_n
+    type: positive_integer
+    required: true
+    min_value: 1
+    max_value: 100
+  result_grain:
+  - Employee Code
+  sql_template: 'WITH totals AS (
+
+    SELECT employee_code, sum(hours) AS approved_hours, uniqExact(toDate(request_date)) AS requested_days
+
+    FROM dbpcm_warehouse.timeoff_requests
+
+    WHERE status = ''Approved'' AND event_type = ''Time Off Request''
+
+    AND request_date >= {period_start} AND request_date < {period_end}
+
+    GROUP BY employee_code
+
+    ), ranked AS (
+
+    SELECT employee_code, approved_hours, requested_days, dense_rank() OVER (ORDER BY approved_hours DESC) AS hours_rank
+    FROM totals
+
+    )
+
+    SELECT employee_code AS `Employee Code`, approved_hours AS `Approved Time-Off Hours`, requested_days AS `Requested
+    Days`, hours_rank AS `Rank`
+
+    FROM ranked WHERE hours_rank <= {top_n} ORDER BY hours_rank, employee_code'
+  uses_rules: []
+- id: bp-average-annual-salary-by-status
+  intent: Average annual compensation by pay type, filtered by employee status. Salary uses annual_salary; Hourly
+    uses hourly_salary and estimated annual compensation = hourly_salary * 2080 (40 hours/week, 52 weeks/year; excludes
+    overtime). Keep pay types separate. Defaults to Active + On Leave; employee_status overrides or All removes
+    the filter.
+  slots_summary: employee_status
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
+  slots:
+  - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
+    type: enum
+    binds_to: dbpcm_warehouse.employee.employee_status
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    - All
+    optional_pattern: employee_status IN ('Active', 'On Leave')
+  sql_template: SELECT employee_pay_type AS `Pay Type`, CASE WHEN employee_pay_type = 'Hourly' THEN 'Estimated annual
+    compensation (2080 hours)' WHEN employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown compensation
+    basis' END AS `Compensation Basis`, avg(CASE WHEN employee_pay_type = 'Salary' THEN annual_salary WHEN employee_pay_type
+    = 'Hourly' THEN hourly_salary * 2080 ELSE NULL END) AS `Average Annual Compensation`, avg(CASE WHEN employee_pay_type
+    = 'Hourly' THEN hourly_salary ELSE NULL END) AS `Average Hourly Rate` FROM dbpcm_warehouse.employee WHERE (employee_status
+    = {employee_status} OR {employee_status} = 'All') GROUP BY employee_pay_type
+  result_grain:
+  - Pay Type
+  uses_rules:
+  - compensation_by_pay_type
 - id: bp-average-salary-by-department
-  intent: Average annual salary and employee headcount by department; optional employee status and department; omitted
-    filters include all accessible employees. Average excludes NULL salaries; headcount includes them.
+  intent: Average annual compensation and headcount by department and pay type. Averages exclude unknown compensation;
+    headcount includes it. Salary uses annual_salary; Hourly uses hourly_salary and estimated annual compensation
+    = hourly_salary * 2080 (40 hours/week, 52 weeks/year; excludes overtime). Keep pay types separate. Defaults
+    to Active + On Leave; employee_status overrides or All removes the filter.
   slots_summary: department, employee_status
   status: validated
   drift_status: clean
@@ -236,15 +329,19 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.annual_salary
   - dbpcm_warehouse.employee.employee_status
-  resolves:
-    salary: annual_salary
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: department
     type: string
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     required: false
     enum_values:
@@ -257,13 +354,22 @@
     - Not Hired
     - Prehire
     - Unknown
+    - All
     binds_to: dbpcm_warehouse.employee.employee_status
-    optional_pattern: 'TRUE'
+    optional_pattern: employee_status IN ('Active', 'On Leave')
   result_grain:
   - Department
-  sql_template: "SELECT department_name AS department,\n       AVG(annual_salary) AS avg_salary,\n       COUNT(DISTINCT\
-    \ employee_code) AS headcount\nFROM dbpcm_warehouse.employee\nWHERE department_name = {department}\n  AND employee_status\
-    \ = {employee_status}\nGROUP BY department_name\n"
+  - Pay Type
+  sql_template: "SELECT employee_pay_type AS `Pay Type`, CASE WHEN employee_pay_type = 'Hourly' THEN 'Estimated\
+    \ annual compensation (2080 hours)' WHEN employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown\
+    \ compensation basis' END AS `Compensation Basis`, department_name AS department,\n       AVG((CASE WHEN employee_pay_type\
+    \ = 'Salary' THEN annual_salary WHEN employee_pay_type = 'Hourly' THEN hourly_salary * 2080 ELSE NULL END))\
+    \ AS average_annual_compensation,\n       COUNT(DISTINCT employee_code) AS headcount, avg(CASE WHEN employee_pay_type\
+    \ = 'Hourly' THEN hourly_salary ELSE NULL END) AS `Average Hourly Rate`\nFROM dbpcm_warehouse.employee\nWHERE\
+    \ department_name = {department}\n  AND (employee_status = {employee_status} OR {employee_status} = 'All')\n\
+    GROUP BY employee_pay_type, department_name\n"
+  uses_rules:
+  - compensation_by_pay_type
 - id: bp-compare-employee-check-detail-two-periods
   intent: Compare a single employee's two paychecks line-item by line-item across two pay periods, with per-item
     deltas
@@ -286,10 +392,12 @@
     binds_to: dbpcm_warehouse.payroll.employee_code
   - name: period_a
     type: period
+    temporal_type: date
     required: true
     binds_to: dbpcm_warehouse.payroll.pay_period_end_date
   - name: period_b
     type: period
+    temporal_type: date
     required: true
     binds_to: dbpcm_warehouse.payroll.pay_period_end_date
   result_grain:
@@ -327,9 +435,89 @@
       \ 0) AS hours_b\nFROM scratch.detail_a AS a\nFULL OUTER JOIN scratch.detail_b AS b\n  ON a.register_type =\
       \ b.register_type AND a.type_code = b.type_code\nORDER BY coalesce(a.register_type, b.register_type),\n  \
       \       coalesce(a.type_code, b.type_code)\n"
+- id: bp-compensation-ranking
+  intent: Top N highest-paid employees separately within Salary and Hourly pay types. Salary uses recorded annual
+    salary; Hourly uses hourly_salary * 2080 estimated annual compensation (40 hours/week, 52 weeks/year, excludes
+    overtime). This is current compensation, not actual payroll earnings. Defaults to Active + On Leave; top_n applies
+    to each pay type.
+  slots_summary: top_n, employee_status, department
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_name
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.hourly_salary
+  - dbpcm_warehouse.department.department_name
+  slots:
+  - name: top_n
+    type: positive_integer
+    required: true
+    min_value: 1
+    max_value: 1000
+  - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    - All
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.department.department_name
+    optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
+  result_grain:
+  - Pay Type
+  - Rank
+  sql_template: 'WITH compensation AS (
+
+    SELECT e.employee_code, e.employee_name, e.department_name, e.employee_pay_type, e.hourly_salary,
+
+    CASE WHEN e.employee_pay_type = ''Salary'' THEN e.annual_salary WHEN e.employee_pay_type = ''Hourly'' THEN e.hourly_salary
+    * 2080 ELSE NULL END AS annual_compensation
+
+    FROM dbpcm_warehouse.employee e WHERE (e.employee_status = {employee_status} OR {employee_status} = ''All'')
+    AND e.department_name = {department}
+
+    ), ranked AS (
+
+    SELECT employee_code, employee_name, department_name, employee_pay_type, hourly_salary, annual_compensation,
+    row_number() OVER (PARTITION BY employee_pay_type ORDER BY annual_compensation DESC, employee_code) AS compensation_rank
+
+    FROM compensation WHERE annual_compensation IS NOT NULL
+
+    )
+
+    SELECT employee_pay_type AS `Pay Type`, compensation_rank AS `Rank`, employee_code AS `Employee Code`, employee_name
+    AS `Employee Name`, department_name AS `Department`, annual_compensation AS `Annual Compensation`, hourly_salary
+    AS `Hourly Rate`
+
+    FROM ranked WHERE compensation_rank <= {top_n} ORDER BY employee_pay_type, compensation_rank'
+  uses_rules:
+  - default_employee_population
+  - compensation_by_pay_type
 - id: bp-departments-above-company-average-salary
-  intent: Departments whose average salary exceeds the company-wide average
-  slots_summary: ''
+  intent: Departments above the corresponding company average, separately for Salary annual salaries and Hourly
+    annual estimates (hourly rate * 2080, 40 hours/week, 52 weeks/year). Defaults to Active + On Leave; employee_status
+    overrides or All removes the filter.
+  slots_summary: employee_status
   status: validated
   drift_status: clean
   catalog_sha: ''
@@ -337,32 +525,56 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
   result_grain:
   - Department
+  - Pay Type
   composes:
   - order: 0
     output:
-      company_avg: scalar
-    sql_template: 'SELECT AVG(annual_salary) AS company_avg
-
-      FROM dbpcm_warehouse.employee
-
-      '
+      company_salary_avg: scalar
+      company_hourly_avg: scalar
+    sql_template: SELECT avg(CASE WHEN employee_pay_type = 'Salary' THEN annual_salary ELSE NULL END) AS company_salary_avg,
+      avg(CASE WHEN employee_pay_type = 'Hourly' THEN hourly_salary * 2080 ELSE NULL END) AS company_hourly_avg
+      FROM dbpcm_warehouse.employee WHERE (employee_status = {employee_status} OR {employee_status} = 'All')
   - order: 1
     feeds_from:
     - 0
     consumes:
-      company_avg: $0.company_avg
+      company_salary_avg: $0.company_salary_avg
+      company_hourly_avg: $0.company_hourly_avg
     output: {}
-    sql_template: 'SELECT department_name AS department, AVG(annual_salary) AS dept_avg
-
-      FROM dbpcm_warehouse.employee
-
-      GROUP BY department_name
-
-      HAVING AVG(annual_salary) > {company_avg}
-
-      '
+    sql_template: SELECT department_name AS `Department`, employee_pay_type AS `Pay Type`, CASE WHEN employee_pay_type
+      = 'Hourly' THEN 'Estimated annual compensation (2080 hours)' ELSE 'Recorded annual salary' END AS `Compensation
+      Basis`, avg(CASE WHEN employee_pay_type = 'Salary' THEN annual_salary WHEN employee_pay_type = 'Hourly' THEN
+      hourly_salary * 2080 ELSE NULL END) AS `Department Average Annual Compensation`, avg(CASE WHEN employee_pay_type
+      = 'Hourly' THEN hourly_salary ELSE NULL END) AS `Average Hourly Rate` FROM dbpcm_warehouse.employee WHERE
+      (employee_status = {employee_status} OR {employee_status} = 'All') GROUP BY department_name, employee_pay_type
+      HAVING avg(CASE WHEN employee_pay_type = 'Salary' THEN annual_salary WHEN employee_pay_type = 'Hourly' THEN
+      hourly_salary * 2080 ELSE NULL END) > CASE WHEN employee_pay_type = 'Salary' THEN {company_salary_avg} WHEN
+      employee_pay_type = 'Hourly' THEN {company_hourly_avg} ELSE NULL END
+  slots:
+  - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
+    type: enum
+    binds_to: dbpcm_warehouse.employee.employee_status
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    - All
+    optional_pattern: employee_status IN ('Active', 'On Leave')
+  uses_rules:
+  - compensation_by_pay_type
 - id: bp-earnings-by-department-via-scratch-join
   intent: Total earnings by department, materializing per-employee earnings and joining departments
   slots_summary: department
@@ -375,11 +587,14 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: department
     type: string
     required: true
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   result_grain:
   - Department
   composes:
@@ -426,6 +641,7 @@
     binds_to: dbpcm_warehouse.payroll.employee_code
   - name: period
     type: period
+    temporal_type: date
     required: true
     binds_to: dbpcm_warehouse.payroll.pay_period_end_date
   result_grain:
@@ -451,6 +667,7 @@
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.most_recent_hire_date
   - dbpcm_warehouse.employee.termination_date
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: date_basis
     type: enum
@@ -469,6 +686,7 @@
     - month
   - name: period
     type: period_range
+    temporal_type: date
     required: true
   - name: employee_status
     type: enum
@@ -488,8 +706,10 @@
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -510,13 +730,15 @@
 
     GROUP BY `Group` ORDER BY `Group`'
 - id: bp-employee-day-clock-span
-  intent: Employee-day first actual clock-in, last actual clock-out and matched-pair count, with paid hours. Clock
+  intent: Employee-day first recorded In time, last recorded Out time and matched-pair count, with paid hours. Clock
     span may contain unpaid gaps; it is not hours worked, a single shift or a lateness finding. Days are assigned
     by recorded punch_date; midnight ownership is not inferred. Optional punch-type filters restrict which pairs
     contribute. Required half-open punch-date period and resolved table_source prevent accidental cross-source double
     counting. FINAL deduplicates storage versions, not overlapping real-world events. Department means recorded
     labor-allocation department code, not current home department. No scheduled shift, tardiness or overtime policy
-    is inferred. Observed first/last dates do not prove completeness; missing days/months are not zero-filled.
+    is inferred. Observed first/last dates do not prove completeness; missing days/months are not zero-filled. Salaried
+    approved leave and automatic pay-period-end entries can generate these records; this blueprint does not establish
+    physical attendance or current clock-in.
   slots_summary: period, source, employee, department, hours_type, pay_class, in_type, out_type
   status: validated
   drift_status: clean
@@ -536,6 +758,7 @@
   slots:
   - name: period
     type: period_range
+    temporal_type: date
     required: true
   - name: source
     type: entity
@@ -585,7 +808,8 @@
   - Employee Code
   - Punch Date
   sql_template: 'SELECT employee_code AS `Employee Code`, punch_date AS `Punch Date`, min(in_punch_time) AS `First
-    Clock In`, max(out_punch_time) AS `Last Clock Out`, count(*) AS `Pair Count`, sum(earn_hours) AS `Paid Hours`
+    Recorded In`, max(out_punch_time) AS `Last Recorded Out`, count(*) AS `Pair Count`, sum(earn_hours) AS `Paid
+    Hours`
 
     FROM dbpcm_warehouse.punch_pair FINAL
 
@@ -595,10 +819,11 @@
 
     GROUP BY employee_code, punch_date ORDER BY employee_code, punch_date'
 - id: bp-employee-summary
-  intent: Employee headcount, salary sum/average/minimum/maximum and known-salary count, grouped by company, department
-    or status. Optional status, department and employee filters; omit to include all. Salary statistics exclude
-    NULLs; no implicit active-only filter. One employee row per authorized employee is required. No date-period
-    or salary-threshold filter.
+  intent: Headcount and annual compensation sum, average, minimum, maximum and known-compensation count by company,
+    department or status, separately by pay type. Unknown compensation is NULL; headcount retains other and unknown
+    pay types. Salary uses annual_salary; Hourly uses hourly_salary and estimated annual compensation = hourly_salary
+    * 2080 (40 hours/week, 52 weeks/year; excludes overtime). Keep pay types separate. Defaults to Active + On Leave;
+    employee_status overrides or All removes the filter.
   slots_summary: group_by, employee_status, department, employee
   status: validated
   drift_status: clean
@@ -608,6 +833,9 @@
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: group_by
     type: enum
@@ -617,6 +845,7 @@
     - department
     - status
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     required: false
     enum_values:
@@ -629,13 +858,16 @@
     - Not Hired
     - Prehire
     - Unknown
+    - All
     binds_to: dbpcm_warehouse.employee.employee_status
-    optional_pattern: 'TRUE'
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -643,19 +875,32 @@
     optional_pattern: 'TRUE'
   result_grain:
   - Group
-  sql_template: "SELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status\
-    \ ELSE 'Company' END AS `Group`,\n uniqExact(e.employee_code) AS `Employee Count`,\n count(e.annual_salary)\
-    \ AS `Known Salary Count`,\n sum(e.annual_salary) AS `Salary Sum`, avg(e.annual_salary) AS `Average Salary`,\n\
-    \ min(e.annual_salary) AS `Minimum Salary`, max(e.annual_salary) AS `Maximum Salary`\nFROM dbpcm_warehouse.employee\
-    \ e\nWHERE e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code =\
-    \ {employee}\nGROUP BY CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status\
-    \ ELSE 'Company' END\nORDER BY `Group`\n"
+  - Pay Type
+  sql_template: "SELECT e.employee_pay_type AS `Pay Type`, CASE WHEN e.employee_pay_type = 'Hourly' THEN 'Estimated\
+    \ annual compensation (2080 hours)' WHEN e.employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown\
+    \ compensation basis' END AS `Compensation Basis`, CASE WHEN {group_by} = 'department' THEN e.department_name\
+    \ WHEN {group_by} = 'status' THEN e.employee_status ELSE 'Company' END AS `Group`,\n uniqExact(e.employee_code)\
+    \ AS `Employee Count`,\n count((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type\
+    \ = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS `Known Compensation Count`,\n sum((CASE WHEN e.employee_pay_type\
+    \ = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL\
+    \ END)) AS `Annual Compensation Sum`, avg((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN\
+    \ e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS `Average Annual Compensation`,\n\
+    \ min((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN\
+    \ e.hourly_salary * 2080 ELSE NULL END)) AS `Minimum Annual Compensation`, max((CASE WHEN e.employee_pay_type\
+    \ = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL\
+    \ END)) AS `Maximum Annual Compensation`, avg(CASE WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary\
+    \ ELSE NULL END) AS `Average Hourly Rate`\nFROM dbpcm_warehouse.employee e\nWHERE (e.employee_status = {employee_status}\
+    \ OR {employee_status} = 'All') AND e.department_name = {department} AND e.employee_code = {employee}\nGROUP\
+    \ BY e.employee_pay_type, CASE WHEN {group_by} = 'department' THEN e.department_name WHEN {group_by} = 'status'\
+    \ THEN e.employee_status ELSE 'Company' END\nORDER BY `Group`\n"
+  uses_rules:
+  - compensation_by_pay_type
 - id: bp-employee-tenure-summary
   intent: Elapsed years from original or most recent hire date to a supplied ISO YYYY-MM-DD reference_date, using
     calendar days / 365.25. Company/department/current-status groups, average/min/max and valid-date count. Excludes
-    NULL, dates at/before 1900-01-01 and future hire dates. For employment tenure of current staff select Active;
-    all-status elapsed time does NOT stop at termination and is not historical active headcount. Date is explicit,
-    not inferred from today.
+    NULL, dates at/before 1900-01-01 and future hire dates. all-status elapsed time does NOT stop at termination
+    and is not historical active headcount. Date is explicit, not inferred from today. Defaults to Active + On Leave;
+    employee_status selects another status or All to remove the filter.
   slots_summary: group_by, hire_basis, reference_date, employee_status, department, employee
   status: validated
   drift_status: clean
@@ -666,6 +911,7 @@
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: group_by
     type: enum
@@ -682,8 +928,10 @@
     - most_recent_hire
   - name: reference_date
     type: string
+    temporal_type: date
     required: true
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     required: false
     enum_values:
@@ -696,13 +944,16 @@
     - Not Hired
     - Prehire
     - Unknown
+    - All
     binds_to: dbpcm_warehouse.employee.employee_status
-    optional_pattern: 'TRUE'
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -716,11 +967,12 @@
     \ AS `Average Elapsed Years`,\n min(dateDiff('day', CASE {hire_basis} WHEN 'most_recent_hire' THEN e.most_recent_hire_date\
     \ ELSE e.hire_date END, toDate({reference_date})) / 365.25) AS `Minimum Elapsed Years`,\n max(dateDiff('day',\
     \ CASE {hire_basis} WHEN 'most_recent_hire' THEN e.most_recent_hire_date ELSE e.hire_date END, toDate({reference_date}))\
-    \ / 365.25) AS `Maximum Elapsed Years`\nFROM dbpcm_warehouse.employee e WHERE e.employee_status = {employee_status}\
-    \ AND e.department_name = {department} AND e.employee_code = {employee} AND (CASE {hire_basis} WHEN 'most_recent_hire'\
-    \ THEN e.most_recent_hire_date ELSE e.hire_date END) > toDate('1900-01-01') AND (CASE {hire_basis} WHEN 'most_recent_hire'\
-    \ THEN e.most_recent_hire_date ELSE e.hire_date END) <= toDate({reference_date})\nGROUP BY CASE {group_by} WHEN\
-    \ 'department' THEN e.department_name WHEN 'status' THEN e.employee_status ELSE 'Company' END ORDER BY `Group`"
+    \ / 365.25) AS `Maximum Elapsed Years`\nFROM dbpcm_warehouse.employee e WHERE (e.employee_status = {employee_status}\
+    \ OR {employee_status} = 'All') AND e.department_name = {department} AND e.employee_code = {employee} AND (CASE\
+    \ {hire_basis} WHEN 'most_recent_hire' THEN e.most_recent_hire_date ELSE e.hire_date END) > toDate('1900-01-01')\
+    \ AND (CASE {hire_basis} WHEN 'most_recent_hire' THEN e.most_recent_hire_date ELSE e.hire_date END) <= toDate({reference_date})\n\
+    GROUP BY CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status ELSE\
+    \ 'Company' END ORDER BY `Group`"
 - id: bp-hires-in-range
   intent: "New hires per month within an explicit start/end date range \u2014 counts by original hire date; rehires\
     \ are not re-counted"
@@ -735,13 +987,14 @@
   slots:
   - name: hire_window
     type: period_range
+    temporal_type: date
     required: true
   result_grain:
   - month
   window_anchor: calendar
   sql_template: "SELECT toStartOfMonth(hire_date) AS month,\n       COUNT(DISTINCT employee_code) AS hires\nFROM\
     \ dbpcm_warehouse.employee\nWHERE hire_date >= {hire_window_start}\n  AND hire_date < {hire_window_end}\n  AND\
-    \ (employee_status != 'N' OR employee_status IS NULL)\nGROUP BY toStartOfMonth(hire_date)\n"
+    \ (employee_status != 'Not Hired' OR employee_status IS NULL)\nGROUP BY toStartOfMonth(hire_date)\n"
 - id: bp-hires-per-month
   intent: "New hires per month over a trailing window of the last N months \u2014 counts by original hire date;\
     \ rehires are not re-counted"
@@ -795,6 +1048,66 @@
     \ AS projected_next_n_hires\nFROM dbpcm_warehouse.employee\nWHERE hire_date >= addMonths((\n        SELECT toStartOfMonth(max(hire_date))\n\
     \        FROM dbpcm_warehouse.employee\n        WHERE employee_status != 'N' OR employee_status IS NULL\n  \
     \    ), 1) - INTERVAL {window_months} MONTH\n  AND (employee_status != 'N' OR employee_status IS NULL)\n"
+- id: bp-latest-hired-employees
+  intent: Latest hired employee list ordered by most recent hire date, including rehires. Defaults to Active + On
+    Leave. Excludes missing/sentinel and future hire dates. row_limit is the requested top N; original hire is not
+    the ranking date.
+  slots_summary: row_limit, employee_status, department
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_name
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.department.department_name
+  slots:
+  - name: row_limit
+    type: positive_integer
+    required: true
+    min_value: 1
+    max_value: 1000
+  - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    - All
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.department.department_name
+    optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
+  result_grain:
+  - Employee Code
+  sql_template: 'SELECT e.employee_code AS `Employee Code`, e.employee_name AS `Employee Name`, e.department_name
+    AS `Department`, e.employee_status AS `Status`, e.most_recent_hire_date AS `Most Recent Hire Date`
+
+    FROM dbpcm_warehouse.employee e
+
+    WHERE (e.employee_status = {employee_status} OR {employee_status} = ''All'') AND e.department_name = {department}
+
+    AND e.most_recent_hire_date > toDate(''1900-01-01'') AND e.most_recent_hire_date <= now()
+
+    ORDER BY e.most_recent_hire_date DESC, e.employee_code LIMIT {row_limit}'
+  uses_rules:
+  - default_employee_population
+  - missing_date_sentinel
 - id: bp-overtime-by-department
   intent: Earnings by department for a given pay period, filtered to a specific pay type (type_code) such as overtime
   slots_summary: department, pay_period, type_code
@@ -809,13 +1122,17 @@
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: department
     type: string
     required: true
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: pay_period
     type: period
+    temporal_type: date
     required: true
     binds_to: dbpcm_warehouse.payroll.pay_period_end_date
   - name: type_code
@@ -850,6 +1167,7 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: group_by
     type: enum
@@ -871,6 +1189,7 @@
     binds_to: dbpcm_warehouse.payroll.register_type
   - name: period
     type: period_range
+    temporal_type: date
     required: true
   - name: type_code
     type: entity
@@ -895,8 +1214,10 @@
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -950,6 +1271,7 @@
     - hours_type
   - name: period
     type: period_range
+    temporal_type: date
     required: true
   - name: source
     type: entity
@@ -1009,10 +1331,11 @@
     \ THEN toString(punch_date) WHEN 'month' THEN substring(toString(punch_date),1,7) WHEN 'hours_type' THEN hours_type\
     \ ELSE 'Company' END ORDER BY `Group`"
 - id: bp-salary-distribution
-  intent: Annual salary distribution with configurable positive whole-currency band width. Lower bound inclusive,
-    upper bound exclusive; no formatted-label rounding. Counts and percentage denominator include only selected
-    recorded salaries, not employees missing salaries. Required population selects recorded or positive only. No
-    implicit active filter.
+  intent: Annual compensation histogram by pay type with positive whole-currency band_width. Lower inclusive, upper
+    exclusive; percentages use the selected known-compensation population within each pay type. salary_population
+    selects recorded (including zero) or positive values. Salary uses annual_salary; Hourly uses hourly_salary and
+    estimated annual compensation = hourly_salary * 2080 (40 hours/week, 52 weeks/year; excludes overtime). Keep
+    pay types separate. Defaults to Active + On Leave; employee_status overrides or All removes the filter.
   slots_summary: band_width, salary_population, employee_status, department, employee
   status: validated
   drift_status: clean
@@ -1022,6 +1345,9 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: band_width
     type: positive_integer
@@ -1034,7 +1360,9 @@
     enum_values:
     - recorded
     - positive
+    description: Use recorded (including zero) unless the user explicitly requests positive/nonzero compensation.
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     required: false
     enum_values:
@@ -1047,13 +1375,16 @@
     - Not Hired
     - Prehire
     - Unknown
+    - All
     binds_to: dbpcm_warehouse.employee.employee_status
-    optional_pattern: 'TRUE'
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -1061,17 +1392,30 @@
     optional_pattern: 'TRUE'
   result_grain:
   - Lower Bound
-  sql_template: "SELECT intDiv(e.annual_salary, {band_width}) * {band_width} AS `Lower Bound`,\n (intDiv(e.annual_salary,\
-    \ {band_width}) + 1) * {band_width} AS `Upper Bound Exclusive`,\n count(*) AS `Employee Count`, 100.0 * count(*)\
-    \ / sum(count(*)) OVER () AS `Percent of Selected Recorded Salaries`\nFROM dbpcm_warehouse.employee e WHERE\
-    \ e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code = {employee}\
-    \ AND e.annual_salary IS NOT NULL\n AND ({salary_population} = 'recorded' OR e.annual_salary > 0)\nGROUP BY\
-    \ intDiv(e.annual_salary, {band_width}) ORDER BY `Lower Bound`"
+  - Pay Type
+  sql_template: "SELECT e.employee_pay_type AS `Pay Type`, CASE WHEN e.employee_pay_type = 'Hourly' THEN 'Estimated\
+    \ annual compensation (2080 hours)' WHEN e.employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown\
+    \ compensation basis' END AS `Compensation Basis`, floor((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary\
+    \ WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) / {band_width}) * {band_width}\
+    \ AS `Lower Bound`,\n (floor((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type\
+    \ = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) / {band_width}) + 1) * {band_width} AS `Upper Bound\
+    \ Exclusive`,\n count(*) AS `Employee Count`, 100.0 * count(*) / sum(count(*)) OVER (PARTITION BY e.employee_pay_type)\
+    \ AS `Percent Within Pay Type`\nFROM dbpcm_warehouse.employee e WHERE (e.employee_status = {employee_status}\
+    \ OR {employee_status} = 'All') AND e.department_name = {department} AND e.employee_code = {employee} AND (CASE\
+    \ WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary\
+    \ * 2080 ELSE NULL END) IS NOT NULL\n AND ({salary_population} = 'recorded' OR (CASE WHEN e.employee_pay_type\
+    \ = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL\
+    \ END) > 0)\nGROUP BY e.employee_pay_type, floor((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary\
+    \ WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) / {band_width}) ORDER BY `Lower\
+    \ Bound`"
+  uses_rules:
+  - compensation_by_pay_type
 - id: bp-salary-exact-median
-  intent: Exact annual salary median (middle-pair mean), average, minimum, maximum and recorded-salary count by
-    company, department or current status. No approximation. Required salary_population chooses all recorded values
-    including zero, or positive salaries only. NULL salaries excluded; no implicit active filter. Does not compute
-    arbitrary percentiles.
+  intent: Exact middle-pair median, mean, min, max and known-compensation count by company, department or status,
+    separately by pay type. salary_population selects recorded values (including zero) or positive values; NULLs
+    excluded. Salary uses annual_salary; Hourly uses hourly_salary and estimated annual compensation = hourly_salary
+    * 2080 (40 hours/week, 52 weeks/year; excludes overtime). Keep pay types separate. Defaults to Active + On Leave;
+    employee_status overrides or All removes the filter.
   slots_summary: group_by, salary_population, employee_status, department, employee
   status: validated
   drift_status: clean
@@ -1081,6 +1425,9 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: group_by
     type: enum
@@ -1095,7 +1442,9 @@
     enum_values:
     - recorded
     - positive
+    description: Use recorded (including zero) unless the user explicitly requests positive/nonzero compensation.
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     required: false
     enum_values:
@@ -1108,13 +1457,16 @@
     - Not Hired
     - Prehire
     - Unknown
+    - All
     binds_to: dbpcm_warehouse.employee.employee_status
-    optional_pattern: 'TRUE'
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -1122,20 +1474,36 @@
     optional_pattern: 'TRUE'
   result_grain:
   - Group
-  sql_template: "SELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status\
-    \ ELSE 'Company' END AS `Group`, count(e.annual_salary) AS `Recorded Salary Count`,\n (quantileExactLow(0.5)(e.annual_salary)\
-    \ + quantileExactHigh(0.5)(e.annual_salary)) / 2 AS `Exact Median Salary`,\n avg(e.annual_salary) AS `Average\
-    \ Salary`, min(e.annual_salary) AS `Minimum Salary`, max(e.annual_salary) AS `Maximum Salary`\nFROM dbpcm_warehouse.employee\
-    \ e WHERE e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code = {employee}\n\
-    \ AND e.annual_salary IS NOT NULL AND ({salary_population} = 'recorded' OR e.annual_salary > 0)\nGROUP BY CASE\
-    \ {group_by} WHEN 'department' THEN e.department_name WHEN 'status' THEN e.employee_status ELSE 'Company' END\
+  - Pay Type
+  sql_template: "SELECT e.employee_pay_type AS `Pay Type`, CASE WHEN e.employee_pay_type = 'Hourly' THEN 'Estimated\
+    \ annual compensation (2080 hours)' WHEN e.employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown\
+    \ compensation basis' END AS `Compensation Basis`, CASE WHEN {group_by} = 'department' THEN e.department_name\
+    \ WHEN {group_by} = 'status' THEN e.employee_status ELSE 'Company' END AS `Group`, count((CASE WHEN e.employee_pay_type\
+    \ = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL\
+    \ END)) AS `Known Compensation Count`,\n (quantileExactLow(0.5)((CASE WHEN e.employee_pay_type = 'Salary' THEN\
+    \ e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) + quantileExactHigh(0.5)((CASE\
+    \ WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary\
+    \ * 2080 ELSE NULL END))) / 2 AS `Exact Median Annual Compensation`,\n avg((CASE WHEN e.employee_pay_type =\
+    \ 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END))\
+    \ AS `Average Annual Compensation`, min((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN\
+    \ e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS `Minimum Annual Compensation`,\
+    \ max((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN\
+    \ e.hourly_salary * 2080 ELSE NULL END)) AS `Maximum Annual Compensation`, avg(CASE WHEN e.employee_pay_type\
+    \ = 'Hourly' THEN e.hourly_salary ELSE NULL END) AS `Average Hourly Rate`\nFROM dbpcm_warehouse.employee e WHERE\
+    \ (e.employee_status = {employee_status} OR {employee_status} = 'All') AND e.department_name = {department}\
+    \ AND e.employee_code = {employee}\n AND (CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN\
+    \ e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) IS NOT NULL AND ({salary_population}\
+    \ = 'recorded' OR (CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type =\
+    \ 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) > 0)\nGROUP BY e.employee_pay_type, CASE WHEN {group_by}\
+    \ = 'department' THEN e.department_name WHEN {group_by} = 'status' THEN e.employee_status ELSE 'Company' END\
     \ ORDER BY `Group`"
+  uses_rules:
+  - compensation_by_pay_type
 - id: bp-salary-threshold-count
-  intent: How many employees make over a salary amount? Count employees earning above, below, at least or exactly
-    a specified annual salary. Returns one employee count, not an employee list. Count employees whose recorded
-    annual salary is above, at least, exactly equal to or below a whole-currency threshold. Optional current status,
-    department and employee. NULL salary never matches. Returns a scalar zero for no matches. Fractional-currency
-    thresholds require direct SQL.
+  intent: Employee counts by pay type above, below, at least or exactly a whole-currency annual compensation threshold.
+    Empty results mean no matches. Salary uses annual_salary; Hourly uses hourly_salary and estimated annual compensation
+    = hourly_salary * 2080 (40 hours/week, 52 weeks/year; excludes overtime). Keep pay types separate. Defaults
+    to Active + On Leave; employee_status overrides or All removes the filter.
   slots_summary: comparison, salary, employee_status, department, employee
   status: validated
   drift_status: clean
@@ -1145,6 +1513,9 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: comparison
     type: enum
@@ -1160,6 +1531,7 @@
     min_value: 0
     max_value: 1000000000
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     required: false
     enum_values:
@@ -1172,31 +1544,43 @@
     - Not Hired
     - Prehire
     - Unknown
+    - All
     binds_to: dbpcm_warehouse.employee.employee_status
-    optional_pattern: 'TRUE'
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
     binds_to: dbpcm_warehouse.employee.employee_code
     optional_pattern: 'TRUE'
-  result_grain: []
-  sql_template: SELECT count(DISTINCT e.employee_code) AS `Employee Count` FROM dbpcm_warehouse.employee e WHERE
-    e.employee_status = {employee_status} AND e.department_name = {department} AND e.employee_code = {employee}
-    AND (({comparison} = 'above' AND e.annual_salary > {salary}) OR ({comparison} = 'at_least' AND e.annual_salary
-    >= {salary}) OR ({comparison} = 'equal' AND e.annual_salary = {salary}) OR ({comparison} = 'below' AND e.annual_salary
-    < {salary}))
+  result_grain:
+  - Pay Type
+  sql_template: SELECT e.employee_pay_type AS `Pay Type`, CASE WHEN e.employee_pay_type = 'Hourly' THEN 'Estimated
+    annual compensation (2080 hours)' WHEN e.employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown
+    compensation basis' END AS `Compensation Basis`, count(DISTINCT e.employee_code) AS `Employee Count` FROM dbpcm_warehouse.employee
+    e WHERE (e.employee_status = {employee_status} OR {employee_status} = 'All') AND e.department_name = {department}
+    AND e.employee_code = {employee} AND (({comparison} = 'above' AND (CASE WHEN e.employee_pay_type = 'Salary'
+    THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) > {salary})
+    OR ({comparison} = 'at_least' AND (CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type
+    = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) >= {salary}) OR ({comparison} = 'equal' AND (CASE WHEN
+    e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary
+    * 2080 ELSE NULL END) = {salary}) OR ({comparison} = 'below' AND (CASE WHEN e.employee_pay_type = 'Salary' THEN
+    e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) < {salary}))
+    GROUP BY e.employee_pay_type
+  uses_rules:
+  - compensation_by_pay_type
 - id: bp-salary-threshold-directory
-  intent: Show all employees who earn over a salary amount; list employees earning above, below or exactly a specified
-    annual salary. Top N highest paid employees. Returns employee records, not just a count. List employee codes,
-    department, current status and annual salary above/at least/equal/below a whole-currency threshold, ordered
-    by salary descending then employee code. Configurable result limit; top N uses a threshold of at least zero
-    and excludes missing salaries. Ties are broken by employee code; no within-department ranking. Result limit
-    is not a completeness guarantee.
+  intent: Employee directory filtered by a whole-currency annual compensation threshold, ordered by pay type then
+    annual compensation. row_limit caps the entire directory; this is not a top-N-per-pay-type ranking. Salary uses
+    annual_salary; Hourly uses hourly_salary and estimated annual compensation = hourly_salary * 2080 (40 hours/week,
+    52 weeks/year; excludes overtime). Keep pay types separate. Defaults to Active + On Leave; employee_status overrides
+    or All removes the filter.
   slots_summary: comparison, salary, row_limit, employee_status, department, employee
   status: validated
   drift_status: clean
@@ -1206,6 +1590,9 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.employee_pay_type
+  - dbpcm_warehouse.employee.hourly_salary
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: comparison
     type: enum
@@ -1226,6 +1613,7 @@
     min_value: 1
     max_value: 1000
   - name: employee_status
+    description: Omit for Active + On Leave; select a status to override, or All to remove the status filter.
     type: enum
     required: false
     enum_values:
@@ -1238,13 +1626,16 @@
     - Not Hired
     - Prehire
     - Unknown
+    - All
     binds_to: dbpcm_warehouse.employee.employee_status
-    optional_pattern: 'TRUE'
+    optional_pattern: e.employee_status IN ('Active', 'On Leave')
   - name: department
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   - name: employee
     type: entity
     required: false
@@ -1252,15 +1643,91 @@
     optional_pattern: 'TRUE'
   result_grain:
   - Employee Code
-  sql_template: 'SELECT e.employee_code AS `Employee Code`, e.department_name AS `Department`, e.employee_status
-    AS `Status`, e.annual_salary AS `Annual Salary`
+  sql_template: 'SELECT e.employee_pay_type AS `Pay Type`, CASE WHEN e.employee_pay_type = ''Hourly'' THEN ''Estimated
+    annual compensation (2080 hours)'' WHEN e.employee_pay_type = ''Salary'' THEN ''Recorded annual salary'' ELSE
+    ''Unknown compensation basis'' END AS `Compensation Basis`, e.employee_code AS `Employee Code`, e.department_name
+    AS `Department`, e.employee_status AS `Status`, (CASE WHEN e.employee_pay_type = ''Salary'' THEN e.annual_salary
+    WHEN e.employee_pay_type = ''Hourly'' THEN e.hourly_salary * 2080 ELSE NULL END) AS `Annual Compensation`, e.hourly_salary
+    AS `Hourly Rate`
 
-    FROM dbpcm_warehouse.employee e WHERE e.employee_status = {employee_status} AND e.department_name = {department}
-    AND e.employee_code = {employee} AND (({comparison} = ''above'' AND e.annual_salary > {salary}) OR ({comparison}
-    = ''at_least'' AND e.annual_salary >= {salary}) OR ({comparison} = ''equal'' AND e.annual_salary = {salary})
-    OR ({comparison} = ''below'' AND e.annual_salary < {salary}))
+    FROM dbpcm_warehouse.employee e WHERE (e.employee_status = {employee_status} OR {employee_status} = ''All'')
+    AND e.department_name = {department} AND e.employee_code = {employee} AND (({comparison} = ''above'' AND (CASE
+    WHEN e.employee_pay_type = ''Salary'' THEN e.annual_salary WHEN e.employee_pay_type = ''Hourly'' THEN e.hourly_salary
+    * 2080 ELSE NULL END) > {salary}) OR ({comparison} = ''at_least'' AND (CASE WHEN e.employee_pay_type = ''Salary''
+    THEN e.annual_salary WHEN e.employee_pay_type = ''Hourly'' THEN e.hourly_salary * 2080 ELSE NULL END) >= {salary})
+    OR ({comparison} = ''equal'' AND (CASE WHEN e.employee_pay_type = ''Salary'' THEN e.annual_salary WHEN e.employee_pay_type
+    = ''Hourly'' THEN e.hourly_salary * 2080 ELSE NULL END) = {salary}) OR ({comparison} = ''below'' AND (CASE WHEN
+    e.employee_pay_type = ''Salary'' THEN e.annual_salary WHEN e.employee_pay_type = ''Hourly'' THEN e.hourly_salary
+    * 2080 ELSE NULL END) < {salary}))
 
-    ORDER BY e.annual_salary DESC, e.employee_code LIMIT {row_limit}'
+    ORDER BY e.employee_pay_type, (CASE WHEN e.employee_pay_type = ''Salary'' THEN e.annual_salary WHEN e.employee_pay_type
+    = ''Hourly'' THEN e.hourly_salary * 2080 ELSE NULL END) DESC, e.employee_code LIMIT {row_limit}'
+  uses_rules:
+  - compensation_by_pay_type
+- id: bp-termination-family
+  intent: Employees with a recorded termination date in a half-open period, with total matching record count before
+    the display limit. Includes same-day/later rehires and employees no longer currently Terminated. Apply current
+    status only when explicitly requested. For counts/grouped summaries use bp-employee-date-summary with date_basis=termination.
+  slots_summary: period, row_limit, employee_status, department
+  status: validated
+  drift_status: clean
+  catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
+  uses:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.employee_name
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.termination_date
+  - dbpcm_warehouse.department.department_name
+  slots:
+  - name: period
+    type: period_range
+    temporal_type: date
+    required: true
+  - name: row_limit
+    type: positive_integer
+    required: true
+    min_value: 1
+    max_value: 1000
+  - name: employee_status
+    description: Omit for all recorded terminations in the period; set only when current status is explicitly requested.
+    type: enum
+    required: false
+    enum_values:
+    - Active
+    - Deceased
+    - Inactive
+    - Retired
+    - Terminated
+    - On Leave
+    - Not Hired
+    - Prehire
+    - Unknown
+    - All
+    binds_to: dbpcm_warehouse.employee.employee_status
+    optional_pattern: 'TRUE'
+  - name: department
+    type: entity
+    required: false
+    binds_to: dbpcm_warehouse.department.department_name
+    optional_pattern: 'TRUE'
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
+  result_grain:
+  - Employee Code
+  sql_template: 'SELECT e.employee_code AS `Employee Code`, e.employee_name AS `Employee Name`, e.department_name
+    AS `Department`, e.employee_status AS `Current Status`, e.termination_date AS `Termination Date`, count(*) OVER
+    () AS `Total Matching Records`
+
+    FROM dbpcm_warehouse.employee e
+
+    WHERE e.termination_date >= {period_start} AND e.termination_date < {period_end}
+
+    AND (e.employee_status = {employee_status} OR {employee_status} = ''All'') AND e.department_name = {department}
+
+    ORDER BY e.termination_date DESC, e.employee_code LIMIT {row_limit}'
+  uses_rules:
+  - terminations_in_period
 - id: bp-timecard-earnings-summary
   intent: 'Total timecard earnings, paid hours, entry counts and employee counts by company, employee, allocated
     department, day, month or earning code. Supports per-person hours and pay in a period and monthly labor-cost
@@ -1299,6 +1766,7 @@
     - earning_code
   - name: period
     type: period_range
+    temporal_type: date
     required: true
   - name: source
     type: entity
@@ -1355,11 +1823,14 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.department.department_name
   slots:
   - name: department
     type: string
     required: true
-    binds_to: dbpcm_warehouse.employee.department_name
+    binds_to: dbpcm_warehouse.department.department_name
+    description: Resolve department names/abbreviations against the directory; a known department may have no matching
+      employees.
   uses_rules:
   - id: gross_earnings
     resolve_via: resolveValues(register_type, 'earnings')

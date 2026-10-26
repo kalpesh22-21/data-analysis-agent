@@ -452,3 +452,64 @@ def test_sql_only_table_identity_does_not_choose_between_distinct_executions():
     payload = brief.payload()
     assert payload["tables_shown_to_the_user"][0]["identified_by"] == sql
     assert len(payload["results"]) == 2
+
+
+async def test_clarification_gets_catalog_defaults_without_query_or_schema_fetch():
+    store = InMemorySessionStore()
+    enriched = await enrich_brief(
+        JudgeBrief("ask_user", "How many employees?", pending_question="Which population?"),
+        trail=[], turn_index=0, session_id=CREDS.session_id, store=store,
+        catalog_provider=catalog(), credentials=CREDS, analysis_state=None,
+    )
+    table = enriched.evidence_package["catalog"]["tables"][0]
+    assert table["rules"][0]["predicate"] == "status = 'A'"
+    assert not enriched.sql_executed
+    assert enriched.results == ()
+
+
+def test_prequery_defaults_remain_scope_filtered():
+    context = catalog_context(
+        catalog(), [], frozenset({"hr.employee.id", "hr.employee.status"}),
+        include_defaults=True,
+    )
+    assert "salary" not in json.dumps(context)
+    assert context["tables"][0]["rules"][0]["id"] == "active"
+
+
+def test_size_trimming_preserves_population_and_interpretation_defaults():
+    from data_agent.runtime.loop.answer_judge import _fit_payload
+
+    table = {
+        "table": "hr.employee", "description": "large " * 5000,
+        "columns": {"salary": {"description": "large " * 5000}},
+        "rules": [{"id": "active", "predicate": "status = 'A'", "applies_when": "headcount"}],
+        "default_filters": ["status = 'A'"],
+        "ambiguities": [{"term": "salary", "default": "annual salary"}],
+    }
+    fitted = _fit_payload({"evidence_package": {"catalog": {"tables": [table]}}}, 1000)
+    trimmed = fitted["evidence_package"]["catalog"]["tables"][0]
+    assert trimmed["omitted_for_size"]
+    for key in ("rules", "default_filters", "ambiguities"):
+        assert trimmed[key] == table[key]
+    assert "description" not in trimmed
+
+
+def test_public_database_alias_resolves_without_guessing_other_databases():
+    from data_agent.runtime.provenance.catalog_handle import load_catalog_handle_from_catalog
+    handle = load_catalog_handle_from_catalog({'dbpcm_warehouse.employee': {
+        'columns': {'employee_status': {'type': 'String'}},
+        'rules': [{'id': 'current', 'predicate': "employee_status IN ('Active','On Leave')"}],
+    }})
+    for name in ['dbpcm_warehouse.employee', 'dbpcm_datawarehouse.employee', 'employee']:
+        context = catalog_context(handle, ['SELECT employee_status FROM '+name], frozenset())
+        assert context['tables'][0]['rules'][0]['id'] == 'current'
+        assert context['limitations'] == []
+    for name in ['unrelated.employee', 'foreign.dbpcm_warehouse.employee']:
+        context = catalog_context(handle, ['SELECT * FROM '+name], frozenset())
+        assert context['tables'] == []
+        assert context['limitations'] == ['table_documentation_unresolved']
+
+
+def test_nested_cte_name_does_not_hide_a_physical_table_in_another_scope():
+    sql = "SELECT * FROM hr.employee UNION ALL SELECT * FROM (WITH employee AS (SELECT 1 AS id) SELECT * FROM employee)"
+    assert catalog_context(catalog(), [sql], frozenset())['tables'][0]['table'] == 'hr.employee'

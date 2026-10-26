@@ -116,6 +116,12 @@ class Judge:
         self.briefs.append(brief)
         return self.verdicts.pop(0) if self.verdicts else APPROVED
 
+    async def salvage(self, brief):
+        verdict = await self.review(brief)
+        if verdict.partial_answer is None:
+            raise ValueError("no_valid_partial")
+        return verdict.partial_answer
+
 
 def build(turns, *, judge=None, tools=None, summarizer=None, iterations=8):
     store = InMemorySessionStore()
@@ -765,7 +771,7 @@ def test_resumed_cards_retain_judge_kind_without_exposing_internal_evidence():
 @pytest.mark.parametrize(
     "verdict,visible",
     [
-        (APPROVED, True),
+        (APPROVED, False),
         (replace(APPROVED, reviewed=True), True),
         (
             JudgeVerdict(
@@ -775,7 +781,7 @@ def test_resumed_cards_retain_judge_kind_without_exposing_internal_evidence():
         ),
     ],
 )
-async def test_data_widget_opens_on_no_verdict_but_preserves_explicit_refusal(verdict, visible):
+async def test_data_widget_requires_reviewed_approval(verdict, visible):
     judge = Judge([verdict])
     script = [turn(call("show_profile", "c1")), finalize_options("show_profile", ident="a1")]
     if not verdict.approved:

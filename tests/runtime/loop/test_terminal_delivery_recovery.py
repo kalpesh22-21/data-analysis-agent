@@ -47,6 +47,7 @@ async def test_timed_out_proposal_and_failed_salvage_ship_limitation_once():
     result = await stream_result(loop)
     assert result["review"]["status"] == "exhausted"
     assert "couldn't verify" in result["assistant_text"]
+    assert "review" not in result["assistant_text"].lower()
     assert not result["answer_tables"]
     assert len(judge.briefs) == 2 and model.calls_made == 3
     doc = await assert_history(store, result)
@@ -83,27 +84,29 @@ async def test_finish_rejection_ships_approved_partial_without_another_review(wi
 
 
 @pytest.mark.parametrize("valid", [True, False])
-async def test_finish_applies_only_validated_exact_prose_correction(valid):
-    corrected = (
-        "There are 120 employees in the available records." if valid else "There are 999 employees."
-    )
-    judge = Judge(
-        [
-            JudgeVerdict(True, reviewed=True),
-            JudgeVerdict(True, reviewed=True, repair_type="prose", corrected_answer=corrected),
-        ]
-    )
+async def test_changed_delivery_uses_salvage_once_without_another_prose_review(valid):
+    class RecoveryJudge(Judge):
+        salvage_calls = 0
+
+        async def salvage(self, brief):
+            self.salvage_calls += 1
+            return {
+                **PART, "outcome": "full", "unfinished": [], "captions": [],
+                "table_result_ids": ["q"], "evidence": ["q" if valid else "missing"],
+            }
+
+    judge = RecoveryJudge([JudgeVerdict(True, reviewed=True)])
     loop, store, model, _, _ = build([discovery(), query(), final()], judge)
     change_delivery_before_finish(loop)
     result = await stream_result(loop)
-    assert len(judge.briefs) == (2 if valid else 3) and model.calls_made == 3
+    assert len(judge.briefs) == 1 and judge.salvage_calls == 1 and model.calls_made == 3
     if valid:
-        assert result["assistant_text"] == corrected
+        assert result["assistant_text"] == PART["answer"]
         assert len(result["answer_tables"]) == 1
         assert result["review"]["status"] == "approved"
     else:
-        assert result["assistant_text"] != corrected
-        assert result["review"]["status"] == "rejected"
+        assert result["assistant_text"] != PART["answer"]
+        assert result["review"]["status"] == "exhausted"
         assert not result["answer_tables"]
     await assert_history(store, result)
 
@@ -130,9 +133,9 @@ async def test_finish_rejects_invalid_partial_and_attempts_salvage():
     loop, store, model, _, events = build([discovery(), query(), final()], judge)
     change_delivery_before_finish(loop)
     result = await stream_result(loop)
-    assert result["review"]["status"] == "rejected"
+    assert result["review"]["status"] == "exhausted"
     assert result["assistant_text"] != TEXT
-    assert len(judge.briefs) == 3 and model.calls_made == 3
+    assert len(judge.briefs) == 2 and model.calls_made == 3
     assert ("loop_recovery_validation_failed", {"reason": "unknown_evidence_id"}) in events
     await assert_history(store, result)
 

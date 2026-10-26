@@ -1158,7 +1158,16 @@ async def load_corpus(
         async with driver.session(database=database) as session:
             current_sha = await _read_corpus_meta(session)
         if current_sha and current_sha == corpus_sha:
-            _logger.info("corpus already at corpus_sha=%s; skipping load (B1 no-op)", corpus_sha)
+            if gc:
+                # An additive online seed also stamps CorpusMeta. A matching
+                # version proves upserts, not that deleted canon was reconciled.
+                async with driver.session(database=database) as session:
+                    async def reconcile(tx):
+                        if await _read_corpus_meta(tx) == corpus_sha:
+                            await tx.run(_GC_BLUEPRINTS, corpus_sha=corpus_sha)
+                            await tx.run(_GC_KNOWLEDGE, corpus_sha=corpus_sha)
+                    await session.execute_write(reconcile)
+            _logger.info("corpus already at corpus_sha=%s; skipping embeddings/upserts", corpus_sha)
             return LoadReport(
                 model_id=model_id,
                 blueprints_written=0,

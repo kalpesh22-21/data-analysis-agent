@@ -200,6 +200,10 @@ def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
     blueprints = resolve_blueprint_references(blueprints)
     assert {b.id for b in blueprints} == {
         "bp-employee-summary",
+        "bp-latest-hired-employees",
+        "bp-termination-family",
+        "bp-compensation-ranking",
+        "bp-approved-timeoff-ranking",
         "bp-punch-pair-summary",
         "bp-employee-day-clock-span",
         "bp-timecard-earnings-summary",

@@ -33,7 +33,12 @@ async def test_invalid_salvage_response_is_not_approval():
                         observer=lambda name, payload: events.append((name, payload)))
     with pytest.raises(ValidationError):
         await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
-    assert ("loop_recovery_call_failed", {"reason": "schema_validation"}) in events
+    failure = next(payload for name, payload in events if name == "loop_recovery_call_failed")
+    assert failure["reason"] == "schema_validation"
+    assert failure["exception_type"] == "ValidationError"
+    assert failure["schema_keyword"] == "required"
+    assert failure["schema_path"] == "/required"
+    assert "answer" in failure["missing_fields"]
 
 
 async def test_missing_salvage_tool_call_reports_response_contract_failure():
@@ -42,7 +47,7 @@ async def test_missing_salvage_tool_call_reports_response_contract_failure():
                         observer=lambda name, payload: events.append((name, payload)))
     with pytest.raises(ValueError, match="invalid_recovery_response"):
         await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
-    assert ("loop_recovery_call_failed", {"reason": "response_contract"}) in events
+    assert ("loop_recovery_call_failed", {"reason": "response_contract", "exception_type": "ValueError"}) in events
 
 
 async def test_salvage_preserves_full_provider_result_id_through_caption_and_delivery():
@@ -74,12 +79,12 @@ async def test_salvage_preserves_full_provider_result_id_through_caption_and_del
     assert not any(name == "loop_recovery_validation_failed" for name, _ in events)
 
 
-async def test_guard_rejected_salvage_is_not_logged_as_approved():
+async def test_markdown_presentation_does_not_discard_approved_salvage():
     class SalvageJudge(Judge):
         async def salvage(self, brief):
             return {
                 **PART,
-                "answer": "| Department | Employees |\n|---|---|\n| Sales | 120 |",
+                "answer": "Sales has 120 employees.\n\n| Department | Employees |\n|---|---|\n| Sales | 120 |",
                 "outcome": "full",
                 "unfinished": [],
                 "captions": [],
@@ -91,11 +96,10 @@ async def test_guard_rejected_salvage_is_not_logged_as_approved():
     )])
     loop, _, _, _, events = build([discovery(), query(), final()], judge)
     out = await run(loop)
-    assert out.review["status"] != "approved"
-    assert not any(name == "loop_salvage_approved" for name, _ in events)
-    assert ("loop_recovery_validation_failed", {
-        "reason": "answer_guard", "rule": "markdown_table",
-    }) in events
+    assert out.review["status"] == "approved"
+    assert out.assistant_text == "Sales has 120 employees."
+    assert any(name == "loop_salvage_approved" for name, _ in events)
+    assert not any(name == "loop_recovery_validation_failed" for name, _ in events)
 
 
 async def test_salvage_delivers_full_answer_and_repairs_caption_after_zero_budget():
@@ -217,12 +221,12 @@ async def test_salvage_can_select_a_different_executed_result():
     assert model.calls_made == 4
 
 
-async def test_oversized_partial_is_shortened_by_salvage_without_agent_prose_repair():
+async def test_verbose_approved_partial_is_retained_without_another_salvage():
     class Shorten(Judge):
         async def salvage(self, brief):
             return {**PART, "outcome": "partial", "table_result_ids": ["q"], "captions": []}
 
-    part = {**PART, "answer": PART["answer"] * 200, "table_result_ids": ["q"]}
+    part = {**PART, "answer": (PART["answer"] + " ") * 200, "table_result_ids": ["q"]}
     judge = Shorten(
         [
             JudgeVerdict(
@@ -237,9 +241,10 @@ async def test_oversized_partial_is_shortened_by_salvage_without_agent_prose_rep
     )
     loop, _, model, _, events = build([discovery(), query(), final()], judge)
     out = await run(loop)
-    assert out.assistant_text == TEXT and out.answer_tables
+    assert out.review["status"] == "approved" and out.answer_tables
+    assert out.assistant_text.count(PART["answer"]) == 200
     assert model.calls_made == 3
-    assert any(e == "loop_recovery_validation_failed" for e, _ in events)
+    assert not any(e == "loop_recovery_validation_failed" for e, _ in events)
 
 
 async def test_approved_salvage_is_not_dropped_by_advisory_word_limit():
@@ -286,3 +291,74 @@ async def test_invalid_caption_does_not_discard_supported_salvage_table():
     assert out.assistant_text == PART["answer"]
     assert out.answer_tables and not out.answer_tables[0].get("caption")
     assert ("loop_salvage_caption_omitted", {"reason": "invalid_caption"}) in events
+
+
+@pytest.mark.parametrize('as_text', [True, False])
+async def test_extra_top_level_annotations_are_removed_then_validated(as_text):
+    import json
+    from data_agent.runtime.model.client import ModelTurnResult
+    events = []
+    response = {**PART, 'outcome': 'partial', 'captions': [], 'outcome_notes': 'partial due to row cap',
+                'untrusted_annotation': {'instruction': 'must not survive'}}
+    turn = (ModelTurnResult(assistant_text=json.dumps(response)) if as_text else
+            batch(call('salvageAnswer', 's', **response)))
+    judge = AnswerJudge(RecoveryClient([turn]), 10000,
+                        observer=lambda name, payload: events.append((name, payload)))
+    actual = await judge.salvage(JudgeBrief('exit_prose', 'Headcount?'))
+    assert actual == {**PART, 'outcome': 'partial', 'captions': []}
+    assert ('loop_recovery_fields_omitted', {'removed_count': 2}) in events
+    assert 'untrusted_annotation' not in json.dumps(events)
+
+
+@pytest.mark.parametrize('patch,keyword', [
+    ({'evidence': 'q'}, 'type'),
+    ({'captions': [{'result_id': 'q', 'caption': 'Employees', 'outcome_notes': 'extra'}]}, 'additionalProperties'),
+    ({'outcome': 'invented'}, 'enum'),
+])
+async def test_extra_key_tolerance_does_not_relax_known_or_nested_fields(patch, keyword):
+    import json
+    from data_agent.runtime.model.client import ModelTurnResult
+    events = []
+    response = {**PART, 'outcome': 'partial', 'captions': [], 'outcome_notes': 'extra', **patch}
+    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))]), 10000,
+                        observer=lambda name, payload: events.append((name, payload)))
+    with pytest.raises(ValidationError):
+        await judge.salvage(JudgeBrief('exit_prose', 'Headcount?'))
+    failure = next(payload for name, payload in events if name == 'loop_recovery_call_failed')
+    assert failure['schema_keyword'] == keyword
+    assert PART['answer'] not in json.dumps(failure)
+    assert 'outcome_notes' not in json.dumps(failure)
+
+
+@pytest.mark.parametrize('valid_receipt', [True, False])
+async def test_json_extra_key_salvage_reaches_ui_with_existing_receipt(valid_receipt):
+    import json
+    from data_agent.runtime.model.client import ModelTurnResult
+    ref = 'q' if valid_receipt else 'never-executed'
+    response = {**PART, 'evidence': [ref], 'outcome': 'full', 'unfinished': [], 'table_result_ids': [ref],
+                'captions': [{'result_id': ref, 'caption': 'Employees by department'}],
+                'outcome_notes': 'complete supported result'}
+    recovery = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))]), 10000)
+
+    class JsonSalvageJudge(Judge):
+        async def review(self, brief):
+            from data_agent.runtime.loop.delivery import CURRENT_DELIVERY
+            CURRENT_DELIVERY.get().review_seconds = 0
+            return await super().review(brief)
+
+        async def salvage(self, brief):
+            return await recovery.salvage(brief)
+
+    judge = JsonSalvageJudge([reject()])
+    loop, store, _, mcp, events = build([discovery(), query(), final(), final()], judge)
+    out = await run(loop)
+    if not valid_receipt:
+        assert out.review['status'] == 'rejected'
+        assert not out.answer_tables
+        assert not any(name == 'loop_partial_answer_recovered' for name, _ in events)
+        return
+    assert out.review['status'] == 'approved' and out.review['completion'] == 'full'
+    assert out.assistant_text == PART['answer']
+    assert out.answer_tables[0]['caption'] == 'Employees by department'
+    assert len(mcp.calls) == 1
+    assert any(name == 'loop_partial_answer_recovered' for name, _ in events)

@@ -29,11 +29,14 @@ class ReviewState:
     violation: str = ""
     site: str = "exit_prose"
     feedback: str = ""
+    measured_population: str = ""
+    required_population: str = ""
     intent_id: str = ""
     result_ids: tuple[str, ...] = ()
     repair_type: str = ""
     repair_tables: tuple[dict[str, Any], ...] = ()
     approved_version: str = ""
+    approved_evidence: tuple[str, ...] = ()
     assumptions_before_refusal: tuple[str, ...] = ()
     excluded_components: tuple[dict[str, Any], ...] = ()
 
@@ -50,18 +53,22 @@ class ReviewState:
         state.excluded_components = tuple(state.excluded_components)
         state.repair_tables = tuple(state.repair_tables)
         state.result_ids = tuple(state.result_ids)
+        state.approved_evidence = tuple(state.approved_evidence)
         state.assumptions_before_refusal = tuple(state.assumptions_before_refusal)
         state.calls = min(2, max(0, int(state.calls)))
         if state.scope_hash != scope_hash:
             state.repair_tables = ()
             state.excluded_components = ()
             state.approved_version = ""
+            state.approved_evidence = ()
             state.delivery_version = ""
             state.delivery_status = ""
             state.delivery_reason = ""
             state.prose_correction = {}
             state.approved_partial = {}
             state.feedback = ""
+            state.measured_population = ""
+            state.required_population = ""
             state.result_ids = ()
             state.assumptions_before_refusal = ()
         state.scope_hash = scope_hash
@@ -71,6 +78,8 @@ class ReviewState:
         if not self.violation:
             self.assumptions_before_refusal = tuple(assumptions or ())
         self.violation, self.feedback = verdict.violation, verdict.feedback
+        self.measured_population = verdict.measured_population
+        self.required_population = verdict.required_population
         self.intent_id, self.result_ids = verdict.intent_id, verdict.result_ids
         self.repair_type = verdict.repair_type
         self.answer_version = version

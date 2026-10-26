@@ -1,0 +1,427 @@
+{
+  "date": "2026-10-26",
+  "report": "Lane5 102-question production corpus regression, 2026-10-25",
+  "status": "Local fixes and live synthetic HTTP scenarios verified; remote production acceptance and exploration-latency improvement remain open.",
+  "verification_limits": [
+    "The remote production dataset and its case artifacts are not present locally. No claim that all 102 production cases passed.",
+    "DeepSeek probes use the actual agent prompt, tool contracts, scoped documentation and a prefetched blueprint. They test next-action selection, not retrieval recall or a full agent/database/UI turn.",
+    "Live Trino checks execute bound/converter-translated blueprint SQL over synthetic VALUES. They do not test remote MySQL/ClickHouse connectors, RLS or production data.",
+    "Progress checkpoints are advisory after 8 data attempts or 45 seconds, not a hard latency or query-count guarantee."
+  ],
+  "changes": [
+    {
+      "cases": [
+        "q-010",
+        "q-012",
+        "q-016",
+        "q-097"
+      ],
+      "fix": "Prefer documented defaults with disclosure; new compensation-ranking and latest-hired blueprints; separate Salary and Hourly metrics and use most-recent hire date for newest hires."
+    },
+    {
+      "cases": [
+        "q-015"
+      ],
+      "fix": "Department slots probe scoped directory names, not employee membership. Exact entity misses return BLUEPRINT_ENTITY_NOT_FOUND for agent discovery, while missing values and ambiguity still pause. Known departments with no employees execute and return empty.",
+      "local_acceptance": "Live retrieval -> blueprint/query -> judge -> final HTTP answer reported verified empty IT department without clarification."
+    },
+    {
+      "cases": [
+        "q-011"
+      ],
+      "fix": "Approved answer delivery binds reviewed payload/evidence/scope without numeric occurrence rejection; salvage ignores unknown top-level annotations but validates declared fields and evidence. SQL remains blocked; length is not a rejection."
+    },
+    {
+      "cases": [
+        "q-024",
+        "q-053"
+      ],
+      "fix": "Catalog-consistent population slots, explicit scope precedence and smallest-repair judge feedback; reconcile deleted canon even when stored corpus version already matches."
+    },
+    {
+      "cases": [
+        "q-055",
+        "q-056",
+        "q-057",
+        "q-058"
+      ],
+      "fix": "Approved time-off ranking blueprint retains ties, excludes payouts/unapproved requests, counts distinct requested days. Disclose approved-as-taken assumption. Unresolved pronouns require clarification before further discovery. Advisory progress checks cover runQuery/blueprint/resolveValues exploration."
+    },
+    {
+      "cases": [
+        "q-013",
+        "q-064",
+        "q-065"
+      ],
+      "fix": "Separate recorded termination windows from current-status counts; no invented rehire-date exclusion. New termination directory includes full match count before display limit. Pasted repairs cannot create domain rules."
+    },
+    {
+      "cases": [
+        "q-033",
+        "q-035",
+        "q-048",
+        "q-068"
+      ],
+      "fix": "Use current receipts for wording repairs; pasted drafts are unverified reference and need targeted verification when receipts absent. Preserve runtime-authored safe limitation messages and avoid internal review-budget narration."
+    },
+    {
+      "cases": [
+        "transpiler-addDays",
+        "transpiler-INTERVAL",
+        "transpiler-derived-age-tenure"
+      ],
+      "fix": "Previously implemented signed DAY offsets and IF type/nullability propagation; regression suite remains passing. Existing live cross-engine evidence is in report-obvious-fixes-2026-10-25.json."
+    }
+  ],
+  "local_validation": {
+    "agent_runtime": {
+      "passed": 4672,
+      "skipped": 6,
+      "command": ".venv/bin/pytest tests/runtime -q"
+    },
+    "backend": {
+      "passed": 291,
+      "command": ".venv/bin/pytest tests/corpus tests/semantic_catalog tests/test_trino_report_20261025.py tests/test_trino_sources.py tests/test_timeoff_public_names.py -q"
+    },
+    "live_trino_blueprints": [
+      {
+        "case": "timeoff",
+        "blueprint": "bp-approved-timeoff-ranking",
+        "passed": true,
+        "rows": [
+          [
+            "E1",
+            "8.0",
+            1,
+            1
+          ],
+          [
+            "E3",
+            "8.0",
+            1,
+            1
+          ]
+        ]
+      },
+      {
+        "case": "latest",
+        "blueprint": "bp-latest-hired-employees",
+        "passed": true,
+        "rows": [
+          [
+            "S2",
+            "Salary Two",
+            "Sales",
+            "On Leave",
+            "2021-01-01 00:00:00"
+          ],
+          [
+            "S1",
+            "Salary One",
+            "Sales",
+            "Active",
+            "2020-01-01 00:00:00"
+          ]
+        ]
+      },
+      {
+        "case": "termination",
+        "blueprint": "bp-termination-family",
+        "passed": true,
+        "rows": [
+          [
+            "S1",
+            "Salary One",
+            "Sales",
+            "Active",
+            "2026-05-01 00:00:00",
+            3
+          ]
+        ]
+      },
+      {
+        "case": "compensation",
+        "blueprint": "bp-compensation-ranking",
+        "passed": true,
+        "rows": [
+          [
+            "Hourly",
+            1,
+            "H1",
+            "Hourly One",
+            "Sales",
+            52000.0,
+            25.0
+          ],
+          [
+            "Salary",
+            1,
+            "S2",
+            "Salary Two",
+            "Sales",
+            200000.0,
+            null
+          ]
+        ]
+      }
+    ],
+    "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+    "model_next_action_probes": [
+      {
+        "case": "q010",
+        "question": "Show all employees who earn over $300k",
+        "blueprint": "bp-salary-threshold-directory",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_de7dd3e322c24699a54a5527",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-salary-threshold-directory\",\"slot_bindings\":{\"comparison\": \"above\", \"salary\": 300000, \"row_limit\": 1000}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 1.91
+      },
+      {
+        "case": "q016",
+        "question": "Show me the top 5 latest hired employees",
+        "blueprint": "bp-latest-hired-employees",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_064a31f647f847ae842e02f8",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-latest-hired-employees\",\"slot_bindings\":{\"row_limit\": 5}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 1.93
+      },
+      {
+        "case": "q012",
+        "question": "Top 10 highest paid employees",
+        "blueprint": "bp-compensation-ranking",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_a4dcc938ec6f4bc2a3d2b9fe",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-compensation-ranking\",\"slot_bindings\":{\"top_n\": 10}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 2.24
+      },
+      {
+        "case": "q097",
+        "question": "Who has the highest pay?",
+        "blueprint": "bp-compensation-ranking",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_b810749a895c43b7be53e14a",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-compensation-ranking\",\"slot_bindings\":{\"top_n\": 1}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 2.15
+      },
+      {
+        "case": "q053",
+        "question": "What is the tenure for each department?",
+        "blueprint": "bp-employee-tenure-summary",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_401f650ef4a74ce19abe5a6d",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-employee-tenure-summary\",\"slot_bindings\":{\"group_by\": \"department\", \"hire_basis\": \"original_hire\", \"reference_date\": \"2026-10-26\"}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 2.15
+      },
+      {
+        "case": "q013",
+        "question": "Show me all employees who were terminated this year",
+        "blueprint": "bp-termination-family",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_1fb976ff64114ae5b5f78410",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-termination-family\",\"slot_bindings\":{\"period\": {\"start\": \"2026-01-01\", \"end\": \"2027-01-01\"}, \"row_limit\": 1000}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 1.56
+      },
+      {
+        "case": "q055",
+        "question": "Which employee took the highest time-off hours in the last six months?",
+        "blueprint": "bp-approved-timeoff-ranking",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_4c2e418bf74b4ac3bc759e0d",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-approved-timeoff-ranking\",\"slot_bindings\":{\"period\": {\"start\": \"2026-04-26\", \"end\": \"2026-10-26\"}, \"top_n\": 1}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 3.41
+      },
+      {
+        "case": "q024",
+        "question": "What is the median salary?",
+        "blueprint": "bp-salary-exact-median",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_813ccd356d894a9a9c6143bd",
+                "type": "function",
+                "function": {
+                  "name": "runBlueprint",
+                  "arguments": "{\"id\":\"bp-salary-exact-median\",\"slot_bindings\":{\"group_by\": \"company\", \"salary_population\": \"recorded\"}}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 2.8
+      },
+      {
+        "case": "q057",
+        "question": "How much pay did he receive in the last six months?",
+        "blueprint": "bp-payroll-summary",
+        "response": {
+          "index": 0,
+          "message": {
+            "content": null,
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_19d3feee0b214fe4800331b7",
+                "type": "function",
+                "function": {
+                  "name": "askUser",
+                  "arguments": "{\"question\":\"Which employee do you mean by \\\"he\\\"? The 960 time-off hours matched several employees, so I need the specific person before I can look up their pay.\"}"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          "finish_reason": "tool_calls",
+          "logprobs": null,
+          "raw_output": null
+        },
+        "seconds": 4.13
+      }
+    ]
+  },
+  "remote_acceptance": [
+    "Deploy both revisions and hydrate authoritative corpus with garbage collection enabled; validate old bp-ytd-earnings-per-employee/bp-department-scorecard are no longer retrieved.",
+    "Replay the 102-question battery; capture executed SQL/slots, judge briefs/verdicts, recovery validation and final UI envelope, particularly the cases listed above.",
+    "Check q015 entity resolution and timeoff multi-turn identity flow end-to-end; next-action probes alone do not establish these.",
+    "Compare compensation against current agreed pay-type definitions, not old mixed-pay/positive-only fixtures. Unspecified salary_population uses recorded values including zeros; positive is explicit.",
+    "Verify every approved ordinary/corrected/salvage answer reaches the final UI envelope unless evidence/scope changed or SQL prose failed validation."
+  ],
+  "release_notes": [
+    "Push includes public catalog renames and definitions; private timeoff_requests earn-code context SQL remains local.",
+    "SQL in assistant prose remains blocked; length and repeated numbers do not cause rejection."
+  ],
+  "live_followup": "remote-report-live-2026-10-26.json"
+}

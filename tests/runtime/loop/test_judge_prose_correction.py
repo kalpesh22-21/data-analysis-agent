@@ -87,7 +87,7 @@ async def test_corrected_ranking_ships_exact_text_with_same_table_and_one_judge_
 
 
 @pytest.mark.parametrize(
-    "text", ["", "   ", "There are 999 employees.", "SELECT * FROM hr.employee", "Answer\x00"]
+    "text", ["", "   ", "\x00"]
 )
 async def test_invalid_correction_does_not_clear_prior_rejection(text):
     rejected = JudgeVerdict(False, "unsupported_by_evidence", "Correct the explanation.", True)
@@ -126,7 +126,6 @@ async def test_substantive_rejection_still_returns_to_agent_for_repair():
     [
         {"corrected_answer": ""},
         {"corrected_answer": 123},
-        {"corrected_answer": "x" * 20001},
         {"approved": False},
         {"repair_type": "analysis"},
         {"violation": "unsupported_by_evidence"},
@@ -169,26 +168,26 @@ def test_scope_change_removes_correction_text():
 
 
 @pytest.mark.parametrize(
-    "original,corrected,valid",
+    "original,corrected",
     [
-        ("There are 120 employees.", "There are 120 employees in accessible records.", True),
-        ("There are 120 employees.", "There are 125 employees in accessible records.", False),
-        ("The totals are 24 and 8.", "The available totals are 24 and 8.", True),
-        ("The totals are 24 and 8.", "The available total is 24.", False),
-        ("The change is -10%.", "The change is 10%.", False),
+        ("There are 120 employees.", "There are 125 employees in accessible records."),
+        ("The totals are 24 and 8.", "The available total is 24."),
+        ("The change is -10%.", "The change is 10%."),
+        ("As of 2026-10-25, 120 employees.", "As of 2026-10-26, 120 employees."),
+        ("There are 2,488 employees.", "There are 2488 employees."),
+        ("The change is 10%.", "The change is 10."),
     ],
 )
-async def test_numeric_corrections_preserve_values(original, corrected, valid):
-    judge = Judge([correction(corrected), APPROVED])
-    loop, _, _, _, _ = build([discovery(), query(), final(original), final(original)], judge)
+async def test_runtime_defers_numeric_corrections_to_judge(original, corrected):
+    # This tests runtime ownership, not whether these edits deserve approval:
+    # the judge must assess their factual support against the evidence.
+    judge = Judge([correction(corrected)])
+    loop, _, _, _, events = build([discovery(), query(), final(original)], judge)
     out = await run(loop)
-    if valid:
-        assert out.assistant_text == corrected
-        assert out.review["status"] == "approved"
-        assert len(judge.briefs) == 1
-    else:
-        assert out.review["status"] == "rejected"
-        assert not out.answer_tables
+    assert out.assistant_text == corrected
+    assert out.review["status"] == "approved"
+    assert len(judge.briefs) == 1
+    assert not any(name == "loop_answer_judge_refused" for name, _ in events)
 
 
 async def test_correction_cannot_request_new_components():
@@ -199,3 +198,49 @@ async def test_correction_cannot_request_new_components():
         JudgeBrief("exit_table", "Ranking?", draft=ORIGINAL, allow_prose_correction=True)
     )
     assert not verdict.reviewed
+
+
+async def test_q011_repeated_verified_number_ships_correction_and_table_without_salvage():
+    original = '2,488 Active/On Leave employees have an annual salary above $500 (display capped at 1,000 rows).'
+    corrected = 'A total of 2,488 Active/On Leave employees have an annual salary above $500; the display is capped at the first 1,000 rows (of the 2,488 that match).'
+    judge = Judge([correction(corrected)])
+    loop, store, model, mcp, events = build([discovery(), query(), final(original)], judge,
+        rows=[{'columns': ['Employee Count', 'Salary Threshold', 'Display Limit'],
+               'rows': [[2488, 500, 1000]], 'row_count': 1, 'truncated': False}])
+    out = await run(loop, 'List employees with salary over $500.')
+    assert out.assistant_text == corrected
+    assert out.review['status'] == 'approved'
+    assert len(out.answer_tables) == 1
+    assert len(judge.briefs) == 1 and model.calls_made == 3 and len(mcp.calls) == 1
+    assert not any(name in {'loop_answer_judge_refused', 'loop_partial_answer_failed'} for name, _ in events)
+    assert (await store.get_or_create_session(CREDS.session_id)).messages[-1].content == corrected
+
+
+async def test_rejected_edit_is_not_mislabeled_as_missing_evidence_or_original_approval():
+    judge = Judge([correction('')])
+    loop, _, _, _, _ = build([discovery(), query(), final('There are 120 employees.')], judge)
+    out = await run(loop)
+    assert out.review['status'] == 'rejected'
+    assert out.review['violation'] == 'prose_correction_rejected'
+    assert out.assistant_text == out.review['reason']
+    assert 'verify the claims' not in out.assistant_text
+    assert '120 employees' not in out.assistant_text
+
+
+@pytest.mark.parametrize("text", [
+    "  There are 120 employees.  ",
+    "There are 120 employees.\x00",
+    "| Department | Employees |\n|---|---|\n| Sales | 120 |",
+])
+async def test_approved_presentation_survives_normalization_and_reaches_history(text):
+    from data_agent.runtime.loop.approved_answer import normalize_approved_text
+
+    judge = Judge([correction(text)])
+    loop, store, _, _, events = build([discovery(), query(), final()], judge)
+    out = await run(loop)
+    assert out.review["status"] == "approved"
+    assert out.answer_tables
+    assert len(judge.briefs) == 1
+    assert out.assistant_text == normalize_approved_text(text, provenance=frozenset(), has_tables=True)
+    assert (await store.get_or_create_session(CREDS.session_id)).messages[-1].content == out.assistant_text
+    assert not any(name == "loop_answer_judge_refused" for name, _ in events)

@@ -1,0 +1,43 @@
+{
+  "scope": "Data-agent judge and delivery simplification; backend and private accrual catalog untouched.",
+  "changes": [
+    "Ordinary, corrected and salvaged answers share an exact-payload delivery receipt bound to successful evidence and access scope.",
+    "Answer delivery verifies the receipt without an additional semantic judge call. Clarification review remains separate.",
+    "One terminal salvage entry point retains its independent timeout and goes through the same delivery receipt check.",
+    "Correction and salvage share output-hygiene validation; removed repeated semantic/style guards after approval.",
+    "Removed prose_correction.py and unused delivery-context flags; retained strict evidence and component selection contracts.",
+    "Review attempts reports proposal review calls rather than defaulting to zero."
+  ],
+  "validation": {
+    "loop_and_observability": {
+      "passed": 1229,
+      "failed": 0
+    },
+    "full_runtime": {
+      "passed": 4638,
+      "failed": 21,
+      "skipped": 6
+    },
+    "baseline_comparison": "All 21 full-runtime failures reproduced against an isolated checkout of the pre-refactor index. Existing blueprint fixture, prompt contract, and remote-runtime expectations; not introduced by this refactor.",
+    "receipt_cases": [
+      "unchanged payload",
+      "changed text",
+      "changed caption",
+      "changed evidence preview",
+      "failed receipt",
+      "removed receipt",
+      "changed scope",
+      "unrelated new receipt"
+    ],
+    "regressions": [
+      "q011 repeated numeric value",
+      "salvage extra root fields",
+      "unknown evidence rejection",
+      "salvage UI/history delivery",
+      "independent salvage timeout",
+      "population rejection copy"
+    ],
+    "static": "Pyflakes checks and git diff --check passed.",
+    "live_model_or_production_replay": false
+  }
+}

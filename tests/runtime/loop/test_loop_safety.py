@@ -287,3 +287,17 @@ def test_rc_guard_events_export_shape_fields_without_message_payloads():
         assert all(progress.shape[k] == v for k, v in shape.items())
         assert "secret-" not in json.dumps(attributes)
         assert "secret-" not in json.dumps(progress.shape)
+
+
+def test_progress_checkpoint_counts_queries_and_time_without_blocking_work():
+    from data_agent.runtime.loop.loop_safety import LoopSafety
+    events=[]
+    safety=LoopSafety(read_limit=20,no_progress_limit=4,help_failure_limit=2,observer=lambda n,p: events.append((n,p)))
+    for _ in range(8):
+        safety.record_attempt('runQuery')
+    reminder=safety.progress_checkpoint(20)
+    assert 'gap still unresolved' in reminder and 'concrete next step' in reminder
+    assert safety.check('runQuery') is None
+    assert safety.progress_checkpoint(30) == ''
+    assert safety.progress_checkpoint(90)
+    assert len(events)==2

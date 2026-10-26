@@ -1,0 +1,945 @@
+{
+  "date": "2026-10-26",
+  "stack": "HTTP data-agent :18600 -> clickhouse-api MCP :18192; live Neo4j retrieval/embeddings, Trino/MySQL and native ClickHouse, Fireworks DeepSeek v4p1-flash. In-memory agent session store for local testing.",
+  "data": "Synthetic CLIENT_A test data, not remote production. Signed test JWTs and scoped session catalogs used.",
+  "tests": {
+    "agent_runtime": "4674 passed, 6 skipped",
+    "backend_staged_release_copy": "2555 passed, 87 skipped, 1 xfailed"
+  },
+  "http_runs": 15,
+  "final_unique_scenarios": 11,
+  "checks": {
+    "empty_it": true,
+    "median": true,
+    "latest": true,
+    "terminations": true,
+    "timeoff_rank": true,
+    "timeoff_breakdown": true,
+    "person_pay": true,
+    "mixed_payroll": true,
+    "tenure_population": true,
+    "person_punch": true,
+    "pasted_median_repair": true
+  },
+  "judge_probes": [
+    {
+      "case": "period_rehire_guard",
+      "passed": true,
+      "verdict": {
+        "approved": false,
+        "violation": "unrequested_employee_status_filter",
+        "feedback": "The 3,780 figure was measured over a narrowed population: only employees whose recorded status is currently Terminated and whose most recent hire date falls before the termination date. The applicable catalog rule for recorded terminations in a period uses the termination date alone \u2014 current-status and rehire/date-ordering restrictions require explicit user scope, which the user did not give, and date ordering must not be used to exclude records. Re-run counting every accessible record with a termination date in 2026 regardless of current status or hire-date ordering, and return the employee-",
+        "reviewed": true,
+        "intent_id": "",
+        "result_ids": [
+          "q"
+        ],
+        "repair_type": "analysis",
+        "corrected_answer": null,
+        "partial_answer": null,
+        "failure_reason": "",
+        "measured_population": "Terminated",
+        "required_population": "all accessible records"
+      }
+    },
+    {
+      "case": "status_rehire_guard",
+      "passed": true,
+      "verdict": {
+        "approved": false,
+        "violation": "measurement_mismatch",
+        "feedback": "The count applies an unrequested rehire-date exclusion (dropping records whose most recent hire date is on or after the termination date), so 32,702 is a narrowed subset, not the terminated-status count the user asked for. Recount using the recorded status alone \u2014 employees whose status is Terminated \u2014 with no hire/termination date ordering condition, then state the resulting number.",
+        "reviewed": true,
+        "intent_id": "",
+        "result_ids": [
+          "q"
+        ],
+        "repair_type": "analysis",
+        "corrected_answer": null,
+        "partial_answer": null,
+        "failure_reason": "",
+        "measured_population": "",
+        "required_population": ""
+      }
+    },
+    {
+      "case": "status_control",
+      "passed": true,
+      "verdict": {
+        "approved": true,
+        "violation": "",
+        "feedback": "",
+        "reviewed": true,
+        "intent_id": "",
+        "result_ids": [],
+        "repair_type": "",
+        "corrected_answer": null,
+        "partial_answer": null,
+        "failure_reason": "",
+        "measured_population": "",
+        "required_population": ""
+      }
+    },
+    {
+      "case": "wording_tally",
+      "passed": true,
+      "verdict": {
+        "approved": true,
+        "violation": "",
+        "feedback": "",
+        "reviewed": true,
+        "intent_id": "",
+        "result_ids": [],
+        "repair_type": "prose",
+        "corrected_answer": "There are 29 staff: 15 Active and 14 Terminated.",
+        "partial_answer": null,
+        "failure_reason": "",
+        "measured_population": "",
+        "required_population": ""
+      }
+    }
+  ],
+  "fixture_failure_and_retest": {
+    "initial_punch_turn": "Delivered a partial limitation after the locally created plain MergeTree fixture rejected FINAL (ClickHouse ILLEGAL_FINAL).",
+    "correction": "Changed the two-row synthetic fixture to ReplacingMergeTree. No production-code workaround or removal of FINAL.",
+    "retest": "Fresh session completed all four timeoff -> breakdown -> payroll -> punches turns, retaining E005."
+  },
+  "remaining": [
+    "Remote 102-question production replay is still required.",
+    "Exploration latency remains: payroll follow-up reached 153.28 seconds / 17 tool calls despite matching the independently checked total. Advisory progress coaching is not a hard cap.",
+    "Raw production totals from the old report are not acceptance values for this synthetic dataset or for updated pay-type compensation definitions."
+  ],
+  "cases": [
+    {
+      "case": "timeoff_rank",
+      "question": "Which employee took the highest time-off hours in the last six months?",
+      "seconds": 56.02,
+      "tool_calls": 8,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "Employee E005 (Synthetic Employee 05) took the highest approved time-off hours in the last six months \u2014 16.0 hours across 1 requested day, measured over 2026-04-26 to 2026-10-26. This counts approved time-off request hours (approved requests assumed taken as requested), not payroll-paid hours; results cover the request records you're authorized to access.",
+      "answer_tables": [
+        {
+          "caption": "Top employee by approved time-off hours, 2026-04-26 to 2026-10-26",
+          "sql": "WITH totals AS (SELECT employee_code, sum(hours) AS approved_hours, uniqExact(toDate(request_date)) AS requested_days FROM dbpcm_warehouse.timeoff_requests WHERE status = 'Approved' AND event_type = 'Time Off Request' AND request_date >= CAST('2026-04-26' AS DATE) AND request_date < CAST('2026-10-26' AS DATE) GROUP BY employee_code), ranked AS (SELECT employee_code, approved_hours, requested_days, dense_rank() OVER (ORDER BY approved_hours DESC) AS hours_rank FROM totals) SELECT employee_code AS \"Employee Code\", approved_hours AS \"Approved Time-Off Hours\", requested_days AS \"Requested Days\", hours_rank AS \"Rank\" FROM ranked WHERE hours_rank <= 1 ORDER BY hours_rank, employee_code",
+          "result": {
+            "columns": [
+              "Employee Code",
+              "Approved Time-Off Hours",
+              "Requested Days",
+              "Rank"
+            ],
+            "rows": [
+              [
+                "E005",
+                "16.000000",
+                1,
+                1
+              ]
+            ],
+            "row_count": 1,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "event_type"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "hours"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "request_date"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "status"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "empty_it",
+      "question": "List the IT department employees.",
+      "seconds": 65.6,
+      "tool_calls": 14,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "No employees are assigned to the Information Technology (IT) department \u2014 the directory shows IT as an existing department with no staff records in any status, so there is no one to list.",
+      "answer_tables": [
+        {
+          "caption": "Employees in the IT department (none found)",
+          "sql": "SELECT e.employee_code AS `Employee Code`,\n       e.employee_name AS `Employee Name`,\n       e.department_name AS `Department`,\n       e.employee_status AS `Status`,\n       e.position_title_position_info AS `Position Title`\nFROM dbpcm_datawarehouse.employee e\nWHERE e.department_name = 'Information Technology'\n  AND e.employee_status IN ('Active', 'On Leave')\nORDER BY e.employee_name",
+          "result": {
+            "columns": [
+              "Employee Code",
+              "Employee Name",
+              "Department",
+              "Status",
+              "Position Title"
+            ],
+            "rows": [],
+            "row_count": 0,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.employee",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_status"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "position_title_position_info"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "latest",
+      "question": "Show me the top 5 latest hired employees.",
+      "seconds": 15.13,
+      "tool_calls": 3,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "Here are the 5 most recently hired employees, ranked by most recent hire date (rehires included). Default population applied: Active + On Leave employees only.",
+      "answer_tables": [
+        {
+          "caption": "Top 5 latest hired employees by most recent hire date",
+          "sql": "SELECT e.employee_code AS \"Employee Code\", e.employee_name AS \"Employee Name\", e.department_name AS \"Department\", e.employee_status AS \"Status\", e.most_recent_hire_date AS \"Most Recent Hire Date\" FROM dbpcm_warehouse.employee AS e WHERE (e.employee_status IN ('Active', 'On Leave') OR e.employee_status IN ('Active', 'On Leave')) AND TRUE AND e.most_recent_hire_date > toDate('1900-01-01') AND e.most_recent_hire_date <= now() ORDER BY e.most_recent_hire_date DESC, e.employee_code LIMIT 5",
+          "result": {
+            "columns": [
+              "Employee Code",
+              "Employee Name",
+              "Department",
+              "Status",
+              "Most Recent Hire Date"
+            ],
+            "rows": [
+              [
+                "E005",
+                "Synthetic Employee 05",
+                "Engineering",
+                "Active",
+                "2025-01-15T00:00:00"
+              ],
+              [
+                "E011",
+                "Synthetic Employee 11",
+                "Engineering",
+                "Active",
+                "2025-01-15T00:00:00"
+              ],
+              [
+                "E017",
+                "Synthetic Employee 17",
+                "Engineering",
+                "Active",
+                "2025-01-15T00:00:00"
+              ],
+              [
+                "E004",
+                "Synthetic Employee 04",
+                "Human Resources",
+                "Active",
+                "2024-01-15T00:00:00"
+              ],
+              [
+                "E010",
+                "Synthetic Employee 10",
+                "Human Resources",
+                "Active",
+                "2024-01-15T00:00:00"
+              ]
+            ],
+            "row_count": 5,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.employee",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_status"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "most_recent_hire_date"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "median",
+      "question": "What is the median salary?",
+      "seconds": 48.96,
+      "tool_calls": 7,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "The median annual salary for salaried employees is **$64,375** (based on 20 employees with recorded annual salaries). The figure covers employees currently Active or On Leave; hourly staff are measured on a separate pay basis and are not included in this median.",
+      "answer_tables": [
+        {
+          "caption": "Median annual salary (salaried employees, company-wide)",
+          "sql": "SELECT e.employee_pay_type AS \"Pay Type\", CASE WHEN e.employee_pay_type = 'Hourly' THEN 'Estimated annual compensation (2080 hours)' WHEN e.employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown compensation basis' END AS \"Compensation Basis\", CASE WHEN 'company' = 'department' THEN e.department_name WHEN 'company' = 'status' THEN e.employee_status ELSE 'Company' END AS \"Group\", count((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Known Compensation Count\", (quantileExactLow(0.5)((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) + quantileExactHigh(0.5)((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END))) / 2 AS \"Exact Median Annual Compensation\", avg((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Average Annual Compensation\", min((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Minimum Annual Compensation\", max((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Maximum Annual Compensation\", avg(CASE WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary ELSE NULL END) AS \"Average Hourly Rate\" FROM dbpcm_warehouse.employee AS e WHERE (e.employee_status IN ('Active', 'On Leave') OR e.employee_status IN ('Active', 'On Leave')) AND TRUE AND TRUE AND NOT ((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) IS NULL) AND ('recorded' = 'recorded' OR (CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) > 0) GROUP BY e.employee_pay_type, CASE WHEN 'company' = 'department' THEN e.department_name WHEN 'company' = 'status' THEN e.employee_status ELSE 'Company' END ORDER BY \"Group\"",
+          "result": {
+            "columns": [
+              "Pay Type",
+              "Compensation Basis",
+              "Group",
+              "Known Compensation Count",
+              "Exact Median Annual Compensation",
+              "Average Annual Compensation",
+              "Minimum Annual Compensation",
+              "Maximum Annual Compensation",
+              "Average Hourly Rate"
+            ],
+            "rows": [
+              [
+                "Salary",
+                "Recorded annual salary",
+                "Company",
+                20,
+                64375.0,
+                64375.0,
+                "28750.000000",
+                "100000.000000",
+                null
+              ]
+            ],
+            "row_count": 1,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.employee",
+                  "annual_salary"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_pay_type"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_status"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "hourly_salary"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "terminations",
+      "question": "Show all employees who were terminated this year.",
+      "seconds": 54.93,
+      "tool_calls": 8,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "No employees have a recorded termination date in 2026 among the records you're authorized to access. The query returned no rows.\n\nThis reflects only the accessible records; if you expected terminations this year, they may be outside your access scope, or the recorded termination dates may fall outside the 2026 calendar year. No current-status filter was applied, so any 2026 termination would have been included regardless of the employee's present status.",
+      "answer_tables": [
+        {
+          "caption": "Employees with a recorded termination date in 2026",
+          "sql": "SELECT e.employee_code AS \"Employee Code\", e.employee_name AS \"Employee Name\", e.department_name AS \"Department\", e.employee_status AS \"Current Status\", e.termination_date AS \"Termination Date\", count(*) OVER () AS \"Total Matching Records\" FROM dbpcm_warehouse.employee AS e WHERE e.termination_date >= CAST('2026-01-01' AS DATE) AND e.termination_date < CAST('2027-01-01' AS DATE) AND (TRUE OR TRUE) AND TRUE ORDER BY e.termination_date DESC, e.employee_code LIMIT 1000",
+          "result": {
+            "columns": [
+              "Employee Code",
+              "Employee Name",
+              "Department",
+              "Current Status",
+              "Termination Date",
+              "Total Matching Records"
+            ],
+            "rows": [],
+            "row_count": 0,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.employee",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_status"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "termination_date"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "tenure",
+      "question": "What is the average tenure for each department?",
+      "seconds": 80.04,
+      "tool_calls": 14,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "Average tenure by home department, for the current workforce (Active and On Leave employees), measured from original hire date to today (2026-10-26):\n\nOperations has the longest average service (~5.3 years), followed by Human Resources (~4.5) and Engineering (~3.5). Information Technology currently has no active or on-leave staff, so no average tenure applies there.",
+      "answer_tables": [
+        {
+          "caption": "Average tenure (years) by department \u2014 Active + On Leave employees",
+          "sql": "SELECT d.department_name AS `Department`,\n       coalesce(t.`Employees`, 0) AS `Employees`,\n       t.`Average Tenure (Years)`\nFROM dbpcm_datawarehouse.department d\nLEFT JOIN (\n  SELECT e.department_name AS department_name,\n         count(*) AS `Employees`,\n         avg(dateDiff('day', toDate(e.hire_date), toDate('2026-10-26')) / 365.25) AS `Average Tenure (Years)`\n  FROM dbpcm_datawarehouse.employee e\n  WHERE e.employee_status IN ('Active', 'On Leave')\n    AND toDate(e.hire_date) > toDate('1900-01-01')\n    AND toDate(e.hire_date) <= toDate('2026-10-26')\n  GROUP BY e.department_name\n) t ON t.department_name = d.department_name\nORDER BY `Department`",
+          "result": {
+            "columns": [
+              "Department",
+              "Employees",
+              "Average Tenure (Years)"
+            ],
+            "rows": [
+              [
+                "Engineering",
+                7,
+                3.491541996675467
+              ],
+              [
+                "Human Resources",
+                7,
+                4.492030898601739
+              ],
+              [
+                "Information Technology",
+                0,
+                null
+              ],
+              [
+                "Operations",
+                6,
+                5.278576317590691
+              ]
+            ],
+            "row_count": 4,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.department",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_status"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "hire_date"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "timeoff_breakdown",
+      "question": "What types of time off did that employee use, and on how many unique days, in that same period?",
+      "seconds": 70.79,
+      "tool_calls": 13,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "Employee E005 used one type of time off in the last six months: Paid time off (PTO), on 1 unique requested day, totalling 16.0 approved hours. Same period (2026-04-26 to 2026-10-25) and same approved-request basis as the earlier ranking.",
+      "answer_tables": [
+        {
+          "caption": "E005 time-off types and unique requested days, 2026-04-26 to 2026-10-25",
+          "sql": "SELECT earn_code AS `Time-Off Type Code`, earn_description AS `Time-Off Type`, sum(hours) AS `Approved Hours`, uniqExact(toDate(request_date)) AS `Unique Requested Days`\nFROM dbpcm_datawarehouse.timeoff_requests\nWHERE employee_code = 'E005' AND status = 'Approved' AND event_type = 'Time Off Request'\nAND toDate(request_date) >= toDate('2026-04-26') AND toDate(request_date) < toDate('2026-10-26')\nGROUP BY earn_code, earn_description\nORDER BY `Approved Hours` DESC",
+          "result": {
+            "columns": [
+              "Time-Off Type Code",
+              "Time-Off Type",
+              "Approved Hours",
+              "Unique Requested Days"
+            ],
+            "rows": [
+              [
+                "PTO",
+                "Paid time off",
+                "16.000000",
+                1
+              ]
+            ],
+            "row_count": 1,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "earn_code"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "earn_description"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "event_type"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "hours"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "request_date"
+                ],
+                [
+                  "dbpcm_warehouse.timeoff_requests",
+                  "status"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "person_pay",
+      "question": "How much gross pay did that employee receive in those six months?",
+      "seconds": 153.28,
+      "tool_calls": 17,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 2,
+        "site": "exit_table",
+        "completion": "full"
+      },
+      "answer": "Employee E005 (Synthetic Employee 05) received $15,498.00 in gross pay (earnings-register amounts, before taxes, deductions and benefits) over the six months 2026-04-26 to 2026-10-26, measured by pay (check) date. That total is the sum of 1,722 earnings line items spread across 86 pay dates, so it reflects line-item detail rather than a count of paychecks.\n\nCoverage caveat: this employee's available earnings records run only from pay date 2026-08-01 through 2026-10-25 (monthly: Aug $5,589.00, Sep $5,463.00, Oct $4,446.00). No earnings rows exist earlier in the window, so this is the total for the period payroll data actually covers, not a full six-month figure. Results cover the records you are authorized to access.",
+      "answer_tables": [
+        {
+          "caption": "Gross pay (earnings register) for employee E005, pay dates 2026-04-26 to 2026-10-26, with line-item count and distinct pay dates",
+          "sql": "SELECT sum(amount) AS `Gross Pay`, count(*) AS `Payroll Line Count`, uniqExact(toString(pay_date)) AS `Pay Dates`\nFROM dbpcm_datawarehouse.payroll\nWHERE employee_code = 'E005' AND register_type = 'EARN'\nAND toDate(pay_date) >= toDate('2026-04-26') AND toDate(pay_date) < toDate('2026-10-26')",
+          "result": {
+            "columns": [
+              "Gross Pay",
+              "Payroll Line Count",
+              "Pay Dates"
+            ],
+            "rows": [
+              [
+                "15498.00",
+                1722,
+                86
+              ]
+            ],
+            "row_count": 1,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.payroll",
+                  "amount"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "pay_date"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "register_type"
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "caption": "Gross pay by pay month, employee E005 (available pay dates only)",
+          "sql": "SELECT substring(toString(pay_date), 1, 7) AS `Pay Month`, sum(amount) AS `Gross Pay`, count(*) AS `Lines`, uniqExact(toString(pay_date)) AS `Pay Dates`\nFROM dbpcm_datawarehouse.payroll\nWHERE employee_code = 'E005' AND register_type = 'EARN'\nAND toDate(pay_date) >= toDate('2026-04-26') AND toDate(pay_date) < toDate('2026-10-26')\nGROUP BY `Pay Month` ORDER BY `Pay Month`",
+          "result": {
+            "columns": [
+              "Pay Month",
+              "Gross Pay",
+              "Lines",
+              "Pay Dates"
+            ],
+            "rows": [
+              [
+                "2026-08",
+                "5589.00",
+                621,
+                31
+              ],
+              [
+                "2026-09",
+                "5463.00",
+                607,
+                30
+              ],
+              [
+                "2026-10",
+                "4446.00",
+                494,
+                25
+              ]
+            ],
+            "row_count": 3,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.payroll",
+                  "amount"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "pay_date"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "register_type"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "person_punch",
+      "question": "Did that employee have any punch records in those six months?",
+      "seconds": 67.63,
+      "tool_calls": 13,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "Yes \u2014 E005 (Synthetic Employee 05) has punch-pair records in the six months from 2026-04-26 to 2026-10-25: 2 matched punch pairs on 2 observed days (2026-09-01 and 2026-09-02), all from the synthetic source. Note that these pairs carry 0.00 paid hours and $0.00 earning amount.\n\nCaveat: this employee is salaried, and salaried time-off approvals and automatic pay-period-end timesheets can generate punch records without the employee clocking in. So the presence of these two pairs does not establish that the employee actually clocked in or was physically present.",
+      "answer_tables": [
+        {
+          "caption": "Punch-pair summary for E005, 2026-04-26 to 2026-10-25",
+          "sql": "SELECT CASE 'employee' WHEN 'employee' THEN employee_code WHEN 'department' THEN department_code WHEN 'day' THEN toString(punch_date) WHEN 'month' THEN SUBSTRING(toString(punch_date), 1, 7) WHEN 'hours_type' THEN hours_type ELSE 'Company' END AS \"Group\", count(*) AS \"Pair Count\", count(DISTINCT employee_code) AS \"Employee Count\", count(DISTINCT punch_date) AS \"Observed Days\", sum(earn_hours) AS \"Paid Hours\", sum(earn_amount) AS \"Pair Earning Amount\", min(punch_date) AS \"First Observed Date\", max(punch_date) AS \"Last Observed Date\" FROM dbpcm_warehouse.punch_pair FINAL WHERE punch_date >= toDate('2026-04-26') AND punch_date < toDate('2026-10-26') AND table_source = 'synthetic' AND employee_code = 'E005' AND TRUE AND TRUE AND TRUE AND TRUE AND TRUE GROUP BY CASE 'employee' WHEN 'employee' THEN employee_code WHEN 'department' THEN department_code WHEN 'day' THEN toString(punch_date) WHEN 'month' THEN SUBSTRING(toString(punch_date), 1, 7) WHEN 'hours_type' THEN hours_type ELSE 'Company' END ORDER BY \"Group\"",
+          "result": {
+            "columns": [
+              "Group",
+              "Pair Count",
+              "Employee Count",
+              "Observed Days",
+              "Paid Hours",
+              "Pair Earning Amount",
+              "First Observed Date",
+              "Last Observed Date"
+            ],
+            "rows": [
+              [
+                "E005",
+                2,
+                1,
+                2,
+                "0.000000",
+                "0.00",
+                "2026-09-01",
+                "2026-09-02"
+              ]
+            ],
+            "row_count": 1,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.punch_pair",
+                  "department_code"
+                ],
+                [
+                  "dbpcm_warehouse.punch_pair",
+                  "earn_amount"
+                ],
+                [
+                  "dbpcm_warehouse.punch_pair",
+                  "earn_hours"
+                ],
+                [
+                  "dbpcm_warehouse.punch_pair",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.punch_pair",
+                  "hours_type"
+                ],
+                [
+                  "dbpcm_warehouse.punch_pair",
+                  "punch_date"
+                ],
+                [
+                  "dbpcm_warehouse.punch_pair",
+                  "table_source"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "mixed_payroll",
+      "question": "Show gross payroll earnings by employee home department for September 2026. Include all employee statuses, use payroll EARN amounts and employee department names.",
+      "seconds": 79.49,
+      "tool_calls": 10,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "Gross payroll earnings (EARN) for September 2026 by employee home department, all employee statuses included:\n\n\nPayroll line items with a September 2026 pay date were grouped by the employee's home department (the department recorded in the employee directory). All 24 employees on the September payroll matched a department record, so no earnings fell into an unmatched bucket. These are finalized gross earnings \u2014 the EARN register only \u2014 not net pay or total employer cost.",
+      "answer_tables": [
+        {
+          "caption": "Gross payroll earnings by employee home department, September 2026 (pay date)",
+          "sql": "SELECT e.department_name AS `Home Department`,\n       sum(CAST(p.amount AS Decimal(38,2))) AS `Gross Earnings`,\n       sum(CAST(p.line_count AS BIGINT)) AS `Source Line Count`,\n       uniqExact(p.employee_code) AS `Employee Count`\nFROM (\n  SELECT employee_code, sum(amount) AS amount, count(*) AS line_count\n  FROM dbpcm_datawarehouse.payroll\n  WHERE register_type = 'EARN'\n    AND pay_date >= toDate('2026-09-01') AND pay_date < toDate('2026-10-01')\n  GROUP BY employee_code\n) p\nLEFT JOIN dbpcm_datawarehouse.employee e ON p.employee_code = e.employee_code\nGROUP BY e.department_name\nORDER BY `Home Department`",
+          "result": {
+            "columns": [
+              "Home Department",
+              "Gross Earnings",
+              "Source Line Count",
+              "Employee Count"
+            ],
+            "rows": [
+              [
+                "Engineering",
+                "116544.00",
+                4856,
+                8
+              ],
+              [
+                "Human Resources",
+                "106832.00",
+                4856,
+                8
+              ],
+              [
+                "Operations",
+                "126256.00",
+                4856,
+                8
+              ]
+            ],
+            "row_count": 3,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.employee",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "amount"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "employee_code"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "pay_date"
+                ],
+                [
+                  "dbpcm_warehouse.payroll",
+                  "register_type"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "pasted_median_repair",
+      "question": "You drafted: The median annual salary is $64,375. That answer was NOT sent. Reword it so the median states its population. Do not claim zero annual salaries prove hourly pay. The actual request is: what is the median salary for current employees? Verify only what is necessary if the earlier results are unavailable.",
+      "seconds": 56.75,
+      "tool_calls": 6,
+      "status": "done",
+      "review": {
+        "status": "approved",
+        "attempts": 1,
+        "site": "exit_table"
+      },
+      "answer": "Among current employees (Active or On Leave) on the salaried pay basis, the median annual salary is $64,375 \u2014 based on the 20 salaried employees with a recorded annual salary. Hourly staff are reported separately and are not included in this annual figure.",
+      "answer_tables": [
+        {
+          "caption": "Median annual salary for current employees (salaried pay basis)",
+          "sql": "SELECT e.employee_pay_type AS \"Pay Type\", CASE WHEN e.employee_pay_type = 'Hourly' THEN 'Estimated annual compensation (2080 hours)' WHEN e.employee_pay_type = 'Salary' THEN 'Recorded annual salary' ELSE 'Unknown compensation basis' END AS \"Compensation Basis\", CASE WHEN 'company' = 'department' THEN e.department_name WHEN 'company' = 'status' THEN e.employee_status ELSE 'Company' END AS \"Group\", count((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Known Compensation Count\", (quantileExactLow(0.5)((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) + quantileExactHigh(0.5)((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END))) / 2 AS \"Exact Median Annual Compensation\", avg((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Average Annual Compensation\", min((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Minimum Annual Compensation\", max((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END)) AS \"Maximum Annual Compensation\", avg(CASE WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary ELSE NULL END) AS \"Average Hourly Rate\" FROM dbpcm_warehouse.employee AS e WHERE (e.employee_status IN ('Active', 'On Leave') OR e.employee_status IN ('Active', 'On Leave')) AND TRUE AND TRUE AND NOT ((CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) IS NULL) AND ('recorded' = 'recorded' OR (CASE WHEN e.employee_pay_type = 'Salary' THEN e.annual_salary WHEN e.employee_pay_type = 'Hourly' THEN e.hourly_salary * 2080 ELSE NULL END) > 0) GROUP BY e.employee_pay_type, CASE WHEN 'company' = 'department' THEN e.department_name WHEN 'company' = 'status' THEN e.employee_status ELSE 'Company' END ORDER BY \"Group\"",
+          "result": {
+            "columns": [
+              "Pay Type",
+              "Compensation Basis",
+              "Group",
+              "Known Compensation Count",
+              "Exact Median Annual Compensation",
+              "Average Annual Compensation",
+              "Minimum Annual Compensation",
+              "Maximum Annual Compensation",
+              "Average Hourly Rate"
+            ],
+            "rows": [
+              [
+                "Salary",
+                "Recorded annual salary",
+                "Company",
+                20,
+                64375.0,
+                64375.0,
+                "28750.000000",
+                "100000.000000",
+                null
+              ]
+            ],
+            "row_count": 1,
+            "truncated": false,
+            "provenance": {
+              "version": 1,
+              "columns": [
+                [
+                  "dbpcm_warehouse.employee",
+                  "annual_salary"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "department_name"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_pay_type"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "employee_status"
+                ],
+                [
+                  "dbpcm_warehouse.employee",
+                  "hourly_salary"
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "passed": true
+    }
+  ]
+}

@@ -381,3 +381,23 @@ async def test_load_corpus_empty_sha_never_skips_and_never_touches_meta() -> Non
     assert _UPSERT_CORPUS_META not in issued  # never stamps meta on the empty-sha path
     # The meta was never even READ (the fast path is gated on a truthy corpus_sha).
     assert _READ_CORPUS_META not in [q for q, _ in driver.session_calls]
+
+
+async def test_matching_sha_still_reconciles_deleted_canon_without_embedding():
+    class Tx(_RecordingTx):
+        async def run(self, query, **params):
+            if query == _READ_CORPUS_META:
+                self.calls.append((query,params))
+                return _Result({'corpus_sha':'sha-x'})
+            return await super().run(query,**params)
+
+    class NoEmbedding:
+        async def embed(self, texts):
+            raise AssertionError('Reconciliation must not repeat embeddings')
+
+    driver = _RecordingDriver(meta_sha='sha-x')
+    driver.tx = Tx()
+    report = await load_corpus(driver, NoEmbedding(), [_bp('kept')], [], model_id='test', corpus_sha='sha-x', gc=True)
+    assert report.skipped
+    assert [q for q,_ in driver.tx.calls] == [_READ_CORPUS_META, _GC_BLUEPRINTS, _GC_KNOWLEDGE]
+    assert all(p.get('corpus_sha')=='sha-x' for q,p in driver.tx.calls if q in {_GC_BLUEPRINTS,_GC_KNOWLEDGE})
