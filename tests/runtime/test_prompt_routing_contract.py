@@ -149,5 +149,6 @@ def test_help_and_capability_prompts_agree_with_finalization():
 def test_prompt_is_bounded_and_byte_stable():
     from data_agent.runtime import prompts
 
-    assert len(AGENT_SYSTEM_PROMPT) < 15000
+    # Includes shared Markdown answer guidance for agent and judge delivery.
+    assert len(AGENT_SYSTEM_PROMPT) < 16000
     assert importlib.reload(prompts).AGENT_SYSTEM_PROMPT == AGENT_SYSTEM_PROMPT

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from data_agent.runtime.prompts import ANSWER_MARKDOWN_GUIDANCE
+
 from .client import MCPClient, MCPToolSpec
 
 ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
@@ -400,7 +402,7 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
         "properties": {
             "answer": {
                 "type": "string",
-                "description": "Your complete final answer to the user, in plain prose. Do not narrate internal "
+                "description": "Your complete final answer to the user, in Markdown prose. Do not narrate internal "
                 "retries, tool selection, judge reviews, or other internal processing. "
                 "Describes the tables rather than reproducing their rows.",
             },
@@ -477,7 +479,7 @@ ANSWER_WITH_TEXT_TOOL_SCHEMA: dict[str, Any] = {
         "properties": {
             "answer": {
                 "type": "string",
-                "description": "The complete final answer shown to the user. Do not narrate internal retries, "
+                "description": "The complete final answer shown to the user, in Markdown prose. Do not narrate internal retries, "
                 "tool selection, judge reviews, or other internal processing.",
             },
             "evidence": {
@@ -670,7 +672,7 @@ FINALIZE_ANSWER_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "answer": {"type": "string"},
+            "answer": {"type": "string", "description": ANSWER_MARKDOWN_GUIDANCE},
             "tables": {
                 "type": "array",
                 "items": {
