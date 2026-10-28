@@ -12,6 +12,8 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from data_agent.runtime.mcp._transport import trace_headers
+
 _logger = logging.getLogger(__name__)
 _UNAVAILABLE = {"error": "The query service could not be run.", "error_code": "EXPORT_UNAVAILABLE"}
 
@@ -46,6 +48,7 @@ def export_router(settings, extract_credentials, session_catalog, *, transport=N
             _logger.warning("snapshot scope unavailable failure_class=%s", type(exc).__name__)
             return JSONResponse(status_code=502, content=_UNAVAILABLE)
         headers = {
+            **trace_headers(),
             "Authorization": authorization,
             "X-Session-Id": credentials.session_id,
             "X-Catalog-Scope": scope,

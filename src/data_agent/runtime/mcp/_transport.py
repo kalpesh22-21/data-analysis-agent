@@ -11,6 +11,14 @@ separate because their consequences differ; they share only the `(code, message)
 from __future__ import annotations
 
 import httpx
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+
+def trace_headers() -> dict[str, str]:
+    """Carry the active tool span, without baggage or caller-supplied headers."""
+    headers: dict[str, str] = {}
+    TraceContextTextMapPropagator().inject(headers)
+    return headers
 
 
 class SideChannelError(Exception):
@@ -34,7 +42,7 @@ def side_channel_headers(jwt: str, session_id: str) -> dict[str, str]:
         scratch route also NAMES the table, D92). Neither is ever reflected back into a
         handle, a corpus node, or a model-visible message.
     """
-    headers = {"Authorization": f"Bearer {jwt}"}
+    headers = {"Authorization": f"Bearer {jwt}", **trace_headers()}
     # OMIT the header rather than send an empty one. Exactly ONE caller reaches here with
     # a blank session id: the review inbox's borrowed-reviewer-token path, where
     # `SuppliedTokenMinter.binds_session` is False because the inbox holds a token somebody
@@ -58,7 +66,7 @@ def auth_headers(*, service_key: str | None, jwt: str, session_id: str) -> dict[
         daemon) authenticate an export with no user JWT in hand.
     """
     if service_key:
-        return {"X-Service-Key": service_key}
+        return {"X-Service-Key": service_key, **trace_headers()}
     return side_channel_headers(jwt, session_id)
 
 
