@@ -282,3 +282,27 @@ async def test_dag_provided_optional_binds_value_in_node() -> None:
     node1_sql = mcp.calls[1].args["sql"]
     assert "Department = 'Sales'" in node1_sql
     assert "WHERE TRUE" not in node1_sql
+
+
+async def test_default_enum_renders_as_literal_and_explicit_value_overrides() -> None:
+    for bindings, expected in [({}, "DESC"), ({"direction": "ASC"}, "ASC")]:
+        detail = _detail(
+            slots=[{"name": "direction", "type": "enum", "required": False,
+                    "enum_values": ["DESC", "ASC"], "default": "DESC"}],
+            sql_template=(
+                "SELECT Department AS department, AVG(AnnualSalary) AS avg_salary "
+                "FROM dbpcm_warehouse.employee GROUP BY Department "
+                "ORDER BY CASE WHEN {direction} = 'DESC' THEN avg_salary END DESC"
+            ),
+        )
+        mcp = FakeMCPClient(scripted={"runQuery": [
+            _rq(["department", "avg_salary"], [["Sales", 1.0]]),
+            _rq(["__bp_n", "__bp_d"], [[1, 1]]),
+        ]})
+        outcome = await _executor(mcp, detail).execute(
+            blueprint_id="bp-c", slot_bindings=bindings, credentials=_creds()
+        )
+        assert isinstance(outcome, ExecCompleted)
+        assert f"'{expected}' = 'DESC'" in mcp.calls[0].args["sql"]
+        assert outcome.result_full["bound_slots"] == {"direction": expected}
+        assert len(mcp.calls) == 2  # no extra domain query for the authored default

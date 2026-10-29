@@ -194,6 +194,7 @@ _SLOT_SCHEMA = {
         },
         "required": {"type": "boolean"},
         "optional_pattern": {"type": ["string", "null"]},
+        "default": {"type": ["string", "integer", "number", "boolean", "null"]},
         "enum_values": {"type": ["array", "null"], "items": {"type": "string"}},
     },
     "required": ["name", "type", "binds_to", "required"],

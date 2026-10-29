@@ -62,7 +62,7 @@ class SlotBinding:
 
     name: str
     value: Any
-    resolved_from: str = "direct"  # "direct" | "domain" | "enum" | "list"
+    resolved_from: str = "direct"  # "direct" | "domain" | "enum" | "list" | "default"
 
 
 @dataclass(frozen=True)
@@ -145,6 +145,9 @@ def resolve_slot(
                 reason="missing",
                 question=f"What value should I use for '{spec.name}'?",
             )
+        if spec.default is not None:
+            # Author defaults were validated at parse time; keep their exact type/value.
+            return SlotBinding(name=spec.name, value=spec.default, resolved_from="default")
         return OmitSlot(name=spec.name, optional_pattern=spec.optional_pattern)
 
     # The windowed-period types resolve BEFORE the string/entity container guard

@@ -19,6 +19,7 @@ from typing import Any, get_args
 import sqlglot
 import sqlglot.expressions as exp
 
+from data_agent.runtime.blueprint.models import BlueprintParseError, SlotSpec
 from data_agent.runtime.blueprint.template import (
     TemplateBindError,
     parse_template,
@@ -572,6 +573,7 @@ def _slot_plan(raw: Any, *, at: str) -> SlotPlan:
             default=None,
         ),
         enum_values=_enum_values(slot, at=at),
+        default=slot.get("default"),
     )
 
 
@@ -1362,14 +1364,20 @@ def _validate_roles(
                     f"{at}.slot is type 'enum' but has no enum_values; give the closed "
                     "set, or use type 'entity' for a free-text value",
                 )
-            # No-drop (D97): an optional slot MUST carry an optional_pattern, else
-            # an absent bind silently drops the predicate.
-            if not p.slot.required and not p.slot.optional_pattern:
+            # No-drop (D97): optional slots need an omission pattern or default.
+            # Share compiler gate e2 and parse-time default validation.
+            try:
+                runtime_slot = SlotSpec.parse(p.slot.to_doc())
+            except BlueprintParseError:
+                return _role_shape(
+                    f"{at}.slot has an invalid slot declaration; check default and type constraints"
+                )
+            if runtime_slot.needs_omission_pattern:
                 return _role_shape(
                     f"{at}.slot is optional (required=false) but has no "
-                    "optional_pattern, so an absent bind would silently drop the "
+                    "optional_pattern and no default, so an absent bind would silently drop the "
                     "predicate; give the fragment that renders when it is absent "
-                    "(usually 'TRUE'), or mark the slot required",
+                    "(usually 'TRUE'), declare a default, or mark the slot required",
                 )
             # Well-formedness (Slice C): a PRESENT optional_pattern must be a
             # self-contained boolean SQL fragment carrying NO placeholder — the SAME

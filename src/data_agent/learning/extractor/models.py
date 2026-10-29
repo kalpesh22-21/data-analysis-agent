@@ -196,6 +196,7 @@ class SlotPlan:
     required: bool
     optional_pattern: str | None = None  # SQL fragment when an optional slot is ABSENT
     enum_values: tuple[str, ...] | None = None
+    default: Any | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -205,6 +206,7 @@ class SlotPlan:
             "required": self.required,
             "optional_pattern": self.optional_pattern,
             "enum_values": list(self.enum_values) if self.enum_values is not None else None,
+            **({"default": self.default} if self.default is not None else {}),
         }
 
 

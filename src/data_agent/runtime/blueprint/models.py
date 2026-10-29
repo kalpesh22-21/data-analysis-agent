@@ -258,6 +258,14 @@ class SlotSpec:
     max_value: int | None = None
     temporal_type: str | None = None  # date or datetime; no arbitrary SQL types
 
+    default: Any | None = None
+    description: str | None = None
+
+    @property
+    def needs_omission_pattern(self) -> bool:
+        """Shared compiler/extractor D97 bindability gate for referenced slots."""
+        return not self.required and self.optional_pattern is None and self.default is None
+
     @classmethod
     def parse(cls, raw: Any) -> SlotSpec:
         if not isinstance(raw, dict):
@@ -306,6 +314,27 @@ class SlotSpec:
         optional_pattern = raw.get("optional_pattern")
         if optional_pattern is not None and not isinstance(optional_pattern, str):
             raise BlueprintParseError(f"slot {name!r} 'optional_pattern' must be a string")
+        default = raw.get("default")
+        if default is not None:
+            if not isinstance(default, (str, int, float, bool)):
+                raise BlueprintParseError(
+                    f"slot {name!r} default must be scalar, got {type(default).__name__}"
+                )
+            if required:
+                raise BlueprintParseError(
+                    f"slot {name!r} is required; caller binding makes a default dead configuration"
+                )
+            if type_ in {"period_range", "list"}:
+                raise BlueprintParseError(f"slot {name!r} of type {type_!r} must not declare default")
+            if optional_pattern is not None:
+                raise BlueprintParseError(f"slot {name!r} must not declare both optional_pattern and default")
+            if type_ == "enum" and default not in enum_values:
+                raise BlueprintParseError(
+                    f"slot {name!r} default {default!r} is not in enum_values {enum_values!r}"
+                )
+        description = raw.get("description")
+        if description is not None and (not isinstance(description, str) or not description):
+            raise BlueprintParseError(f"slot {name!r} description must be a non-empty string or null")
         temporal_type = raw.get("temporal_type")
         if temporal_type is not None and (
             not isinstance(temporal_type, str) or temporal_type not in {"date", "datetime"}
@@ -344,6 +373,8 @@ class SlotSpec:
             min_value=min_value,
             max_value=max_value,
             temporal_type=temporal_type,
+            default=default,
+            description=description,
         )
 
 

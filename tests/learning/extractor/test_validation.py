@@ -1130,3 +1130,23 @@ def test_schema_edit_wrong_typed_proposed_yaml_beside_a_valid_patch_is_declined(
     assert isinstance(out, Decline)
     assert out.reason == REASON_MALFORMED
     assert "candidate.payload.proposed_yaml" in out.detail
+
+
+@pytest.mark.parametrize("default, accepted", [("NA", True), ("na", False), (["NA"], False)])
+def test_optional_enum_default_matches_runtime_validation(default, accepted):
+    from data_agent.runtime.blueprint.models import BlueprintParseError, SlotSpec
+
+    plan = param_slot("region", slot_type="enum", required=False, value="NA")
+    plan["slot"].update(enum_values=["NA", "EU"], default=default,
+                         optional_pattern=None)
+    out = _validate(blueprint_raw(parameterization=_plan_with(plan, column="region")))
+    assert isinstance(out, ExtractedCandidate) is accepted
+    if accepted:
+        runtime = SlotSpec.parse(plan["slot"])
+        assert not runtime.needs_omission_pattern
+        from data_agent.learning.extractor.validation import _slot_plan
+        stored = _slot_plan(plan["slot"], at="slot").to_doc()
+        assert stored["default"] == "NA"
+    else:
+        with pytest.raises(BlueprintParseError):
+            SlotSpec.parse(plan["slot"])
