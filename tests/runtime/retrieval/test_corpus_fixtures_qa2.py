@@ -106,8 +106,8 @@ def test_ddl_parser_recovers_the_expected_columns() -> None:
 
 def test_every_fixture_uses_key_byte_matches_a_real_warehouse_column() -> None:
     # Public time-off names are aliases; the backend retains these storage names.
-    scope_keys = {k.replace('.accrual_events.', '.timeoff_requests.')
-                  .replace('.accrual_balances.', '.timeoff_balances.')
+    scope_keys = {k.replace('.accrual_events.', '.time_off_request.')
+                  .replace('.accrual_balances.', '.time_off_balance.')
                   for k in _warehouse_scope_keys()}
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     offenders: list[tuple[str, str]] = []

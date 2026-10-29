@@ -9,12 +9,12 @@
   drift_status: clean
   catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
-  - dbpcm_warehouse.timeoff_balances.employee_code
-  - dbpcm_warehouse.timeoff_balances.accrual_code
-  - dbpcm_warehouse.timeoff_balances.beginning_balance
-  - dbpcm_warehouse.timeoff_balances.accrued_amount
-  - dbpcm_warehouse.timeoff_balances.awarded_amount
-  - dbpcm_warehouse.timeoff_balances.taken_amount
+  - dbpcm_warehouse.time_off_balance.employee_code
+  - dbpcm_warehouse.time_off_balance.accrual_code
+  - dbpcm_warehouse.time_off_balance.beginning_balance
+  - dbpcm_warehouse.time_off_balance.accrued_amount
+  - dbpcm_warehouse.time_off_balance.awarded_amount
+  - dbpcm_warehouse.time_off_balance.taken_amount
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_name
@@ -30,7 +30,7 @@
   - name: accrual_code
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.timeoff_balances.accrual_code
+    binds_to: dbpcm_warehouse.time_off_balance.accrual_code
     optional_pattern: 'TRUE'
   - name: employee_status
     type: enum
@@ -63,7 +63,7 @@
   - Group
   sql_template: "WITH b AS (\n SELECT employee_code, accrual_code, sum(beginning_balance) AS beginning,\n sum(accrued_amount)\
     \ AS accrued, sum(awarded_amount) AS awarded,\n sum(taken_amount) AS taken, count(*) AS balance_rows\n FROM\
-    \ dbpcm_warehouse.timeoff_balances WHERE accrual_code = {accrual_code}\n GROUP BY employee_code, accrual_code\n\
+    \ dbpcm_warehouse.time_off_balance WHERE accrual_code = {accrual_code}\n GROUP BY employee_code, accrual_code\n\
     )\nSELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'plan' THEN b.accrual_code ELSE 'Company'\
     \ END AS `Group`, sum(CAST(b.beginning AS Nullable(Decimal(38, 6)))) AS `Beginning Balance`,\n sum(CAST(b.accrued\
     \ AS Nullable(Decimal(38, 6)))) AS `Accrued Amount`, sum(CAST(b.awarded AS Nullable(Decimal(38, 6)))) AS `Awarded\
@@ -87,12 +87,12 @@
   drift_status: clean
   catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
-  - dbpcm_warehouse.timeoff_requests.employee_code
-  - dbpcm_warehouse.timeoff_requests.status
-  - dbpcm_warehouse.timeoff_requests.event_type
-  - dbpcm_warehouse.timeoff_requests.earn_code
-  - dbpcm_warehouse.timeoff_requests.request_date
-  - dbpcm_warehouse.timeoff_requests.hours
+  - dbpcm_warehouse.time_off_request.employee_code
+  - dbpcm_warehouse.time_off_request.status
+  - dbpcm_warehouse.time_off_request.event_type
+  - dbpcm_warehouse.time_off_request.earn_code
+  - dbpcm_warehouse.time_off_request.request_date
+  - dbpcm_warehouse.time_off_request.hours
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_name
@@ -121,17 +121,17 @@
     - Denied
     - Removed
     - Calendar Only
-    binds_to: dbpcm_warehouse.timeoff_requests.status
+    binds_to: dbpcm_warehouse.time_off_request.status
     optional_pattern: 'TRUE'
   - name: event_type
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.timeoff_requests.event_type
+    binds_to: dbpcm_warehouse.time_off_request.event_type
     optional_pattern: 'TRUE'
   - name: earn_code
     type: entity
     required: false
-    binds_to: dbpcm_warehouse.timeoff_requests.earn_code
+    binds_to: dbpcm_warehouse.time_off_request.earn_code
     optional_pattern: 'TRUE'
   - name: employee_status
     type: enum
@@ -164,7 +164,7 @@
   - Group
   - Event Status
   sql_template: "WITH a AS (\n SELECT employee_code, status, event_type, substring(toString(request_date), 1, 7)\
-    \ AS month,\n count(*) AS event_rows, sum(hours) AS hours\n FROM dbpcm_warehouse.timeoff_requests\n WHERE status\
+    \ AS month,\n count(*) AS event_rows, sum(hours) AS hours\n FROM dbpcm_warehouse.time_off_request\n WHERE status\
     \ = {event_status} AND event_type = {event_type} AND earn_code = {earn_code}\n AND toDate(request_date) >= toDate({period_start})\
     \ AND toDate(request_date) < toDate({period_end})\n GROUP BY employee_code, status, event_type, substring(toString(request_date),\
     \ 1, 7)\n)\nSELECT CASE {group_by} WHEN 'department' THEN e.department_name WHEN 'department_status' THEN e.department_name\
@@ -232,11 +232,11 @@
   drift_status: clean
   catalog_sha: 0c0c24a9bb5ccc742d3b7f9685607355a6d6a051
   uses:
-  - dbpcm_warehouse.timeoff_requests.employee_code
-  - dbpcm_warehouse.timeoff_requests.hours
-  - dbpcm_warehouse.timeoff_requests.request_date
-  - dbpcm_warehouse.timeoff_requests.status
-  - dbpcm_warehouse.timeoff_requests.event_type
+  - dbpcm_warehouse.time_off_request.employee_code
+  - dbpcm_warehouse.time_off_request.hours
+  - dbpcm_warehouse.time_off_request.request_date
+  - dbpcm_warehouse.time_off_request.status
+  - dbpcm_warehouse.time_off_request.event_type
   slots:
   - name: period
     type: period_range
@@ -253,7 +253,7 @@
 
     SELECT employee_code, sum(hours) AS approved_hours, uniqExact(toDate(request_date)) AS requested_days
 
-    FROM dbpcm_warehouse.timeoff_requests
+    FROM dbpcm_warehouse.time_off_request
 
     WHERE status = ''Approved'' AND event_type = ''Time Off Request''
 

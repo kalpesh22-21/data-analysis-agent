@@ -59,10 +59,10 @@ def db():
     INSERT INTO dbpcm_warehouse.department VALUES ('D1','Engineering'),('D2','HR'),('D3','Empty');
     CREATE TABLE dbpcm_warehouse.payroll(employee_code TEXT, pay_date TEXT, amount REAL, register_type TEXT, type_code TEXT);
     INSERT INTO dbpcm_warehouse.payroll VALUES ('E1','2026-09-01',100,'EARN','REG'),('E1','2026-09-01',50,'EARN','OT'),('E2','2026-09-01',200,'EARN','REG'),('E3','2026-09-01',300,'EARN','REG'),('E9','2026-09-01',25,'EARN','REG'),('E1','2026-10-01',900,'EARN','REG'),('E1','2026-09-01',40,'EETAX','TAX');
-    CREATE TABLE dbpcm_warehouse.timeoff_balances(employee_code TEXT, accrual_code TEXT, beginning_balance REAL, accrued_amount REAL, awarded_amount REAL, taken_amount REAL);
-    INSERT INTO dbpcm_warehouse.timeoff_balances VALUES ('E1','PTO',10,1,0,2),('E1','PTO',20,2,0,3),('E2','PTO',40,4,0,7),('E1','SICK',99,0,0,1);
-    CREATE TABLE dbpcm_warehouse.timeoff_requests(employee_code TEXT, status TEXT, event_type TEXT, earn_code TEXT, request_date TEXT, hours REAL);
-    INSERT INTO dbpcm_warehouse.timeoff_requests VALUES ('E1','Approved','Time Off Request','PTO','2026-09-01',8),('E1','Requested','Time Off Request','PTO','2026-09-02',4),('E2','Denied','Time Off Request','SICK','2026-09-03',6),('E9','Approved','Payout Request','PTO','2026-09-04',5),('E1','Approved','Time Off Request','PTO','2026-10-01',90);
+    CREATE TABLE dbpcm_warehouse.time_off_balance(employee_code TEXT, accrual_code TEXT, beginning_balance REAL, accrued_amount REAL, awarded_amount REAL, taken_amount REAL);
+    INSERT INTO dbpcm_warehouse.time_off_balance VALUES ('E1','PTO',10,1,0,2),('E1','PTO',20,2,0,3),('E2','PTO',40,4,0,7),('E1','SICK',99,0,0,1);
+    CREATE TABLE dbpcm_warehouse.time_off_request(employee_code TEXT, status TEXT, event_type TEXT, earn_code TEXT, request_date TEXT, hours REAL);
+    INSERT INTO dbpcm_warehouse.time_off_request VALUES ('E1','Approved','Time Off Request','PTO','2026-09-01',8),('E1','Requested','Time Off Request','PTO','2026-09-02',4),('E2','Denied','Time Off Request','SICK','2026-09-03',6),('E9','Approved','Payout Request','PTO','2026-09-04',5),('E1','Approved','Time Off Request','PTO','2026-10-01',90);
     ''')
     yield con
     con.close()
@@ -224,7 +224,7 @@ def test_compensation_rankings_keep_top_n_per_pay_type(db):
 
 def test_timeoff_ranking_retains_ties_and_excludes_payouts_unapproved_and_outside_period(db):
     db.executescript("""
-    INSERT INTO dbpcm_warehouse.timeoff_requests VALUES
+    INSERT INTO dbpcm_warehouse.time_off_request VALUES
     ('E3','Approved','Time Off Request','PTO','2026-09-05',8),
     ('E3','Approved','Time Off Request','SICK','2026-09-05',0),
     ('E2','Approved','Time Off Request','PTO','2026-09-06',4);
