@@ -798,6 +798,7 @@
   </template>
 </main>
 
+<script src="/answer-document.js"></script>
 <script>
 (function () {
   "use strict";
@@ -925,10 +926,6 @@
     block.querySelector(".turn-question").textContent = question || "";
   }
 
-  function setBlockAnswer(block, text) {
-    block.querySelector(".turn-answer").textContent = text || "";
-  }
-
   // Live turns carry status + tool_calls_made; history turns do not (field
   // absent → leave the status line empty).
   function setBlockStatus(block, data) {
@@ -938,7 +935,7 @@
       return;
     }
     status.textContent =
-      "status: " + data.status + " · tool_calls_made: " + data.tool_calls_made;
+      "status: " + data.status + (data.tool_calls_made == null ? "" : " · tool_calls_made: " + data.tool_calls_made);
   }
 
   // --- Enriched result rendering (UI Slice 1 renderers, scoped to a block) ---
@@ -949,49 +946,6 @@
 
   // Field 1 — `sql: string[] | null`: one <pre> code block per statement, in
   // order. null / [] → hide the panel.
-  function renderSql(root, sqlList) {
-    var sqlPanel = root.querySelector(".sql-panel");
-    var sqlBlocks = root.querySelector(".sql-blocks");
-    clearNode(sqlBlocks);
-    if (!Array.isArray(sqlList) || sqlList.length === 0) {
-      sqlPanel.hidden = true;
-      return;
-    }
-    sqlList.forEach(function (sql) {
-      var pre = document.createElement("pre");
-      pre.className = "sql-block";
-      var code = document.createElement("code");
-      code.textContent = cellText(sql);
-      pre.appendChild(code);
-      sqlBlocks.appendChild(pre);
-    });
-    sqlPanel.hidden = false;
-  }
-
-  // Field 1b — `assumptions: string[] | null`: plain-English sentences the agent
-  // made when answering (never SQL/code). Rendered as an escaped bulleted list
-  // via textContent (defense-in-depth even though model-authored). null / [] →
-  // hide the panel — same omit-when-empty convention as renderSql.
-  function renderAssumptions(root, assumptions) {
-    var panel = root.querySelector(".assumptions-panel");
-    var list = root.querySelector(".assumptions-list");
-    clearNode(list);
-    if (!Array.isArray(assumptions) || assumptions.length === 0) {
-      panel.hidden = true;
-      return;
-    }
-    assumptions.forEach(function (assumption) {
-      var li = document.createElement("li");
-      li.setAttribute("data-testid", "assumption-item");
-      li.textContent = cellText(assumption);
-      list.appendChild(li);
-    });
-    panel.hidden = false;
-  }
-
-  // Fill a turn's grid from column names + row-arrays. Shared by the LIVE answer
-  // table (paged from `answer_sql`) and the HISTORY path (which still carries a
-  // per-tool-call `result_table` — `/session/history` is unchanged).
   function fillGrid(head, body, columns, rows) {
     clearNode(head);
     clearNode(body);
@@ -1021,68 +975,9 @@
   // regardless, so this is a display choice, not a limit.
   var PAGE_SIZE = 50;
 
-  // Field 2 (2026-08) — the query/queries the model designated as its answer via
-  // `answerWithTable`. This replaced `result_table`, which shipped a fixed ~20-row
-  // preview the user could not page past.
-  //
-  // 2026-08-12 (08 §E) — the designation went from ONE query to a LIST. The result
-  // envelope now carries `answer_tables: [{sql, caption, blueprint_use, verification}]`
-  // (cap 8, every field but `sql` nullable) and KEEPS `answer_sql`/`blueprint_use`/
-  // `verification` populated as derived projections of `answer_tables[0]`, so an old
-  // session, an old envelope and a new single-table turn all land on the same
-  // one-panel path below.
-  //
-  // The rows are NOT on the result event — we fetch them a page at a time from
-  // `POST /api/query/page`, which proxies the runtime's `/query/page`. That endpoint
-  // takes ONE `sql`, so N tables are N independent calls, each with its own offset;
-  // paging needed no server change at all. The BFF attaches the JWT server-side
-  // (D82/D5: the browser never holds a token), and the runtime re-parses and re-runs
-  // the SQL through the SAME scope-enforced dispatch path the agent uses. So echoing
-  // a designated SQL back from the browser grants nothing: a tampered query can only
-  // reach what this session's own scope allows.
-
-  // Mirrors the runtime's MAX_ANSWER_TABLES (= MAX_INTENTS, 08 §F). The runtime
-  // truncates first; this is the browser's own belt, so a malformed envelope cannot
-  // make it open an unbounded number of panels.
-  var MAX_ANSWER_TABLES = 8;
-
-  // Id source, so each cloned grid can be labelled by its own summary.
+  // Page only explicitly approved table handles under the current session scope.
   var answerTableSeq = 0;
 
-  // Normalize the envelope into the list the renderer walks: `answer_tables` wins
-  // when it yields at least one entry with a `sql`, otherwise the legacy scalar
-  // `answer_sql` is the single entry. Same list-wins-when-non-empty precedence the
-  // runtime applies to the tool args (08 §B.3), so the N<=1 path is reached
-  // identically whether the runtime sent the list, the scalar, or both.
-  //
-  // An entry with no `sql` is dropped: the runtime resolves `blueprint_id` to its
-  // terminal SQL before the wire, so a sql-less entry is nothing the browser can page.
-  function normalizeAnswerTables(data) {
-    var out = [];
-    if (data && Array.isArray(data.answer_tables)) {
-      data.answer_tables.forEach(function (entry) {
-        if (!entry || !entry.sql) return;
-        out.push({
-          sql: entry.sql,
-          caption: entry.caption || null,
-          data_as_of: entry.data_as_of || null,
-          blueprint_use: entry.blueprint_use || null,
-          verification: entry.verification || null,
-        });
-      });
-    }
-    if (out.length === 0 && data && data.answer_sql) {
-      // Legacy / derived single table. Its blueprint + verification claims are the
-      // turn-level ones, which the block-level chip and badge render exactly as
-      // they do today — so this entry deliberately carries none of its own.
-      out.push({ sql: data.answer_sql, caption: null, blueprint_use: null, verification: null });
-    }
-    return out.length > MAX_ANSWER_TABLES ? out.slice(0, MAX_ANSWER_TABLES) : out;
-  }
-
-  // Clone one answer-table panel into `container` and hand back its nodes. Every
-  // renderer below works on this handle instead of root.querySelector(".result-table"),
-  // which is what made the panel a singleton and the paging state shared.
   function cloneTablePanel(container, title) {
     var frag = els.answerTableTemplate.content.cloneNode(true);
     var panel = frag.querySelector(".result-table");
@@ -1122,66 +1017,19 @@
   // never went through one (08 §C). Same rule as the block-level badge: absence is
   // information, never a warning — a missing block renders nothing rather than a
   // red state. `empty_result` is the one non-green state that IS rendered (J6).
-  function renderTableVerification(badge, verification) {
-    if (verification && verification.empty_result === true) {
-      renderEmptyVerification(badge);
+  function renderDataAsOf(element, value, source) {
+    if (source && source.freshness) {
+      element.textContent = window.answerFreshnessLabel(source);
+      element.hidden = !element.textContent;
       return;
     }
-    if (!verification || verification.passed !== true) {
-      badge.hidden = true;
-      badge.textContent = "";
-      badge.removeAttribute("title");
-      return;
-    }
-    badge.textContent = "Structure checked ✓";
-    badge.setAttribute(
-      "title",
-      verification.grain_checked === false
-        ? "Output columns checked; grouping was not checked."
-        : "Output columns and grouping checked; this does not prove the calculation answers the question."
-    );
-    badge.hidden = false;
-  }
-
-  // J6 — the "empty — unverifiable" chip, shared by both badge renderers so the
-  // per-table and block-level surfaces cannot describe the same state differently.
-  //
-  // NOT A WARNING, and not the "failed" state that still does not exist: a
-  // blueprint ran and came back with zero rows, so the D56 grain check (`row_count
-  // === distinct_grain_count`) compared 0 to 0 and proved nothing. The empty answer
-  // itself is fine and is what the prose reports; what is being withdrawn is the
-  // claim that anything was verified. Rendering nothing here would be the quieter
-  // lie — the grid would sit under the same silence a hand-written query gets,
-  // when a blueprint demonstrably ran.
-  function renderEmptyVerification(badge) {
-    badge.textContent = "empty — unverifiable";
-    badge.setAttribute(
-      "title",
-      "The blueprint returned no rows, so the grain check had nothing to verify."
-    );
-    badge.hidden = false;
-  }
-
-  // A panel's summary label: the model's own `caption` when it sent one, else
-  // "Results" at N=1 (unchanged) and a positional label when there are several
-  // grids that would otherwise be indistinguishable while collapsed.
-  function tableTitle(table, index, total) {
-    if (table.caption) return cellText(table.caption);
-    if (total <= 1) return "Results";
-    return "Table " + (index + 1) + " of " + total;
-  }
-
-  // Wire ONE cloned panel to `POST /api/query/page`. `offset` lives in this
-  // closure, per panel — that is the whole point of the clone: paging one grid
-  // must not page another, or page the wrong one.
-  function renderDataAsOf(element, value) {
     var date = typeof value === "string" ? new Date(value) : null;
     var valid = date && Number.isFinite(date.getTime());
     element.textContent = valid ? "Data as of " + date.toISOString().replace("T", " ").replace("Z", " UTC") : "";
     element.hidden = !valid;
   }
 
-  function wireTablePaging(panelEls, sql, autoOpen) {
+  function wireTablePaging(panelEls, tableRef, autoOpen) {
     var offset = 0;
     var loaded = false;
 
@@ -1199,7 +1047,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: sessionId,
-          sql: sql,
+          table_ref: tableRef,
           limit: PAGE_SIZE,
           offset: offset,
         }),
@@ -1223,7 +1071,7 @@
             return;
           }
           // A successful fresh page supersedes history, including unknown freshness.
-          renderDataAsOf(panelEls.dataAsOf, res.payload.data_as_of);
+          renderDataAsOf(panelEls.dataAsOf, res.payload.data_as_of, res.payload);
           var rows = Array.isArray(res.payload.rows) ? res.payload.rows : [];
           fillGrid(panelEls.head, panelEls.body, res.payload.columns, rows);
           panelEls.caption.hidden = true;
@@ -1271,281 +1119,56 @@
 
   // Render every designated answer table into the turn block's container: one
   // cloned panel each, each with its own paging closure.
-  function renderAnswerTables(root, tables) {
-    var container = root.querySelector(".answer-tables");
-    clearNode(container);
-    container.classList.remove("multi");
-    // No designated table — a scalar answer, or a model that did not call the
-    // tool. Both are "no grid", which is the correct default for a single value.
-    if (!tables || tables.length === 0) return;
-
-    var multi = tables.length > 1;
-    if (multi) container.classList.add("multi");
-
-    tables.forEach(function (table, index) {
-      var panelEls = cloneTablePanel(container, tableTitle(table, index, tables.length));
-      // Per-panel chip + badge only when there are several. At N<=1 the
-      // block-level pair carries the same claims and renders exactly as today; a
-      // turn-level claim sitting above per-table ones is redundant when they agree
-      // and contradictory when they do not (08 §C.3).
-      if (multi) {
-        fillBlueprintChip(panelEls.chip, table.blueprint_use);
-        renderTableVerification(panelEls.badge, table.verification);
-      }
-      // The lead table of a multi-table answer opens (and so fetches) at render;
-      // the rest — and a lone table, as before — wait to be opened.
-      renderDataAsOf(panelEls.dataAsOf, table.data_as_of);
-      wireTablePaging(panelEls, table.sql, multi && index === 0);
-    });
-  }
-
-  // HISTORY path — `result_table: {columns, preview_rows, row_count, truncated} | null`.
-  // Header from `columns` (may be [] → no header, raw cells only). Body from
-  // `preview_rows` (row-arrays of scalars). Truncation caption when the preview
-  // is a subset of `row_count`. null / no rows → hide.
-  function renderResultTable(root, table) {
-    var container = root.querySelector(".answer-tables");
-    clearNode(container);
-    container.classList.remove("multi");
-    var rows = table && Array.isArray(table.preview_rows) ? table.preview_rows : null;
-    // No preview → no panel at all (the container collapses), which is what
-    // `hidden` used to buy on the singleton subtree.
-    if (!table || !rows || rows.length === 0) return;
-
-    var panelEls = cloneTablePanel(container, "Results");
-    fillGrid(
-      panelEls.head,
-      panelEls.body,
-      Array.isArray(table.columns) ? table.columns : [],
-      rows
-    );
-    // History rows are static — nothing to page, so the pager stays hidden as the
-    // template ships it.
-    var shown = rows.length;
-    var rowCount = typeof table.row_count === "number" ? table.row_count : shown;
-    if (table.truncated === true || shown < rowCount) {
-      panelEls.caption.textContent = "showing " + shown + " of " + rowCount + " rows";
-      panelEls.caption.hidden = false;
-    }
-  }
-
-  // Field 3 — `blueprint_use: {blueprint_id, slots} | null`: a single chip
-  // `Using blueprint {id} · {k}={v} · …`. null → no chip.
-  function renderBlueprintChip(root, blueprintUse) {
-    fillBlueprintChip(root.querySelector(".blueprint-chip"), blueprintUse);
-  }
-
-  // The chip's text, on whichever chip node it belongs to — the block-level one
-  // at N<=1, or a panel's own at N>1 (08 §C.3: the chip follows the badge's
-  // shape, per table plus the envelope's primary).
-  function fillBlueprintChip(chip, blueprintUse) {
-    if (!blueprintUse || !blueprintUse.blueprint_id) {
-      chip.hidden = true;
-      chip.textContent = "";
-      return;
-    }
-    var parts = ["Using blueprint " + cellText(blueprintUse.blueprint_id)];
-    var slots = blueprintUse.slots || {};
-    Object.keys(slots).forEach(function (key) {
-      parts.push(key + "=" + cellText(slots[key]));
-    });
-    chip.textContent = parts.join(" · ");
-    chip.hidden = false;
-  }
-
-  // Field 4 — `verification: {passed, method, grain_checked, empty_result?,
-  // status?} | null`: a passive "verified ✓" badge only when passed===true. null →
-  // render nothing (absence is information — never a warning). No "failed" state
-  // exists. `empty_result === true` (J6) is the one explicit non-green state.
-  function renderVerification(root, verification) {
-    var badge = root.querySelector(".verified-badge");
-    if (verification && verification.empty_result === true) {
-      renderEmptyVerification(badge);
-      return;
-    }
-    if (!verification || verification.passed !== true) {
-      badge.hidden = true;
-      badge.textContent = "";
-      badge.removeAttribute("title");
-      return;
-    }
-    badge.textContent = "Structure checked ✓";
-    // grain_checked===false → grain probe was skipped; keep it subtle via title.
-    if (verification.grain_checked === false) {
-      badge.setAttribute("title", "Output columns checked; grouping was not checked.");
-    } else {
-      badge.setAttribute("title", "Output columns and grouping checked; this does not prove the calculation answers the question.");
-    }
-    badge.hidden = false;
-  }
-
-  // Field 5 — `provenance: string[] | null`: sorted "database.table.column"
-  // chips. null → hide (lineage undetermined). [] → subtle "no tables read".
-  function renderProvenance(root, provenance) {
-    var panel = root.querySelector(".provenance-panel");
-    var chips = root.querySelector(".provenance-chips");
-    clearNode(chips);
-    if (provenance === null || provenance === undefined || !Array.isArray(provenance)) {
-      panel.hidden = true;
-      return;
-    }
-    if (provenance.length === 0) {
-      var note = document.createElement("span");
-      note.className = "prov-empty";
-      note.textContent = "no tables read";
-      chips.appendChild(note);
-      panel.hidden = false;
-      return;
-    }
-    provenance.forEach(function (entry) {
-      var chip = document.createElement("span");
-      chip.className = "static-chip";
-      chip.setAttribute("data-testid", "provenance-chip");
-      chip.textContent = cellText(entry);
-      chips.appendChild(chip);
-    });
-    panel.hidden = false;
-  }
-
-  // Per-SQL lineage breakdown (§5.2) — history turns only. Lists each tool call
-  // as {tool_name, sql, provenance}: name label, SQL in a <pre>, provenance as
-  // chips. Live turns pass no per-SQL data (undefined) → panel hidden.
-  function renderPerSqlBreakdown(root, toolCalls) {
-    var panel = root.querySelector(".per-sql-panel");
-    var list = root.querySelector(".per-sql-list");
-    clearNode(list);
-    if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
-      panel.hidden = true;
-      return;
-    }
-    toolCalls.forEach(function (call) {
-      if (!call) return;
-      var item = document.createElement("div");
-      item.className = "per-sql-item";
-      item.setAttribute("data-testid", "turn-tool-call");
-
-      var name = document.createElement("div");
-      name.className = "per-sql-name";
-      name.textContent = cellText(call.tool_name);
-      item.appendChild(name);
-      var freshness = document.createElement("div");
-      freshness.className = "data-as-of result-caption";
-      renderDataAsOf(freshness, call.data_as_of);
-      item.appendChild(freshness);
-
-      if (call.sql) {
-        var pre = document.createElement("pre");
-        pre.className = "sql-block";
-        var code = document.createElement("code");
-        code.textContent = cellText(call.sql);
-        pre.appendChild(code);
-        item.appendChild(pre);
-      }
-
-      var prov = call.provenance;
-      if (Array.isArray(prov) && prov.length > 0) {
-        var chipRow = document.createElement("div");
-        chipRow.className = "chip-row";
-        prov.forEach(function (entry) {
-          var chip = document.createElement("span");
-          chip.className = "static-chip";
-          chip.setAttribute("data-testid", "provenance-chip");
-          chip.textContent = cellText(entry);
-          chipRow.appendChild(chip);
-        });
-        item.appendChild(chipRow);
-      }
-
-      list.appendChild(item);
-    });
-    panel.hidden = false;
-  }
-
-  // Populate a turn block from a normalized result shape (§5.3). Used by both
-  // the live `result` event and the history rehydrate path — every field is
-  // guarded, so a missing field simply hides its panel. Does NOT touch the
-  // question (rendered at block creation) or clear prior blocks.
   function renderTurnBlock(block, data) {
-    setBlockAnswer(block, data.assistant_text);
     setBlockStatus(block, data);
-    renderAssumptions(block, data.assumptions);
-    // `sql` was renamed `sql_executed` (every query the turn RAN — the audit list).
-    renderSql(block, data.sql_executed);
-    // The answer tables: prefer the model-designated `answer_tables` / `answer_sql`
-    // (paged from the runtime, live AND on reload — `/session/history` returns them
-    // too). Fall back to a static `result_table` preview only for history turns that
-    // designated nothing, which is all older sessions have.
-    var answerTables = normalizeAnswerTables(data);
-    if (answerTables.length > 0) {
-      renderAnswerTables(block, answerTables);
-    } else {
-      renderResultTable(block, data.result_table || null);
+    var container = block.querySelector(".turn-answer");
+    block.querySelector(".answer-tables").replaceChildren();
+    if (!data.answer_document && data.status && data.status.startsWith("paused")) {
+      container.textContent = data.pending_question || "Waiting for your input.";
+      return;
     }
-    // With several tables the block-level chip and badge are suppressed and each
-    // panel wears its own (08 §C.3): one flag over a mixed set claims a blueprint
-    // gate — and a blueprint — for grids that never went through one. The envelope's
-    // pair are projections of `answer_tables[0]`, so at the block level they would
-    // be table 1's claims worn by the whole turn. At N<=1 this is the unchanged
-    // single-chip / single-badge path.
-    var multiTable = answerTables.length > 1;
-    renderBlueprintChip(block, multiTable ? null : data.blueprint_use);
-    renderVerification(block, multiTable ? null : data.verification);
-    renderProvenance(block, data.provenance);
-    renderPerSqlBreakdown(block, data.tool_calls);
+    var doc = data.answer_document;
+    window.renderAnswerDocument(container, doc, function (parent, ref, title, source) {
+      var panel = cloneTablePanel(parent, title);
+      renderDataAsOf(panel.dataAsOf, source.data_as_of, source);
+      wireTablePaging(panel, ref, false);
+    });
+    if (!doc) return;
+    var refresh = document.createElement("button");
+    refresh.textContent = "Refresh answer";
+    container.appendChild(refresh);
+    refresh.onclick = async function () {
+      refresh.disabled = true;
+      var capturedSession = sessionId;
+      try {
+        var response = await fetch("/api/answer/refresh", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({session_id:capturedSession, answer_id:doc.answer_id, expected_revision:doc.revision})
+        });
+        if (!response.ok) {
+          if ([401,403,404].includes(response.status)) container.textContent = "This answer is unavailable. Reload to check access.";
+          throw new Error("Refresh failed. Reload before trying again.");
+        }
+        await consumeSSE(response, function (event, result) {
+          if (sessionId !== capturedSession || !block.isConnected) return;
+          if (event === "progress") refresh.textContent = result.message || "Refreshing…";
+          if (event === "error") {
+            if (result.code === "RefreshAccessChangedError") { container.textContent = "Access changed. Reloading…"; rehydrateHistory(); }
+            throw new Error(result.message);
+          }
+          if (event === "result" && result.answer_document && result.answer_document.answer_id === doc.answer_id && result.answer_document.revision > doc.revision) renderTurnBlock(block, result);
+        });
+      } catch (error) { showError("REFRESH_FAILED", error.message); }
+      finally { refresh.disabled = false; refresh.textContent = "Refresh answer"; }
+    };
   }
 
   // --- History rehydrate (§5.4) ---
 
-  // Collect every non-null per-tool-call SQL into the array the Slice-1 `sql`
-  // panel expects (string[] | null).
-  function collectSql(toolCalls) {
-    var out = [];
-    toolCalls.forEach(function (call) {
-      if (call && call.sql) out.push(call.sql);
-    });
-    return out.length > 0 ? out : null;
-  }
-
-  // The main result table for a history turn is the last tool call that
-  // produced one (the final query's result — the answer table). Per-SQL detail
-  // for every call still shows in the breakdown panel.
-  function pickResultTable(toolCalls) {
-    var table = null;
-    toolCalls.forEach(function (call) {
-      if (call && call.result_table) table = call.result_table;
-    });
-    return table;
-  }
-
-  // Render one `/api/history` turn into a fresh block. Maps the history wire
-  // shape onto the renderTurnBlock shape: provenance_union → provenance,
-  // tool_calls → sql / result_table / per-SQL breakdown. History turns carry no
-  // blueprint_use / verification / status, so those panels stay hidden.
-  //
-  // The key names here must match what `renderTurnBlock` READS. They drifted once:
-  // the live result renamed `sql` -> `sql_executed` and `result_table` ->
-  // `answer_sql`, and this adapter kept passing the old names, so a RELOADED
-  // transcript silently lost both its SQL panel and its table while the live turn
-  // rendered fine. Reload is the only place that regression shows.
+  // History uses exactly the same saved document as live delivery.
   function renderHistoryTurn(turn) {
     var block = createTurnBlock(turn.question);
-    var toolCalls = Array.isArray(turn.tool_calls) ? turn.tool_calls : [];
-    renderTurnBlock(block, {
-      assistant_text: turn.answer,
-      assumptions: turn.assumptions,
-      sql_executed: collectSql(toolCalls),
-      // `/session/history` resolves these for BOTH designation forms, including
-      // `blueprint_id`, so a reloaded blueprint answer pages the same table it did
-      // live. `pickResultTable` is the fallback for turns that designated nothing.
-      // `answer_tables` is the multi-table list and MUST be forwarded beside
-      // `answer_sql` — a reloaded multi-table turn otherwise silently drops back to
-      // one grid, and reload is the only place that regression shows.
-      answer_sql: turn.answer_sql,
-      answer_tables: turn.answer_tables,
-      result_table: pickResultTable(toolCalls),
-      provenance: turn.provenance_union,
-      tool_calls: toolCalls,
-    });
+    renderTurnBlock(block, {answer_document: turn.answer_document});
     return block;
   }
 

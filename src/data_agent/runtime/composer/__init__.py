@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from copy import deepcopy
+from hashlib import sha256
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -370,13 +371,15 @@ def build_document(
         columns, rows = list(preview.columns), preview.preview_rows
         complete = not preview.truncated and preview.row_count == len(rows)
         source = {
-            "retrieved_at": entry.ts,
+            "retrieved_at": entry.retrieved_at or entry.ts,
             "row_count": preview.row_count,
             "completeness": "complete" if complete else "partial",
         }
         # Opaque handle resolves only through a persisted approved answer + scoped trail.
         if rid in sql_by_id or entry.tool_name == "runQuery" and entry.args.get("sql"):
-            source["table_ref"] = f"{turn_index}:{rid}"
+            source["table_ref"] = table_reference(turn_index, rid)
+        if entry.freshness is not None:
+            source["freshness"] = deepcopy(entry.freshness)
         data_as_of = getattr(entry, "data_as_of", None)
         if data_as_of:
             source["data_as_of"] = data_as_of
@@ -552,11 +555,16 @@ def _visual(p, columns, rows, *, business_values=frozenset()):
     }
 
 
-def seal_document(candidate, *, answer_id, generated_at):
+def table_reference(turn_index, result_id):
+    """Stable opaque identity; authorization remains session- and scope-bound."""
+    return "tbl_" + sha256(f"{turn_index}:{result_id}".encode()).hexdigest()
+
+
+def seal_document(candidate, *, answer_id, generated_at, revision=1):
     return {
         "schema_version": 1,
         "answer_id": answer_id,
-        "revision": 1,
+        "revision": revision,
         "generated_at": generated_at,
         **deepcopy(candidate),
     }
@@ -564,4 +572,4 @@ def seal_document(candidate, *, answer_id, generated_at):
 
 def text_document(text):
     """Runtime limitation/conversation with no automatically selected data."""
-    return {"takeaway": text or "", "sections": [], "sources": {}}
+    return {"takeaway": text if text and text.strip() else "I could not produce a verified answer from the available evidence.", "sections": [], "sources": {}}

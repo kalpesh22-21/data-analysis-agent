@@ -263,17 +263,14 @@ async def test_an_ask_user_pause_carries_no_provenance_even_when_determined() ->
     assert (_E, "EmployeeCode") in done.provenance
 
 
-async def test_a_hard_ceiling_stop_carries_no_provenance() -> None:
-    """`stopped_hard_ceiling` is TERMINAL but not `done`: it force-blocks pending
-    intents and returns the best partial. `provenance` stays `None` — there is no
-    assistant message it could be the tag of."""
+async def test_a_hard_ceiling_stop_persists_its_nonempty_limitation_document() -> None:
     loop, store, _events = _build([_query_turn("c1")], max_loop_iterations=1, max_budget_windows=1)
-
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
-
     assert outcome.status == "stopped_hard_ceiling"
-    assert outcome.provenance is None
-    # The trail DID record a determined read, so `None` above is the rule, not luck.
+    assert outcome.provenance == frozenset()  # runtime limitation contains no data claims
+    assert outcome.answer_document["takeaway"].strip()
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert doc.messages[-1].answer_document == outcome.answer_document
     trail = await store.load_trail(SESSION_ID)
     assert [e.provenance for e in trail] == [frozenset({(_E, "EmployeeCode")})]
 

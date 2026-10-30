@@ -123,6 +123,8 @@ def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
             provenance=outcome.provenance,
             result_preview=outcome.preview,
             data_as_of=outcome.data_as_of,
+            freshness=outcome.freshness,
+            retrieved_at=outcome.retrieved_at,
             result_full=outcome.result_full,
             # The D56-verified result is the trusted answer — carry an explicit
             # "authoritative" marker into the model's tool message so it does not

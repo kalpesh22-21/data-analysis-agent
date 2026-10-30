@@ -199,6 +199,14 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         doc, _ = await self._get_doc(session_id)
         return list(doc.tool_trail) if doc is not None else []
 
+    async def publish_answer_refresh(self, session_id, *, answer_id, expected_revision, message, trail):
+        from .answer_refresh import apply_refresh
+        await self._ensure_connected()
+        def apply(doc):
+            apply_refresh(doc, answer_id=answer_id, expected_revision=expected_revision,
+                          message=message, trail=trail)
+        await self._mutate_with_cas_retry(session_id, apply)
+
     async def append_message(self, session_id: str, message: TurnMessage) -> None:
         await self._ensure_connected()
         await self._mutate_with_cas_retry(session_id, lambda doc: doc.messages.append(message))

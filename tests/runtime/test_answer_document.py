@@ -389,5 +389,5 @@ async def test_unsupported_chart_cell_delivers_exact_reviewed_table_without_quer
     assert approved_sections[0]["presentation"] == {"kind": "table", "result_id": "q"}
     assert any("shown as a table" in c for c in approved_sections[0]["caveats"])
     assert out.answer_document["sections"] == approved_sections
-    assert out.answer_document["sources"]["q"]["table_ref"] == "0:q"
+    assert out.answer_document["sources"]["q"]["table_ref"] .startswith("tbl_")
     assert len(mcp.calls) == 1

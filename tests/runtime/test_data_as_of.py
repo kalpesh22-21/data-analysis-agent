@@ -1,8 +1,6 @@
 """Ingestion timestamps stay tied to the serving execution through every projection."""
 
 from dataclasses import replace
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -36,6 +34,10 @@ OLDER = "2026-10-12T06:00:00.000Z"
 NEWER = "2026-10-13T06:00:00.000Z"
 
 
+def receipt(stamp):
+    return {"mode":"ingested", "sources":[{"table":"dbpcm_warehouse.employee", "kind":"ingested", "data_as_of":stamp}]} if stamp else None
+
+
 @pytest.mark.parametrize(
     "value",
     [None, {}, 123, "garbage", "2026-10-13", "2026-10-13T06:00:00", "2026-02-30T00:00:00Z", True],
@@ -63,7 +65,7 @@ def test_union_is_fail_closed(values, expected):
     assert union_data_as_of(values) == expected
 
 
-async def test_dispatch_uses_runtime_lookup_and_strips_upstream_metadata():
+async def test_dispatch_uses_api_receipt_and_strips_metadata_from_rows():
     raw = {
         "columns": ["EmployeeCode"],
         "rows": [["E1"]],
@@ -73,12 +75,13 @@ async def test_dispatch_uses_runtime_lookup_and_strips_upstream_metadata():
     }
     mcp = FakeMCPClient(scripted={"runQuery": [raw]}, data_as_of=OLDER)
     result = await ToolDispatcher(
-        mcp, CATALOG, freshness_client=SimpleNamespace(lookup=AsyncMock(return_value=NEWER))
+        mcp, CATALOG
     ).dispatch(
         "runQuery", {"sql": "SELECT EmployeeCode FROM dbpcm_warehouse.employee"}, _credentials()
     )
     assert result.status == "ok"
-    assert result.data_as_of == NEWER
+    assert result.data_as_of == OLDER
+    assert result.freshness["mode"] == "ingested"
     assert "data_as_of" not in result.result_full
     assert "provenance" not in result.result_full
     assert NEWER not in str(result.result_preview)
@@ -118,8 +121,8 @@ async def test_blueprint_aggregates_nodes(first, second, expected):
     )
     dispatcher = FakeDispatcher(
         [
-            replace(_ok_result(frozenset(), _rq(["n"], [[2]])), data_as_of=first),
-            replace(_ok_result(frozenset(), _rq(["n"], [[2]])), data_as_of=second),
+            replace(_ok_result(frozenset(), _rq(["n"], [[2]])), data_as_of=first, freshness=receipt(first)),
+            replace(_ok_result(frozenset(), _rq(["n"], [[2]])), data_as_of=second, freshness=receipt(second)),
         ]
     )
     outcome = await BlueprintExecutor(
@@ -165,10 +168,8 @@ def test_page_uses_fresh_dispatch_timestamp(monkeypatch, stamp):
     raw = {"columns": ["n"], "rows": [[1]], "row_count": 1, "truncated": False}
     if stamp:
         raw["data_as_of"] = stamp
-    monkeypatch.setattr(
-        "data_agent.runtime.provenance.freshness.FreshnessClient.lookup",
-        AsyncMock(return_value=stamp),
-    )
+    if stamp:
+        raw["freshness"] = receipt(stamp)
     client, _ = _client(monkeypatch, scripted={"runQuery": [raw]})
     response = client.post("/query/page", json={"sql": "SELECT 1 AS n"}, headers=HEADERS)
     assert response.status_code == 200
@@ -192,10 +193,9 @@ async def test_live_answer_and_replay_keep_serving_timestamp():
             ),
         ],
         rows=[
-            {"columns": ["Employee Count"], "rows": [[120]], "row_count": 1, "data_as_of": NEWER}
+            {"columns": ["Employee Count"], "rows": [[120]], "row_count": 1, "data_as_of": NEWER, "freshness": receipt(NEWER)}
         ],
     )
-    loop._tool_dispatcher._freshness_client = SimpleNamespace(lookup=AsyncMock(return_value=NEWER))
     outcome = await run(loop, "Count employees and show the result.")
     wire = _outcome_to_dict(outcome)
     assert wire["answer_document"]["sources"]["q"]["data_as_of"] == NEWER
@@ -214,9 +214,6 @@ async def test_blueprint_resume_includes_pre_pause_freshness(before_pause):
 
     initial = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]}, data_as_of=before_pause)
     executor = _executor(initial, _approval_detail())
-    executor._tool_dispatcher._freshness_client = SimpleNamespace(
-        lookup=AsyncMock(return_value=before_pause)
-    )
     paused = await executor.execute(blueprint_id="bp-pr", slot_bindings={}, credentials=_creds())
     assert isinstance(paused, ExecPaused)
     resumed = FakeMCPClient(
@@ -229,9 +226,6 @@ async def test_blueprint_resume_includes_pre_pause_freshness(before_pause):
         data_as_of=NEWER,
     )
     executor = _executor(resumed, _approval_detail())
-    executor._tool_dispatcher._freshness_client = SimpleNamespace(
-        lookup=AsyncMock(return_value=NEWER)
-    )
     outcome = await executor.resume(
         blueprint_id="bp-pr",
         slot_bindings={},
@@ -286,7 +280,7 @@ def test_disabled_environment_hides_page_metadata(monkeypatch):
         monkeypatch,
         scripted={
             "runQuery": [
-                {"columns": ["n"], "rows": [[1]], "row_count": 1, "data_as_of": NEWER},
+                {"columns": ["n"], "rows": [[1]], "row_count": 1, "data_as_of": NEWER, "freshness": receipt(NEWER)},
             ]
         },
     )

@@ -238,7 +238,8 @@ class QueryPageBody(BaseModel):
     """
 
     session_id: str
-    sql: str
+    sql: str | None = None
+    table_ref: str | None = None
     limit: int | None = None
     offset: int | None = None
 
@@ -539,6 +540,23 @@ async def turn_resume(body: ResumeBody) -> StreamingResponse:
     return await _proxy_stream("/turn/resume", body.session_id, {"answer": body.answer})
 
 
+class RefreshBody(BaseModel):
+    session_id: str
+    answer_id: str
+    expected_revision: int
+
+
+@app.post("/api/answer/refresh")
+async def answer_refresh(body: RefreshBody):
+    return await _proxy_stream("/answer/refresh", body.session_id,
+                              {"answer_id": body.answer_id, "expected_revision": body.expected_revision})
+
+
+@app.get("/answer-document.js")
+async def answer_document_script():
+    return FileResponse(_STATIC_DIR / "answer-document.js", media_type="application/javascript")
+
+
 @app.get("/api/history")
 async def history(session_id: str) -> JSONResponse:
     """UI Slice 3 (§4): JSON (non-streaming) proxy for the runtime's
@@ -567,7 +585,11 @@ async def query_page(body: QueryPageBody) -> JSONResponse:
     scope denial) reaches the browser's error branch unflattened."""
     jwt = await _jwt_for_session(body.session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": body.session_id}
-    payload = {"sql": body.sql, "limit": body.limit, "offset": body.offset}
+    payload = {"limit": body.limit, "offset": body.offset}
+    if body.sql is not None:
+        payload["sql"] = body.sql
+    if body.table_ref is not None:
+        payload["table_ref"] = body.table_ref
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             r = await client.post(f"{RUNTIME_URL}/query/page", headers=headers, json=payload)

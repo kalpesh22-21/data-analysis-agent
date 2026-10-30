@@ -67,6 +67,16 @@ class InMemorySessionStore:
         doc = self._docs.get(session_id)
         return list(doc.tool_trail) if doc is not None else []
 
+    async def publish_answer_refresh(self, session_id, *, answer_id, expected_revision, message, trail):
+        from .answer_refresh import apply_refresh
+        def apply(doc):
+            apply_refresh(doc, answer_id=answer_id, expected_revision=expected_revision,
+                          message=message, trail=trail)
+        doc = await self.get_or_create_session(session_id)
+        apply(doc)
+        doc.last_activity = _now()
+        self._bump_version(session_id)
+
     async def append_message(self, session_id: str, message: TurnMessage) -> None:
         doc = await self.get_or_create_session(session_id)
         doc.messages.append(message)

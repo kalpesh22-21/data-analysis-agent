@@ -98,7 +98,7 @@ def materialize(case, *, count=4, numeric_strings=False, reverse=False, null_mea
     try:
         normalized = proposal_to_internal(proposal)
         receipt = SimpleNamespace(tool_call_id='audit', turn_index=0, tool_name='runQuery', status='ok', error_code=None,
-                                  provenance=frozenset(), args={'sql': 'SELECT synthetic_audit'}, ts='2026-10-29T00:00:00Z',
+                                  provenance=frozenset(), args={'sql': 'SELECT synthetic_audit'}, ts='2026-10-29T00:00:00Z', retrieved_at=None, freshness=None,
                                   result_preview=ResultPreview(columns=columns, row_count=count+1 if truncated else count,
                                                                truncated=truncated, preview_rows=rows))
         document = build_document(normalized, [receipt], turn_index=0)

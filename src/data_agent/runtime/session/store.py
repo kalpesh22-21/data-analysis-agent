@@ -51,6 +51,12 @@ class SessionStore(Protocol):
         """Return the `tool_trail` for *session_id* (empty list if none)."""
         ...
 
+    async def publish_answer_refresh(self, session_id: str, *, answer_id: str,
+                                     expected_revision: int, message: TurnMessage,
+                                     trail: list[TrailEntry]) -> None:
+        """Atomically replace the expected answer revision and append its execution receipts."""
+        ...
+
     async def append_message(self, session_id: str, message: TurnMessage) -> None:
         """Append one user/assistant message and bump `last_activity`."""
         ...

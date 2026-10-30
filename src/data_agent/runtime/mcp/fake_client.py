@@ -68,7 +68,7 @@ class FakeMCPClient:
             and tool_name in {"runQuery", "sampleRows", "explainQuery"}
             and isinstance(response, dict)
         ):
-            return {"data_as_of": self._data_as_of, **response}
+            return {"data_as_of": self._data_as_of, "freshness": {"mode": "ingested", "sources": [{"table": "dbpcm_warehouse.employee", "kind": "ingested", "data_as_of": self._data_as_of}]}, **response}
         return response
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:

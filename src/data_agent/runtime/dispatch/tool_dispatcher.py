@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from data_agent.runtime.provenance.freshness import capture_freshness, ingestion_date, timestamp
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.dispatch.sql_diagnostics import (
     encode_column_reference_diagnostic,
@@ -159,6 +160,8 @@ class ToolResult:
     # entry does not carry.
     window_note: str | None = None
     data_as_of: str | None = None
+    freshness: dict | None = None
+    retrieved_at: str | None = None
     terminal: bool = False
 
 
@@ -489,7 +492,6 @@ class ToolDispatcher:
         catalog: CatalogHandle | CatalogProvider,
         *,
         data_as_of_enabled: bool = True,
-        freshness_client: Any = None,
         preview_row_count: int = 20,
         max_tool_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
         schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
@@ -499,7 +501,6 @@ class ToolDispatcher:
     ) -> None:
         self._mcp_client = mcp_client
         self._data_as_of_enabled = data_as_of_enabled
-        self._freshness_client = freshness_client
         # Retained for the agent's pre-execution aggregation/measurement checks.
         # Execution provenance comes exclusively from the API response.
         self._catalog = catalog
@@ -638,6 +639,8 @@ class ToolDispatcher:
             )
             provenance = capture_provenance(tool_name, raw_result)
             data_as_of = None
+            freshness = None
+            retrieved_at = None
             if tool_name in DATA_TOOLS:
                 from data_agent.runtime.context.scope_filter import is_provenance_in_scope
 
@@ -647,14 +650,14 @@ class ToolDispatcher:
                         "The API provenance includes columns outside the request's access scope. "
                         "This is an API contract mismatch, not an empty query result.",
                     )
-                if self._data_as_of_enabled and self._freshness_client is not None:
-                    data_as_of = await self._freshness_client.lookup(
-                        tool_name, model_args, credentials, provenance
-                    )
+                if self._data_as_of_enabled:
+                    freshness = capture_freshness(raw_result)
+                    data_as_of = ingestion_date(freshness)
+                    retrieved_at = timestamp(raw_result.get("retrieved_at"))
                 raw_result = {
                     key: value
                     for key, value in raw_result.items()
-                    if key not in {"provenance", "data_as_of"}
+                    if key not in {"provenance", "data_as_of", "freshness", "retrieved_at"}
                 }
                 if tool_name in {"runQuery", "explainQuery"}:
                     key = (
@@ -775,6 +778,8 @@ class ToolDispatcher:
             user_message=None,
             provenance=provenance,
             data_as_of=data_as_of,
+            freshness=freshness,
+            retrieved_at=retrieved_at,
             result_preview=preview,
             result_full=raw_result,
         )

@@ -251,7 +251,7 @@ def events(body):
     return frames
 
 
-async def run_case(name, question, fault, settings, *, resume_answer=None):
+async def run_case(name, question, fault, settings, *, resume_answer=None, refresh=False):
     # Each sequential case owns a fresh app/provider. Do not leave the global SDK
     # instrumentor attached to the preceding case's shut-down exporter.
     instrumentor = OpenAIInstrumentor()
@@ -354,6 +354,17 @@ async def run_case(name, question, fault, settings, *, resume_answer=None):
                 outcome = await exchange("/turn", {"message": question})
                 if outcome.get("status") == "paused_ask_user" and resume_answer is not None:
                     outcome = await exchange("/turn/resume", {"answer": resume_answer})
+                if refresh and outcome.get("answer_document"):
+                    prior = outcome["answer_document"]
+                    outcome = await exchange("/answer/refresh", {
+                        "answer_id": prior["answer_id"], "expected_revision": prior["revision"]})
+                    refreshed = outcome.get("answer_document", {})
+                    history = (await client.get("/session/history", headers=headers)).json()
+                    state["refresh_verified"] = (
+                        refreshed.get("answer_id") == prior["answer_id"]
+                        and refreshed.get("revision") == prior["revision"] + 1
+                        and any(t.get("answer_document") == refreshed for t in history.get("turns", []))
+                    )
                 if name == "scalar" and outcome.get("status") == "done":
                     outcome = await exchange(
                         "/turn", {"message": "And how many of those are in Sales?"}
@@ -408,6 +419,8 @@ async def run_case(name, question, fault, settings, *, resume_answer=None):
     if fault in {"judge_reject", "invalid_source", "question_reject"}:
         checks["fault_exercised"] = fault in state["injections"]
         checks["approved_after_repair"] = outcome.get("review", {}).get("status") == "approved"
+    if refresh:
+        checks["atomic_refresh_and_history"] = state.get("refresh_verified", False)
     if fault in {"judge_reject", "invalid_source"}:
         checks["repair_reuses_queries"] = len(state["queries"]) == state.get(
             "queries_at_repair", -1
@@ -497,6 +510,7 @@ async def main(args):
         openai_model=args.model or base.openai_model,
         openai_base_url=base.openai_base_url,
         model_api=base.model_api,
+        data_as_of_enabled=base.data_as_of_enabled,
         answer_judge_enabled=True,
         answer_judge_timeout_seconds=30,
         progress_summary_enabled=False,
@@ -565,7 +579,7 @@ async def main(args):
         question, fault = cases[name]
         print("START", name, flush=True)
         try:
-            result = await run_case(name, question, fault, settings, resume_answer=question_specs.get(name, {}).get("resume_answer", "Sales" if name.startswith("clarification") else None))
+            result = await run_case(name, question, fault, settings, resume_answer=question_specs.get(name, {}).get("resume_answer", "Sales" if name.startswith("clarification") else None), refresh=question_specs.get(name, {}).get("refresh", False))
         except Exception as exc:
             result = {
                 "case": name,
@@ -591,6 +605,11 @@ async def main(args):
                 section.get("presentation", {}).get("kind") == spec["expected_kind"]
                 for section in document.get("sections", [])
             )
+        if spec.get("expected_freshness"):
+            frames = [f["data"] for x in result.get("exchanges", []) for f in x["events"] if f["event"] == "result"]
+            sources = [source for frame in frames for source in frame.get("answer_document", {}).get("sources", {}).values()]
+            result["checks"]["api_freshness_delivered"] = bool(sources) and all(
+                source.get("freshness", {}).get("mode") == spec["expected_freshness"] for source in sources)
         report["results"].append(result)
         save(args.output, report)
         failed = [k for k, v in result["checks"].items() if not v]

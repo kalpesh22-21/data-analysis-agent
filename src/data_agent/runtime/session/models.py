@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from data_agent.runtime.provenance.capture import capture_data_as_of
+from data_agent.runtime.provenance.freshness import capture_freshness, timestamp
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,8 @@ class TrailEntry:
     # about a window anchor, carrying no column identifier and no warehouse value.
     window_note: str | None = None
     data_as_of: str | None = None
+    freshness: dict | None = None
+    retrieved_at: str | None = None
     capability_terminal: bool = False
     serves_intents: tuple[str, ...] = ()
     model_response: dict[str, Any] | None = None
@@ -289,6 +292,8 @@ class TrailEntry:
                 else [_provenance_to_doc(item) for item in self.answer_table_provenance]
             ),
             "window_note": self.window_note,
+            **({"freshness": self.freshness} if self.freshness is not None else {}),
+            **({"retrieved_at": self.retrieved_at} if self.retrieved_at is not None else {}),
             **({"data_as_of": self.data_as_of} if self.data_as_of is not None else {}),
             "capability_terminal": self.capability_terminal,
             "serves_intents": list(self.serves_intents),
@@ -322,6 +327,8 @@ class TrailEntry:
             # non-string one loads as `None` rather than as a value the renderer would
             # print at the model verbatim.
             data_as_of=capture_data_as_of("runQuery", doc),
+            freshness=capture_freshness(doc),
+            retrieved_at=timestamp(doc.get("retrieved_at")),
             window_note=(
                 doc.get("window_note") if isinstance(doc.get("window_note"), str) else None
             ),

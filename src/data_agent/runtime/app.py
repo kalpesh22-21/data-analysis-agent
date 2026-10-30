@@ -96,7 +96,6 @@ from data_agent.runtime.observability.progress import ProgressEmitter, combine_o
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
-from data_agent.runtime.provenance.freshness import FreshnessClient
 from data_agent.runtime.query_page import (
     QueryPageError,
     build_page_sql,
@@ -111,6 +110,12 @@ from data_agent.runtime.retrieval.tools import (
 )
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
+from data_agent.runtime.session.answer_refresh import (
+    RefreshAccessChangedError,
+    RefreshRejectedError,
+    RefreshStore,
+    find_answer,
+)
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError, SessionStore
 from data_agent.runtime.session_history import project_history
@@ -141,6 +146,11 @@ class TurnRequest(BaseModel):
     message: str
 
 
+class RefreshRequest(BaseModel):
+    answer_id: str
+    expected_revision: int
+
+
 class ResumeRequest(BaseModel):
     answer: str
 
@@ -150,10 +160,11 @@ class QueryPageRequest(BaseModel):
 
     `limit`/`offset` are permissive (`Any`, clamped by `clamp_page_params`) rather
     than validated ints: a bad paging param is UI plumbing, not a reason to 422 a
-    user's scroll. `sql` is the only field that can fail the request.
+    user's scroll. Supply exactly one approved `table_ref` or generic `sql`.
     """
 
-    sql: str
+    sql: str | None = None
+    table_ref: str | None = None
     limit: Any = None
     offset: Any = None
 
@@ -237,7 +248,7 @@ async def _stream_turn(
 
         try:
             outcome = await task
-        except (AlreadyConsumedError, CASMismatchError) as exc:
+        except (AlreadyConsumedError, CASMismatchError, RefreshRejectedError) as exc:
             yield _format_sse("error", {"code": type(exc).__name__, "message": str(exc)})
             return
         except Exception:  # noqa: BLE001 - last-resort SSE error framing, never a bare 500
@@ -292,7 +303,6 @@ def create_app(
     mcp_client: MCPClient | None = None,
     model_client: ModelClient | None = None,
     catalog: CatalogHandle | None = None,
-    freshness_client: FreshnessClient | None = None,
     embedding_client: EmbeddingClient | None = None,
     resolve_values: ResolveValuesComposite | None = None,
     retrieval: RetrievalPipeline | None = None,
@@ -618,16 +628,17 @@ def create_app(
         async def capability_prefetch_provider(query: str, user_jwt: str | None = None):
             return await prefetch_capabilities(capability_client, query, end_user_jwt=user_jwt)
 
-    context_assembler = ContextAssembler(
-        session_store,
-        preview_row_count=settings.preview_row_count,
-        retrieval=active_retrieval,
-        retrieval_prefetch_tool_enabled=settings.retrieval_prefetch_tool_enabled,
-        capability_tools_enabled=settings.capability_tools_enabled,
-        capability_prefetch_provider=capability_prefetch_provider,
-        base_system_prompt=settings.effective_agent_system_prompt(),
-        tracer=tracer,
-    )
+    def _context_assembler(store):
+        return ContextAssembler(
+            store,
+            preview_row_count=settings.preview_row_count,
+            retrieval=active_retrieval,
+            retrieval_prefetch_tool_enabled=settings.retrieval_prefetch_tool_enabled,
+            capability_tools_enabled=settings.capability_tools_enabled,
+            capability_prefetch_provider=capability_prefetch_provider,
+            base_system_prompt=settings.effective_agent_system_prompt(),
+            tracer=tracer,
+        )
 
     # B5: TOOL spans are emitted by ToolDispatcher itself (wired via the
     # `tracer=` constructor argument below); this only covers AgentLoop's own
@@ -657,7 +668,6 @@ def create_app(
             mcp_client,
             catalog_provider,
             data_as_of_enabled=settings.data_as_of_enabled,
-            freshness_client=freshness_client or FreshnessClient(settings),
             preview_row_count=settings.preview_row_count,
             # Per-result preview size cap (2026-08 fix): bounds a single stored tool
             # result (esp. a wide getTableSchema) so the trail cannot balloon.
@@ -675,7 +685,10 @@ def create_app(
             disable_redaction=settings.otlp_disable_redaction,
         )
 
-    def _build_agent_loop(observer: ToolObserver) -> AgentLoop:
+    def _build_agent_loop(observer: ToolObserver, store=None) -> AgentLoop:
+        return _agent_loop_for_store(observer, store or session_store)
+
+    def _agent_loop_for_store(observer: ToolObserver, session_store: SessionStore) -> AgentLoop:
         dispatcher = _build_dispatcher(observer)
         # D77: the composite wraps the SAME dispatcher (so its inner runQuery
         # shares the per-request observer/tracer and the free D5/D57/provenance
@@ -909,7 +922,7 @@ def create_app(
         return AgentLoop(
             model_client=model_client,
             tool_dispatcher=dispatcher,
-            context_assembler=context_assembler,
+            context_assembler=_context_assembler(session_store),
             session_store=session_store,
             tools_provider=_tools_provider,
             max_loop_iterations=settings.max_loop_iterations,
@@ -1257,6 +1270,51 @@ def create_app(
         )
         return JSONResponse(content={"session_id": x_session_id, **body})
 
+    @app.post("/answer/refresh")
+    async def refresh_answer(body: RefreshRequest,
+                             authorization: str | None = Header(default=None),
+                             x_session_id: str | None = Header(default=None, alias="X-Session-Id")):
+        credentials = _extract_credentials(authorization=authorization, session_id=x_session_id, settings=settings)
+        credentials = await _session_credentials(credentials)
+        original = await session_store.get_or_create_session(credentials.session_id)
+        try:
+            target = find_answer(original, body.answer_id, credentials.column_scope)
+        except PermissionError:
+            raise HTTPException(404, detail="The answer is unavailable.") from None
+        if target.answer_document["revision"] != body.expected_revision:
+            raise HTTPException(409, detail="This answer has changed. Reload before refreshing again.")
+        questions = [m.content for m in original.messages
+                     if m.turn_index == target.turn_index and m.role == "user"]
+        if not questions:
+            raise HTTPException(409, detail="The original question is unavailable.")
+        staging = RefreshStore(session_store, original, target)
+        emitter = ProgressEmitter()
+        loop = _build_agent_loop(combine_observers(emitter.observe, _tracing_observer, *extra_observers), staging)
+
+        async def _call():
+            with tracing.agent_span(tracer, session_id=credentials.session_id,
+                    scope_hash=hash_scope(credentials.column_scope), turn_index=target.turn_index,
+                    user_input=questions[0], request_metadata=tracing.request_context(credentials.jwt)) as turn_span:
+                question = questions[0]
+                if len(questions) > 1:
+                    question += "\n\nPreviously supplied clarifications:\n" + "\n".join(questions[1:])
+                outcome = await loop.run(session_id=credentials.session_id, credentials=credentials,
+                                         user_message=question)
+                if outcome.status.startswith("paused") or (outcome.review or {}).get("status") != "approved":
+                    raise RefreshRejectedError("Refresh could not be approved. The saved answer is unchanged.")
+                current_credentials = await _session_credentials(credentials)
+                if current_credentials.column_scope != credentials.column_scope:
+                    raise RefreshAccessChangedError("Access changed during refresh. Reload the answer.")
+                message, trail = await staging.publication(credentials.session_id, body.answer_id, body.expected_revision)
+                await session_store.publish_answer_refresh(credentials.session_id, answer_id=body.answer_id,
+                    expected_revision=body.expected_revision, message=message, trail=trail)
+                outcome = replace(outcome, answer_document=message.answer_document)
+                tracing.record_turn_output(turn_span, outcome)
+                return replace(outcome, delivery_traceparent=tracing.inject_current_traceparent())
+
+        return _TurnStreamingResponse(_stream_turn(_call, emitter, delivery_observer=_tracing_observer),
+            media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     @app.get("/answer/action")
     async def answer_action(answer_id: str, capability_ref: str,
                             authorization: str | None = Header(default=None),
@@ -1299,7 +1357,17 @@ def create_app(
         credentials = await _session_credentials(credentials)
         limit, offset = clamp_page_params(body.limit, body.offset)
         try:
-            page_sql = build_page_sql(body.sql, limit=limit, offset=offset)
+            if bool(body.sql) == bool(body.table_ref):
+                raise HTTPException(400, detail="Supply exactly one of table_ref or sql.")
+            sql = body.sql
+            if body.table_ref:
+                from data_agent.runtime.answer_access import resolve_table
+                doc = await session_store.get_or_create_session(credentials.session_id)
+                try:
+                    sql = await resolve_table(doc, body.table_ref, credentials, session_store)
+                except PermissionError:
+                    raise HTTPException(404, detail="The selected answer data is unavailable.") from None
+            page_sql = build_page_sql(sql, limit=limit, offset=offset)
         except QueryPageError as exc:
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
@@ -1334,6 +1402,8 @@ def create_app(
                 # The UI shows "next" while a page comes back full.
                 "has_more": len(rows) >= limit,
                 **({"data_as_of": result.data_as_of} if result.data_as_of is not None else {}),
+                **({"freshness": result.freshness} if result.freshness is not None else {}),
+                **({"retrieved_at": result.retrieved_at} if result.retrieved_at is not None else {}),
             }
         )
 

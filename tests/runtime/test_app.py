@@ -1276,7 +1276,7 @@ def test_selected_table_is_delivered_once_in_the_document(monkeypatch):
     data = _parse_sse(response.text)[-1]["data"]
     assert data["answer_document"]["sections"][0]["title"] == "Average salary"
     assert data["answer_document"]["sections"][0]["presentation"] == {"kind": "table", "result_id": "selected"}
-    assert data["answer_document"]["sources"]["selected"]["table_ref"] == "0:selected"
+    assert data["answer_document"]["sources"]["selected"]["table_ref"].startswith("tbl_")
     assert not {"assistant_text", "answer_tables", "answer_sql", "capability_cards"} & data.keys()
     history = client.get("/session/history", headers=HEADERS).json()["turns"][0]
     assert history["answer_tables"][0]["sql"] == _RAW_SQL

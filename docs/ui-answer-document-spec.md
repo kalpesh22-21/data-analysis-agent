@@ -52,9 +52,13 @@ type AnswerDocument = {
 
 type ResultSource = {
   retrieved_at: string;
-  data_as_of?: string;              // actual source freshness, only when known
+  data_as_of?: string;              // oldest ingested source, only with complete coverage
+  freshness?: {
+    mode: 'live' | 'ingested' | 'mixed' | 'unknown';
+    sources: { table: string; kind: 'live' | 'ingested' | 'unknown'; data_as_of?: string }[];
+  };
   row_count: number;                // nonnegative integer; count for this result
-  completeness: 'complete' | 'partial' | 'unknown';
+  completeness: 'complete' | 'partial';
   table_ref?: string;               // opaque server-authorized paging handle
 };
 
@@ -251,6 +255,7 @@ Transport heartbeats keep the stream alive without changing visible status. Back
 ## 9. Persistence, freshness, and refresh
 
 - Lane5 persists the exact approved document before terminal delivery. Ember/BFF persists that document with its own conversation record and associated S3 results. Ordinary reload uses these saved artifacts without query reexecution or a backend complete-history fetch. Preserve existing automatic snapshot recovery on access-scope changes. Do not recompute presentation from current heuristics.
+- Freshness comes from clickhouse-api’s source receipts, not Lane5’s own ClickHouse lookup. Live-only results display “Live data · retrieved at …”. Mixed results identify live sources separately and use the oldest ingested source’s date (employee live + payroll ingested uses payroll’s date). Unknown coverage omits the overall date. Blueprint receipts combine executed nodes and survive pause/resume.
 - `retrieved_at` means query retrieval time. `data_as_of` means known data freshness. The snapshot service’s expiry timestamp means the deadline for snapshot access. Never substitute one for another.
 - Expired snapshots disable unavailable paging/download actions and show the affected section's expiry notice. Preserve the authorized historical answer. Blocks-only sections still have source retrieval timestamps even without snapshots.
 - Old retrieval time is not automatic proof of stale source data. If a business freshness threshold is needed, the backend supplies that policy separately; the UI must not invent it.
@@ -322,8 +327,11 @@ Reference: [previous UI/backend contract](ui-backend-contract.md). This specific
 - `POST /query/snapshots` accepts `{ "table_ref": "<sources[result_id].table_ref>" }` for a new answer. Lane5 resolves it against the session's approved document and current scope, then forwards the selected SQL to the existing clickhouse-api snapshot service. Do not send both `table_ref` and `sql`. Existing generic SQL snapshot callers are unchanged.
 - Snapshot creation executes the selected SQL; it does not upload the earlier preview. Persist the returned snapshot ID with its exact result reference. Ordinary reload and pagination use that saved snapshot ID. Do not treat snapshot creation time as the original query retrieval time or as proof that independently executed results are identical.
 - `GET /answer/action?answer_id=…&capability_ref=…` resolves a selected prepared action under the current session and scope. Use the returned prepared state; do not rebuild its arguments from display text.
-- Backend session history is unchanged. New assistant records additionally retain `answer_document`; model context continues to use stored conversation and execution records.
-- Each new turn currently emits revision 1. An atomic, reviewed refresh of a whole document is a coordinated follow-up; the existing snapshot rebuild alone must not relabel old summaries as newly verified.
+- `GET /session/history` returns each visible turn’s exact persisted `answer_document`. Current access scope gates the entire document; hidden answers expose no document. Model context continues to use stored conversation and execution records.
+- New turns emit revision 1. `POST /answer/refresh` accepts `{ "answer_id": "…", "expected_revision": 1 }` with the same session authentication as `/turn`. It reruns the original question and supplied clarifications in isolated conversation state, using current access, fresh queries, and the answer judge. It streams progress and heartbeat events, then one complete `result.answer_document` on success. The answer ID stays fixed; revision increments by one. Replace the whole document and reset snapshot associations together.
+- A stale revision returns HTTP 409 before streaming. A concurrent refresh that loses publication emits an SSE `error` with code `CASMismatchError`; rejected/paused refreshes emit `RefreshRejectedError`. Failed refreshes do not replace the saved answer. Keep the old visible revision while refreshing; reload on conflict. HTTP 401/403/404 requires removing inaccessible cached content and checking access. `RefreshAccessChangedError` also requires clearing the cached answer and reloading scoped history.
+- Publication atomically replaces the answer and adds its new execution references. Existing unrelated turns survive concurrent writes. Failed staging may leave unreferenced result blobs until their normal TTL expires. Prepared actions are resolved afresh; refresh never invokes actions.
+- Table handles are opaque and change when refreshed executions replace their sources. Never parse a handle or reuse an old snapshot association for a new revision. The local harness can also page by `POST /query/page` with `table_ref`, `limit`, and `offset`; Ember should continue to persist snapshot IDs. Snapshot rebuild alone does not refresh summaries.
 
 ## 15. Recovery delivery
 

@@ -99,6 +99,7 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         "error_code": entry.error_code,
         "user_message": user_message,
         "result_preview": preview,
+        **({"freshness": entry.freshness, "retrieved_at": entry.retrieved_at, "data_as_of": entry.data_as_of} if entry.freshness is not None else {}),
     }
     if diagnostic:
         rendered["sql_diagnostic"] = diagnostic

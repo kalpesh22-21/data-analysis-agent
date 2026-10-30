@@ -40,7 +40,8 @@ from data_agent.runtime.mcp.scratch_client import (
     ScratchClientError,
     ScratchClientProtocol,
 )
-from data_agent.runtime.provenance.capture import capture_data_as_of, union_data_as_of
+from data_agent.runtime.provenance.capture import capture_data_as_of
+from data_agent.runtime.provenance.freshness import capture_freshness, ingestion_date, merge_freshness, timestamp
 from data_agent.runtime.provenance.catalog_handle import SemanticCatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
 from data_agent.runtime.retrieval.scope_filter import is_blueprint_in_scope
@@ -146,6 +147,8 @@ class ExecCompleted:
     preview: ResultPreview
     provenance: frozenset[tuple[str, str]] | None
     data_as_of: str | None = None
+    freshness: dict | None = None
+    retrieved_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -668,7 +671,7 @@ class BlueprintExecutor:
                 # prove the table still holds what it wrote rather than a
                 # row-TTL-expired remnant (see `_restore_materialized`).
                 running[node.order] = _node_record(
-                    {}, result.provenance, node_sql, table_name, mat_rows, result.data_as_of
+                    {}, result.provenance, node_sql, table_name, mat_rows, result.data_as_of, result.freshness, result.retrieved_at
                 )
                 _record_empty_output(node, node_outputs)
                 continue
@@ -705,7 +708,8 @@ class BlueprintExecutor:
                 )
                 return ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
             running[node.order] = _node_record(
-                scalar_out, result.provenance, node_sql, data_as_of=result.data_as_of
+                scalar_out, result.provenance, node_sql, data_as_of=result.data_as_of,
+                freshness=result.freshness, retrieved_at=result.retrieved_at
             )
             _record_output(node, scalar_out, result.result_full, node_outputs)
             terminal = (node.sql_template, node_sql, result.result_full)
@@ -714,6 +718,7 @@ class BlueprintExecutor:
             # Every node skipped/gated — nothing to verify or return.
             return ExecFailed(ABORTED_CODE, _ABORTED_MESSAGE, retryable=True)
 
+        freshness = merge_freshness([r.get("freshness") for r in running.values() if r.get("sql")])
         # 5. Verify the FINAL node result (D56) + build the verified answer.
         return await self._finalize(
             blueprint,
@@ -722,9 +727,9 @@ class BlueprintExecutor:
             provenances,
             credentials,
             bound_slots=bound_slots,
-            data_as_of=union_data_as_of(
-                [r.get("data_as_of") for r in running.values() if r.get("sql")]
-            ),
+            data_as_of=ingestion_date(freshness),
+            freshness=freshness,
+            retrieved_at=max((r["retrieved_at"] for r in running.values() if r.get("retrieved_at")), default=None),
             resolved_rule_bindings=rule_bindings,
         )
 
@@ -892,6 +897,8 @@ class BlueprintExecutor:
         *,
         bound_slots: dict[str, Any] | None = None,
         data_as_of: str | None = None,
+        freshness: dict | None = None,
+        retrieved_at: str | None = None,
         resolved_rule_bindings: dict[str, Any] | None = None,
     ) -> ExecOutcome:
         """Run the D56 gate over the FINAL node result and build the verified
@@ -961,6 +968,8 @@ class BlueprintExecutor:
             preview=preview,
             provenance=_union_provenance(provenances),
             data_as_of=data_as_of,
+            freshness=freshness,
+            retrieved_at=retrieved_at,
         )
 
     def _pause(
@@ -1963,6 +1972,8 @@ def _node_record(
     table: str | None = None,
     row_count: int | None = None,
     data_as_of: str | None = None,
+    freshness: dict | None = None,
+    retrieved_at: str | None = None,
 ) -> dict[str, Any]:
     """A completed-node record: its SCALAR `output`, the captured `provenance`, the
     bound `sql`, and — for a table PRODUCER only — the full
@@ -1985,6 +1996,8 @@ def _node_record(
         "sql": sql,
         "table": table,
         "row_count": row_count,
+        **({"freshness": freshness} if freshness is not None else {}),
+        **({"retrieved_at": retrieved_at} if retrieved_at is not None else {}),
         **({"data_as_of": data_as_of} if data_as_of is not None else {}),
     }
 
@@ -2053,6 +2066,8 @@ def _dumps_completed(running: dict[int, dict[str, Any]]) -> str | None:
     payload = [
         {
             "order": order,
+            **({"freshness": running[order]["freshness"]} if running[order].get("freshness") is not None else {}),
+            **({"retrieved_at": running[order]["retrieved_at"]} if running[order].get("retrieved_at") is not None else {}),
             "output": running[order].get("output", {}),
             "provenance": _prov_to_jsonable(running[order].get("provenance")),
             "sql": running[order].get("sql"),
@@ -2109,6 +2124,8 @@ def _rehydrate_completed(completed_nodes_json: str | None) -> dict[int, dict[str
                     if isinstance(rows, int) and not isinstance(rows, bool) and rows >= 0
                     else None,
                     data_as_of=capture_data_as_of("runQuery", entry),
+                    freshness=capture_freshness(entry),
+                    retrieved_at=timestamp(entry.get("retrieved_at")),
                 )
     return completed
 

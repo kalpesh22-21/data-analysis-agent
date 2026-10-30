@@ -15,6 +15,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -66,6 +67,18 @@ def _unwrap_fastmcp_result(structured: Any) -> Any:
     if isinstance(structured, dict) and set(structured) == {"result"}:
         return structured["result"]
     return structured
+
+
+# Explicit read allowlist: retries must never duplicate a write/action.
+_READ_TOOLS = frozenset({"runQuery", "listDatabases", "listTables", "getTableSchema", "explainQuery", "sampleRows"})
+
+
+def transient_transport_error(exc):
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(transient_transport_error(e) for e in exc.exceptions)
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {429, 500, 502, 503, 504}
+    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError, httpx.RemoteProtocolError))
 
 
 class RealMCPClient:
@@ -123,8 +136,15 @@ class RealMCPClient:
         session_id: str,
     ) -> dict[str, Any] | list[Any]:
         headers = await self._scoped_headers(jwt, session_id)
-        async with self._session(headers) as session:
-            result = await session.call_tool(tool_name, args)
+        for attempt in range(2):
+            try:
+                async with self._session(headers) as session:
+                    result = await session.call_tool(tool_name, args)
+                break
+            except Exception as exc:
+                if attempt or tool_name not in _READ_TOOLS or not transient_transport_error(exc):
+                    raise
+                await asyncio.sleep(0.2)
 
         if result.isError:
             text = result.content[0].text if result.content else "unknown MCP tool error"

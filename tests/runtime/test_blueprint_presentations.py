@@ -20,7 +20,7 @@ def test_every_blueprint_projection_has_a_valid_reviewable_presentation(case, va
     assert result['rendered'] == expected, result['reasons']
     if expected == 'table' and case['kind'] != 'table':
         assert result['reasons'] and 'shown as a table' in result['reasons'][0]
-    assert result['document']['sources']['audit']['table_ref'] == '0:audit'
+    assert result['document']['sources']['audit']['table_ref'].startswith("tbl_")
     json.dumps(result['document'], allow_nan=False)
 
 

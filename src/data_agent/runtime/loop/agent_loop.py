@@ -2270,6 +2270,9 @@ class AgentLoop:
             )
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance,
             business_values=await self._context_business_values(session_id, turn_index))
+        if checkpoint is None and not (assistant_text or "").strip():
+            assistant_text = "I could not produce a verified answer from the available evidence."
+            provenance = frozenset()
         if accum.answer_document is not None:
             accum.answer_document = {**accum.answer_document, "takeaway": assistant_text or ""}
         review, withheld = await review_delivery(
@@ -2329,7 +2332,7 @@ class AgentLoop:
             answer_document = seal_document(
                 candidate, answer_id=f"answer-{turn_index}", generated_at=_now_iso()
             )
-        if persist_text is not None or (status == "done" and assistant_text):
+        if persist_text is not None or (checkpoint is None and assistant_text):
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
             # that persist pass the same string they pass as *assistant_text*, so
             # this assignment is an identity for them and fail-closed for anything
@@ -2637,6 +2640,8 @@ class AgentLoop:
             # exactly how the resume path lost the `authoritative` marker before.
             window_note=tool_result.window_note,
             data_as_of=tool_result.data_as_of,
+            freshness=tool_result.freshness,
+            retrieved_at=tool_result.retrieved_at,
             # The tag survives the pause on the checkpoint, so the intent this
             # blueprint was run for closes by tag exactly as an unpaused one does.
             serves_intent=checkpoint.serves_intent,
@@ -4120,6 +4125,8 @@ class AgentLoop:
                     # entry serialises byte-identically.
                     window_note=tool_result.window_note,
                     data_as_of=tool_result.data_as_of,
+                    freshness=tool_result.freshness,
+                    retrieved_at=tool_result.retrieved_at,
                     capability_terminal=tool_result.terminal
                     or bool(
                         isinstance(tool_result.result_full, dict)

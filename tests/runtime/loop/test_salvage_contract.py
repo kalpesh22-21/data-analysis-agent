@@ -359,7 +359,7 @@ async def test_salvage_materializes_selected_visual_and_persists_it(kind, select
     rendered = out.answer_document['sections'][0]
     assert rendered['presentation']['kind'] == kind
     assert rendered['supporting_table'] == {'result_id': 'q'}
-    assert out.answer_document['sources']['q']['table_ref'] == '0:q'
+    assert out.answer_document['sources']['q']['table_ref'].startswith("tbl_")
     assert len(mcp.calls) == 1
     doc = await store.get_or_create_session(CREDS.session_id)
     assert doc.messages[-1].answer_document == out.answer_document

@@ -13,6 +13,7 @@ no KV de-reference happens on the read path.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -237,6 +238,8 @@ def project_history(
                 "turn_index": turn_index,
                 "question": questions[turn_index],
                 "answer": assistant.content if assistant is not None else None,
+                **({"answer_document": deepcopy(assistant.answer_document)}
+                   if assistant and assistant.answer_document is not None else {}),
                 "extra_evidence": assistant.extra_evidence if assistant is not None else None,
                 **(
                     {"review": assistant.review}
@@ -289,8 +292,10 @@ def project_history(
     if not data_as_of_enabled:
         # Suppress old persisted receipts too; toggling the flag requires no data migration.
         for turn in turns:
-            for item in [*(turn.get("answer_tables") or []), *turn["tool_calls"]]:
+            for item in [*(turn.get("answer_tables") or []), *turn["tool_calls"],
+                         *turn.get("answer_document", {}).get("sources", {}).values()]:
                 item.pop("data_as_of", None)
+                item.pop("freshness", None)
     return {"turns": turns, "pending_question": pending_question}
 
 

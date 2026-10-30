@@ -598,6 +598,9 @@ def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> d
 # after which a prompt edit silently changes judge behaviour with nothing testing it. What
 # follows restates ONLY the rules these criteria test.
 _ANSWER_JUDGE_PROMPT = (
+    "Freshness is source-specific: live sources have retrieval time, ingested sources have ETL dates. "
+    "For mixed results, data_as_of is the oldest ingested source date, never the live source date. "
+    "Unknown freshness must not be described as current. "
     "Review answer_document as the complete proposed UI answer, including section titles, "
     "values, source bindings, actions, caveats, and fallback tables. Internal selected tables "
     "include supporting data: only presentation.kind=table is a visible grid. Strongly prefer "
