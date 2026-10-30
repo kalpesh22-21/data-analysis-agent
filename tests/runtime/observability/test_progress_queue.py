@@ -124,15 +124,15 @@ async def test_real_turn_executes_before_summary_and_result_follows_drained_prog
     progress = [
         json.loads(frame.split("data: ")[1]) for frame in frames if "event: progress" in frame
     ]
-    paired = [event for event in progress if event["shape"].get("tool_call_id") == "call_1"]
-    assert len(paired) == 3
-    assert [p["shape"].get("lifecycle") for p in paired] == [None, "start", "ok"]
-    assert paired[0]["step"] == (
+    expected_message = (
         "Finding the requested employee details"
         if outcome == "summary"
         else "Finding the matching records"
     )
-    assert paired[1]["step"] == paired[2]["step"] == paired[0]["step"]
+    paired = [event for event in progress if event["message"] == expected_message]
+    assert len(paired) == 3
+    assert all(event["phase"] == "analyzing" for event in paired)
+    assert [p["sequence"] for p in progress] == list(range(1, len(progress) + 1))
     assert "event: result" in frames[-1]
     assert "summary_task" not in "".join(frames)
     assert "private provider" not in "".join(frames)

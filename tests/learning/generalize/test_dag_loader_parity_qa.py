@@ -441,12 +441,11 @@ def _canon_docs(directory: Path) -> dict[str, Any]:
 
 
 def test_check_dag_accepts_every_composite_in_the_real_mcp_canon() -> None:
-    """The builder's parity test reads the HERMETIC MIRROR
-    (`tests/fixtures/corpus/blueprints.yaml`). The mirror has drifted from the real
-    canon before (three blueprints, recorded in
-    `test_corpus_loader_structural_key_qa.py`), so read the REAL canon directly here:
-    the mirror-vs-canon guard and this one then fail independently, and a canon-only
-    composite the loop cannot express is caught even while the mirror is stale."""
+    """Check the real corpus independently of the fixed demo seed and snapshot.
+
+    A canon-only composite the loop cannot express is caught even before the
+    committed snapshot is refreshed.
+    """
     canon = _canon_docs(_REAL_CANON_DIR)
     composites = {
         bid: doc["composes"] for bid, doc in canon.items() if doc.get("composes")
@@ -465,14 +464,10 @@ def test_the_canon_composite_the_parity_claim_rests_on_still_uses_a_table_interm
 
 
 def test_the_hermetic_mirror_still_matches_the_real_canon_on_composes() -> None:
-    """The learning-side parity test feeds the MIRROR into `check_dag`, so its claim
-    ('the loop can express what the runtime runs') is only as true as the mirror.
-    `test_corpus_loader_structural_key_qa.py` guards this for the structural-key
-    fields; this is the same guard stated from the learning side so a drift shows up
-    next to the test that depends on it."""
+    """Keep the full snapshot's DAG definitions synchronized with the real corpus."""
     yaml = pytest.importorskip("yaml")
     canon = _canon_docs(_REAL_CANON_DIR)
-    mirror = {d["id"]: d for d in yaml.safe_load((_FIXTURE_DIR / "blueprints.yaml").read_text())}
+    mirror = {d["id"]: d for d in yaml.safe_load((_FIXTURE_DIR.parent / "corpus_snapshot" / "blueprints.yaml").read_text())}
     assert set(canon) == set(mirror)
     drift = [bid for bid in sorted(canon) if canon[bid].get("composes") != mirror[bid].get("composes")]
     assert drift == [], f"mirror composes drifted from the real canon: {drift}"

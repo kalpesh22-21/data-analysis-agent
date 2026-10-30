@@ -9,6 +9,7 @@ from data_agent.runtime.app import _stream_turn
 from data_agent.runtime.loop.answer_judge import JudgeVerdict
 from data_agent.runtime.observability.progress import ProgressEmitter
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import recovery_sections
 from tests.runtime.loop.test_partial_answer import PART, TEXT, final, reject
 from tests.runtime.test_harness_improvements import CREDS, Judge, build, discovery, query, run
 
@@ -27,8 +28,9 @@ async def stream_result(loop):
 async def assert_history(store, result):
     doc = await store.get_or_create_session(CREDS.session_id)
     history = project_history(doc.messages, doc.tool_trail, CREDS.column_scope, None)
-    assert history["turns"][0]["answer"] == result["assistant_text"]
-    assert history["turns"][0]["answer_tables"] == result["answer_tables"]
+    assert history["turns"][0]["answer"] == result["answer_document"]["takeaway"]
+    assert bool(history["turns"][0]["answer_tables"]) == bool(result["answer_document"]["sections"])
+    assert doc.messages[-1].answer_document == result["answer_document"]
     return doc
 
 
@@ -46,9 +48,9 @@ async def test_timed_out_proposal_and_failed_salvage_ship_limitation_once():
     loop, store, model, _, _ = build([discovery(), query(), final()], judge)
     result = await stream_result(loop)
     assert result["review"]["status"] == "exhausted"
-    assert "couldn't verify" in result["assistant_text"]
-    assert "review" not in result["assistant_text"].lower()
-    assert not result["answer_tables"]
+    assert "couldn't verify" in result["answer_document"]["takeaway"]
+    assert "review" not in result["answer_document"]["takeaway"].lower()
+    assert not result["answer_document"]["sections"]
     assert len(judge.briefs) == 2 and model.calls_made == 3
     doc = await assert_history(store, result)
     assert doc.review_states["0"]["delivery_reason"] == "timeout"
@@ -67,15 +69,15 @@ def change_delivery_before_finish(loop):
 
 @pytest.mark.parametrize("with_table", [False, True])
 async def test_finish_rejection_ships_approved_partial_without_another_review(with_table):
-    part = {**PART, "table_result_ids": ["q"] if with_table else []}
+    part = {**PART, 'sections': recovery_sections(['q'] if with_table else [])}
     judge = Judge([JudgeVerdict(True, reviewed=True), reject(part)])
     loop, store, model, _, events = build([discovery(), query(), final()], judge)
     change_delivery_before_finish(loop)
     result = await stream_result(loop)
-    assert result["assistant_text"] == TEXT
+    assert result["answer_document"]["takeaway"] == TEXT
     assert result["review"]["completion"] == "partial"
     assert result["review"]["status"] == "approved"
-    assert bool(result["answer_tables"]) == with_table
+    assert bool(result["answer_document"]["sections"]) == with_table
     assert len(judge.briefs) == 2 and model.calls_made == 3
     await assert_history(store, result)
     event = next(shape for name, shape in events if name == "loop_partial_answer_recovered")
@@ -90,10 +92,7 @@ async def test_changed_delivery_uses_salvage_once_without_another_prose_review(v
 
         async def salvage(self, brief):
             self.salvage_calls += 1
-            return {
-                **PART, "outcome": "full", "unfinished": [], "captions": [],
-                "table_result_ids": ["q"], "evidence": ["q" if valid else "missing"],
-            }
+            return {**PART, 'outcome': 'full', 'unfinished': [], 'evidence': ['q' if valid else 'missing'], 'sections': recovery_sections(['q'], titles=[], evidence=['q' if valid else 'missing'])}
 
     judge = RecoveryJudge([JudgeVerdict(True, reviewed=True)])
     loop, store, model, _, _ = build([discovery(), query(), final()], judge)
@@ -101,13 +100,13 @@ async def test_changed_delivery_uses_salvage_once_without_another_prose_review(v
     result = await stream_result(loop)
     assert len(judge.briefs) == 1 and judge.salvage_calls == 1 and model.calls_made == 3
     if valid:
-        assert result["assistant_text"] == PART["answer"]
-        assert len(result["answer_tables"]) == 1
+        assert result["answer_document"]["takeaway"] == PART["takeaway"]
+        assert len(result["answer_document"]["sections"]) == 1
         assert result["review"]["status"] == "approved"
     else:
-        assert result["assistant_text"] != PART["answer"]
+        assert result["answer_document"]["takeaway"] != PART["takeaway"]
         assert result["review"]["status"] == "exhausted"
-        assert not result["answer_tables"]
+        assert not result["answer_document"]["sections"]
     await assert_history(store, result)
 
 
@@ -123,8 +122,8 @@ async def test_timeout_does_not_override_an_outstanding_rejection():
     loop, _, _, _, _ = build([discovery(), query(), final(), final()], judge)
     result = await stream_result(loop)
     assert result["review"]["status"] == "rejected"
-    assert "The leave ranking is shown" not in result["assistant_text"]
-    assert not result["answer_tables"]
+    assert "The leave ranking is shown" not in result["answer_document"]["takeaway"]
+    assert not result["answer_document"]["sections"]
     assert len(judge.briefs) == 3
 
 
@@ -134,7 +133,7 @@ async def test_finish_rejects_invalid_partial_and_attempts_salvage():
     change_delivery_before_finish(loop)
     result = await stream_result(loop)
     assert result["review"]["status"] == "exhausted"
-    assert result["assistant_text"] != TEXT
+    assert result["answer_document"]["takeaway"] != TEXT
     assert len(judge.briefs) == 2 and model.calls_made == 3
     assert ("loop_recovery_validation_failed", {"reason": "unknown_evidence_id"}) in events
     await assert_history(store, result)

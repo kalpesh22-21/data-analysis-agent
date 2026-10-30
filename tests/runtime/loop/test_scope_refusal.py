@@ -17,6 +17,7 @@ from data_agent.runtime.composite.scope_refusal import (
 from data_agent.runtime.dispatch.denial_mapping import DenialKind, classify_denial
 from data_agent.runtime.loop.agent_loop import TurnContext
 from data_agent.runtime.observability.progress import to_progress_event
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.observability.test_tracing import _observed_attributes
 from tests.runtime.test_harness_improvements import CREDS, batch, build, call, discovery, query, run
 
@@ -25,14 +26,7 @@ DECLINE = "Weather is outside my scope. I can help with HR, payroll, and product
 
 def finish(answer=DECLINE, evidence=None):
     return batch(
-        call(
-            "finalizeAnswer",
-            "final",
-            answer=answer,
-            tables=[],
-            capability_refs=[],
-            evidence=evidence or [],
-        )
+        call("finalizeAnswer", "final", **answer_arguments(takeaway=answer, tables=[], capability_refs=[], evidence=evidence or []))
     )
 
 

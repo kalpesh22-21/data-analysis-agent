@@ -1,9 +1,9 @@
 """Presentation cleanup retains prose and never imposes a prose-size gate."""
 import pytest
 
-from data_agent.runtime.loop.approved_answer import normalize_approved_text
-from data_agent.runtime.loop.answer_rules import contains_sql, has_markdown_table
 from data_agent.runtime.loop.answer_judge import AnswerJudge, JudgeBrief
+from data_agent.runtime.loop.answer_rules import contains_sql, has_markdown_table
+from data_agent.runtime.loop.approved_answer import normalize_approved_text
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from tests.runtime.loop.test_judge_prose_correction import correction, final, response
 from tests.runtime.test_harness_improvements import Judge, build, discovery, query, run
@@ -45,13 +45,13 @@ async def test_judge_parser_accepts_long_correction():
 @pytest.mark.parametrize("route", ["proposal", "correction", "salvage"])
 @pytest.mark.parametrize("sql", ["SELECT * FROM hr.employee;", "```sql\nSELECT count(*) FROM hr.employee\n```"])
 async def test_sql_is_blocked_before_presentation_cleanup(route, sql):
-    from tests.runtime.loop.test_partial_answer import PART
     from data_agent.runtime.loop.answer_judge import JudgeVerdict
+    from tests.runtime.loop.test_partial_answer import PART
 
     text = "There are 120 employees.\n\n" + sql
     class SQLJudge(Judge):
         async def salvage(self, brief):
-            return {**PART, "answer": text, "outcome": "full", "unfinished": [], "captions": []}
+            return {**PART, 'takeaway': text, 'outcome': 'full', 'unfinished': []}
 
     judge = SQLJudge([correction(text)]) if route == "correction" else SQLJudge([JudgeVerdict(False, "unsupported_by_evidence", "Repair prose.", reviewed=True, repair_type="prose")]) if route == "salvage" else SQLJudge()
     loop, _, _, _, _ = build([discovery(), query(), final(text if route == "proposal" else "There are 120 employees.")], judge)

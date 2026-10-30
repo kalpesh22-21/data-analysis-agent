@@ -94,6 +94,6 @@ async def test_timeout_retry_disables_thinking_on_http_request(approved):
     assert requests[1]["messages"] == requests[0]["messages"]
     assert requests[1]["tools"] == requests[0]["tools"]
     assert verdict.reviewed and verdict.approved == approved
-    assert events == ["loop_answer_judge_timeout_retry"]
+    assert events == ["loop_presentation_review_started", "loop_answer_judge_timeout_retry"]
     assert client._thinking_token_budget == 4096
     assert client._chat_template_kwargs == {}

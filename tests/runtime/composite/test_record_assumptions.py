@@ -512,7 +512,7 @@ def test_history_surfaces_assumptions_when_answer_survives_narrowed_scope() -> N
 # --- #4 SSE serialization: `_outcome_to_dict` passes `assumptions` through ------
 
 
-def test_outcome_to_dict_includes_assumptions_list_and_null() -> None:
+def test_outcome_to_dict_does_not_emit_parallel_assumptions() -> None:
     from data_agent.runtime.app import _outcome_to_dict
     from data_agent.runtime.loop.agent_loop import TurnOutcome
 
@@ -525,7 +525,7 @@ def test_outcome_to_dict_includes_assumptions_list_and_null() -> None:
             assumptions=["Assumed FY2026", "Assumed active = employed"],
         )
     )
-    assert with_list["assumptions"] == ["Assumed FY2026", "Assumed active = employed"]
+    assert "assumptions" not in with_list
 
     # A turn that recorded nothing serializes `assumptions` to JSON null (the
     # `[] -> None` fork; an old client ignores the key either way).
@@ -537,7 +537,7 @@ def test_outcome_to_dict_includes_assumptions_list_and_null() -> None:
             tool_calls_made=0,
         )
     )
-    assert without["assumptions"] is None
+    assert "assumptions" not in without
 
 
 async def test_successful_call_reaches_the_model_as_its_real_confirmation() -> None:

@@ -172,11 +172,11 @@ from .finalization import (
 )
 from .help_grounding import HELP_TOOLS, HELP_UNAVAILABLE_TEXT, HelpGrounding
 from .judge_ship_guard import (
+    PROSE_CORRECTION_REJECTED,
     JudgeShipGuard,
     capability_hedge_text,
     coherent_capability_ship_text,
     ship_decline_text,
-    PROSE_CORRECTION_REJECTED,
     table_hedge_text,
 )
 from .loop_safety import (
@@ -539,6 +539,9 @@ class TurnOutcome:
     # None` fork, accumulated across budget windows at every return site).
     assumptions: list[str] | None = None
     capability_cards: list[dict[str, Any]] | None = None
+    answer_document: dict[str, Any] | None = None
+    # Internal delivery context; never serialized into the UI contract.
+    delivery_traceparent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -570,7 +573,7 @@ def _answer_table_result_invalid(result_id: str, available: Sequence[str]) -> To
         f"Table result_id '{result_id}' does not identify an accessible, successful "
         "warehouse execution from this turn. Discovery and capability preparation "
         "results cannot be displayed as warehouse tables. Select an existing runQuery "
-        "or verified runBlueprint result_id; put prepared UI options in capability_refs. "
+        "or verified runBlueprint result_id; put prepared UI options in section actions. "
         "This is a presentation repair: do not rerun completed analysis or pass a "
         "result_id to runBlueprint. Available table result IDs: "
         + json.dumps(list(available))
@@ -2068,6 +2071,7 @@ class AgentLoop:
             sql_executed=tuple(accum.sql_executed or ()),
             results=results,
             draft=draft,
+            answer_document=accum.answer_document if site != "ask_user" else None,
             designated_tables=designated_tables,
             pending_question=pending_question,
             pending_options=pending_options,
@@ -2266,6 +2270,8 @@ class AgentLoop:
             )
         assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=provenance,
             business_values=await self._context_business_values(session_id, turn_index))
+        if accum.answer_document is not None:
+            accum.answer_document = {**accum.answer_document, "takeaway": assistant_text or ""}
         review, withheld = await review_delivery(
             self, session_id, turn_index, assistant_text, accum, checkpoint
         )
@@ -2312,6 +2318,17 @@ class AgentLoop:
             if completion_notice:
                 assistant_text += "\n\n" + completion_notice
             provenance = frozenset()
+        from data_agent.runtime.composer import seal_document, text_document
+
+        answer_document = None
+        if checkpoint is None:
+            candidate = accum.answer_document or text_document(assistant_text)
+            # No components without a matching review receipt when review is enabled.
+            if review.get("status") not in {"approved", "disabled"}:
+                candidate = text_document(assistant_text)
+            answer_document = seal_document(
+                candidate, answer_id=f"answer-{turn_index}", generated_at=_now_iso()
+            )
         if persist_text is not None or (status == "done" and assistant_text):
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
             # that persist pass the same string they pass as *assistant_text*, so
@@ -2334,12 +2351,12 @@ class AgentLoop:
                     review=review,
                     failure=failure,
                     extra_evidence=accum.extra_evidence,
+                    answer_document=answer_document,
+                    prepared_actions=list(accum.capability_cards) if accum.capability_cards else None,
                     delivered_components={
                         "tables": [t.to_doc() for t in accum.answer_tables],
                         "cards": list(accum.capability_cards or ()),
-                    }
-                    if partial_recovered
-                    else None,
+                    } if partial_recovered else None,
                 ),
             )
             self._observer("loop_response_persisted", {"status": review.get("status", "")})
@@ -2376,6 +2393,7 @@ class AgentLoop:
             blueprint_use=envelope.blueprint_use,
             verification=envelope.verification,
             answer_tables=envelope.answer_tables,
+            answer_document=answer_document,
             extra_evidence=accum.extra_evidence,
             provenance=provenance,
             # `[]` (no recordAssumptions this turn) -> `None`, same fork as
@@ -3227,7 +3245,6 @@ class AgentLoop:
             # terminal exit #2 below. Reset per iteration — a designation only ends
             # the turn it was made in.
             proposal_args = None
-            proposal_call_id = None
             # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
             # BATCH. Reset per iteration beside `designated_answer_text`, and for the
             # same reason: it describes one response, not one turn.
@@ -3391,8 +3408,8 @@ class AgentLoop:
                         else ""
                     )
                     + "Your assistant message has not completed this turn. If you can answer now, "
-                    "call finalizeAnswer with your complete text in answer. For a simple "
-                    "conversational reply, use empty tables, capability_refs, and evidence lists; "
+                    "call finalizeAnswer with your complete text in takeaway. For a simple "
+                    "conversational reply, use empty sections and evidence lists; "
                     "no lookup is needed. If the request still needs work, continue with the "
                     "appropriate capability or data tools, then call finalizeAnswer. "
                     "For supported claims, evidence contains successful result IDs, not tool names."
@@ -3516,20 +3533,14 @@ class AgentLoop:
                 dispatched_ids.add(tool_call.id)
                 is_unified_finalizer = tool_call.name == "finalizeAnswer"
                 if is_unified_finalizer:
-                    from .proposal import (
-                        normalize_proposal_args,
-                        retain_cited_repair_tables,
-                        validate_proposal_args,
-                    )
+                    from data_agent.runtime.composer import PresentationError, proposal_to_internal
 
-                    tool_call = replace(
-                        tool_call, arguments=retain_cited_repair_tables(
-                            normalize_proposal_args(tool_call.arguments), review_state
-                        )
-                    )
-                    error = validate_proposal_args(tool_call.arguments)
-                    if error:
-                        tool_call = replace(tool_call, argument_error=error)
+                    try:
+                        arguments = proposal_to_internal(tool_call.arguments)
+                    except PresentationError as exc:
+                        tool_call = replace(tool_call, argument_error=str(exc))
+                    else:
+                        tool_call = replace(tool_call, arguments=arguments)
                     tool_call = replace(
                         tool_call,
                         name=ANSWER_TABLE_TOOL_NAME
@@ -4029,7 +4040,6 @@ class AgentLoop:
                     and tool_result.status == "ok"
                 ):
                     proposal_args = dict(call_args)
-                    proposal_call_id = tool_call.id
                 # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
                 # pause (today only `runBlueprint`, on a slot-resolution
                 # `askUser`). This GENERALIZES the terminal `askUser` branch
@@ -4562,11 +4572,12 @@ class AgentLoop:
                 )
 
             if proposal_args is not None:
-                final_text = clean_answer_text(proposal_args.get("answer")) or ""
+                final_text = clean_answer_text(proposal_args.get("answer")) or ("The requested results are shown below." if proposal_args.get("sections") else "")
+                presentation_business_values = await self._context_business_values(session_id, turn_index)
                 final_text, proposal_redactions = scrub_answer_prose(
                     final_text,
                     provenance=await self._compute_turn_provenance_union(session_id, turn_index),
-                    business_values=await self._context_business_values(session_id, turn_index),
+                    business_values=presentation_business_values,
                 )
                 if proposal_redactions:
                     self._observer(
@@ -4655,7 +4666,22 @@ class AgentLoop:
                         **accum.result_sql_by_call_id,
                     },
                 ) if not evidence_error else None
+                from data_agent.runtime.composer import PresentationError, build_document
+
+                accum.answer_document = None
+                try:
+                    accum.answer_document = build_document(
+                        {**proposal_args, "answer": final_text}, evidence_trail,
+                        turn_index=turn_index, cards=accum.capability_cards,
+                        assumptions=accum.assumptions,
+                        business_values=presentation_business_values,
+                        sql_by_id={**{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
+                                   **accum.result_sql_by_call_id},
+                    )
+                except PresentationError as exc:
+                    evidence_complaints.append(str(exc))
                 complete = {
+                    "answer_document": accum.answer_document,
                     "answer": final_text,
                     "tables": [t.to_doc() for t in accum.answer_tables],
                     "assumptions": accum.assumptions,
@@ -4703,7 +4729,7 @@ class AgentLoop:
                 kind = "ungrounded_answer"
                 if not final_text:
                     feedback, kind = (
-                        "Provide the complete answer in finalizeAnswer.answer.",
+                        "Provide the complete answer in finalizeAnswer.takeaway.",
                         "empty_answer",
                     )
                 elif pending_intents(analysis_state):
@@ -4713,30 +4739,6 @@ class AgentLoop:
                     )
                 elif rule:
                     feedback, kind = rule.nudge(final_text), rule.charges_to
-                elif (
-                    any(
-                        e.tool_name in DATA_ANSWER_TOOLS
-                        and e.status == "ok"
-                        and e.result_preview is not None
-                        and e.result_preview.row_count > 1
-                        and e.tool_call_id
-                        not in {c["result_id"] for c in review_state.excluded_components}
-                        for e in evidence_trail
-                    )
-                    and not accum.has_answer_tables
-                    and not accum.capability_cards
-                ):
-                    echo = final_text[:MAX_NUDGE_DRAFT_CHARS]
-                    if len(echo) < len(final_text):
-                        echo += " …[truncated]"
-                    feedback, kind = (
-                        f"You drafted: {echo}\n\nThe turn is NOT over. Use finalizeAnswer.tables with the result IDs for the requested breakdown. Disclose any missing part and include the complete answer in finalizeAnswer.answer.",
-                        "answer_shape",
-                    )
-                if (kind == "answer_shape" and not rule and feedback and not evidence_error
-                    and self._answer_judge is not None and getattr(self._answer_judge, "enabled", True)):
-                    editorial_findings += ("missing_result_selection",)
-                    feedback = ""
                 rule_feedback = rule is not None and feedback == rule.nudge(final_text)
                 # Preserve the existing gate precedence, but show all evidence/prep
                 # complaints with its nudge so one repair can address them together.
@@ -4846,6 +4848,10 @@ class AgentLoop:
                                 allow_partial_answer=True,
                                 previous_rejection=review_state.feedback or review_state.violation,
                                 deliverables=tuple(deliverables),
+                                presentation_reasons=tuple(
+                                    {"section_id": s["id"], "table_reason": s["table_reason"]}
+                                    for s in proposal_args["sections"] if s.get("table_reason")
+                                ),
                                 selected_components=tuple(component_catalog),
                                 referenced_result_ids=evidence_assessment.references,
                                 capability_presented=tuple(
@@ -4982,10 +4988,6 @@ class AgentLoop:
                         )
                         review_state.site = site
                         review_state.reject(verdict, version, accum.assumptions or ())
-                        review_state.repair_tables = tuple(
-                            dict(t) for t in (proposal_args or {}).get("tables", [])
-                            if isinstance(t, dict) and isinstance(t.get("result_id"), str)
-                        ) if verdict.repair_type in {"prose", "presentation"} else ()
                         ship_guard.note_refusal(
                             site,
                             verdict.violation,
@@ -4994,7 +4996,7 @@ class AgentLoop:
                             required_population=review_state.required_population,
                         )
                         if (not review_state.repaired and review_state.calls < 2 and remaining > 0
-                            and verdict.repair_type not in {"prose", "presentation"}):
+                            and verdict.repair_type != "prose"):
                             review_state.repaired = True
                             feedback = verdict.feedback
                             finalization_nudge = answer_judge_nudge_text(final_text, feedback)
@@ -5016,19 +5018,6 @@ class AgentLoop:
                         session_id, turn_index, review_state.to_doc()
                     )
                 if not feedback or finalization_nudge is None:
-                    if review_state.approved_version == version:
-                        await self._maybe_start_summary(
-                            "finalizeAnswer", proposal_call_id, proposal_args, judge_approved=True
-                        )
-                        for event in ("tool_dispatch_start", "tool_dispatch_ok"):
-                            self._observer(
-                                event,
-                                {
-                                    "tool_name": "finalizeAnswer",
-                                    "tool_call_id": proposal_call_id,
-                                    "judge_approved": True,
-                                },
-                            )
                     if pending_intents(analysis_state):
                         self._observer(
                             "loop_enforcement_exhausted",
@@ -5082,7 +5071,7 @@ class AgentLoop:
                     "a concise supported overview rather than inventorying the catalog. If no "
                     "relevant article or option was found, finalize with that limitation. Continue "
                     "discovery only for a specific fact necessary to answer an unresolved part. "
-                    "Use finalizeAnswer; empty tables, capability_refs and evidence lists are valid "
+                    "Use finalizeAnswer; empty sections and evidence lists are valid "
                     "when declining unsupported claims."
                 )
                 discovery_rounds = 0

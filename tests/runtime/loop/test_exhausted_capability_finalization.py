@@ -5,6 +5,7 @@ import pytest
 from data_agent.runtime.capabilities.client import CapabilityDefinition
 from data_agent.runtime.capabilities.tools import GetCapabilityTool, PresentCapabilityCardTool
 from data_agent.runtime.loop.answer_judge import APPROVED, JudgeVerdict
+from tests.runtime.final_answer import recovery_sections
 from tests.runtime.test_harness_improvements import (
     CREDS,
     Judge,
@@ -17,14 +18,11 @@ from tests.runtime.test_harness_improvements import (
     run,
 )
 
+
 class ApprovingSalvage(Judge):
     async def salvage(self, brief):
         self.briefs.append(brief)
-        return {"outcome": "partial", "answer": "\n".join(f"{c['description']}: The prepared view is included." for c in brief.capability_presented), "captions": [],
-                "evidence": [c["result_id"] for c in brief.selected_components],
-                "table_result_ids": [c["result_id"] for c in brief.selected_components if c["kind"] == "table"],
-                "capability_refs": [c["capability_ref"] for c in brief.selected_components if c["kind"] == "capability"],
-                "unfinished": ["Other requested parts could not be verified."]}
+        return {'outcome': 'partial', 'takeaway': '\n'.join(f"{c['description']}: The prepared view is included." for c in brief.capability_presented), 'evidence': [c['result_id'] for c in brief.selected_components], 'unfinished': ['Other requested parts could not be verified.'], 'sections': recovery_sections([c['result_id'] for c in brief.selected_components if c['kind'] == 'table'], titles=[], capability_refs=[c['capability_ref'] for c in brief.selected_components if c['kind'] == 'capability'], evidence=[c['result_id'] for c in brief.selected_components])}
 
 
 NAMES = ("employees", "headcount", "compensation")
@@ -32,23 +30,17 @@ LABELS = ("Employees in position", "Department headcount", "Compensation history
 
 
 def finalize(ident, *, valid=False, table=False, refs=NAMES):
-    return batch(
-        call(
-            "finalizeAnswer",
-            ident,
-            answer="The requested views are available.",
-            tables=[{"result_id": "q", "caption": "Department totals"}] if table else [],
-            capability_refs=list(refs),
-            evidence=["prep:0", "prep:1", "prep:2"]
-            if valid
-            else [
-                "load:0",
-                "functions.employees",
-                "functions.headcount",
-                "resolve:3",
-            ],
-        )
+    from dataclasses import replace
+
+    from tests.runtime.final_answer import final_answer
+    result = final_answer(
+        assistant_text="The requested views are available.",
+        tables=[{"result_id": "q", "caption": "Department totals"}] if table else [],
+        capability_refs=list(refs),
+        evidence=["prep:0", "prep:1", "prep:2"] if valid else
+                 ["load:0", "functions.employees", "functions.headcount", "resolve:3"],
     )
+    return replace(result, tool_calls=[replace(result.tool_calls[0], id=ident)])
 
 
 def setup(

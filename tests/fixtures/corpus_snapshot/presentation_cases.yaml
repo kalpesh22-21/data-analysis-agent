@@ -1,0 +1,190 @@
+# Reviewed presentation candidates, not fixed runtime layouts. The request and actual
+# result completeness, grain and values still decide whether a chart is appropriate.
+bp-accrual-balance-summary: {kind: grouped, categories: [Group], measures: [Beginning Balance, Accrued Amount, Awarded Amount, Taken Amount, Source Balance Rows, Employee Count]}
+bp-accrual-code-dictionary: {kind: bars, categories: [Accrual Code], measures: [Holder Count]}
+bp-accrual-event-summary: {kind: grouped, categories: [Group, Event Status], measures: [Event Day Rows, Event Hours, Employee Count]}
+bp-active-headcount-by-department: {kind: bars, categories: [department_code, department], measures: [headcount]}
+bp-adjustment-line-volume: {kind: line, categories: [Month], measures: [Adjustment Lines, Adjustment Amount]}
+bp-age-band-distribution: {kind: bars, categories: [Age Band], measures: [Headcount, Avg Age In Band, Median Age In Band]}
+bp-approved-timeoff-hours: {kind: bars, categories: [Department], measures: [Approved Hours]}
+bp-approved-timeoff-ranking: {kind: bars, categories: [Employee Code, Employee Name], measures: [Approved Time-Off Hours, Requested Days]}
+bp-average-annual-salary-by-status: {kind: bars, categories: [Pay Type, Compensation Basis], measures: [Average Annual Compensation, Average Hourly Rate]}
+bp-average-salary-by-department: {kind: bars, categories: [department, Pay Type, Compensation Basis], measures: [average_annual_compensation, headcount, Average Hourly Rate]}
+bp-avg-request-size: {kind: bars, categories: [Earn Code, Leave Type], measures: [Average Hours, Request Rows]}
+bp-avg-shift-length: {kind: bars, categories: [Department], measures: [Avg Shift Hours, Pair Count]}
+bp-break-gap-median: {kind: bars, categories: [Employee Code, Punch Date], measures: [Median Break Gap Hours, Gap Count]}
+bp-card-vs-personal-split: {kind: bars, categories: [Expense Type], measures: [Approved Amount]}
+bp-category-by-department: {kind: bars, categories: [Department], measures: [Total Dollars]}
+bp-category-earnings-per-employee: {kind: bars, categories: [Employee Code, Employee Name], measures: [Total Dollars]}
+bp-category-hours-monthly: {kind: line, categories: [Month], measures: [Total Hours]}
+bp-category-mom-volatility: {kind: bars, categories: [Category], measures: [Current Month Dollars, Prior Month Dollars, Dollar Change, Pct Change]}
+bp-category-spend-over-threshold: {kind: bars, categories: [Employee Code, Employee Name], measures: [Total Dollars]}
+bp-change-actor-mix: {kind: bars, categories: [Month, User Type], measures: [Change Events]}
+bp-change-velocity-spikes: {kind: bars, categories: [Day], measures: [Change Events, Daily Mean, Daily Std Dev]}
+bp-clock-time-profile: {kind: bars, categories: [Department], measures: [Median Clock-In Min, Median Clock-Out Min, Pair Count]}
+bp-commission-by-employee: {kind: bars, categories: [Employee Code, Employee Name], measures: [Total Commission]}
+bp-comp-range-exceptions: {kind: bars, categories: [Employee Code], measures: [Annual Salary, Range Min, Range Mid, Range Max, Compa Ratio]}
+bp-compare-employee-check-detail-two-periods: {kind: bars, categories: [register_type, type_code, type_code_description], measures: [amount_a, amount_b, amount_delta, hours_a, hours_b]}
+bp-compare-employee-paychecks-two-periods: {kind: bars, categories: [Pay Category, Pay Code, Description], measures: [Recent Amount, Recent Hours, Prior Amount, Prior Hours, Amount Change, Hours Change]}
+bp-compensation-ranking: {kind: bars, categories: [Pay Type, Employee Code, Employee Name], measures: [Annual Compensation, Hourly Rate]}
+bp-consecutive-day-streaks: {kind: bars, categories: [Employee Code, Streak Start, Streak End], measures: [Streak Length]}
+bp-deduction-breakdown: {kind: bars, categories: [Deduction Code], measures: [Total Deductions]}
+bp-denied-expenses: {kind: bars, categories: [Department], measures: [Denied Count, Denied Amount, Denial Rate]}
+bp-department-directory: {kind: bars, categories: [Department Code, Department], measures: [Active Headcount, Total Headcount]}
+bp-department-label-audit: {kind: bars, categories: [Department Name], measures: [Affected Employees]}
+bp-department-ot-share: {kind: bars, categories: [Department], measures: [Overtime Dollars, Gross Earnings, OT Share %]}
+bp-department-scorecard: {kind: bars, categories: [Department], measures: [Active Headcount, Avg Salary (Active), Avg Tenure Years (Active), Pct Female (Active), Pct Direct Deposit (Active), On Leave, On Leave Over 1 Year No End]}
+bp-department-turnover-rate: {kind: bars, categories: [Department], measures: [Terms, Turnover Rate Pct]}
+bp-departments-above-company-average-salary: {kind: bars, categories: [Department, Pay Type, Compensation Basis], measures: [Department Average Annual Compensation, Average Hourly Rate]}
+bp-dol-status-per-work-location: {kind: bars, categories: [Work Location], measures: [Full Time, Part Time, Seasonal, None, Total]}
+bp-duplicate-expense-flag-list: {kind: bars, categories: [Employee Code], measures: [Flagged Amount, Flagged Lines]}
+bp-earning-category-dictionary: {kind: table}
+bp-earnings-by-category: {kind: scalar, measures: [Total Earnings, Total Hours]}
+bp-earnings-by-department-via-scratch-join: {kind: bars, categories: [department], measures: [total_earnings]}
+bp-earnings-by-dol-status: {kind: bars, categories: [DOL Status], measures: [Gross Earnings]}
+bp-earnings-by-pay-basis: {kind: bars, categories: [Pay Basis], measures: [Gross Earnings]}
+bp-earnings-by-work-state: {kind: bars, categories: [Work State], measures: [Gross Earnings]}
+bp-earnings-category-mix: {kind: bars, categories: [Category], measures: [Total Dollars, Total Hours, Dollar Pct, Hours Pct]}
+bp-earnings-category-trend: {kind: line, categories: [Month], measures: [Total Dollars]}
+bp-earnings-monthly-trend: {kind: line, categories: [Month], measures: [Total Earnings]}
+bp-earnings-quarter-to-date: {kind: scalar, measures: [Gross Earnings, Net Pay]}
+bp-effective-mileage-rate: {kind: bars, categories: [Expense Rule], measures: [Total Approved, Total Miles, Effective Rate]}
+bp-employee-benefits-summary: {kind: bars, categories: [Benefit Code], measures: [Total Benefit Contributions]}
+bp-employee-change-timeline: {kind: table}
+bp-employee-change-volume: {kind: bars, categories: [Month, Changed Field], measures: [Change Events]}
+bp-employee-check-detail-for-period: {kind: bars, categories: [register_type, type_code, type_code_description], measures: [amount, hours]}
+bp-employee-coverage-matrix: {kind: table}
+bp-employee-date-summary: {kind: grouped, categories: [Group], measures: [Employee Count]}
+bp-employee-day-clock-span: {kind: table}
+bp-employee-directory: {kind: table}
+bp-employee-record-dq-flags: {kind: table}
+bp-employee-summary: {kind: grouped, categories: [Group, Pay Type, Compensation Basis], measures: [Employee Count, Known Compensation Count, Annual Compensation Sum, Average Annual Compensation, Minimum Annual Compensation, Maximum Annual Compensation, Average Hourly Rate]}
+bp-employee-tax-withheld: {kind: bars, categories: [Tax Code], measures: [Total Tax Withheld]}
+bp-employee-tenure-summary: {kind: grouped, categories: [Group], measures: [Valid Hire Date Count, Average Elapsed Years, Minimum Elapsed Years, Maximum Elapsed Years]}
+bp-employees-in-inactive-seats: {kind: table}
+bp-employer-tax-summary: {kind: bars, categories: [Tax Code], measures: [Total Employer Tax]}
+bp-expense-approval-backlog: {kind: bars, categories: [Employee Code], measures: [Pending Lines, Pending Amount, Avg Days Pending]}
+bp-expense-approval-trim: {kind: bars, categories: [Expense Rule], measures: [Approved Total, Submitted Total, Trimmed Total, Line Count]}
+bp-expense-by-account-category: {kind: bars, categories: [Account Code, Account Description], measures: [Approved Spend]}
+bp-expense-by-policy: {kind: bars, categories: [Policy], measures: [Approved Spend, Line Count]}
+bp-expense-concept-spend: {kind: bars, categories: [Matched Description], measures: [Approved Spend, Line Count]}
+bp-expense-cycle-time: {kind: line, categories: [Month], measures: [Line Count, Median Submission To Approval, Median Approval To Payment]}
+bp-expense-line-size-distribution: {kind: bars, categories: [Account Description, Band Start], measures: [Line Count]}
+bp-expense-monthly-trend: {kind: line, categories: [Month], measures: [Total Approved Spend]}
+bp-expense-payroll-recon: {kind: table}
+bp-expense-per-capita: {kind: bars, categories: [Department], measures: [Approved Spend, Active Headcount, Per Capita Spend]}
+bp-expense-senders-no-punches: {kind: table}
+bp-expenses-unreconciled-to-payroll: {kind: bars, categories: [Expense Status], measures: [Line Count, Total Amount]}
+bp-fica-medicare-totals: {kind: bars, categories: [Tax Side, Tax Code], measures: [Total Tax]}
+bp-future-dated-position-changes: {kind: table}
+bp-future-hire-roster: {kind: table}
+bp-future-termination-roster: {kind: table}
+bp-gross-earnings-period-compare: {kind: line, categories: [Period], measures: [Gross Earnings]}
+bp-gross-earnings-summary: {kind: scalar, measures: [Total Gross Earnings]}
+bp-gross-wages-date-window: {kind: scalar, measures: [Total Gross Wages]}
+bp-headcount-by-dol-status: {kind: bars, categories: [DOL Status], measures: [Headcount]}
+bp-headcount-by-hire-era: {kind: bars, categories: [Hire Era], measures: [Headcount, Avg Tenure Years]}
+bp-headcount-by-pay-frequency: {kind: bars, categories: [Pay Frequency], measures: [Headcount]}
+bp-headcount-by-union: {kind: bars, categories: [Union Code], measures: [Headcount]}
+bp-headcount-by-work-city-country: {kind: bars, categories: [Country, State, City], measures: [Headcount]}
+bp-headcount-by-works-in-state: {kind: bars, categories: [Works In State], measures: [Headcount, Lives Elsewhere]}
+bp-headcount-growth-rate: {kind: line, categories: [Month], measures: [Hires, Terms, Net Delta]}
+bp-headcount-monthly-trend: {kind: line, categories: [Month], measures: [Active Headcount, Terms In Month]}
+bp-hires-in-range: {kind: line, categories: [month], measures: [hires]}
+bp-hires-per-month: {kind: line, categories: [month], measures: [hires]}
+bp-hires-projection: {kind: scalar, measures: [hires_in_window, avg_monthly_hires, projected_next_n_hires]}
+bp-holiday-work-audit: {kind: line, categories: [Punch Date], measures: [Employees, Total Hours, Line Count]}
+bp-inactive-supervisor-audit: {kind: table}
+bp-inactive-without-leave-start: {kind: table}
+bp-labor-allocation-coverage: {kind: bars, categories: [Mapping Status], measures: [Headcount]}
+bp-labor-allocation-dictionary: {kind: bars, categories: [Allocation Code, Allocation Description], measures: [Usage Count]}
+bp-labor-allocation-resolution: {kind: table}
+bp-labor-allocation-rollup: {kind: bars, categories: [Allocation Code, Allocation Description], measures: [Active Headcount, Avg Salary]}
+bp-latest-hired-employees: {kind: table}
+bp-long-shift-days: {kind: bars, categories: [Employee Code, Punch Date], measures: [Daily Hours, Line Count]}
+bp-longest-tenured-employees: {kind: bars, categories: [Employee Code, Name], measures: [Tenure Years]}
+bp-manager-span-of-control: {kind: bars, categories: [Manager Code, Manager], measures: [Direct Reports]}
+bp-median-annual-salary: {kind: scalar, measures: [Median Annual Salary, Headcount]}
+bp-median-hourly-rate-by-state-union: {kind: bars, categories: [Works In State, Union Flag], measures: [Median Hourly Rate, Headcount]}
+bp-median-salary-by-position-level: {kind: bars, categories: [Position Level], measures: [Median Annual Salary, Headcount]}
+bp-mileage-summary: {kind: scalar, measures: [Approved Amount, Approved Miles, Submitted Miles]}
+bp-missing-emergency-contacts: {kind: table}
+bp-missing-receipts: {kind: bars, categories: [Expense Rule, Rule Description], measures: [Missing Receipts, Missing Share]}
+bp-missing-supervisor-exceptions: {kind: table}
+bp-name-identity-audit: {kind: table}
+bp-negative-paycheck-employees: {kind: table}
+bp-negative-pto-balances: {kind: table}
+bp-net-pay-summary: {kind: scalar, measures: [Total Net Pay]}
+bp-new-hire-90d-attrition: {kind: scalar, measures: [Hires In Window, Terms Within 90 Days, 90-Day Attrition Pct]}
+bp-night-shift-share: {kind: bars, categories: [Department], measures: [Total Hours, Night Hours, Night Share Pct]}
+bp-orphan-register-codes: {kind: bars, categories: [Employee Code], measures: [Register Lines]}
+bp-ot-two-basis-tieout: {kind: table}
+bp-overtime-by-department: {kind: bars, categories: [department], measures: [earnings]}
+bp-overtime-hours-dollars: {kind: bars, categories: [Department], measures: [Overtime Dollars, Overtime Hours]}
+bp-paid-hours-summary: {kind: scalar, measures: [Total Paid Hours]}
+bp-pairs-per-day-distribution: {kind: bars, categories: [Pairs Per Day], measures: [Employee-Days]}
+bp-pay-timing-exceptions: {kind: table}
+bp-payout-request-summary: {kind: scalar, measures: [Payout Requests, Total Hours, Employees]}
+bp-payroll-codes-unmapped: {kind: table}
+bp-payroll-duplicate-line-audit: {kind: table}
+bp-payroll-line-counts: {kind: scalar, measures: [Register Lines, Distinct Checks]}
+bp-payroll-setup-gap-scorecard: {kind: table}
+bp-payroll-summary: {kind: grouped, categories: [Group], measures: [Payroll Amount, Source Line Count, Employee Count]}
+bp-pending-timeoff-queue: {kind: table}
+bp-placeholder-category-audit: {kind: scalar, measures: [Distinct Earn Codes, Total Dollars, Total Hours]}
+bp-position-change-activity: {kind: bars, categories: [Department, Changed Field], measures: [Change Events]}
+bp-post-termination-accrual-audit: {kind: table}
+bp-post-termination-changes: {kind: bars, categories: [Employee Code, Changed Field], measures: [Post-Termination Changes]}
+bp-post-termination-pay-audit: {kind: table}
+bp-punch-anomalies: {kind: table}
+bp-punch-coverage-gap: {kind: scalar, measures: [Active Employees, Employees With Punches, Employees Without Punches, Coverage Pct]}
+bp-punch-pair-summary: {kind: grouped, categories: [Group], measures: [Pair Count, Employee Count, Observed Days, Paid Hours, Pair Earning Amount]}
+bp-punch-plus-timeoff-overlap: {kind: bars, categories: [Employee Code, Employee Name], measures: [Overlap Days]}
+bp-punch-source-audit: {kind: bars, categories: [Month, Table Source], measures: [Pair Count]}
+bp-punch-type-mix: {kind: bars, categories: [In Punch Type, Out Punch Type], measures: [Pair Count]}
+bp-quarterly-terminations-with-top-reasons: {kind: bars, categories: [Quarter, Term Reason], measures: [Terms]}
+bp-records-per-status: {kind: bars, categories: [Employee Status], measures: [Records]}
+bp-register-type-breakdown: {kind: bars, categories: [Register Type], measures: [Total Amount]}
+bp-regular-vs-premium-hours-ratio: {kind: line, categories: [Month], measures: [Regular Hours, Premium Hours, Regular Pct]}
+bp-rehired-employees: {kind: table}
+bp-retroactive-change-share: {kind: bars, categories: [Changed Field], measures: [Retroactive Changes, Share Pct]}
+bp-salary-distribution: {kind: bars, categories: [Pay Type, Compensation Basis, Lower Bound, Upper Bound Exclusive], measures: [Employee Count, Percent Within Pay Type]}
+bp-salary-exact-median: {kind: grouped, categories: [Group, Pay Type, Compensation Basis], measures: [Known Compensation Count, Exact Median Annual Compensation, Average Annual Compensation, Minimum Annual Compensation, Maximum Annual Compensation, Average Hourly Rate]}
+bp-salary-histogram: {kind: bars, categories: [Salary Band], measures: [Headcount]}
+bp-salary-threshold-count: {kind: bars, categories: [Pay Type, Compensation Basis], measures: [Employee Count]}
+bp-salary-threshold-directory: {kind: table}
+bp-shift-differential-spend: {kind: scalar, measures: [Shift Differential Dollars, Shift Differential Hours]}
+bp-supervision-anomalies: {kind: table}
+bp-supervisor-chain-depth: {kind: bars, categories: [Chain Depth], measures: [Headcount, Share Pct]}
+bp-tenure-band-distribution: {kind: bars, categories: [Tenure Band], measures: [Headcount]}
+bp-termination-family: {kind: table}
+bp-timecard-earnings-all-history: {kind: bars, categories: [Earn Code], measures: [Total Earnings, Total Hours]}
+bp-timecard-earnings-summary: {kind: grouped, categories: [Group], measures: [Timecard Earning Amount, Paid Hours, Entry Count, Employee Count, Observed Days]}
+bp-timecard-vs-register-recon: {kind: table}
+bp-timeoff-by-leave-type: {kind: bars, categories: [Earn Code, Earn Description], measures: [Approved Hours]}
+bp-timeoff-denial-rate: {kind: bars, categories: [Department], measures: [Decided Requests, Denied Requests, Denial Rate Pct]}
+bp-timeoff-funnel: {kind: bars, categories: [Status], measures: [Request Count]}
+bp-timeoff-lead-time: {kind: bars, categories: [Earn Code, Leave Type], measures: [Median Lead Days, Request Rows]}
+bp-timeoff-seasonality: {kind: line, categories: [Month], measures: [Approved Hours]}
+bp-timeoff-vs-paid-leave-tieout: {kind: table}
+bp-timeoff-withdrawal-rate: {kind: bars, categories: [Department], measures: [Total Requests, Removed Requests, Withdrawal Rate Pct]}
+bp-top-changed-fields: {kind: bars, categories: [Changed Field], measures: [Change Events]}
+bp-top-codes-in-category: {kind: bars, categories: [Earn Code, Description], measures: [Total Dollars, Total Hours]}
+bp-top-expense-spenders: {kind: bars, categories: [Employee Code, Employee Name], measures: [Approved Spend]}
+bp-top-home-zip-city: {kind: bars, categories: [Zip Code, City, State], measures: [Headcount]}
+bp-top-payroll-codes: {kind: bars, categories: [Type Code], measures: [Total Amount]}
+bp-top-timeoff-users: {kind: bars, categories: [Employee Code, Employee Name], measures: [Approved Hours, Current Balance Hours]}
+bp-total-earnings-by-department: {kind: bars, categories: [department], measures: [total_earnings]}
+bp-unpaid-active-employees: {kind: table}
+bp-unused-leave-roster: {kind: bars, categories: [Employee Code, Employee Name], measures: [Balance Hours]}
+bp-upcoming-anniversaries: {kind: table}
+bp-upcoming-timeoff-roster: {kind: table}
+bp-weekend-work-share: {kind: line, categories: [Month], measures: [Total Hours, Weekend Hours, Weekday Hours, Weekend Share Pct]}
+bp-weekly-overtime-hours: {kind: bars, categories: [Employee Code, Week Start], measures: [Weekly Hours, Overtime Hours]}
+bp-worked-hours-daily: {kind: line, categories: [Punch Date], measures: [Total Hours, Line Count]}
+bp-workforce-composition: {kind: bars, categories: [Employment Type, DOL Status], measures: [Headcount, Share Pct]}
+bp-workforce-diversity-profile: {kind: bars, categories: [Gender, Marital Status, Age Band, EEO-1 Category, Leadership Cohort], measures: [Headcount, Share Pct]}
+bp-workforce-kpi-bundle: {kind: scalar, measures: [Active Headcount, Total Records, W2 Share Pct, Median Annual Salary, Avg Tenure Years, Pct Full Time, Pct Direct Deposit, Hires In Window, Terms In Window, Turnover Rate In Window, On Leave, Missing Emergency Contacts]}
+bp-workforce-movements: {kind: table}
+bp-ytd-earnings-per-employee: {kind: bars, categories: [Employee Code, Employee Name], measures: [Gross Earnings, Net Pay, Paid Hours]}
+bp-zero-net-pay-employees: {kind: table}

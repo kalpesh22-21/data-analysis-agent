@@ -11,6 +11,7 @@ from data_agent.runtime.capabilities.tools import GetCapabilityTool, PresentCapa
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult, _build_preview
 from data_agent.runtime.loop.answer_judge import JudgeVerdict
 from data_agent.runtime.loop.turn_accumulators import TurnAccumulators
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.test_harness_improvements import CREDS, Judge, batch, build, call, run
 
 
@@ -51,9 +52,7 @@ async def test_real_handler_reload_and_prose_repair_reuse_preparation():
         return call(name, ident, employees=["Venkat"])
 
     def answer(ident, text):
-        return call(
-            "finalizeAnswer", ident, answer=text, tables=[], capability_refs=[name], evidence=["p1"]
-        )
+        return call("finalizeAnswer", ident, **answer_arguments(takeaway=text, tables=[], capability_refs=[name], evidence=["p1"]))
 
     judge = Judge(
         [
@@ -152,16 +151,9 @@ def prepare(ident, employee="Venkat"):
 
 
 def finish(failed=False, evidence="p1"):
-    return call(
-        "finalizeAnswer",
-        "finish",
-        answer="I don't have any information to answer your question."
+    return call("finalizeAnswer", "finish", **answer_arguments(takeaway="I don't have any information to answer your question."
         if failed
-        else "Select the employee in the displayed option.",
-        tables=[],
-        capability_refs=[] if failed else ["show_profile"],
-        evidence=[] if failed else [evidence],
-    )
+        else "Select the employee in the displayed option.", tables=[], capability_refs=[] if failed else ["show_profile"], evidence=[] if failed else [evidence]))
 
 
 @pytest.mark.parametrize("failed", [False, True])

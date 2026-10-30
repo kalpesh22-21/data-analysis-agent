@@ -23,6 +23,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -30,6 +31,7 @@ import anyio
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from opentelemetry import context as otel_context
 from pydantic import BaseModel
 from starlette.types import Send
 
@@ -186,57 +188,13 @@ def _format_sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def _outcome_to_dict(outcome: TurnOutcome, *, data_as_of_enabled: bool = True) -> dict[str, Any]:
+def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
+    """One presentation contract; no parallel prose/table/card payloads."""
     return {
         "status": outcome.status,
-        "assistant_text": outcome.assistant_text,
         "pending_question": outcome.pending_question,
         "tool_calls_made": outcome.tool_calls_made,
-        # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §1):
-        # additive, nullable fields. `sql_executed`/`answer_sql`/`blueprint_use`/
-        # `verification` pass through as-is; `provenance` projects the fail-closed
-        # `frozenset[(db.table, column)]` union to a sorted, deduped list of
-        # `"database.table.column"` strings.
-        #
-        # `sql_executed` (was `sql`) is EVERY query the turn ran — the audit list,
-        # including probes and intermediate steps. `answer_sql` is the ONE query the
-        # model designated as the answer via `presentTable`; the UI runs that itself
-        # against `POST /query/page` and renders it with real paging. The two are
-        # deliberately distinct: what ran, versus what the answer IS.
-        #
-        # `result_table` is GONE. It carried a fixed ~20-row `ResultPreview` of
-        # whichever query happened to run last — unpageable, and chosen by the
-        # runtime rather than the model.
-        "sql_executed": outcome.sql_executed,
-        "answer_sql": outcome.answer_sql,
-        "blueprint_use": outcome.blueprint_use,
-        "verification": outcome.verification,
-        # 08: EVERY table the model designated, one per part of a multi-part answer,
-        # each with its own `caption`, `blueprint_use` chip and `verification` badge
-        # and each paged independently through `POST /query/page`. ADDITIVE — the
-        # three keys above keep their meaning and are derived from `answer_tables[0]`
-        # in the loop, so an old client that ignores this key renders exactly as it
-        # did (the posture `assumptions` shipped with).
-        "answer_tables": (
-            outcome.answer_tables
-            if data_as_of_enabled or outcome.answer_tables is None
-            else [
-                {key: value for key, value in table.items() if key != "data_as_of"}
-                for table in outcome.answer_tables
-            ]
-        ),
-        "extra_evidence": outcome.extra_evidence,
-        "provenance": (
-            sorted(f"{db}.{col}" for db, col in outcome.provenance)
-            if outcome.provenance is not None
-            else None
-        ),
-        # recordAssumptions (docs/decisions/ui-assumptions-contract.md): the
-        # model-declared, plain-English assumptions behind this answer. Pass-through
-        # list-or-`None` (the `[] -> None` fork mirrors `sql`), so an old client
-        # ignores the unknown key.
-        "assumptions": outcome.assumptions,
-        "capability_cards": outcome.capability_cards,
+        **({"answer_document": outcome.answer_document} if outcome.answer_document is not None and not outcome.status.startswith("paused") else {}),
         **({"review": outcome.review} if outcome.review is not None else {}),
         **({"failure": outcome.failure} if outcome.failure is not None else {}),
     }
@@ -246,7 +204,6 @@ async def _stream_turn(
     agent_loop_call: Callable[[], Awaitable[TurnOutcome]],
     emitter: ProgressEmitter,
     *,
-    data_as_of_enabled: bool = True,
     delivery_observer=None,
 ) -> AsyncIterator[str]:
     """Drive one `AgentLoop.run`/`resume` call as a background task while
@@ -260,9 +217,23 @@ async def _stream_turn(
             emitter.close()
 
     task = asyncio.create_task(_runner())
+    events = emitter.stream().__aiter__()
+    next_event = asyncio.create_task(anext(events))
+    sequence = 0
+    turn_id = str(uuid4())
     try:
-        async for event in emitter.stream():
-            yield _format_sse("progress", {"step": event.step, "shape": event.shape})
+        while True:
+            ready, _ = await asyncio.wait({next_event}, timeout=10)
+            if not ready:
+                yield ": heartbeat\n\n"
+                continue
+            try:
+                event = next_event.result()
+            except StopAsyncIteration:
+                break
+            sequence += 1
+            yield _format_sse("progress", {"turn_id": turn_id, "sequence": sequence, "phase": event.shape.get("phase", "analyzing"), "message": event.step})
+            next_event = asyncio.create_task(anext(events))
 
         try:
             outcome = await task
@@ -280,18 +251,27 @@ async def _stream_turn(
             return
 
         yield _format_sse(
-            "result", _outcome_to_dict(outcome, data_as_of_enabled=data_as_of_enabled)
+            "result", _outcome_to_dict(outcome)
         )
         if delivery_observer:
-            delivery_observer("loop_response_emitted", {"status": outcome.status})
+            # The worker's agent.turn has ended; retain its parentage for delivery.
+            context = tracing.context_from_traceparent(outcome.delivery_traceparent)
+            token = otel_context.attach(context) if context is not None else None
+            try:
+                delivery_observer("loop_response_emitted", {"status": outcome.status})
+            finally:
+                if token is not None:
+                    otel_context.detach(token)
     finally:
         # The request owns this worker. Retrieve its result even when the consumer
         # closes between events, and shield cleanup from Starlette's disconnect
         # cancel scope so async resource cleanup can finish before we return.
+        if not next_event.done():
+            next_event.cancel()
         if not task.done():
             task.cancel()
         with anyio.CancelScope(shield=True):
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.gather(task, next_event, return_exceptions=True)
 
 
 class _TurnStreamingResponse(StreamingResponse):
@@ -1007,7 +987,15 @@ def create_app(
                 await asyncio.to_thread(tracing.shutdown_tracing, tracer_provider)
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
-    app.include_router(export_router(settings, _extract_credentials, session_catalog))
+    async def _resolve_snapshot_table(credentials, table_ref):
+        from data_agent.runtime.answer_access import resolve_table
+
+        credentials = await _session_credentials(credentials)
+        doc = await session_store.get_or_create_session(credentials.session_id)
+        return await resolve_table(doc, table_ref, credentials, session_store)
+
+    app.include_router(export_router(settings, _extract_credentials, session_catalog,
+                                    resolve_table_sql=_resolve_snapshot_table))
 
 
     # Readiness gate (singleton-hydrator redesign): an UNAUTHENTICATED probe the runtime
@@ -1130,11 +1118,12 @@ def create_app(
                     session_id=x_session_id, credentials=credentials, user_message=body.message
                 )
                 tracing.record_turn_output(turn_span, outcome)
-                return outcome
+                return replace(outcome, delivery_traceparent=tracing.inject_current_traceparent())
 
         return _TurnStreamingResponse(
-            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled, delivery_observer=_tracing_observer),
+            _stream_turn(_call, emitter, delivery_observer=_tracing_observer),
             media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.post("/turn/resume")
@@ -1176,11 +1165,12 @@ def create_app(
                     session_id=x_session_id, credentials=credentials, answer=body.answer
                 )
                 tracing.record_turn_output(turn_span, outcome)
-                return outcome
+                return replace(outcome, delivery_traceparent=tracing.inject_current_traceparent())
 
         return _TurnStreamingResponse(
-            _stream_turn(_call, emitter, data_as_of_enabled=settings.data_as_of_enabled, delivery_observer=_tracing_observer),
+            _stream_turn(_call, emitter, delivery_observer=_tracing_observer),
             media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.get("/session/history")
@@ -1266,6 +1256,19 @@ def create_app(
             observer=combine_observers(_tracing_observer, *extra_observers),
         )
         return JSONResponse(content={"session_id": x_session_id, **body})
+
+    @app.get("/answer/action")
+    async def answer_action(answer_id: str, capability_ref: str,
+                            authorization: str | None = Header(default=None),
+                            x_session_id: str | None = Header(default=None, alias="X-Session-Id")):
+        credentials = _extract_credentials(authorization=authorization, session_id=x_session_id, settings=settings)
+        credentials = await _session_credentials(credentials)
+        from data_agent.runtime.answer_access import resolve_action
+        doc = await session_store.get_or_create_session(credentials.session_id)
+        try:
+            return resolve_action(doc, answer_id, capability_ref, credentials)
+        except PermissionError:
+            return JSONResponse(status_code=404, content={"error": "The prepared action is unavailable."})
 
     @app.post("/query/page")
     async def query_page(

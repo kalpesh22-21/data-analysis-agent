@@ -52,7 +52,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview
 from tests._blueprint_gate import expand_blueprint
-from tests.runtime.final_answer import final_answer
+from tests.runtime.final_answer import answer_arguments, final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
@@ -189,32 +189,9 @@ async def test_the_answer_with_table_exit_scrubs_prose_and_leaves_the_sql_alone(
     this turn — withheld in the sentence, verbatim in the SQL the UI renders
     beside it. Both assertions are load-bearing in OPPOSITE directions."""
     loop, store, events = _build(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="a1",
-                        name="answerWithTable",
-                        arguments={
-                            "answer": f"Grouped {_E} by department_name.",
-                            "tables": [{"sql": _SQL}],
-                        },
-                    )
-                ]
-            ),
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="a2",
-                        name="answerWithTable",
-                        arguments={
-                            "answer": f"Grouped {_E} by department_name.",
-                            "tables": [{"sql": _SQL}],
-                        },
-                    )
-                ]
-            ),
-        ],
+        [ModelTurnResult(tool_calls=[ToolCallRequest(id="q", name="runQuery", arguments={"sql": _SQL})]),
+         final_answer(assistant_text=f"Grouped {_E} by department_name.", tables=[{"result_id": "q"}])],
+        mcp=FakeMCPClient(scripted={"runQuery": [{"columns": ["Department", "n"], "rows": [["Sales", 3]], "row_count": 1}]}),
         runtime_tools={"answerWithTable": AnswerWithTableTool()},
     )
 
@@ -246,6 +223,7 @@ class _FakeBlueprintTool:
     ) -> ToolResult:
         return ToolResult(
             status="ok",
+            authoritative=True,
             tool_name="runBlueprint",
             error_code=None,
             retryable=None,
@@ -281,11 +259,8 @@ async def test_a_blueprint_id_is_withheld_from_prose_while_blueprint_use_still_n
                 tool_calls=[
                     ToolCallRequest(
                         id="a1",
-                        name="answerWithTable",
-                        arguments={
-                            "answer": f"I ran {_BP}: Sales leads with 3.",
-                            "tables": [{"blueprint_id": _BP}],
-                        },
+                        name="finalizeAnswer",
+                        arguments=answer_arguments(takeaway=f"I ran {_BP}: Sales leads with 3.", tables=[{"result_id": "rb1"}]),
                     )
                 ]
             ),

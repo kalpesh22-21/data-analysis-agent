@@ -18,7 +18,7 @@ _logger = logging.getLogger(__name__)
 _UNAVAILABLE = {"error": "The query service could not be run.", "error_code": "EXPORT_UNAVAILABLE"}
 
 
-def export_router(settings, extract_credentials, session_catalog, *, transport=None):
+def export_router(settings, extract_credentials, session_catalog, *, transport=None, resolve_table_sql=None):
     router = APIRouter(prefix="/query/snapshots", tags=["Answer Snapshots"])
 
     async def proxy(request, path, authorization, session_id, *, download=False):
@@ -55,6 +55,20 @@ def export_router(settings, extract_credentials, session_catalog, *, transport=N
         }
         if request.method == "POST":
             headers["Content-Type"] = request.headers.get("content-type", "application/json")
+        body = await request.body() if request.method == "POST" else None
+        if request.method == "POST" and path == "":
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeDecodeError):
+                return JSONResponse(status_code=400, content={"error": "Invalid snapshot request."})
+            if isinstance(payload, dict) and "table_ref" in payload:
+                if resolve_table_sql is None or "sql" in payload or not isinstance(payload["table_ref"], str):
+                    return JSONResponse(status_code=400, content={"error": "Select one approved table reference."})
+                try:
+                    sql = await resolve_table_sql(credentials, payload.pop("table_ref"))
+                except PermissionError:
+                    return JSONResponse(status_code=404, content={"error": "The selected answer data is unavailable."})
+                body = json.dumps({**payload, "sql": sql}).encode()
         timeout = 150.0 if request.method == "POST" else 120.0 if download else 60.0
         client = httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False)
         upstream = None
@@ -75,7 +89,7 @@ def export_router(settings, extract_credentials, session_catalog, *, transport=N
                 request.method,
                 url,
                 headers=headers,
-                content=await request.body() if request.method == "POST" else None,
+                content=body,
             )
             upstream = await client.send(outgoing, stream=True)
             response_headers = {

@@ -70,7 +70,7 @@ _STEP_LABELS: dict[str, str] = {
     "loop_read_refetch_limit": "using information already received",
     "loop_help_center_circuit_opened": "product guidance is temporarily unavailable",
     "loop_no_new_evidence_stop": "stopping — no additional information was found",
-    "loop_ask_user_batch_calls_dropped": "deferring other work until your answer",
+    "loop_ask_user_batch_calls_dropped": "checking whether more information is needed",
     # Retrieval and model-call starts stay internal; UI progress comes from tool steps.
     "blueprint_rule_resolved": "identified the requested group to include",
     "tool_dispatch_start": "working on the next part of your question…",
@@ -136,12 +136,18 @@ def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | No
     Returns `None` for observer events that have no user-facing progress label; callers
     simply drop those.
     """
-    if payload.get("tool_name") == "updateAnalysisState":
+    if event == "loop_presentation_review_started":
+        phase = payload.get("phase", "checking_answer")
+        message = "Checking whether more information is needed" if phase == "checking_information_need" else "Checking the answer"
+        return ProgressEvent(message, {"phase": phase})
+    if event in {"loop_answer_judge_refused", "loop_finalization_refused"}:
+        return ProgressEvent("Refining the analysis", {"phase": "refining_analysis"})
+    if payload.get("tool_name") in {"updateAnalysisState", "answerWithText", "answerWithTable", "finalizeAnswer"}:
         return None
-    # Answer tools stage proposals; their dispatch success is not judge approval.
-    if payload.get("tool_name") in {"answerWithText", "answerWithTable", "finalizeAnswer"}:
-        if payload.get("judge_approved") is not True:
-            return None
+    if payload.get("tool_name") == "askUser":
+        if event == "tool_dispatch_start":
+            return ProgressEvent("Checking whether more information is needed", {"phase": "checking_information_need"})
+        return None
     if event == _PROGRESS_SUMMARY_EVENT:
         # Value-rich, LLM-authored line → straight into `step` (verbatim, never
         # templated so a `{` in the text cannot raise). D25-relaxed channel; see

@@ -390,21 +390,8 @@ async def _query_tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
     return [{"type": "function", "name": "runQuery", "description": "", "parameters": {}}]
 
 
-async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> None:
-    """THE PREFIX IS THE TEST, second instance (05 §J, 06). The answer-shape gate
-    is a MEASUREMENT feature as much as a correction: it exists because the
-    unconditional "present a table" rule failed live and nobody could see it
-    failing. If `loop_answer_shape_refused` did not survive `guardrail_observer` —
-    which drops every event lacking the `loop_` prefix, silently — the gate would
-    correct turns in production and report nothing, and the raw-recorder tests in
-    `tests/runtime/loop/test_answer_shape_gate.py` would stay green throughout.
-    That is exactly how `loop_analysis_state_auto_bound` shipped mute for a review
-    round, so this drives the REAL observer instead.
-
-    It also proves the payload EXPORTS: `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` is a
-    strict allowlist, so a correctly-named span can still arrive carrying nothing,
-    and `multi_row_calls` is the only attribute this event has.
-    """
+async def test_approved_prose_does_not_emit_automatic_table_refusals() -> None:
+    """Multirow evidence alone must not trigger a table repair or refusal span."""
     tracer, exporter = _tracer_with_memory_exporter()
     observer = tracing.guardrail_observer(tracer)
 
@@ -432,9 +419,6 @@ async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> 
                     )
                 ]
             ),
-            # Bare-text finish holding three untabled rows -> refused once...
-            final_answer(assistant_text="Sales 3, Eng 2, Ops 1."),
-            # ...then again on the round handed back -> exhausted, and it passes.
             final_answer(assistant_text="Sales 3, Eng 2, Ops 1."),
         ]
     )
@@ -457,19 +441,8 @@ async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> 
 
     spans = exporter.get_finished_spans()
     refused = [s for s in spans if s.name == ANSWER_SHAPE_REFUSED_EVENT]
-    assert len(refused) == 1, (
-        "the answer-shape refusal did not survive guardrail_observer — check the "
-        f"`loop_` prefix on {ANSWER_SHAPE_REFUSED_EVENT!r}"
-    )
-    assert dict(refused[0].attributes)["multi_row_calls"] == 1, (
-        "the refusal span exported no `multi_row_calls` — the key is missing from "
-        "_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST, so the span carries nothing"
-    )
-    exhausted = [s for s in spans if s.name == ANSWER_SHAPE_EXHAUSTED_EVENT]
-    assert len(exhausted) == 1, (
-        "the exhausted counter did not survive guardrail_observer — check the "
-        f"`loop_` prefix on {ANSWER_SHAPE_EXHAUSTED_EVENT!r}"
-    )
+    assert not refused
+    assert not [s for s in spans if s.name == ANSWER_SHAPE_EXHAUSTED_EVENT]
     # D25: the gate reads row counts and emits a count. No SQL, no cell value, no
     # question text reaches any span this turn.
     for finished_span in spans:

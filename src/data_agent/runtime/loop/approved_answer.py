@@ -19,6 +19,7 @@ def answer_version(text, accum, trail, turn_index, scope_hash, evidence_ids=None
     return fingerprint(
         {
             "answer": text or "",
+            "answer_document": accum.answer_document,
             "tables": [table.to_doc() for table in accum.answer_tables],
             "cards": accum.capability_cards,
             "assumptions": accum.assumptions,
@@ -30,6 +31,8 @@ def answer_version(text, accum, trail, turn_index, scope_hash, evidence_ids=None
 
 
 def approve_answer(state, text, accum, trail, turn_index):
+    if accum.answer_document is not None:
+        accum.answer_document = {**accum.answer_document, "takeaway": text or ""}
     state.approved_evidence = tuple(
         entry.tool_call_id
         for entry in trail
@@ -44,6 +47,7 @@ def approve_answer(state, text, accum, trail, turn_index):
 def normalize_approved_text(text, *, provenance, business_values=frozenset(), has_tables=False):
     """Normalize presentation before binding approval; never discard supported content."""
     from data_agent.runtime.answer_scrub import scrub_answer_prose
+
     from .answer_rules import strip_markdown_tables
 
     if not isinstance(text, str):

@@ -7,6 +7,7 @@ from data_agent.runtime.loop.proposal import ReviewState
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.session.models import TurnMessage
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import final_answer, recovery_sections
 from tests.runtime.loop.test_answer_judge_unit import _raw_turn
 from tests.runtime.test_harness_improvements import (
     CREDS,
@@ -29,14 +30,8 @@ def build(*args, **kwargs):
     return result
 
 
-PART = {
-    "answer": "Sales has 120 employees in the available records.",
-    "evidence": ["q"],
-    "table_result_ids": [],
-    "capability_refs": [],
-    "unfinished": ["The leave ranking could not be verified."],
-}
-TEXT = PART["answer"] + "\n\nUnfinished: " + PART["unfinished"][0]
+PART = {'takeaway': 'Sales has 120 employees in the available records.', 'evidence': ['q'], 'unfinished': ['The leave ranking could not be verified.'], 'sections': recovery_sections([], capability_refs=[], evidence=['q'])}
+TEXT = PART["takeaway"] + "\n\nUnfinished: " + PART["unfinished"][0]
 
 
 def reject(part=None):
@@ -50,15 +45,7 @@ def reject(part=None):
 
 
 def final():
-    return batch(
-        call(
-            "finalizeAnswer",
-            "final",
-            answer="There are 120 employees. The leave ranking is shown.",
-            tables=[{"result_id": "q", "caption": "Headcount"}],
-            evidence=["q"],
-        )
-    )
+    return final_answer(assistant_text="There are 120 employees. The leave ranking is shown.", tables=[{"result_id": "q", "caption": "Headcount"}], evidence=["q"])
 
 
 async def test_terminal_review_delivers_partial_and_history_omits_unapproved_table():
@@ -83,13 +70,13 @@ async def test_terminal_review_delivers_partial_and_history_omits_unapproved_tab
 
 
 async def test_cached_partial_survives_unavailable_later_review_and_keeps_approved_table():
-    part = {**PART, "table_result_ids": ["q"]}
+    part = {**PART, 'sections': recovery_sections(['q'])}
     judge = Judge([reject(part), APPROVED])
     loop, store, _, _, _ = build([discovery(), query(), final(), final()], judge)
     out = await run(loop)
     assert out.assistant_text == TEXT
     assert len(out.answer_tables) == 1
-    assert out.answer_tables[0]["caption"] == "Headcount"
+    assert out.answer_tables[0]["caption"] == "Results"
     assert len(judge.briefs) == 2  # reuse the independent subset approval
     doc = await store.get_or_create_session(CREDS.session_id)
     history = project_history(doc.messages, doc.tool_trail, CREDS.column_scope, None)
@@ -112,10 +99,10 @@ async def test_later_full_rejection_preserves_independently_approved_partial():
         {"evidence": ["missing"]},
         {"evidence": ["s"]},
         {"evidence": []},
-        {"table_result_ids": ["missing"]},
-        {"capability_refs": ["missing"]},
+        {'sections': recovery_sections(['missing'])},
+        {'sections': recovery_sections([], capability_refs=['missing'])},
         {"unfinished": []},
-        {"answer": ""},
+        {'takeaway': ''},
     ],
 )
 async def test_invalid_partial_never_clears_rejection(changes):
@@ -146,7 +133,7 @@ async def test_judge_contract_parses_independent_partial_approval():
 
 
 def test_scope_change_discards_cached_partial():
-    state = ReviewState(scope_hash="old", approved_partial={"answer": TEXT})
+    state = ReviewState(scope_hash="old", approved_partial={'takeaway': TEXT})
     assert not ReviewState.restore(state.to_doc(), "new").approved_partial
 
 
@@ -216,13 +203,7 @@ async def test_no_successful_evidence_cannot_produce_partial():
 async def test_partial_selects_only_approved_capability_and_persists_selection():
     from tests.runtime.loop.test_exhausted_capability_finalization import setup
 
-    part = {
-        "answer": "The employee view is available.",
-        "evidence": ["prep:0"],
-        "table_result_ids": [],
-        "capability_refs": ["employees"],
-        "unfinished": ["Compensation history could not be verified."],
-    }
+    part = {'takeaway': 'The employee view is available.', 'evidence': ['prep:0'], 'unfinished': ['Compensation history could not be verified.'], 'sections': recovery_sections([], capability_refs=['employees'], evidence=['prep:0'])}
     loop, store, _, _ = setup(Judge([reject(part)]))
     loop._answer_judge_review_budget_seconds = 90.0
     out = await run(loop)
@@ -374,3 +355,43 @@ async def test_exit_deadline_is_independent_of_remaining_budget(monkeypatch, con
         assert deadlines == [expected]
     finally:
         CURRENT_DELIVERY.reset(token)
+
+
+async def test_model_failure_after_blueprint_preserves_terminal_query_for_salvage():
+    from dataclasses import replace
+
+    import httpx
+
+    from tests.runtime.test_harness_improvements import Tool
+
+    class Blueprint(Tool):
+        async def run(self, *args, **kwargs):
+            result = await super().run(*args, **kwargs)
+            return replace(result, authoritative=True)
+
+    sql = "SELECT Department, COUNT(*) AS n FROM hr.employee GROUP BY Department"
+    blueprint = Blueprint("runBlueprint", {
+        "status": "verified", "blueprint_id": "bp", "terminal_sql": sql,
+        "verify": {"grain_ok": True, "signature_ok": True, "grain_checked": True},
+        "columns": ["Department", "n"], "rows": [["Sales", 120]], "row_count": 1,
+    })
+    judge = Judge([reject({**PART, 'sections': recovery_sections(['q'])})])
+    loop, _, model, _, _ = build(
+        [batch(call("getBlueprint", "g", id="bp")),
+         batch(call("runBlueprint", "q", id="bp", slot_bindings={}))],
+        judge, extra={"getBlueprint": Tool("getBlueprint", {"found": True}),
+                      "runBlueprint": blueprint},
+    )
+    send = model.send_turn
+
+    async def fail_after_blueprint(*args, **kwargs):
+        if model.calls_made >= 2:
+            raise httpx.ConnectError("injected model failure")
+        return await send(*args, **kwargs)
+
+    model.send_turn = fail_after_blueprint
+    out = await run(loop)
+    assert out.review["status"] == "approved"
+    assert out.answer_tables[0]["sql"] == sql
+    assert out.answer_document["sections"][0]["presentation"]["result_id"] == "q"
+    assert judge.briefs[0].selected_components[0]["result_id"] == "q"

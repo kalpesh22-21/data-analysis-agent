@@ -7,6 +7,7 @@ import pytest
 from data_agent.runtime.loop.proposal import extra_evidence
 from data_agent.runtime.session.models import ResultPreview
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.loop.test_repository_regressions import entry
 from tests.runtime.test_harness_improvements import (
     CREDS,
@@ -98,14 +99,7 @@ async def test_verified_count_blueprint_is_returned_as_extra_evidence():
         [
             batch(call("runBlueprint", "bp", id="count-employees", slot_bindings={})),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "answer",
-                    answer="There are 120 employees.",
-                    tables=[],
-                    capability_refs=[],
-                    evidence=["bp"],
-                )
+                call("finalizeAnswer", "answer", **answer_arguments(takeaway="There are 120 employees.", tables=[], capability_refs=[], evidence=["bp"]))
             ),
         ],
         extra={"runBlueprint": CountBlueprint()},
@@ -127,25 +121,23 @@ async def test_three_citations_only_two_explicit_tables_reach_result_and_history
         [
             discovery(),
             *[batch(call("runQuery", f"q{n}", sql=sql)) for n, sql in enumerate(queries)],
-            batch(call(
-                "finalizeAnswer", "answer", answer="There are 120 employees.",
-                tables=[{"result_id": "q0", "caption": "Count"},
-                        {"result_id": "q1", "caption": "Check"}],
-                evidence=["q0", "q1", "q2"], capability_refs=[],
-            )),
+            batch(call("finalizeAnswer", "answer", **answer_arguments(takeaway="There are 120 employees.", tables=[{"result_id": "q0", "caption": "Count"},
+                        {"result_id": "q1", "caption": "Check"}], evidence=["q0", "q1", "q2"], capability_refs=[]))),
         ],
         rows=[{"columns": [f"Count {n}"], "rows": [[120]], "row_count": 1} for n in range(3)],
     )
     out = await run(loop, "Count employees and show the first two results.")
     wire = _outcome_to_dict(out)
-    assert [t["caption"] for t in wire["answer_tables"]] == ["Count", "Check"]
-    assert [e["result_id"] for e in wire["extra_evidence"]] == ["q2"]
-    assert wire["extra_evidence"][0]["sql"] == queries[2]
+    assert [t["title"] for t in wire["answer_document"]["sections"]] == ["Count", "Check"]
+    assert [e["result_id"] for e in out.extra_evidence] == ["q2"]
+    assert out.extra_evidence[0]["sql"] == queries[2]
+    assert set(wire["answer_document"]["sources"]) == {"q0", "q1"}
+    assert "extra_evidence" not in wire
     doc = await store.get_or_create_session(CREDS.session_id)
     messages = [TurnMessage.from_doc(m.to_doc()) for m in doc.messages]
     history = project_history(messages, doc.tool_trail, CREDS.column_scope, None)["turns"][0]
-    assert history["extra_evidence"] == wire["extra_evidence"]
-    assert history["answer_tables"] == wire["answer_tables"]
+    assert history["extra_evidence"] == out.extra_evidence
+    assert history["answer_tables"] == out.answer_tables
     narrowed = project_history(messages, doc.tool_trail, frozenset({"hr.employee.Salary"}), None)["turns"][0]
     assert narrowed["extra_evidence"] is None
 

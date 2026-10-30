@@ -543,3 +543,13 @@ async def test_no_thinking_retry_is_isolated_and_removes_thinking_budget():
     }
     assert transport.chat.completions.calls[1]["extra_body"] == {"thinking_token_budget": 4096}
     assert retry._max_retries == 0
+
+
+@pytest.mark.parametrize("model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-2025-04-14"])
+async def test_non_reasoning_openai_salvage_omits_provider_template_kwargs(model):
+    transport = _FakeOpenAIClient([], [_chat_message_result("salvaged")])
+    client = OpenAIModelClient(transport, model=model)
+    result = await client.without_thinking({"enable_thinking": False, "thinking": False}).begin_turn().send_turn([], [])
+    assert result.assistant_text == "salvaged"
+    assert "extra_body" not in transport.chat.completions.calls[0]
+    assert not client._chat_template_kwargs

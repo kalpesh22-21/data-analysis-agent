@@ -73,12 +73,16 @@ class TurnMessage:
     failure: dict[str, Any] | None = None
     delivered_components: dict[str, Any] | None = None
     extra_evidence: list[dict[str, Any]] | None = None
+    answer_document: dict[str, Any] | None = None
+    prepared_actions: list[dict[str, Any]] | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
             "turn_index": self.turn_index,
             "role": self.role,
             "content": self.content,
+            **({"prepared_actions": self.prepared_actions} if self.prepared_actions is not None else {}),
+            **({"answer_document": self.answer_document} if self.answer_document is not None else {}),
             **({"extra_evidence": self.extra_evidence} if self.extra_evidence is not None else {}),
             **({"review": self.review} if self.review is not None else {}),
             **({"failure": self.failure} if self.failure is not None else {}),
@@ -105,6 +109,8 @@ class TurnMessage:
             turn_index=int(doc["turn_index"]),
             role=doc["role"],
             content=doc["content"],
+            answer_document=doc.get("answer_document"),
+            prepared_actions=doc.get("prepared_actions"),
             review=doc.get("review"),
             failure=doc.get("failure"),
             delivered_components=doc.get("delivered_components"),

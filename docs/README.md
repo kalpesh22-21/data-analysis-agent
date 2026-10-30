@@ -24,6 +24,8 @@ fundamentals of OpenAI's in-house data agent but adapted for a **curated** wareh
 
 ## Proposed designs
 
+- [Unified answer document UI specification](ui-answer-document-spec.md) — implemented Lane5 answer contract and Ember/BFF handoff, including remaining coordinated integration work.
+
 - [Compact episodic memory](episodic-memory-design.md) — task checkpoints, bounded context, retrieval, and evidence expansion; planned for later implementation.
 
 ## Decision record

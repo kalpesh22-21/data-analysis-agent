@@ -47,6 +47,7 @@ from typing import Any, Literal
 import httpx
 from openai import APITimeoutError
 
+from data_agent.runtime.composer import RECOVERY_SCHEMA
 from data_agent.runtime.model.client import ModelClient, ModelTurnResult, begin_turn_client
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.prompts import ANSWER_MARKDOWN_GUIDANCE
@@ -291,6 +292,7 @@ class JudgeBrief:
     results: tuple[Mapping[str, Any], ...] = ()
     # The answer under judgement: `result.assistant_text` at `exit_prose`, the
     # `answerWithTable` `answer` argument at `exit_table`.
+    answer_document: Mapping[str, Any] | None = None
     draft: str = ""
     allow_prose_correction: bool = False
     allow_partial_answer: bool = False
@@ -308,6 +310,7 @@ class JudgeBrief:
     designated_tool_call_ids: tuple[str, ...] = ()
     deliverables: tuple[Mapping[str, Any], ...] = ()
     measurement_contracts: tuple[Mapping[str, Any], ...] = ()
+    presentation_reasons: tuple[Mapping[str, Any], ...] = ()
     selected_components: tuple[Mapping[str, Any], ...] = ()
     excluded_components: tuple[Mapping[str, Any], ...] = ()
     evidence_package: Mapping[str, Any] = field(default_factory=dict)
@@ -318,6 +321,7 @@ class JudgeBrief:
         doc: dict[str, Any] = {
             "evidence_package": dict(self.evidence_package),
             "referenced_result_ids": list(self.referenced_result_ids),
+            "presentation_reasons": list(self.presentation_reasons),
             "allow_prose_correction": self.allow_prose_correction,
             "allow_partial_answer": self.allow_partial_answer,
             "terminal_partial_review": self.terminal_partial_review,
@@ -331,6 +335,8 @@ class JudgeBrief:
             "selected_components": list(self.selected_components),
             "excluded_components": list(self.excluded_components),
         }
+        if self.answer_document is not None and self.site != "ask_user":
+            doc["answer_document"] = self.answer_document
         if self.date_anchor:
             doc["today"] = self.date_anchor
         if self.site == "ask_user":
@@ -542,27 +548,9 @@ def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> d
                     ],
                 },
                 "partial_answer": {
+                    **RECOVERY_SCHEMA,
                     "type": ["object", "null"],
-                    "description": (
-                        "When allow_partial_answer is true and you reject the full answer, "
-                        "optionally approve this exact supported subset for fallback delivery. "
-                        "This is a separate approval, not a suggested unreviewed draft."
-                    ),
-                    "properties": {
-                        "answer": {"type": "string"},
-                        "evidence": {"type": "array", "items": {"type": "string"}},
-                        "table_result_ids": {"type": "array", "items": {"type": "string"}},
-                        "capability_refs": {"type": "array", "items": {"type": "string"}},
-                        "unfinished": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-                    },
-                    "required": [
-                        "answer",
-                        "evidence",
-                        "table_result_ids",
-                        "capability_refs",
-                        "unfinished",
-                    ],
-                    "additionalProperties": False,
+                    "description": "Independently approve an exact supported answer document subset, including presentation, with explicit unfinished requested outcomes.",
                 },
                 "corrected_answer": {
                     "type": ["string", "null"],
@@ -610,6 +598,20 @@ def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> d
 # after which a prompt edit silently changes judge behaviour with nothing testing it. What
 # follows restates ONLY the rules these criteria test.
 _ANSWER_JUDGE_PROMPT = (
+    "Review answer_document as the complete proposed UI answer, including section titles, "
+    "values, source bindings, actions, caveats, and fallback tables. Internal selected tables "
+    "include supporting data: only presentation.kind=table is a visible grid. Strongly prefer "
+    "zero or one visible table; penalize redundant grids and components. Additional tables "
+    "are justified only by distinct requested value or an explicit user request. Never drop "
+    "requested coverage to satisfy that preference. Wrong layout, confusing titles, duplicate "
+    "tables or source selection require repair_type=presentation using existing receipts, "
+    "not another query. Currency/count/time units do not prove additivity; prohibit invented "
+    "totals, shares and folds. Check ranking direction and ties, time scope and missing-vs-zero. "
+    "Prose corrections only replace the takeaway; use presentation repair for section text. "
+    "If the backend documents why a requested chart is shown as a table, review that actual "
+    "table and reason. Do not reject solely for the chart limitation or demand the same "
+    "unsupported chart again. Approve when the table conveys the supported answer honestly. "
+
     "When allow_partial_answer is true, a rejected full answer may include partial_answer: "
     "your independently approved useful findings, exact evidence IDs, and an explicit list of "
     "unfinished parts. Review that subset fully before returning it. Keep approved=false with "
@@ -617,11 +619,14 @@ _ANSWER_JUDGE_PROMPT = (
     "deliver the approved subset if work stops. Lead with supported findings. Even one request "
     "can have useful partial findings. Never infer correctness from tool success alone. "
     "Use existing evidence only, including successful results not selected in the original draft. "
-    "Select displayed tables/cards only from selected_components, by table_result_ids or "
-    "capability_refs; empty arrays display none. No original assumptions or other components "
-    "will accompany the partial answer; state necessary qualifications in answer. The exact "
-    "display is answer followed by two newlines and 'Unfinished: ' plus unfinished items joined "
-    "with spaces. Approve this complete display and its selected components together. "
+    "Use takeaway, sections, evidence and unfinished. Sections use the same presentation selectors "
+    "as finalizeAnswer, with exact result IDs/columns, evidence_refs, caveats and actions. "
+    "Select data and prepared actions only from selected_components. Preserve requested charts "
+    "when supported; validate their complete rows, measures, ranking and dates. An explained "
+    "table fallback is acceptable; only missing substantive findings require unfinished work. "
+    "No original assumptions accompany recovery; put necessary qualifications in the document. "
+    "The display is takeaway plus 'Unfinished: ' and the reasons, followed by the selected sections. "
+    "Approve that entire display, not just its prose. "
     "Unfinished parts must be missing user-requested outcomes, not editorial repairs, "
     "assumption wording, unrequested categories, or unproven organization-wide completeness "
     "when accessible-record scope is stated. A PTO-only question does not require non-PTO "
@@ -748,6 +753,9 @@ _ANSWER_JUDGE_PROMPT = (
     "a genuine new assumption.\n"
     "\n"
     "APPROVE UNLESS ONE OF THESE IS TRUE:\n"
+    "If a requested/default date or metric basis is unpopulated, clarification to confirm an "
+    "available alternative is appropriate. Do not demand an unrequested substitute as analysis "
+    "repair or treat that substitute as full completion without user confirmation. "
     "- unrecorded_assumption: the answer rests on a choice the user cannot see and that "
     "`recorded_assumptions` does not carry — a period the question did not name, a "
     "population narrowed one way rather than another, a definition picked among "
@@ -839,7 +847,7 @@ _ANSWER_JUDGE_PROMPT = (
     "do not invent a failure cause. Report the single most fundamental problem or approve."
 )
 _ANSWER_JUDGE_PROMPT += (
-    "\nFor corrected_answer, partial_answer.answer and salvage answer text: "
+    "\nFor corrected_answer, partial_answer.takeaway and salvage takeaway text: "
     + ANSWER_MARKDOWN_GUIDANCE
     + " Missing Markdown styling alone is not grounds for rejection or new analysis."
 )
@@ -1324,6 +1332,10 @@ class AnswerJudge:
     async def salvage(self, brief):
         from .salvage import salvage
         return await salvage(self, brief)
+
+    async def approve_presentation_fallback(self, brief):
+        from .salvage import approve_presentation_fallback
+        return await approve_presentation_fallback(self, brief)
 
     async def partial_relevance(self, snapshot, current, questions):
         from .salvage import relevant

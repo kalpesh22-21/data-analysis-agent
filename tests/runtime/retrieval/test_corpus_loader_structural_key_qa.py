@@ -10,11 +10,11 @@ covers the two things that only show up at the LOAD level:
      Both policies are pinned here so they are not mistaken for one another. Also pinned:
      each blueprint gets its OWN key across a batch, which is the live risk introduced by
      hoisting the derivation into a third `zip(..., strict=True)` sequence.
-  2. CANON/FIXTURE DRIFT — `test_every_canon_fixture_produces_a_structural_key` asserts
-     10/10 coverage against `tests/fixtures/corpus/blueprints.yaml`, the HERMETIC MIRROR
-     of the real MCP canon. If the mirror drifts from
-     `clickhouse-api/app/corpus/data/blueprints/`, that coverage claim silently stops
-     describing the real corpus. A drift guard is what keeps the claim meaningful.
+  2. CANON/SNAPSHOT DRIFT — the complete snapshot in
+     `tests/fixtures/corpus_snapshot/blueprints.yaml` must match the real MCP corpus.
+     It is separate from the small `fixtures/corpus` demo seed, whose local warehouse
+     schema and historical extraction fixtures intentionally remain fixed. The full
+     snapshot drives corpus-wide S4 round-trip tests even without a sibling checkout.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from data_agent.runtime.retrieval.corpus_loader import (
     resolve_blueprint_references,
 )
 
-_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "corpus"
+_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "corpus_snapshot"
 _REAL_CANON_DIR = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/corpus/data/blueprints")
 
 # The fields that feed the structural key. Drift in ANY of these changes the digest and
@@ -300,10 +300,7 @@ def _fixture_docs() -> dict[str, Any]:
 
 
 def test_the_hermetic_fixture_covers_the_same_blueprint_ids_as_the_real_canon() -> None:
-    """`test_every_canon_fixture_produces_a_structural_key` asserts `len(blueprints) == 10`
-    against the MIRROR. That number is only meaningful if the mirror still has the same
-    blueprints as the real MCP canon — otherwise a newly-authored canon blueprint whose
-    template the recipe cannot normalize would ship unnoticed."""
+    """A new or removed corpus blueprint must be reflected in the committed snapshot."""
     canon, fixture = _real_canon_docs(), _fixture_docs()
     assert set(canon) - set(fixture) == set(), "canon has blueprints the fixture mirror lacks"
     assert set(fixture) - set(canon) == set(), "fixture has blueprints the real canon lacks"
@@ -367,7 +364,7 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
     class of silent mirror drift this file exists to catch. Measured: the composite's
     key is byte-identical before and after the extraction."""
     canon = _real_canon_docs()
-    assert len(canon) == 29  # Canonical blueprint inventory.
+    assert len(canon) == 188  # Canonical blueprint inventory, synchronized 2026-10-29.
 
     seeds, _ = corpus_seeds_from_export({"blueprints": canon})
     assert len(seeds) == len(canon), "the export projection dropped a canon blueprint"

@@ -32,7 +32,7 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError
-from tests.runtime.final_answer import final_answer
+from tests.runtime.final_answer import answer_arguments, final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
@@ -503,11 +503,7 @@ async def test_dispatched_tool_call_persists_trail_entry_and_full_result() -> No
                 ]
             ),
             final_answer(assistant_text="Here are the employee codes."),
-            # The two-row result trips the ANSWER-SHAPE GATE (05 §J): the first
-            # prose finish is refused once and handed back a round. This test is
-            # about trail persistence, so it simply answers in prose again — the
-            # window's one grant is spent, and the second finish passes.
-            final_answer(assistant_text="Here are the employee codes."),
+
         ]
     )
     raw_result = {
@@ -523,10 +519,10 @@ async def test_dispatched_tool_call_persists_trail_entry_and_full_result() -> No
         session_id=SESSION_ID, credentials=_credentials(), user_message="List employee codes."
     )
     assert outcome.status == "done"
-    assert outcome.tool_calls_made == 3
+    assert outcome.tool_calls_made == 2
 
     trail = await store.load_trail(SESSION_ID)
-    assert len(trail) == 3
+    assert len(trail) == 2
     entry = trail[0]
     assert entry.tool_call_id == "call_1"
     assert entry.tool_name == "runQuery"
@@ -1177,20 +1173,10 @@ async def test_registered_runtime_tool_intercepted_one_call_never_dispatched() -
 
 
 def _finalize_options(names, answer="Use the displayed options.", ident="final"):
-    return ModelTurnResult(
-        tool_calls=[
-            ToolCallRequest(
-                id=ident,
-                name="finalizeAnswer",
-                arguments={
-                    "answer": answer,
-                    "tables": [],
-                    "capability_refs": names,
-                    "evidence": [],
-                },
-            )
-        ]
-    )
+    from dataclasses import replace
+    result = final_answer(assistant_text=answer, capability_refs=names,
+                          evidence=[f"cap_{i+1}" for i in range(len(names))])
+    return replace(result, tool_calls=[replace(result.tool_calls[0], id=ident)])
 
 
 async def test_capability_cards_drain_the_batch_and_finish_together() -> None:
@@ -1344,11 +1330,8 @@ async def test_help_center_answer_reaches_judge_without_sql_grounding_refusal() 
                 tool_calls=[
                     ToolCallRequest(
                         id="answer_1",
-                        name="answerWithText",
-                        arguments={
-                            "answer": "The documented limit is 1,000.",
-                            "evidence": ["getHelpCenterDocument"],
-                        },
+                        name="finalizeAnswer",
+                        arguments=answer_arguments(takeaway="The documented limit is 1,000.", evidence=["help_1"]),
                     )
                 ]
             ),
@@ -1397,11 +1380,8 @@ async def test_help_center_grounding_rejection_preserves_general_judge_allowance
                 tool_calls=[
                     ToolCallRequest(
                         id="answer_1",
-                        name="answerWithText",
-                        arguments={
-                            "answer": "The limit is 2,000.",
-                            "evidence": ["getHelpCenterDocument"],
-                        },
+                        name="finalizeAnswer",
+                        arguments=answer_arguments(takeaway="The limit is 2,000.", evidence=["help_1"]),
                     )
                 ]
             ),
@@ -1409,11 +1389,8 @@ async def test_help_center_grounding_rejection_preserves_general_judge_allowance
                 tool_calls=[
                     ToolCallRequest(
                         id="answer_2",
-                        name="answerWithText",
-                        arguments={
-                            "answer": "The documented limit is 1,000.",
-                            "evidence": ["getHelpCenterDocument"],
-                        },
+                        name="finalizeAnswer",
+                        arguments=answer_arguments(takeaway="The documented limit is 1,000.", evidence=["help_1"]),
                     )
                 ]
             ),
@@ -1452,12 +1429,8 @@ async def test_capability_card_waits_for_required_answer_table() -> None:
                     ToolCallRequest(
                         id="answer_1",
                         name="finalizeAnswer",
-                        arguments={
-                            "answer": "Here are the results and the requested page.",
-                            "tables": [{"result_id": "query_1"}],
-                            "capability_refs": [capability.name],
-                            "evidence": ["query_1"],
-                        },
+                        arguments=answer_arguments(takeaway="Here are the results and the requested page.",
+                            tables=[{"result_id": "query_1"}], capability_refs=[capability.name], evidence=["query_1", "cap_1"]),
                     )
                 ]
             ),

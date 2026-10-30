@@ -34,7 +34,6 @@ class ReviewState:
     intent_id: str = ""
     result_ids: tuple[str, ...] = ()
     repair_type: str = ""
-    repair_tables: tuple[dict[str, Any], ...] = ()
     approved_version: str = ""
     approved_evidence: tuple[str, ...] = ()
     assumptions_before_refusal: tuple[str, ...] = ()
@@ -51,13 +50,11 @@ class ReviewState:
             return cls(scope_hash=scope_hash)
         state = cls(**{k: v for k, v in value.items() if k in cls.__dataclass_fields__})
         state.excluded_components = tuple(state.excluded_components)
-        state.repair_tables = tuple(state.repair_tables)
         state.result_ids = tuple(state.result_ids)
         state.approved_evidence = tuple(state.approved_evidence)
         state.assumptions_before_refusal = tuple(state.assumptions_before_refusal)
         state.calls = min(2, max(0, int(state.calls)))
         if state.scope_hash != scope_hash:
-            state.repair_tables = ()
             state.excluded_components = ()
             state.approved_version = ""
             state.approved_evidence = ()
@@ -250,38 +247,6 @@ def assess_deliverable_evidence(state, args, trail) -> EvidenceAssessment:
     )
 
 
-def retain_cited_repair_tables(args: dict[str, Any], state: ReviewState) -> dict[str, Any]:
-    """A prose-only repair retains prior tables still cited as evidence.
-
-    References re-enter normal table resolution and exclusion checks. Never reuse
-    raw SQL, uncited results, or selections from a different scope.
-    """
-    if not (state.repaired and state.repair_type in {"prose", "presentation"}
-            and args.get("tables") == [] and isinstance(args.get("evidence"), list)):
-        return args
-    refs = {r for r in args["evidence"] if isinstance(r, str)}
-    tables = [dict(t) for t in state.repair_tables
-              if isinstance(t, dict) and isinstance(t.get("result_id"), str)
-              and t["result_id"] in refs]
-    return {**args, "tables": tables} if tables else args
-
-
-def normalize_proposal_args(args: dict[str, Any]) -> dict[str, Any]:
-    """Default omitted selections; inferred table references still require validation."""
-    normalized = dict(args)
-    normalized.setdefault("capability_refs", [])
-    if "evidence" not in normalized:
-        tables = normalized.get("tables")
-        normalized["evidence"] = list(
-            dict.fromkeys(
-                table["result_id"]
-                for table in (tables if isinstance(tables, list) else [])
-                if isinstance(table, dict) and isinstance(table.get("result_id"), str)
-            )
-        )
-    return normalized
-
-
 def extra_evidence(references, trail, selected=(), excluded=(), sql_by_id=None):
     """Project cited support separately from explicitly selected UI components.
 
@@ -305,15 +270,6 @@ def extra_evidence(references, trail, selected=(), excluded=(), sql_by_id=None):
             receipt["result_preview"] = entry.result_preview.to_doc()
         receipts.append(receipt)
     return receipts or None
-
-
-def validate_proposal_args(args: Any) -> str | None:
-    from jsonschema import Draft202012Validator
-
-    from data_agent.runtime.mcp.tool_schema import FINALIZE_ANSWER_SCHEMA
-
-    error = next(Draft202012Validator(FINALIZE_ANSWER_SCHEMA["parameters"]).iter_errors(args), None)
-    return ("Invalid finalizeAnswer arguments: " + error.message[:400]) if error else None
 
 
 def selected_components(args, trail, result_sql_by_call_id=None):
@@ -400,6 +356,13 @@ def filter_excluded_components(args, excluded):
         )
 
     result = dict(args)
+    if isinstance(result.get("sections"), list):
+        # Drop the whole dependent section, including titles and fallback tables.
+        # A repair must explicitly propose any supported replacement for review.
+        result["sections"] = [s for s in result["sections"]
+                              if not (set(s.get("evidence_refs", [])) & ids)
+                              and not any(a.get("capability_ref") in names
+                                          for a in s.get("actions", []))]
     if rejected_table(result):
         for key in ("sql", "blueprint_id", "result_id"):
             result.pop(key, None)

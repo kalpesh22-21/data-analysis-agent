@@ -1,3 +1,4 @@
+
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.provenance.capture import capture_provenance
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TrailEntry
+from tests.runtime.final_answer import answer_arguments
 
 PAYLOAD = {
     "columns": [
@@ -135,14 +137,7 @@ async def test_real_loop_finalizes_context_without_resolving_or_querying():
         [
             batch(call("getTableSchema", "schema", database="hr", table="accruals")),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "final",
-                    answer="VAC_CTX means Vacation. This is current client configuration.",
-                    tables=[],
-                    capability_refs=[],
-                    evidence=["schema"],
-                )
+                call("finalizeAnswer", "final", **answer_arguments(takeaway="VAC_CTX means Vacation. This is current client configuration.", tables=[], capability_refs=[], evidence=["schema"]))
             ),
         ],
         judge=judge,

@@ -35,3 +35,5 @@ deploy/helm/*/Chart.lock
 remote-developer.md
 docs/remote-*
 kimi_api_key.txt
+/NEW_FEATURE.md
+/EMBER-CARDS.md

@@ -43,7 +43,7 @@ from data_agent.runtime.session.models import (
     live_analysis_state,
 )
 from data_agent.runtime.session_history import project_history
-from tests.runtime.final_answer import final_answer
+from tests.runtime.final_answer import answer_arguments, final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
@@ -52,7 +52,7 @@ _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
 
 STATE = "updateAnalysisState"
-ANSWER = "answerWithTable"
+ANSWER = "answerWithText"
 
 # A marker string that appears ONLY inside an intent description, so a leak into
 # telemetry / a persisted message is unambiguous wherever it turns up.
@@ -161,9 +161,9 @@ def _completed(intent_id: str, evidence: str) -> dict[str, Any]:
     }
 
 
-def _answer_call(call_id: str, answer: str = "Here is the answer.") -> ToolCallRequest:
+def _answer_call(call_id: str, answer: str = "I cannot answer from the available information.") -> ToolCallRequest:
     return ToolCallRequest(
-        id=call_id, name=ANSWER, arguments={"answer": answer, "tables": [{"sql": "SELECT 1"}]}
+        id=call_id, name="finalizeAnswer", arguments=answer_arguments(takeaway=answer)
     )
 
 
@@ -217,7 +217,7 @@ async def test_a_turn_with_no_live_state_finalizes_through_both_exits() -> None:
             [
                 ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
             ],
-            "Here is the answer.",
+            "I cannot answer from the available information.",
         ),
     ):
         loop, store, events, _ = _build(script)
@@ -333,7 +333,7 @@ async def test_exit_two_is_refused_with_a_retryable_error_naming_the_intents() -
     # Retryable, or the turn it exists to keep alive would end here.
     assert doc.finalization_blocks["0:1:intents"] == 1
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "answer_with_table", "pending_count": 2}
+        {"exit": "answer_with_text", "pending_count": 2}
     ]
     # The designation never became the turn's answer table.
     assert outcome.answer_sql is None
@@ -362,7 +362,7 @@ async def test_the_refusal_precedes_answer_sql_resolution_and_its_hooks() -> Non
                     tool_calls=[
                         ToolCallRequest(
                             id="a1",
-                            name=ANSWER,
+                            name="answerWithTable",
                             # Names a blueprint that never ran this turn — the
                             # `ANSWER_TABLE_BLUEPRINT_NOT_RUN` shape.
                             arguments={

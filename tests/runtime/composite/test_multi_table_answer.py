@@ -1,19 +1,10 @@
-"""Multi-table `answerWithTable` (docs/decisions/release-1/08-multi-table-answer.md).
+"""Internal table-resolution and saved-history regressions.
 
-Covers `composite/answer_with_table.py`'s designation resolver and the loop /
-history / wire consequences of it. It is a sibling of `test_answer_with_table.py`
-rather than an extension of it because the single-table file IS the regression
-suite for the 6/6 shorthand path, and keeping the two apart makes it obvious which
-assertions guard the shape that already works.
-
-WHAT THE MEASUREMENT WAS. `answerWithTable` carried ONE `sql`/`blueprint_id`, so a
-multi-intent turn produced several result sets and could name only one of them:
-6/6 on single-deliverable turns, 1/9 on multi-intent ones across 17 live sessions.
-Two prompt-level merge rules were written to close the gap and BOTH were reverted
-after live measurement, because the instruction set they created was unsatisfiable
-rather than badly worded. Nothing here can prove the model uses the new payload —
-only a live multi-intent turn can (07 §A's whole point). What these tests prove is
-that when it does, the runtime carries every table honestly.
+Live answer selection now requires execution references and is covered by
+`tests/runtime/test_answer_document.py` and `tests/runtime/test_app.py`.
+Retired raw-SQL finalization and parallel UI-envelope assertions are intentionally
+not part of the new document contract. Keep these resolver/history checks for
+existing saved sessions and the private verification machinery.
 """
 
 from __future__ import annotations
@@ -451,129 +442,12 @@ def test_the_roll_up_is_an_and_and_never_emits_passed_false() -> None:
     assert json.dumps([rollup_verification([verified, unverified])]) == "[null]"
 
 
-async def test_mixed_verification_is_reported_per_table_and_rolled_up_conservatively() -> None:
-    """The honest-reporting case, end to end: one verified blueprint table and one
-    raw `sql=` table.
-
-    Per table the badge is exact; the envelope's badge is withheld, because a green
-    badge over a set containing a hand-written query is a claim about something the
-    user is looking at that nothing checked.
-    """
-    loop, _store, _events = _build(
-        [
-            _run_blueprints("bp-headcount"),
-            _answer(
-                "a1",
-                answer="Headcount and salaries.",
-                tables=[
-                    {"blueprint_id": "bp-headcount", "caption": "Headcount"},
-                    {"sql": SALARY_SQL, "caption": "Salaries"},
-                ],
-            ),
-        ],
-        blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
-    )
-    await expand_blueprint(_store, SESSION_ID, "bp-headcount")
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert [t["sql"] for t in outcome.answer_tables] == [HEADCOUNT_SQL, SALARY_SQL]
-    assert [t["caption"] for t in outcome.answer_tables] == ["Headcount", "Salaries"]
-    assert outcome.answer_tables[0]["verification"] == {
-        "passed": True,
-        "status": "structural checks passed",
-        "method": "blueprint_gate",
-        "grain_checked": True,
-    }
-    # A `sql=` table is ALWAYS null: there is nothing that verified it.
-    assert outcome.answer_tables[1]["verification"] is None
-    assert outcome.answer_tables[1]["blueprint_use"] is None
-    # AND over the designated set.
-    assert outcome.verification is None
-    # …and nowhere in the whole payload is there a `passed: false`.
-    assert '"passed": false' not in json.dumps(
-        {"verification": outcome.verification, "answer_tables": outcome.answer_tables}
-    )
 
 
-async def test_two_verified_blueprints_roll_up_green() -> None:
-    loop, store, _events = _build(
-        [
-            _run_blueprints("bp-headcount", "bp-salary"),
-            _answer(
-                "a1",
-                answer="Both.",
-                tables=[{"blueprint_id": "bp-headcount"}, {"blueprint_id": "bp-salary"}],
-            ),
-        ],
-        blueprints={
-            "bp-headcount": (HEADCOUNT_SQL, True),
-            "bp-salary": (SALARY_SQL, True),
-        },
-    )
-    await expand_blueprint(store, SESSION_ID, "bp-headcount")
-    await expand_blueprint(store, SESSION_ID, "bp-salary")
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert outcome.verification == {
-        "passed": True,
-        "status": "structural checks passed",
-        "method": "blueprint_gate",
-        "grain_checked": True,
-    }
-    assert [t["blueprint_use"]["blueprint_id"] for t in outcome.answer_tables] == [
-        "bp-headcount",
-        "bp-salary",
-    ]
 
 
-async def test_an_unverified_blueprint_table_carries_no_badge() -> None:
-    """The badge is derived from the SAME `runBlueprint` result that produced that
-    table's terminal SQL — captured at ONE site, so the two can never be paired
-    from different runs. An unverified run yields no badge, not a false one."""
-    loop, store, _events = _build(
-        [
-            _run_blueprints("bp-headcount"),
-            _answer("a1", answer="x", tables=[{"blueprint_id": "bp-headcount"}]),
-        ],
-        blueprints={"bp-headcount": (HEADCOUNT_SQL, False)},
-    )
-    await expand_blueprint(store, SESSION_ID, "bp-headcount")
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert outcome.answer_tables[0]["verification"] is None
-    assert outcome.answer_tables[0]["blueprint_use"] == {
-        "blueprint_id": "bp-headcount",
-        "slots": {},
-    }
-    assert outcome.verification is None
 
 
-async def test_a_verified_blueprint_plus_a_raw_sql_answer_loses_its_badge() -> None:
-    """THE DELIBERATE BEHAVIOUR CHANGE (08 §C.3), asserted rather than discovered.
-
-    `_accumulate_enrichment` set `verification` from ANY blueprint returning
-    `status == "verified"` and never reset it, so a turn that ran a verified
-    blueprint for part 1 and then answered with a hand-written query already
-    rendered "verified ✓" over an UNVERIFIED grid. That over-claim predates
-    multi-table; computing the roll-up over the DESIGNATED TABLES is what fixes it.
-
-    So this turn now reports `verification: null`. That is the correction landing.
-    """
-    loop, store, _events = _build(
-        [
-            _run_blueprints("bp-headcount"),
-            _answer("a1", answer="See table.", tables=[{"sql": SALARY_SQL}]),
-        ],
-        blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
-    )
-    await expand_blueprint(store, SESSION_ID, "bp-headcount")
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert outcome.answer_sql == SALARY_SQL
-    assert outcome.verification is None
-    assert outcome.blueprint_use is None
 
 
 async def test_a_turn_with_no_designated_table_keeps_its_turn_level_enrichment() -> None:
@@ -610,106 +484,12 @@ async def test_a_turn_with_no_designated_table_keeps_its_turn_level_enrichment()
 # ---------------------------------------------------------------------------
 
 
-async def test_answer_sql_is_exactly_the_first_tables_projection() -> None:
-    """08 §E: `answer_sql`/`blueprint_use` are DERIVED from `answer_tables[0]` in
-    one place, never accumulated independently — two fields that can disagree is
-    the real cost of going additive, and deriving one from the other is what pays
-    it. The primary is the FIRST item (the model's lead table), not the last."""
-    loop, store, _events = _build(
-        [
-            _run_blueprints("bp-headcount"),
-            _answer(
-                "a1",
-                answer="x",
-                tables=[{"blueprint_id": "bp-headcount"}, {"sql": SALARY_SQL}],
-            ),
-        ],
-        blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
-    )
-    await expand_blueprint(store, SESSION_ID, "bp-headcount")
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert outcome.answer_sql == outcome.answer_tables[0]["sql"]
-    assert outcome.blueprint_use == outcome.answer_tables[0]["blueprint_use"]
 
 
-async def test_a_single_table_turn_is_byte_identical_to_before() -> None:
-    """The N<=1 route is what four consumers depend on: the UI's single-panel path,
-    `/session/history`, the resume seed and every pause path."""
-    loop, _store, _events = _build([_answer("a1", answer="Done.", tables=[{"sql": SALARY_SQL}])])
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert outcome.answer_sql == SALARY_SQL
-    assert outcome.answer_tables == [
-        {"sql": SALARY_SQL, "caption": None, "blueprint_use": None, "verification": None}
-    ]
 
 
-async def test_a_later_call_replaces_the_whole_set_rather_than_appending() -> None:
-    """`_accumulate_answer_sql`'s last-wins rule, promoted verbatim to the list. A
-    second `answerWithTable` means the model changed its mind about which query is
-    the answer — as true of a set as of a string, and appending would make "changed
-    its mind" unexpressible."""
-    loop, _store, _events = _build(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="a1",
-                        name=ANSWER,
-                        arguments={"answer": "one", "tables": [{"sql": HEADCOUNT_SQL}]},
-                    ),
-                    ToolCallRequest(
-                        id="a2",
-                        name=ANSWER,
-                        arguments={"answer": "two", "tables": [{"sql": SALARY_SQL}]},
-                    ),
-                ]
-            )
-        ]
-    )
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert [t["sql"] for t in outcome.answer_tables] == [SALARY_SQL]
 
 
-async def test_answer_tables_reaches_the_sse_result_frame(monkeypatch) -> None:
-    """Additive on the wire: an old client ignores the key, the same posture
-    `assumptions` shipped with."""
-    from fastapi.testclient import TestClient
-
-    from data_agent.runtime import app as app_module
-    from data_agent.runtime.app import create_app
-    from data_agent.runtime.config import RuntimeSettings
-
-    monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: frozenset())
-    store = InMemorySessionStore()
-    app = create_app(
-        settings=RuntimeSettings(_env_file=None),
-        session_store=store,
-        mcp_client=FakeMCPClient(),
-        model_client=ScriptedModelClient(
-            [
-                _answer(
-                    "a1",
-                    answer="Two things.",
-                    tables=[
-                        {"sql": HEADCOUNT_SQL, "caption": "Headcount"},
-                        {"sql": SALARY_SQL, "caption": "Salaries"},
-                    ],
-                )
-            ]
-        ),
-        catalog=CATALOG,
-    )
-    client = TestClient(app)
-    response = client.post(
-        "/turn",
-        json={"message": "q?"},
-        headers={"Authorization": "Bearer t", "X-Session-Id": SESSION_ID},
-    )
-    assert response.status_code == 200
-    data = json.loads(response.text.strip().split("\n\n")[-1].splitlines()[-1].split(":", 1)[1])
-    assert [t["caption"] for t in data["answer_tables"]] == ["Headcount", "Salaries"]
-    assert data["answer_sql"] == data["answer_tables"][0]["sql"]
 
 
 # ---------------------------------------------------------------------------
@@ -717,29 +497,6 @@ async def test_answer_tables_reaches_the_sse_result_frame(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_per_table_provenance_is_persisted_and_positionally_parallel() -> None:
-    loop, store, _events = _build(
-        [
-            _answer(
-                "a1",
-                answer="x",
-                tables=[{"sql": HEADCOUNT_SQL}, {"sql": SALARY_SQL}],
-            )
-        ]
-    )
-    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    entry = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER][0]
-    assert entry.answer_table_provenance is not None
-    assert len(entry.answer_table_provenance) == 2
-    assert entry.answer_table_provenance[0] == frozenset({(_E, "department_name")})
-    assert entry.answer_table_provenance[1] == frozenset(
-        {(_P, "employee_code"), (_P, "annual_salary")}
-    )
-    # …and it round-trips through the document form, additively.
-    assert TrailEntry.from_doc(entry.to_doc()).answer_table_provenance == (
-        entry.answer_table_provenance
-    )
 
 
 def test_a_legacy_trail_document_loads_with_no_answer_table_provenance() -> None:
@@ -810,32 +567,8 @@ def test_a_malformed_per_table_provenance_costs_its_table_not_the_session() -> N
     assert restored.tool_trail[0].answer_table_provenance == (None,)
 
 
-async def test_invalid_table_returns_api_error_and_can_be_corrected() -> None:
-    loop, store, _events = _build([
-        _answer("a1", answer="x", tables=[{"sql": HEADCOUNT_SQL}, {"sql": "SELECT * FROM not_in_the_catalog.mystery"}]),
-        _answer("a2", answer="x", tables=[{"sql": HEADCOUNT_SQL}]),
-    ])
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    entries = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER]
-    assert entries[0].status == "denied"
-    assert entries[0].error_code == "PARSE_FAILED_CLOSED"
-    assert "mystery" in entries[0].denial_detail
-    assert entries[1].provenance == frozenset()
-    assert entries[1].answer_table_provenance == (frozenset({(_E, "department_name")}),)
-    assert outcome.provenance is not None
-    assert [t["sql"] for t in outcome.answer_tables] == [HEADCOUNT_SQL]
 
 
-async def test_out_of_scope_table_returns_error_before_corrected_delivery() -> None:
-    scope = frozenset({f"{_E}.department_name", f"{_E}.employee_code"})
-    loop, store, _events = _build([
-        _answer("a1", answer="x", tables=[{"sql": HEADCOUNT_SQL}, {"sql": SALARY_SQL}]),
-        _answer("a2", answer="x", tables=[{"sql": HEADCOUNT_SQL}]),
-    ])
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(scope), user_message="q?")
-    entries = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == ANSWER]
-    assert entries[0].error_code == "API_PROVENANCE_INVALID"
-    assert [t["sql"] for t in outcome.answer_tables] == [HEADCOUNT_SQL]
 
 
 async def test_history_filters_tables_individually_and_the_turn_gate_still_dominates() -> None:
@@ -971,63 +704,8 @@ def _history_app(monkeypatch, model: ScriptedModelClient, scope: frozenset[str])
     return TestClient(app)
 
 
-def test_a_multi_table_turn_round_trips_through_session_history(monkeypatch) -> None:
-    """THE RELOAD HALF, end to end over HTTP.
-
-    `/session/history` is a SEPARATE projection from the live SSE `result` frame,
-    so `answer_tables` had to be added to both — and without it a reloaded
-    multi-table turn silently degrades to its lead grid: the user sees one table
-    where the live turn showed three, with no error and nothing saying the rest
-    existed. The two projections share ONE serialisation (`AnswerTable.to_doc`)
-    rather than writing the shape twice, which is what keeps them honest.
-    """
-    client = _history_app(
-        monkeypatch,
-        ScriptedModelClient(
-            [
-                _answer(
-                    "a1",
-                    answer="Two things.",
-                    tables=[
-                        {"sql": HEADCOUNT_SQL, "caption": "Headcount"},
-                        {"sql": SALARY_SQL, "caption": "Salaries"},
-                    ],
-                )
-            ]
-        ),
-        frozenset(),
-    )
-    headers = {"Authorization": "Bearer t", "X-Session-Id": SESSION_ID}
-    live = client.post("/turn", json={"message": "q?"}, headers=headers)
-    live_frame = json.loads(live.text.strip().split("\n\n")[-1].splitlines()[-1].split(":", 1)[1])
-
-    reloaded = client.get("/session/history", headers=headers).json()
-    turn = reloaded["turns"][0]
-    # SAME SHAPE, key for key, as the live frame — not merely the same SQL.
-    assert turn["answer_tables"] == live_frame["answer_tables"]
-    assert [t["caption"] for t in turn["answer_tables"]] == ["Headcount", "Salaries"]
-    # …and `answer_sql` is still the derived projection of the first table, for the
-    # same back-compat reason it is on the live envelope.
-    assert turn["answer_sql"] == turn["answer_tables"][0]["sql"] == live_frame["answer_sql"]
 
 
-def test_a_single_table_turns_history_payload_is_unchanged(monkeypatch) -> None:
-    """The N<=1 route, which `/session/history` is one of four consumers of.
-    `answer_sql` keeps its exact meaning and value; `answer_tables` is additive
-    beside it, so an old client that ignores the key renders as it always did."""
-    client = _history_app(
-        monkeypatch,
-        ScriptedModelClient([_answer("a1", answer="One thing.", tables=[{"sql": SALARY_SQL}])]),
-        frozenset(),
-    )
-    headers = {"Authorization": "Bearer t", "X-Session-Id": SESSION_ID}
-    client.post("/turn", json={"message": "q?"}, headers=headers)
-
-    turn = client.get("/session/history", headers=headers).json()["turns"][0]
-    assert turn["answer_sql"] == SALARY_SQL
-    assert turn["answer_tables"] == [
-        {"sql": SALARY_SQL, "caption": None, "blueprint_use": None, "verification": None}
-    ]
 
 
 def test_history_reconstructs_per_table_badges_from_the_same_two_keys() -> None:
@@ -1111,24 +789,6 @@ async def test_an_unrun_blueprint_in_tables_refuses_the_whole_call() -> None:
     assert entry.answer_table_provenance is None
 
 
-async def test_a_multi_table_call_still_ends_the_turn() -> None:
-    """The terminal exit is unchanged: a successful `answerWithTable` carrying
-    non-blank prose ends the turn once the batch drains, whether it designated one
-    table or eight. The second scripted result must never be consumed."""
-    loop, _store, _events = _build(
-        [
-            _answer(
-                "a1",
-                answer="Three parts.",
-                tables=[{"sql": HEADCOUNT_SQL}, {"sql": SALARY_SQL}],
-            ),
-            final_answer(assistant_text="THIS MUST NOT BE REACHED."),
-        ]
-    )
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert outcome.status == "done"
-    assert outcome.assistant_text == "Three parts."
-    assert len(outcome.answer_tables) == 2
 
 
 async def test_finalization_enforcement_still_refuses_a_multi_table_answer() -> None:
@@ -1175,106 +835,10 @@ async def test_finalization_enforcement_still_refuses_a_multi_table_answer() -> 
 # ---------------------------------------------------------------------------
 
 
-async def test_designation_telemetry_is_emitted_with_shape_only_counts() -> None:
-    loop, store, events = _build(
-        [
-            _run_blueprints("bp-headcount"),
-            _answer(
-                "a1",
-                answer="x",
-                tables=[
-                    {"blueprint_id": "bp-headcount", "caption": "Headcount"},
-                    {"sql": SALARY_SQL},
-                ],
-            ),
-        ],
-        blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
-    )
-    await expand_blueprint(store, SESSION_ID, "bp-headcount")
-    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert _payloads(events, "loop_answer_tables_designated") == [
-        {"table_count": 2, "blueprint_table_count": 1, "verified_table_count": 1}
-    ]
-    # D25: no caption, no SQL, no cell values on any answer-table event.
-    for event, payload in events:
-        if event.startswith("loop_answer_table"):
-            assert "Headcount" not in json.dumps(payload)
-            assert SALARY_SQL not in json.dumps(payload)
 
 
-async def test_an_empty_blueprint_table_is_counted_but_not_as_verified() -> None:
-    """J6, through the loop.
-
-    A blueprint DID produce this table, so it counts in `table_count` and
-    `blueprint_table_count` — dropping it there would under-report the blueprint
-    path. What it must NOT do is count as VERIFIED: the D56 grain teeth
-    (`row_count == distinct_grain_count`) compared 0 to 0 and proved nothing, and
-    the runtime has stopped claiming otherwise on the badge. An observer reading
-    `verified_table_count` is reading that same claim, so the two must agree — a
-    count computed from "a verification block is present" would keep reporting a
-    verification rate no other surface still asserts.
-    """
-    loop, store, events = _build(
-        [
-            _run_blueprints("bp-headcount"),
-            _answer("a1", answer="None found.", tables=[{"blueprint_id": "bp-headcount"}]),
-        ],
-        blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
-        empty_blueprints=frozenset({"bp-headcount"}),
-    )
-    await expand_blueprint(store, SESSION_ID, "bp-headcount")
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert _payloads(events, "loop_answer_tables_designated") == [
-        {"table_count": 1, "blueprint_table_count": 1, "verified_table_count": 0}
-    ]
-    # The table itself is still offered — the answer "there are none" needs its
-    # (empty) grid, and the chip still names the blueprint that produced it.
-    assert outcome.answer_tables is not None
-    table = outcome.answer_tables[0]
-    assert table["blueprint_use"]["blueprint_id"] == "bp-headcount"
-    assert table["verification"] == {
-        "passed": False,
-        "method": "blueprint_gate",
-        "grain_checked": False,
-        "empty_result": True,
-        "status": "empty — unverifiable",
-    }
-    # N=1: the UI renders the ENVELOPE's badge, so the roll-up must carry the same
-    # state rather than collapsing to silence.
-    assert outcome.verification == table["verification"]
 
 
-async def test_a_verified_table_beside_an_empty_one_counts_only_the_verified() -> None:
-    """The mixture. One real verification claim survives in the count; the
-    envelope roll-up claims nothing, because neither "verified" nor "empty"
-    describes the pair."""
-    loop, store, events = _build(
-        [
-            _run_blueprints("bp-headcount", "bp-salary"),
-            _answer(
-                "a1",
-                answer="x",
-                tables=[{"blueprint_id": "bp-headcount"}, {"blueprint_id": "bp-salary"}],
-            ),
-        ],
-        blueprints={
-            "bp-headcount": (HEADCOUNT_SQL, True),
-            "bp-salary": (SALARY_SQL, True),
-        },
-        empty_blueprints=frozenset({"bp-salary"}),
-    )
-    await expand_blueprint(store, SESSION_ID, "bp-headcount")
-    await expand_blueprint(store, SESSION_ID, "bp-salary")
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert _payloads(events, "loop_answer_tables_designated") == [
-        {"table_count": 2, "blueprint_table_count": 2, "verified_table_count": 1}
-    ]
-    assert outcome.answer_tables[0]["verification"]["passed"] is True
-    assert outcome.answer_tables[1]["verification"]["empty_result"] is True
-    assert outcome.verification is None
 
 
 def test_the_three_new_keys_actually_reach_the_span() -> None:
@@ -1329,101 +893,6 @@ def test_the_three_new_keys_actually_reach_the_span() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_a_completed_intent_whose_result_went_untabled_is_reported() -> None:
-    """The derivation that 08 §B.1 keeps as a CHECK.
-
-    Tables are LISTED by the model because the evidence call is the wrong query: a
-    designated `sql` is deliberately not required to be one the agent ran, because
-    the executed query carries a LIMIT the agent chose for its own reading and
-    paging needs the un-capped shape. Deriving the table from the evidence would
-    page that capped query and silently truncate every grid.
-
-    It is NOT a refusal — a scalar part of a multi-part answer correctly belongs in
-    the prose — so this only ever emits a count.
-    """
-    mcp = FakeMCPClient(
-        scripted={
-            "runQuery": [
-                {
-                    "columns": ["department_name"],
-                    "rows": [["Sales"]],
-                    "row_count": 1,
-                    "truncated": False,
-                },
-                {"columns": ["annual_salary"], "rows": [[1]], "row_count": 1, "truncated": False},
-            ]
-        }
-    )
-    store = InMemorySessionStore()
-    events: list[tuple[str, dict[str, Any]]] = []
-
-    def _observe(event: str, payload: dict[str, Any]) -> None:
-        events.append((event, dict(payload)))
-
-    loop = AgentLoop(
-        model_client=ScriptedModelClient(
-            [
-                ModelTurnResult(
-                    tool_calls=[
-                        ToolCallRequest(
-                            id="s1",
-                            name=STATE,
-                            arguments={"intents": [{"description": "one"}, {"description": "two"}]},
-                        )
-                    ]
-                ),
-                ModelTurnResult(
-                    tool_calls=[
-                        ToolCallRequest(
-                            id="q1",
-                            name="runQuery",
-                            arguments={"sql": HEADCOUNT_SQL, "serves_intent": "i1"},
-                        ),
-                        ToolCallRequest(
-                            id="q2",
-                            name="runQuery",
-                            arguments={"sql": SALARY_SQL, "serves_intent": "i2"},
-                        ),
-                    ]
-                ),
-                ModelTurnResult(
-                    tool_calls=[
-                        ToolCallRequest(
-                            id="s2",
-                            name=STATE,
-                            arguments={
-                                "intents": [
-                                    {"intent_id": "i1", "status": "completed"},
-                                    {"intent_id": "i2", "status": "completed"},
-                                ]
-                            },
-                        ),
-                        # Only ONE of the two results is tabled.
-                        ToolCallRequest(
-                            id="a1",
-                            name=ANSWER,
-                            arguments={"answer": "x", "tables": [{"sql": HEADCOUNT_SQL}]},
-                        ),
-                    ]
-                ),
-            ]
-        ),
-        tool_dispatcher=ToolDispatcher(mcp, CATALOG, observer=_observe),
-        context_assembler=ContextAssembler(store),
-        session_store=store,
-        tools_provider=_tools_provider,
-        max_loop_iterations=15,
-        max_wall_clock_seconds=60,
-        max_budget_windows=3,
-        observer=_observe,
-        runtime_tools={
-            ANSWER: AnswerWithTableTool(),
-            STATE: UpdateAnalysisStateTool(session_store=store, observer=_observe),
-        },
-    )
-    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two things?")
-
-    assert _payloads(events, "loop_answer_table_intent_uncovered") == [{"intent_count": 1}]
 
 
 # ---------------------------------------------------------------------------

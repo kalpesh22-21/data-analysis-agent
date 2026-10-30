@@ -50,6 +50,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TurnMessage
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import answer_arguments
 
 CREDS = RuntimeCredentials(
     session_id="remote-contract", jwt="secret-token", column_scope=frozenset()
@@ -66,16 +67,9 @@ def turn(*calls, text=None):
     return ModelTurnResult(tool_calls=list(calls), assistant_text=text)
 
 
-def finalize_options(*names, ident="final", answer="Use the displayed option."):
+def finalize_options(*names, ident="final", answer="Use the displayed option.", evidence=()):
     return turn(
-        call(
-            "finalizeAnswer",
-            ident,
-            answer=answer,
-            tables=[],
-            capability_refs=list(names),
-            evidence=[],
-        )
+        call("finalizeAnswer", ident, **answer_arguments(takeaway=answer, tables=[], capability_refs=list(names), evidence=evidence))
     )
 
 
@@ -207,7 +201,7 @@ async def test_summary_reservation_precedes_one_matching_dispatch_pair():
             return "Preparing the option."
 
     loop, _, events, _, _ = build(
-        [turn(call("show_profile", "card-7")), finalize_options("show_profile")],
+        [turn(call("show_profile", "card-7")), finalize_options("show_profile", evidence=["card-7"])],
         tools={"show_profile": CardTool()},
         summarizer=Summarizer(),
     )
@@ -244,9 +238,9 @@ async def test_card_fatal_refusal_cannot_escape_through_fail_open(violation):
     loop, store, events, _, _ = build(
         [
             turn(call("show_profile", "card-1")),
-            finalize_options("show_profile", ident="a1"),
+            finalize_options("show_profile", ident="a1", evidence=["card-1"]),
             turn(call("show_profile", "card-2")),
-            finalize_options("show_profile", ident="a2"),
+            finalize_options("show_profile", ident="a2", evidence=["card-2"]),
         ],
         judge=judge,
         tools={"show_profile": CardTool()},
@@ -272,9 +266,9 @@ async def test_actual_approval_allows_replacement_card():
     loop, _, _, _, _ = build(
         [
             turn(call("show_profile", "c1")),
-            finalize_options("show_profile", ident="a1"),
+            finalize_options("show_profile", ident="a1", evidence=["c1"]),
             turn(call("show_profile", "c2")),
-            finalize_options("show_profile", ident="a2"),
+            finalize_options("show_profile", ident="a2", evidence=["c2"]),
         ],
         judge=judge,
         tools={"show_profile": CardTool()},
@@ -314,8 +308,8 @@ async def test_scope_refusal_never_ships_an_insisted_creative_answer():
     draft = "Here is a lovely poem about spring."
     loop, store, _, _, _ = build(
         [
-            turn(call("answerWithText", "a1", answer=draft)),
-            turn(call("answerWithText", "a2", answer=draft)),
+            turn(call("finalizeAnswer", "a1", **answer_arguments(takeaway=draft))),
+            turn(call("finalizeAnswer", "a2", **answer_arguments(takeaway=draft))),
         ]
     )
     outcome = await run(loop, "Write a poem about spring")
@@ -522,20 +516,10 @@ async def test_table_ship_guard_and_history_agree(violation, keeps_table):
     loop, store, _, _, _ = build(
         [
             turn(
-                call(
-                    "answerWithTable",
-                    "table-1",
-                    answer="Here are the results.",
-                    tables=[{"sql": SQL}],
-                )
+                call("finalizeAnswer", "table-1", **answer_arguments(takeaway="Here are the results."))
             ),
             turn(
-                call(
-                    "answerWithTable",
-                    "table-2",
-                    answer="Here are the results.",
-                    tables=[{"sql": SQL}],
-                )
+                call("finalizeAnswer", "table-2", **answer_arguments(takeaway="Here are the results."))
             ),
         ],
         judge=judge,
@@ -585,7 +569,7 @@ async def test_failed_summary_does_not_prevent_dispatch_and_produces_fallback():
             raise TimeoutError("private input")
 
     loop, _, events, _, _ = build(
-        [turn(call("show_profile")), finalize_options("show_profile")],
+        [turn(call("show_profile")), finalize_options("show_profile", evidence=["call-1"])],
         tools={"show_profile": CardTool()},
         summarizer=Summarizer(),
     )
@@ -689,12 +673,7 @@ async def test_blueprint_advisory_refuses_once_then_dispatches_a_retry():
             turn(call("searchBlueprints", "discovery", query="employees")),
             turn(call("runQuery", "query-2", sql=SQL)),
             turn(
-                call(
-                    "answerWithTable",
-                    "answer-1",
-                    answer="Here are the results.",
-                    tables=[{"sql": SQL}],
-                )
+                call("finalizeAnswer", "answer-1", **answer_arguments(takeaway="Here are the results.", tables=[{"result_id": "query-2"}]))
             ),
         ]
     )
@@ -725,7 +704,7 @@ async def test_same_batch_blueprint_consultation_allows_query_even_when_query_is
             ),
             turn(call("runQuery", "q2", sql=SQL)),
             turn(
-                call("answerWithTable", "a1", answer="Here are the results.", tables=[{"sql": SQL}])
+                call("finalizeAnswer", "a1", **answer_arguments(takeaway="Here are the results.", tables=[{"result_id": "q2"}]))
             ),
         ],
         tools={"searchBlueprints": Search()},
@@ -783,9 +762,9 @@ def test_resumed_cards_retain_judge_kind_without_exposing_internal_evidence():
 )
 async def test_data_widget_requires_reviewed_approval(verdict, visible):
     judge = Judge([verdict])
-    script = [turn(call("show_profile", "c1")), finalize_options("show_profile", ident="a1")]
+    script = [turn(call("show_profile", "c1")), finalize_options("show_profile", ident="a1", evidence=["c1"])]
     if not verdict.approved:
-        script.append(finalize_options("show_profile", ident="a2"))
+        script.append(finalize_options("show_profile", ident="a2", evidence=["c1"]))
     loop, _, _, _, _ = build(script, judge=judge, tools={"show_profile": CardTool()})
     outcome = await run(loop)
     assert bool(outcome.capability_cards) is visible
@@ -837,11 +816,7 @@ async def test_help_unavailable_cannot_launder_instructions(name, status, payloa
         [
             turn(call(name)),
             turn(
-                call(
-                    "answerWithText",
-                    answer="I can't verify this, but open Time Clock and select Start.",
-                    evidence=[],
-                )
+                call("finalizeAnswer", **answer_arguments(takeaway="I can't verify this, but open Time Clock and select Start."))
             ),
         ],
         tools={name: HelpTool()},
@@ -981,9 +956,9 @@ async def test_v2_refused_card_repick_fixture():
     loop, store, events, model, _ = build(
         [
             turn(call(names[0], "cap_1")),
-            finalize_options(names[0], ident="a1", answer=invented),
+            finalize_options(names[0], ident="a1", answer=invented, evidence=["cap_1"]),
             turn(call(names[1], "cap_2")),
-            finalize_options(names[1], ident="a2", answer=invented),
+            finalize_options(names[1], ident="a2", answer=invented, evidence=["cap_2"]),
         ],
         judge=judge,
         tools={n: Navigation(n) for n in names},
@@ -1035,6 +1010,7 @@ async def test_v2_same_batch_registration_and_declined_negative(ready):
             ),
             finalize_options(
                 *(["show_profile"] if ready else []),
+                evidence=["present"] if ready else [],
                 answer="Use the displayed option." if ready else "I can't show that information.",
             ),
         ],

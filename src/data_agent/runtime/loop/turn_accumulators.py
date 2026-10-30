@@ -248,6 +248,7 @@ class TurnAccumulators:
         # this turn. Folded from each SUCCESSFUL recordAssumptions call's ARGUMENTS,
         # read at every `TurnOutcome(...)` return site.
         self._assumptions: list[str] = list(assumptions) if assumptions else []
+        self.answer_document: dict[str, Any] | None = None
         self._capability_cards: list[dict[str, Any]] = []
         self._capability_card_keys: set[tuple[str, str]] = set()
         self.capability_cards_deduped = 0
@@ -389,6 +390,7 @@ class TurnAccumulators:
                 sql = component.get("sql") or self.result_sql_by_call_id.get(component["result_id"])
                 if sql:
                     self._excluded_table_sql.add(sql)
+        self.answer_document = None
         self._selected_capabilities -= self._excluded_capabilities
         self._answer_tables = [
             t for t in self._answer_tables if t.sql not in self._excluded_table_sql
@@ -549,6 +551,7 @@ class TurnAccumulators:
         return "ship_tables_with_hedge" if self.has_answer_tables else "decline_only"
 
     def apply_ship_disposition(self, disposition: str, assumptions: tuple[str, ...]) -> None:
+        self.answer_document = None
         self.extra_evidence = None
         self._assumptions = [item for item in self._assumptions if item in assumptions]
         if disposition not in {"ship_cards_with_hedge", "ship_components_with_hedge"}:

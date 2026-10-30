@@ -26,6 +26,7 @@ Tags:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -41,6 +42,7 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import final_answer
 
 pytestmark = pytest.mark.usefixtures("blueprint_consulted")
 
@@ -99,7 +101,7 @@ def _build_app(monkeypatch, *, disable_redaction: bool | None, span_exporter: An
                         )
                     ]
                 ),
-                ModelTurnResult(assistant_text="Looked it up."),
+                final_answer(assistant_text="Looked it up.", evidence=["q1"]),
             ]
         ),
         catalog=CatalogHandle({"default.t": {"national_id": "String", "ssn": "String"}}),
@@ -211,7 +213,7 @@ def _read_tools_app(monkeypatch, *, disable_redaction: bool, pii_query: str) -> 
                         )
                     ]
                 ),
-                ModelTurnResult(assistant_text="Found it."),
+                final_answer(assistant_text="Found it.", evidence=["sb1"]),
             ]
         ),
         catalog=CatalogHandle({"default.t": {"national_id": "String", "ssn": "String"}}),
@@ -247,5 +249,12 @@ def test_flag_is_telemetry_only_same_answer_both_ways(monkeypatch) -> None:
         client = TestClient(app)
         resp = client.post("/turn", json={"message": "look it up"}, headers=HEADERS)
         assert resp.status_code == 200
-        outcomes.append(resp.text)
+        frames = [json.loads(line[5:]) for line in resp.text.splitlines()
+                  if line.startswith("data:")]
+        assert any(frame.get("answer_document") for frame in frames)
+        for frame in frames:
+            frame.pop("turn_id", None)
+            if frame.get("answer_document"):
+                frame["answer_document"].pop("generated_at", None)
+        outcomes.append(frames)
     assert outcomes[0] == outcomes[1]

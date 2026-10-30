@@ -6,6 +6,7 @@ from data_agent.runtime.context.scope_filter import filter_trail
 from data_agent.runtime.loop.answer_judge import JudgeVerdict
 from data_agent.runtime.loop.proposal import assess_deliverable_evidence, evidence_kind
 from data_agent.runtime.session.models import AnalysisState, TrackedIntent
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.loop.test_repository_regressions import entry
 from tests.runtime.test_harness_improvements import (
     CREDS,
@@ -65,16 +66,9 @@ def setup(
     for index in range(rounds):
         steps += [
             batch(
-                call(
-                    "finalizeAnswer",
-                    f"final:{index}",
-                    answer=DRAFT,
-                    tables=[{"result_id": "q", "caption": "Department headcounts"}],
-                    capability_refs=["functions.runQuery"]
+                call("finalizeAnswer", f"final:{index}", **answer_arguments(takeaway=DRAFT, tables=[{"result_id": "q", "caption": "Department headcounts"}], capability_refs=["functions.runQuery"]
                     if first_capability and index == 0
-                    else [],
-                    evidence=["q"] + ([] if valid_first and index == 0 else [bad_ref]),
-                )
+                    else [], evidence=["q"] + ([] if valid_first and index == 0 else [bad_ref])))
             )
         ]
     result = build(
@@ -312,7 +306,7 @@ async def test_empty_support_after_dropping_control_receipts_still_reaches_judge
     reject = JudgeVerdict(False, "unsupported_by_evidence", "The claim has no support.", True)
     judge = Judge([reject, reject])
     final = batch(
-        call("finalizeAnswer", "final", answer="Everyone is on leave.", tables=[], evidence=["a"])
+        call("finalizeAnswer", "final", **answer_arguments(takeaway="Everyone is on leave.", tables=[], evidence=["a"]))
     )
     loop, _, _, _, _ = build(
         [
@@ -360,13 +354,7 @@ async def test_completed_state_update_ignores_extras_and_preserves_bound_work():
                 )
             ),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "final",
-                    answer="There are 120 employees.",
-                    tables=[{"result_id": "q"}],
-                    evidence=["q", "complete"],
-                )
+                call("finalizeAnswer", "final", **answer_arguments(takeaway="There are 120 employees.", tables=[{"result_id": "q"}], evidence=["q", "complete"]))
             ),
         ],
         judge,

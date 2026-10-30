@@ -67,6 +67,10 @@ def test_root_input_output_and_jti_metadata(monkeypatch, redact):
             "Show payroll above [number]" if redact else "Show payroll above 500"
         )
         assert root.attributes["output.value"] == answer
+        emitted = next(s for s in sink.get_finished_spans() if s.name == "loop_response_emitted")
+        assert emitted.context.trace_id == root.context.trace_id
+        assert emitted.parent.span_id == root.context.span_id
+        assert "delivery_traceparent" not in response.text
         metadata = json.loads(root.attributes["metadata"])
         assert metadata["jti"] == "request-12345"
         assert metadata["clientcode"] == "0O003"

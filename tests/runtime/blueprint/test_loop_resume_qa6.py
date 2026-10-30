@@ -24,12 +24,12 @@ from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
-from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import AlreadyConsumedError, InMemorySessionStore
 from tests._blueprint_gate import expand_blueprint
+from tests.runtime.final_answer import BlueprintAnswerModel as ScriptedModelClient
 from tests.runtime.final_answer import final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
@@ -53,19 +53,8 @@ def _creds() -> RuntimeCredentials:
 
 
 def _prose_resume_script(text: str) -> list[ModelTurnResult]:
-    """Propose prose, then select the verified resumed blueprint. Two consumed rounds prove the persisted multi-row result reached shape review."""
-    return [
-        final_answer(assistant_text=text),
-        ModelTurnResult(
-            tool_calls=[
-                ToolCallRequest(
-                    id="select_resumed",
-                    name="answerWithTable",
-                    arguments={"answer": text, "blueprint_id": _BID},
-                )
-            ]
-        ),
-    ]
+    """Select the exact resumed receipt without an automatic table-selection nudge."""
+    return [final_answer(assistant_text=text, tables=[{"result_id": "__visible_blueprint__"}])]
 
 
 def _rq(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
@@ -183,12 +172,8 @@ async def test_completion_on_resume_writes_exactly_one_runblueprint_entry() -> N
         session_id=SESSION_ID, credentials=_creds(), answer="approve"
     )
     assert done.status == "done"
-    # BOTH scripted turns were consumed, so `_prose_resume_script`'s claim is real:
-    # the resumed blueprint's two rows DID reach the answer-shape gate through the
-    # persisted trail, and the first prose finish was refused. `ScriptedModelClient`
-    # does not raise on leftover turns, so without this the helper's second turn
-    # could go unused and the docstring would quietly become fiction.
-    assert resume_model.calls_made == 2
+    # The explicit selection succeeds in one round using the resumed receipt.
+    assert resume_model.calls_made == 1
 
     trail = await store.load_trail(SESSION_ID)
     bp_entries = [e for e in trail if e.tool_name == "runBlueprint" and e.status == "ok"]

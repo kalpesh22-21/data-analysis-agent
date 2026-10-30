@@ -302,10 +302,10 @@ async def test_no_summarizer_means_no_summary_events_and_no_calls() -> None:
     "event",
     ["tool_dispatch_start", "tool_dispatch_ok", "tool_dispatch_error", "tool_progress_summary"],
 )
-def test_finalization_progress_requires_explicit_judge_approval(tool_name, event):
+def test_finalization_dispatch_never_emits_speculative_progress(tool_name, event):
     payload = {"tool_name": tool_name, "tool_call_id": "answer", "summary": "Preparing the answer"}
     assert to_progress_event(event, payload) is None
-    assert to_progress_event(event, {**payload, "judge_approved": True}) is not None
+    assert to_progress_event(event, {**payload, "judge_approved": True}) is None
 
 
 @pytest.mark.parametrize("review", ["approved", "unavailable", "disabled", "repair", "rejected"])
@@ -368,17 +368,8 @@ async def test_finalization_summary_and_progress_follow_review(review):
         for name, _ in summarizer.calls
         if name in {"answerWithText", "answerWithTable", "finalizeAnswer"}
     ]
-    if review in {"approved", "repair"}:
-        # Observer order reflects real execution; the emitter reorders UI delivery.
-        assert [e for e, _ in visible] == [
-            "tool_dispatch_start",
-            "tool_dispatch_ok",
-            "tool_progress_summary",
-        ]
-        assert final_summaries == ["finalizeAnswer"]
-        assert all(p["judge_approved"] for _, p in visible)
-        last_review = max(i for i, (e, _) in enumerate(events) if e == "review")
-        assert all(i > last_review for i, (_, p) in enumerate(events) if p.get("judge_approved"))
-    else:
-        assert visible == []
-        assert final_summaries == []
+    assert visible == []
+    assert final_summaries == []
+    review_events = [p for e, p in events if e == "loop_presentation_review_started"]
+    assert bool(review_events) == (review != "disabled")
+    assert all(p["phase"] == "checking_answer" for p in review_events)

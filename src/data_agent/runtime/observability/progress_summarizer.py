@@ -128,7 +128,7 @@ _STATIC_LINES: dict[str, str] = {
     "searchBlueprints": "finding a suitable way to calculate the measures you requested",
     "searchKnowledge": "looking up relevant background",
     "resolveValues": "matching your wording to the available choices",
-    "askUser": "putting a question back to you",
+    "askUser": "checking whether more information is needed",
     "recordAssumptions": "noting the assumptions behind the answer",
     "answerWithTable": "putting the answer together",
     "answerWithText": "putting the answer together",

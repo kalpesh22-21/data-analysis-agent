@@ -22,14 +22,15 @@ class Catalog:
         return "server-scope"
 
 
-def client(monkeypatch, handler, *, base="http://snapshot.test", catalog=True):
+def client(monkeypatch, handler, *, base="http://snapshot.test", catalog=True, resolver=None):
     monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **kw: frozenset())
     settings = RuntimeSettings(clickhouse_api_rest_base_url=base)
     scope = Catalog() if catalog else None
     app = FastAPI()
     app.include_router(
         export_router(
-            settings, app_module._extract_credentials, scope, transport=httpx.MockTransport(handler)
+            settings, app_module._extract_credentials, scope, transport=httpx.MockTransport(handler),
+            resolve_table_sql=resolver
         )
     )
     return TestClient(app), scope
@@ -242,3 +243,30 @@ def test_recovery_denial_is_returned_without_retry_loop(monkeypatch, status, cod
     assert response.json()["detail"]["code"] == code
     assert response.headers["Retry-After"] == "2"
     assert len(calls) == 2
+
+
+async def _selected_table(credentials, ref):
+    assert credentials.session_id == "session-1"
+    if ref != "0:selected":
+        raise PermissionError
+    return "SELECT 1"
+
+
+def test_snapshot_creation_resolves_approved_table_reference(monkeypatch):
+    import json
+    seen = []
+
+    def upstream(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(201, json={"snapshot_id": SID})
+
+    api, _ = client(monkeypatch, upstream, resolver=_selected_table)
+    response = api.post("/query/snapshots", json={"table_ref": "0:selected"}, headers=AUTH)
+    assert response.status_code == 201
+    assert seen == [{"sql": "SELECT 1"}]
+    response = api.post("/query/snapshots", json={"table_ref": "0:unselected"}, headers=AUTH)
+    assert response.status_code == 404
+    assert len(seen) == 1
+    response = api.post("/query/snapshots", json={"table_ref": "0:selected", "sql": "SELECT 2"}, headers=AUTH)
+    assert response.status_code == 400
+    assert len(seen) == 1

@@ -15,6 +15,7 @@ from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.real_client import _parse_tool_error_text
 from tests.runtime.dispatch.test_tool_dispatcher import CATALOG, _credentials
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.loop.test_repository_regressions import entry
 from tests.runtime.test_harness_improvements import Judge, batch, build, call, discovery, query, run
 
@@ -57,14 +58,7 @@ async def test_missing_column_feedback_reaches_model_and_corrected_query_can_shi
             batch(call("runQuery", "bad", sql=SQL)),
             query(),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "answer",
-                    answer="Sales has 120 employees.",
-                    tables=[{"result_id": "q"}],
-                    evidence=["q"],
-                    capability_refs=[],
-                )
+                call("finalizeAnswer", "answer", **answer_arguments(takeaway="Sales has 120 employees.", tables=[{"result_id": "q"}], evidence=["q"], capability_refs=[]))
             ),
         ],
         judge,

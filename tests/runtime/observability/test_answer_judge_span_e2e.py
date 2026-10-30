@@ -276,8 +276,8 @@ async def test_salvage_schema_failure_records_diagnostics_without_response_value
     from tests.runtime.loop.test_partial_answer import PART
 
     tracer, exporter = _tracer_with_memory_exporter()
-    response = {**PART, 'outcome': 'full', 'captions': [],
-                'answer': ['PRIVATE_RESPONSE_PAYLOAD']}
+    response = {**PART, 'outcome': 'full', 'unfinished': [],
+                'takeaway': ['PRIVATE_RESPONSE_PAYLOAD']}
     judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))]),
                         token_budget=100000, tracer=tracer,
                         observer=tracing.guardrail_observer(tracer))
@@ -288,7 +288,7 @@ async def test_salvage_schema_failure_records_diagnostics_without_response_value
     assert 'PRIVATE_RESPONSE_PAYLOAD' not in dumped
     judge_span = next(s for s in spans if s.name == 'answer_judge')
     assert judge_span.attributes['schema_keyword'] == 'type'
-    assert judge_span.attributes['schema_path'] == '/properties/answer/type'
+    assert judge_span.attributes['schema_path'] == '/properties/takeaway/type'
 
 
 def test_recovery_schema_coordinates_survive_guardrail_allowlist():

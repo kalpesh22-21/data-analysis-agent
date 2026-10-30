@@ -105,6 +105,7 @@ async def test_completed_turn_keeps_progress_and_terminal_result():
         return TurnOutcome(
             status="done",
             assistant_text="Synthetic answer",
+            answer_document={"takeaway": "Synthetic answer", "sections": [], "sources": {}},
             pending_question=None,
             tool_calls_made=0,
         )

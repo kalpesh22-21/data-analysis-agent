@@ -34,6 +34,7 @@ from data_agent.runtime.model.conversation import restore_response_batches
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests.runtime.final_answer import answer_arguments
 
 SQL = "SELECT Department, count() AS n FROM hr.employee GROUP BY Department"
 CREDS = RuntimeCredentials(session_id="harness-test", jwt="test", column_scope=frozenset())
@@ -57,9 +58,8 @@ def finish(answer="There are 120 employees.", **kwargs):
     return call(
         "finalizeAnswer",
         "answer",
-        answer=answer,
-        tables=[],
-        capability_refs=[],
+        takeaway=answer,
+        sections=[],
         evidence=["q"],
         **kwargs,
     )
@@ -98,8 +98,12 @@ class Judge:
     async def salvage(self, brief):
         verdict = await self.review(brief)
         if verdict.reviewed and verdict.partial_answer:
-            return {**verdict.partial_answer, "outcome": "partial", "captions": []}
+            return {**verdict.partial_answer, "outcome": "partial"}
         raise ValueError("No scripted salvage response")
+
+    async def approve_presentation_fallback(self, brief):
+        verdict = await self.review(brief)
+        return verdict.reviewed and verdict.approved
 
     async def partial_relevance(self, snapshot, current, questions):
         return "potentially_relevant"
@@ -266,17 +270,10 @@ async def test_two_runs_of_same_blueprint_preserve_both_queries():
                 call("runBlueprint", "eng", id="bp", slot_bindings={"department": "Engineering"}),
             ),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "a",
-                    answer="Both departments are shown.",
-                    tables=[
+                call("finalizeAnswer", "a", **answer_arguments(takeaway="Both departments are shown.", tables=[
                         {"result_id": "sales", "caption": "Sales"},
                         {"result_id": "eng", "caption": "Engineering"},
-                    ],
-                    capability_refs=[],
-                    evidence=["sales", "eng"],
-                )
+                    ], capability_refs=[], evidence=["sales", "eng"]))
             ),
         ],
         extra={
@@ -578,14 +575,7 @@ async def test_prepared_capability_requires_explicit_selection():
         [
             batch(call("open_page", "p")),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "f",
-                    answer="Use this option to view the page.",
-                    tables=[],
-                    capability_refs=["open_page"],
-                    evidence=["p"],
-                )
+                call("finalizeAnswer", "f", **answer_arguments(takeaway="Use this option to view the page.", tables=[], capability_refs=["open_page"], evidence=["p"]))
             ),
         ],
         extra={"open_page": Tool("open_page", prepared)},
@@ -600,24 +590,10 @@ async def test_missing_capability_ref_is_repairable_not_an_exception():
     loop, store, *_ = build(
         [
             batch(
-                call(
-                    "finalizeAnswer",
-                    "bad",
-                    answer="Use the option.",
-                    tables=[],
-                    capability_refs=["absent"],
-                    evidence=[],
-                )
+                call("finalizeAnswer", "bad", **answer_arguments(takeaway="Use the option.", tables=[], capability_refs=["absent"], evidence=[]))
             ),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "fixed",
-                    answer="I could not find an available option.",
-                    tables=[],
-                    capability_refs=[],
-                    evidence=[],
-                )
+                call("finalizeAnswer", "fixed", **answer_arguments(takeaway="I could not find an available option.", tables=[], capability_refs=[], evidence=[]))
             ),
         ]
     )
@@ -632,14 +608,7 @@ async def test_top_n_result_reference_preserves_query_meaning():
             discovery(),
             batch(call("runQuery", "q", sql=sql)),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "f",
-                    answer="The top two departments are shown.",
-                    tables=[{"result_id": "q", "caption": "Top two"}],
-                    capability_refs=[],
-                    evidence=["q"],
-                )
+                call("finalizeAnswer", "f", **answer_arguments(takeaway="The top two departments are shown.", tables=[{"result_id": "q", "caption": "Top two"}], capability_refs=[], evidence=["q"]))
             ),
         ]
     )
@@ -679,16 +648,9 @@ async def test_capability_registry_is_reloaded_on_http_resume(monkeypatch, avail
             ),
             batch(call("open_page", "p")),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "f",
-                    answer="Use the option to view the page."
+                call("finalizeAnswer", "f", **answer_arguments(takeaway="Use the option to view the page."
                     if available
-                    else "I cannot find an available option.",
-                    tables=[],
-                    capability_refs=["open_page"] if available else [],
-                    evidence=["p"] if available else [],
-                )
+                    else "I cannot find an available option.", tables=[], capability_refs=["open_page"] if available else [], evidence=["p"] if available else []))
             ),
         ]
     )
@@ -779,24 +741,10 @@ async def test_invalid_finalizer_shape_is_repairable():
     loop, store, *_ = build(
         [
             batch(
-                call(
-                    "finalizeAnswer",
-                    "bad",
-                    answer="Use this option.",
-                    tables=[],
-                    capability_refs=[{}],
-                    evidence=[],
-                )
+                call("finalizeAnswer", "bad", **answer_arguments(takeaway="Use this option.", tables=[], capability_refs=[{}], evidence=[]))
             ),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "fixed",
-                    answer="I cannot find an available option.",
-                    tables=[],
-                    capability_refs=[],
-                    evidence=[],
-                )
+                call("finalizeAnswer", "fixed", **answer_arguments(takeaway="I cannot find an available option.", tables=[], capability_refs=[], evidence=[]))
             ),
         ]
     )
@@ -848,14 +796,7 @@ async def test_raw_result_reference_reconstructs_same_query_in_history():
             discovery(),
             query(),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "a",
-                    answer="The counts are shown.",
-                    tables=[{"result_id": "q", "caption": "Count"}],
-                    capability_refs=[],
-                    evidence=["q"],
-                )
+                call("finalizeAnswer", "a", **answer_arguments(takeaway="The counts are shown.", tables=[{"result_id": "q", "caption": "Count"}], capability_refs=[], evidence=["q"]))
             ),
         ]
     )
@@ -948,14 +889,7 @@ async def test_discovery_streak_prompts_delivery_without_discarding_evidence():
     ]
     steps.append(
         batch(
-            call(
-                "finalizeAnswer",
-                "done",
-                answer="Employee information is available.",
-                tables=[],
-                capability_refs=[],
-                evidence=["schema0"],
-            )
+            call("finalizeAnswer", "done", **answer_arguments(takeaway="Employee information is available.", tables=[], capability_refs=[], evidence=["schema0"]))
         )
     )
     loop, _, model, _, _ = build(
@@ -1011,7 +945,7 @@ async def test_presentation_repair_keeps_cited_query_in_live_answer_and_history(
     from data_agent.runtime.session_history import project_history
 
     judge = Judge([JudgeVerdict(True, reviewed=True, repair_type="prose", corrected_answer="There are 120 employees.")])
-    initial = call("finalizeAnswer", "first", answer="There are 120 employees.", tables=[{"result_id": "q"}], capability_refs=[], evidence=["q"])
+    initial = call("finalizeAnswer", "first", **answer_arguments(takeaway="There are 120 employees.", tables=[{"result_id": "q"}], capability_refs=[], evidence=["q"]))
     loop, store, _, mcp, _ = build([discovery(), query(), batch(initial), batch(finish())], judge)
     outcome = await run(loop, "How many employees?")
     assert outcome.status == "done"
@@ -1036,14 +970,7 @@ async def test_data_display_allows_no_verdict_exhaustion_without_claiming_approv
         [
             batch(call("show_profile", "prepare")),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "done",
-                    answer="Use this option to view the profile.",
-                    tables=[],
-                    capability_refs=["show_profile"],
-                    evidence=[],
-                )
+                call("finalizeAnswer", "done", **answer_arguments(takeaway="Use this option to view the profile.", tables=[], capability_refs=["show_profile"], evidence=["prepare"]))
             ),
         ],
         judge,

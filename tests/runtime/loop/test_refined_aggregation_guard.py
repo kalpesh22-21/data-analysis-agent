@@ -13,6 +13,7 @@ from data_agent.runtime.dispatch.sql_diagnostics import (
     repeated_sql_failure,
 )
 from data_agent.runtime.loop.measurement import cardinality_probes, validate_join_cardinality
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.loop.test_repository_regressions import entry
 
 SQL = "SELECT sum(e.salary) AS total FROM hr.employee e JOIN hr.payroll p ON e.id=p.employee_id"
@@ -33,7 +34,7 @@ async def test_invalid_probe_results_are_not_duplicate_verdicts(rows):
     "code,retryable,expected",
     [
         ("EXECUTION_SERVICE_UNAVAILABLE", False, "AGGREGATION_CHECK_UNAVAILABLE"),
-        ("COLUMN_SCOPE_VIOLATION", False, "AGGREGATION_CHECK_UNAVAILABLE"),
+        ("COLUMN_SCOPE_VIOLATION", False, "COLUMN_SCOPE_VIOLATION"),
         ("SQL_UNSUPPORTED_CONSTRUCT", True, "AGGREGATION_CHECK_FAILED"),
     ],
 )
@@ -50,7 +51,8 @@ async def test_failed_probes_preserve_recovery_policy(code, retryable, expected)
     issue = await validate_join_cardinality(SQL, dispatcher, None)
     assert issue.code == expected and issue.retryable == retryable
     assert "private backend text" not in issue.denial_detail
-    assert "not proof of duplicate" in issue
+    if code != "COLUMN_SCOPE_VIOLATION":
+        assert "not proof of duplicate" in issue
     assert decode_diagnostic(issue.denial_detail)["cause"]["code"] == code
 
 
@@ -190,14 +192,7 @@ async def test_live_loop_blocks_cosmetic_retry_without_third_probe():
             batch(call("runQuery", "b", sql=renamed)),
             batch(call("runQuery", "c", sql=renamed + " ORDER BY Sum")),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "done",
-                    answer="I could not verify a safe salary total from these results.",
-                    tables=[],
-                    capability_refs=[],
-                    evidence=["c"],
-                )
+                call("finalizeAnswer", "done", **answer_arguments(takeaway="I could not verify a safe salary total from these results.", tables=[], capability_refs=[], evidence=["c"]))
             ),
         ],
         rows=[probe, probe],
@@ -210,3 +205,58 @@ async def test_live_loop_blocks_cosmetic_retry_without_third_probe():
     assert outcomes["c"].error_code == "SQL_REPAIR_EXHAUSTED"
     assert len([c for c in mcp.calls if c.tool_name == "runQuery"]) == 2
     assert decode_diagnostic(outcomes["a"].denial_detail)["code"] == "AGGREGATION_DUPLICATE_KEYS"
+
+
+@pytest.mark.parametrize("code,detail", [
+    ("COLUMN_SCOPE_VIOLATION", "This query needs access to columns outside your permitted scope: hr.employee.salary. Use accessible fields."),
+    ("COLUMN_SCOPE_VIOLATION", "Payroll records are unavailable to this session."),
+    ("SCRATCH_SESSION_VIOLATION", "That dataset belongs to another session."),
+])
+async def test_access_denial_survives_probe_blueprint_and_model_context(code, detail):
+    from data_agent.runtime.blueprint.executor import ExecFailed
+    from data_agent.runtime.blueprint.tool import blueprint_outcome_to_tool_result
+    from data_agent.runtime.context.budget import _render_entry
+
+    dispatcher = AsyncMock()
+    dispatcher.dispatch.return_value = SimpleNamespace(
+        status="denied", error_code=code, retryable=False,
+        denial_detail=detail, user_message="unused backend text",
+    )
+    issue = await validate_join_cardinality(SQL, dispatcher, None)
+    mapped = blueprint_outcome_to_tool_result(ExecFailed(
+        issue.code, issue.denial_detail, retryable=issue.retryable,
+    ))
+    receipt = replace(entry("denied", "runBlueprint", status="error"),
+                      error_code=mapped.error_code, denial_detail=mapped.denial_detail)
+    from data_agent.runtime.composite.analysis_state import validate_block_evidence
+
+    assert validate_block_evidence("denied", "NO_ACCESS", [receipt], receipt.turn_index) is None
+    assert validate_block_evidence("denied", "EXECUTION_FAILED", [receipt], receipt.turn_index) is not None
+    model = _render_entry(receipt, 20)
+    assert model["error_code"] == code
+    diagnostic = model["sql_diagnostic"]
+    assert detail in diagnostic["message"]
+    assert diagnostic["cause"] == {"code": code, "message": detail}
+    assert diagnostic["retry"] == "after_access_change"
+    assert diagnostic["retryable"] is False
+    assert "NO_ACCESS" in diagnostic["guidance"]
+    assert "Continue independent accessible parts" in diagnostic["guidance"]
+    assert "EXECUTION_FAILED" not in diagnostic["guidance"]
+    dispatcher.dispatch.assert_awaited_once()
+
+
+@pytest.mark.parametrize("detail", [
+    "This table has columns outside your permitted scope: hr.payroll.amount. Use accessible fields.",
+    "Table is outside your catalog scope.",
+])
+def test_direct_blueprint_denial_preserves_specific_message(detail):
+    from data_agent.runtime.blueprint.executor import ExecFailed
+    from data_agent.runtime.blueprint.tool import blueprint_outcome_to_tool_result
+    from data_agent.runtime.context.budget import _render_entry
+
+    mapped = blueprint_outcome_to_tool_result(ExecFailed(
+        "COLUMN_SCOPE_VIOLATION", detail, retryable=False,
+    ))
+    receipt = replace(entry("denied", "runBlueprint", status="error"),
+                      error_code=mapped.error_code, denial_detail=mapped.denial_detail)
+    assert _render_entry(receipt, 20)["user_message"] == detail

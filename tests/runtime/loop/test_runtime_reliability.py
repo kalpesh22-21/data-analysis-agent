@@ -14,6 +14,7 @@ from data_agent.runtime.loop.answer_judge import JudgeVerdict
 from data_agent.runtime.loop.reliability import MODEL_CALL_TIMEOUT_TEXT
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.observability import tracing
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.test_harness_improvements import (
     CREDS,
     SQL,
@@ -98,14 +99,7 @@ async def test_timeout_withholds_selected_table_after_unresolved_refusal():
             discovery(),
             query(),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "answer",
-                    answer="There are 999 employees.",
-                    tables=[{"result_id": "q", "caption": "Staff"}],
-                    capability_refs=[],
-                    evidence=["q"],
-                )
+                call("finalizeAnswer", "answer", **answer_arguments(takeaway="There are 999 employees.", tables=[{"result_id": "q", "caption": "Staff"}], capability_refs=[], evidence=["q"]))
             ),
         ]
     )
@@ -131,14 +125,7 @@ async def test_timeout_never_promotes_prepared_or_refused_capability(refused):
     if refused:
         steps.append(
             batch(
-                call(
-                    "finalizeAnswer",
-                    "answer",
-                    answer="Here is the paystub.",
-                    tables=[],
-                    capability_refs=["show_card"],
-                    evidence=["card"],
-                )
+                call("finalizeAnswer", "answer", **answer_arguments(takeaway="Here is the paystub.", tables=[], capability_refs=["show_card"], evidence=["card"]))
             )
         )
     loop, _, _, _, events = hanging_loop(steps, extra={"show_card": Tool("show_card", card)})

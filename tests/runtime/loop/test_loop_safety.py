@@ -4,6 +4,7 @@ import json
 
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
 from data_agent.runtime.loop.loop_safety import HELP_BREAKER_TEXT
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.test_harness_improvements import (
     CREDS,
     Tool,
@@ -17,14 +18,7 @@ from tests.runtime.test_harness_improvements import (
 
 def final():
     return batch(
-        call(
-            "finalizeAnswer",
-            "final",
-            answer="I could not verify the requested information.",
-            tables=[],
-            capability_refs=[],
-            evidence=[],
-        )
+        call("finalizeAnswer", "final", **answer_arguments(takeaway="I could not verify the requested information.", tables=[], capability_refs=[], evidence=[]))
     )
 
 
@@ -101,14 +95,7 @@ async def test_rc3_progressing_control_of_same_length_survives_with_rename_event
         )
     steps.append(
         batch(
-            call(
-                "finalizeAnswer",
-                "final",
-                answer="The count is 125.",
-                tables=[],
-                capability_refs=[],
-                evidence=["functions.runQuery:0#5"],
-            )
+            call("finalizeAnswer", "final", **answer_arguments(takeaway="The count is 125.", tables=[], capability_refs=[], evidence=["functions.runQuery:0#5"]))
         )
     )
     loop, store, _, mcp, events = build(

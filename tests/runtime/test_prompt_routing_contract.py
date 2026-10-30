@@ -69,7 +69,7 @@ def test_procedure_has_each_stage(step):
         "exact result_id",
         "Use each execution’s own result ID",
         "Preserve top-N semantics",
-        "single-value answers require a query-backed one-row table",
+        "single-value answers require a query-backed one-row result",
         "never in prose",
         "Evidence for one part does not establish another",
         "recordAssumptions",
@@ -88,12 +88,12 @@ def test_unified_finalizer_is_the_only_advertised_answer_tool():
     assert not {"answerWithText", "answerWithTable"} & names
     properties = FINALIZE_ANSWER_SCHEMA["parameters"]["properties"]
     assert set(FINALIZE_ANSWER_SCHEMA["parameters"]["required"]) == {
-        "answer",
-        "tables",
+        "takeaway",
+        "sections",
     }
-    assert {"capability_refs", "evidence"} <= properties.keys()
-    assert "result_id" in properties["tables"]["items"]["properties"]
-    assert "sql" not in properties["tables"]["items"]["properties"]
+    assert {"sections", "evidence"} <= properties.keys()
+    assert "result_id" in properties["sections"]["items"]["properties"]["presentation"]["properties"]
+    assert "sql" not in properties["sections"]["items"]["properties"]["presentation"]["properties"]
     assert "deliverables" in properties
 
 

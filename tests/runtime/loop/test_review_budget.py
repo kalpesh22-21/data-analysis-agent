@@ -76,20 +76,20 @@ async def test_ordinary_reviews_cannot_spend_repair_reserve(monkeypatch):
     calls = []
 
     async def review(brief):
-        calls.append(brief)
+        calls.append(brief.label)
         now[0] += 30
         return JudgeVerdict(True, reviewed=True)
 
-    loop = SimpleNamespace(_answer_judge=SimpleNamespace(review=review, timeout_seconds=30))
+    loop = SimpleNamespace(_answer_judge=SimpleNamespace(review=review, timeout_seconds=30), _observer=lambda *a: None)
     context = delivery.DeliveryContext(None, review_seconds=60, repair_reserve_seconds=30)
     token = delivery.CURRENT_DELIVERY.set(context)
     try:
-        assert (await delivery.review_once(loop, "initial")).reviewed
-        assert not (await delivery.review_once(loop, "extra")).reviewed
+        assert (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="initial"))).reviewed
+        assert not (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="extra"))).reviewed
         assert context.review_seconds == 30
-        assert (await delivery.review_once(loop, "repair", repair=True)).reviewed
+        assert (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="repair"), repair=True)).reviewed
         assert context.review_seconds == 0
-        assert not (await delivery.review_once(loop, "extra repair", repair=True)).reviewed
+        assert not (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="extra repair"), repair=True)).reviewed
         assert calls == ["initial", "repair"]
     finally:
         delivery.CURRENT_DELIVERY.reset(token)
@@ -148,11 +148,11 @@ async def test_terminal_reserve_survives_exhausted_proposal_and_repair(monkeypat
     calls = []
 
     async def review(brief):
-        calls.append(brief)
+        calls.append(brief.label)
         now[0] += 30
         return JudgeVerdict(True, reviewed=True)
 
-    loop = SimpleNamespace(_answer_judge=SimpleNamespace(review=review, timeout_seconds=30))
+    loop = SimpleNamespace(_answer_judge=SimpleNamespace(review=review, timeout_seconds=30), _observer=lambda *a: None)
     context = delivery.DeliveryContext(
         None,
         review_seconds=90,
@@ -161,12 +161,12 @@ async def test_terminal_reserve_survives_exhausted_proposal_and_repair(monkeypat
     )
     token = delivery.CURRENT_DELIVERY.set(context)
     try:
-        assert (await delivery.review_once(loop, "initial")).reviewed
-        assert not (await delivery.review_once(loop, "extra initial")).reviewed
-        assert (await delivery.review_once(loop, "repair", repair=True)).reviewed
-        assert not (await delivery.review_once(loop, "extra repair", repair=True)).reviewed
+        assert (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="initial"))).reviewed
+        assert not (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="extra initial"))).reviewed
+        assert (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="repair"), repair=True)).reviewed
+        assert not (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="extra repair"), repair=True)).reviewed
         assert context.review_seconds == 30
-        assert (await delivery.review_once(loop, "partial", terminal=True)).reviewed
+        assert (await delivery.review_once(loop, SimpleNamespace(site="exit_prose", label="partial"), terminal=True)).reviewed
         assert context.review_seconds == 0
         assert calls == ["initial", "repair", "partial"]
     finally:

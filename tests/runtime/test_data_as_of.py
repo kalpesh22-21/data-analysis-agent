@@ -28,6 +28,7 @@ from tests.runtime.blueprint.test_executor import (
     _rq,
 )
 from tests.runtime.dispatch.test_tool_dispatcher import CATALOG, _credentials
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.test_query_page import HEADERS, _client
 from tests.runtime.test_session_history import _assistant, _run_query_entry, _user
 
@@ -187,14 +188,7 @@ async def test_live_answer_and_replay_keep_serving_timestamp():
             discovery(),
             batch(call("runQuery", "q", sql=sql)),
             batch(
-                call(
-                    "finalizeAnswer",
-                    "answer",
-                    answer="There are 120 employees.",
-                    tables=[{"result_id": "q", "caption": "Employees"}],
-                    evidence=["q"],
-                    capability_refs=[],
-                )
+                call("finalizeAnswer", "answer", **answer_arguments(takeaway="There are 120 employees.", tables=[{"result_id": "q", "caption": "Employees"}], evidence=["q"], capability_refs=[]))
             ),
         ],
         rows=[
@@ -204,11 +198,11 @@ async def test_live_answer_and_replay_keep_serving_timestamp():
     loop._tool_dispatcher._freshness_client = SimpleNamespace(lookup=AsyncMock(return_value=NEWER))
     outcome = await run(loop, "Count employees and show the result.")
     wire = _outcome_to_dict(outcome)
-    assert wire["answer_tables"][0]["data_as_of"] == NEWER
+    assert wire["answer_document"]["sources"]["q"]["data_as_of"] == NEWER
     doc = await store.get_or_create_session(CREDS.session_id)
     persisted = [TrailEntry.from_doc(e.to_doc()) for e in doc.tool_trail]
     history = project_history(doc.messages, persisted, CREDS.column_scope, None)["turns"][0]
-    assert history["answer_tables"] == wire["answer_tables"]
+    assert history["answer_tables"] == outcome.answer_tables
     tables, _ = await loop._compute_turn_answer_tables(CREDS.session_id, 0)
     assert tables[0].data_as_of == NEWER
 
@@ -321,30 +315,6 @@ def test_disabled_flag_hides_persisted_history_without_mutating_receipts():
     assert "data_as_of" not in turn["answer_tables"][0]
     assert all("data_as_of" not in call for call in turn["tool_calls"])
     assert entry.data_as_of == NEWER
-
-
-async def test_disabled_flag_hides_resumed_outcome_in_sse():
-    from data_agent.runtime.app import _stream_turn
-    from data_agent.runtime.loop.agent_loop import TurnOutcome
-    from data_agent.runtime.observability.progress import ProgressEmitter
-
-    outcome = TurnOutcome(
-        status="done",
-        assistant_text="One",
-        pending_question=None,
-        tool_calls_made=0,
-        answer_tables=[{"sql": "SELECT 1", "data_as_of": NEWER}],
-    )
-
-    async def call():
-        return outcome
-
-    events = [
-        event async for event in _stream_turn(call, ProgressEmitter(), data_as_of_enabled=False)
-    ]
-    assert "event: result" in "".join(events)
-    assert "data_as_of" not in "".join(events)
-    assert outcome.answer_tables[0]["data_as_of"] == NEWER
 
 
 async def test_upstream_timestamp_is_ignored_without_runtime_lookup():

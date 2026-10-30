@@ -43,7 +43,7 @@ async def test_timeout_retries_once_and_honors_verdict(approved):
     assert client.cancelled and client.retry_calls == 1
     assert context.review_seconds < .3
     assert not context.review_failure_reason
-    assert events == ["loop_answer_judge_timeout_retry"]
+    assert events == ["loop_presentation_review_started", "loop_answer_judge_timeout_retry"]
 
 
 @pytest.mark.parametrize("enabled,budget", [(False,.2), (True,.01)])
@@ -71,7 +71,7 @@ async def test_second_timeout_does_not_recurse():
 async def test_cancellation_never_retries():
     client = SlowClient()
     judge = AnswerJudge(client, 20000, timeout_seconds=10)
-    task = asyncio.create_task(review_once(SimpleNamespace(_answer_judge=judge), _brief()))
+    task = asyncio.create_task(review_once(SimpleNamespace(_answer_judge=judge, _observer=lambda *a: None), _brief()))
     await asyncio.sleep(.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -88,7 +88,7 @@ async def test_non_timeout_never_retries(mode):
             return _verdict_turn(True)
 
     client = Client()
-    verdict = await review_once(SimpleNamespace(_answer_judge=AnswerJudge(client, 20000)), _brief())
+    verdict = await review_once(SimpleNamespace(_answer_judge=AnswerJudge(client, 20000), _observer=lambda *a: None), _brief())
     assert verdict.approved
     assert verdict.reviewed == (mode == "success")
     assert client.retry_calls == 0

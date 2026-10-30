@@ -44,7 +44,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview, live_analysis_state
 from tests._blueprint_gate import expand_blueprint
-from tests.runtime.final_answer import final_answer
+from tests.runtime.final_answer import answer_arguments, final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
@@ -860,12 +860,11 @@ async def test_the_live_three_intent_failure_now_completes_with_zero_rejections(
                     ),
                     ToolCallRequest(
                         id="a1",
-                        name=ANSWER,
-                        arguments={
-                            "answer": "Headcount and average salary by department, "
+                        name="finalizeAnswer",
+                        arguments=answer_arguments(
+                            takeaway="Headcount and average salary by department, "
                             "plus the six-month hiring projection.",
-                            "tables": [{"sql": "SELECT 1"}],
-                        },
+                        ),
                     ),
                 ],
             ),

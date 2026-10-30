@@ -21,6 +21,7 @@ from data_agent.runtime.loop.measurement import cardinality_probes
 from data_agent.runtime.loop.turn_accumulators import TurnAccumulators
 from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.loop.test_repository_regressions import entry
 from tests.runtime.test_harness_improvements import CATALOG, CREDS, batch, build, call
 
@@ -129,14 +130,7 @@ async def test_third_failed_sql_is_not_dispatched():
         + [batch(call("runQuery", f"q{i}", sql=sql)) for i in range(3)]
         + [
             batch(
-                call(
-                    "finalizeAnswer",
-                    "f",
-                    answer="I could not complete this calculation.",
-                    tables=[],
-                    capability_refs=[],
-                    evidence=[],
-                )
+                call("finalizeAnswer", "f", **answer_arguments(takeaway="I could not complete this calculation.", tables=[], capability_refs=[], evidence=[]))
             )
         ],
         rows=[MCPToolError("CLICKHOUSE_QUERY_ERROR", "SYNTAX_ERROR") for _ in range(3)],
@@ -185,14 +179,7 @@ async def test_exhaustion_receipt_closes_only_failed_intent_with_explicit_bindin
             )
         ),
         batch(
-            call(
-                "finalizeAnswer",
-                "f",
-                answer="I could not complete the salary calculation.",
-                tables=[],
-                capability_refs=[],
-                evidence=[],
-            )
+            call("finalizeAnswer", "f", **answer_arguments(takeaway="I could not complete the salary calculation.", tables=[], capability_refs=[], evidence=[]))
         ),
     ]
     loop, store, *_ = build(

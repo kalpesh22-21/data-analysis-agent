@@ -124,6 +124,9 @@ BLUEPRINT_NOT_SEARCHED_MESSAGE = (
     "Use runQuery only for uncovered work or when the corpus is unavailable. Do not force a semantic mismatch."
 )
 
+# Authoritative permission receipts shared by direct queries, blueprint probes and intents.
+ACCESS_DENIAL_CODES = frozenset({"COLUMN_SCOPE_VIOLATION", "SCRATCH_SESSION_VIOLATION"})
+
 OUT_OF_SCOPE_REQUEST_CODE = "OUT_OF_SCOPE_REQUEST"
 
 _DENIAL_TABLE: dict[str, DenialInfo] = {

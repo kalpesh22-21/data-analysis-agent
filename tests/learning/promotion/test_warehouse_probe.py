@@ -107,7 +107,9 @@ async def test_probe_runs_the_grain_probe_when_grain_declared() -> None:
     assert result.columns == ("department",)
     # the second call WAS the grain probe (built by the shared helper).
     grain_sql = mcp.calls[1].args["sql"].lower()
-    assert "count(*)" in grain_sql and "count(distinct department)" in grain_sql
+    assert "count(*) as __bp_d" in grain_sql
+    assert 'group by "department"' in grain_sql
+    assert "coalesce(sum(__bp_group_n), 0) as __bp_n" in grain_sql
 
 
 async def test_probe_holds_grain_unverifiable_when_column_unmappable() -> None:

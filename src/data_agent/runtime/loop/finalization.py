@@ -468,7 +468,7 @@ def empty_answer_nudge_text(incomplete_reason: str | None = None) -> str:
         "tool call that gets you closer to it."
     )
     lines.append(
-        "If you cannot answer the question, use finalizeAnswer.answer to say what blocked you — "
+        "If you cannot answer the question, use finalizeAnswer.takeaway to say what blocked you — "
         "that is a valid, complete answer. Silence is not."
     )
     return "\n".join(lines)

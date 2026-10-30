@@ -12,6 +12,7 @@ from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.observability.progress import ProgressEmitter, to_progress_event
 from tests.runtime.dispatch.test_tool_dispatcher import CATALOG, _credentials
+from tests.runtime.final_answer import final_answer
 
 
 @pytest.mark.parametrize("path", ["mcp", "runtime"])
@@ -78,10 +79,11 @@ async def test_dispatch_lifecycle_survives_sse_for_remote_and_runtime_tools(path
     progress = [
         json.loads(frame.split("data: ", 1)[1]) for frame in frames if "event: progress" in frame
     ]
-    assert [p["shape"].get("lifecycle") for p in progress] == [None, "start", status]
-    assert all(p["step"] == "Checking the requested information" for p in progress)
-    assert all(p["shape"]["tool_call_id"] == "step-1" for p in progress)
-    assert all(p["shape"]["tool_name"] == name for p in progress)
+    assert [p["sequence"] for p in progress] == [1, 2, 3]
+    assert all(p["phase"] == "analyzing" for p in progress)
+    assert all(p["message"] == "Checking the requested information" for p in progress)
+    assert len({p["turn_id"] for p in progress}) == 1
+    assert all("shape" not in p and "step" not in p for p in progress)
     assert "event: result" in frames[-1]
     assert "private" not in "".join(frames)
     assert "secret-jwt" not in "".join(frames)
@@ -111,7 +113,6 @@ async def test_blueprint_resume_preserves_denied_result_lifecycle(monkeypatch):
         SESSION_ID,
         _creds,
         _make_loop,
-        _prose_resume_script,
         _resume_mcp,
         _run_to_approval_pause,
     )
@@ -125,7 +126,7 @@ async def test_blueprint_resume_preserves_denied_result_lifecycle(monkeypatch):
     emitter = ProgressEmitter()
     loop = _make_loop(
         store,
-        ScriptedModelClient(_prose_resume_script("This step could not proceed.")),
+        ScriptedModelClient([final_answer(assistant_text="This step could not proceed.")]),
         _resume_mcp(),
         executor=Executor(),
     )
@@ -154,13 +155,10 @@ async def test_blueprint_resume_preserves_denied_result_lifecycle(monkeypatch):
         )
     ]
     progress = [json.loads(f.split("data: ", 1)[1]) for f in frames if "event: progress" in f]
-    dispatch = [
-        p["shape"]
-        for p in progress
-        if p["shape"].get("tool_name") == "runBlueprint" and "lifecycle" in p["shape"]
-    ]
-    assert [p["lifecycle"] for p in dispatch] == ["start", "denied"]
-    assert dispatch[0]["tool_call_id"] == dispatch[1]["tool_call_id"]
+    assert [p["sequence"] for p in progress] == list(range(1, len(progress) + 1))
+    assert progress
+    assert all("message" in p and "phase" in p for p in progress)
+    assert len({p["turn_id"] for p in progress}) == 1
 
 
 @pytest.mark.parametrize("status", ["ok", "denied", "error"])

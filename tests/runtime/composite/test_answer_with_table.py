@@ -1,12 +1,10 @@
-"""Backend tests for the `answerWithTable` runtime tool + the `answer_sql` result
-field (the replacement for `result_table`).
+"""Internal table-resolution and saved-history regressions.
 
-Covers: `clean_answer_sql` normalization; the tool's `ToolResult` shape and
-no-raise-on-malformed-args contract; the TERMINAL contract (a successful call ends
-the turn, and its `answer` becomes the persisted assistant message); designation by
-raw `sql` and by `blueprint_id`; last-designation-wins; the dormant
-`hooks/answer_table.py` seams; and that a successful call reaches the model as a
-real confirmation rather than the D94 withheld sentinel.
+Live answer selection now requires execution references and is covered by
+`tests/runtime/test_answer_document.py` and `tests/runtime/test_app.py`.
+Retired raw-SQL finalization and parallel UI-envelope assertions are intentionally
+not part of the new document contract. Keep these resolver/history checks for
+existing saved sessions and the private verification machinery.
 """
 
 from __future__ import annotations
@@ -31,7 +29,6 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TrailEntry, TurnMessage
-from tests._blueprint_gate import expand_blueprint
 from tests.runtime.final_answer import final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools")
@@ -205,46 +202,8 @@ def _answer(call_id: str, **args: object) -> ModelTurnResult:
     )
 
 
-async def test_a_successful_call_ends_the_turn() -> None:
-    """THE POINT of making it terminal. The model used to designate, receive a
-    trivial confirmation, and then re-send the ENTIRE conversation purely to emit a
-    sentence it could already have written — a round-trip that bought nothing.
-
-    The second scripted result below must never be consumed: exactly ONE model call.
-    """
-    model = ScriptedModelClient(
-        [
-            _answer("a1", answer="Three departments.", tables=[{"sql": _ANSWER_SQL}]),
-            final_answer(assistant_text="THIS MUST NOT BE REACHED."),
-        ]
-    )
-    loop, _ = _build_loop(model)
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="by dept?")
-
-    assert len(model.calls) == 1, "the designation must end the turn, not cost another round-trip"
-    assert outcome.status == "done"
-    assert outcome.assistant_text == "Three departments."
-    assert outcome.answer_sql == _ANSWER_SQL
 
 
-async def test_the_terminal_answer_is_persisted_like_an_ordinary_one() -> None:
-    """`assistant_text` now originates in tool ARGUMENTS rather than a model
-    message, but replay / session_history / the D44 scope gate all read the
-    persisted assistant `TurnMessage`. If it were not written identically, history
-    would silently disagree with the live answer for exactly the table turns."""
-    loop, store = _build_loop(
-        ScriptedModelClient(
-            [_answer("a1", answer="Three departments.", tables=[{"sql": _ANSWER_SQL}])]
-        )
-    )
-    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="by dept?")
-
-    doc = await store.get_or_create_session(SESSION_ID)
-    assistants = [m for m in doc.messages if m.role == "assistant"]
-    assert [m.content for m in assistants] == ["Three departments."]
-    # Tagged with the turn's provenance union, exactly like the no-tool-calls exit.
-    assert assistants[0].provenance is not None
 
 
 async def test_a_decline_finishes_explicitly_without_a_table() -> None:
@@ -279,62 +238,8 @@ async def test_a_call_without_answer_text_does_not_end_the_turn() -> None:
     assert outcome.answer_sql is None  # The final proposal explicitly clears tables.
 
 
-async def test_batched_assumptions_and_answer_both_land() -> None:
-    """A model may batch recordAssumptions with the terminal call. The terminal exit
-    fires only AFTER the whole batch drains, so the assumptions are not lost."""
-    model = ScriptedModelClient(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="r1",
-                        name="recordAssumptions",
-                        arguments={"assumptions": ["'Active' meant currently employed."]},
-                    ),
-                    ToolCallRequest(
-                        id="a1",
-                        name="answerWithTable",
-                        arguments={
-                            "answer": "See the table.",
-                            "tables": [{"sql": _ANSWER_SQL}],
-                        },
-                    ),
-                ]
-            )
-        ]
-    )
-    loop, _ = _build_loop(model)
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert outcome.assumptions == ["'Active' meant currently employed."]
-    assert outcome.answer_sql == _ANSWER_SQL
-    assert outcome.assistant_text == "See the table."
 
 
-async def test_last_designation_wins() -> None:
-    second = "SELECT month, count() FROM dbpcm_warehouse.employee GROUP BY month"
-    model = ScriptedModelClient(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="a1",
-                        name="answerWithTable",
-                        arguments={"answer": "one", "tables": [{"sql": _ANSWER_SQL}]},
-                    ),
-                    ToolCallRequest(
-                        id="a2",
-                        name="answerWithTable",
-                        arguments={"answer": "two", "tables": [{"sql": second}]},
-                    ),
-                ]
-            )
-        ]
-    )
-    loop, _ = _build_loop(model)
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert outcome.answer_sql == second
 
 
 # --- blueprint_id designation ----------------------------------------------
@@ -393,28 +298,8 @@ async def test_the_nudge_is_visible_to_the_model_on_the_next_round_trip() -> Non
     assert "run" in str(rendered[0]["content"]).lower()
 
 
-async def test_a_raw_sql_designation_is_never_nudged() -> None:
-    """The nudge is only for an unresolvable BLUEPRINT reference. A raw-SQL answer
-    has nothing to look up, so it must terminate normally."""
-    model = ScriptedModelClient([_answer("a1", answer="Done.", tables=[{"sql": _ANSWER_SQL}])])
-    loop, _ = _build_loop(model)
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert len(model.calls) == 1
-    assert outcome.answer_sql == _ANSWER_SQL
 
 
-async def test_raw_sql_wins_when_both_are_given() -> None:
-    loop, _ = _build_loop(
-        ScriptedModelClient(
-            [
-                _answer(
-                    "a1", answer="x", tables=[{"sql": _ANSWER_SQL, "blueprint_id": "bp-never-ran"}]
-                )
-            ]
-        )
-    )
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert outcome.answer_sql == _ANSWER_SQL
 
 
 # --- the dormant hook seams -------------------------------------------------
@@ -424,75 +309,12 @@ async def test_hooks_are_dormant_by_default() -> None:
     assert AnswerTableHooks().is_dormant
 
 
-async def test_an_unresolved_hook_can_supply_a_replacement() -> None:
-    seen: list[AnswerTableEvent] = []
-
-    def _hook(event: AnswerTableEvent) -> str:
-        seen.append(event)
-        return "SELECT 1 AS recovered"
-
-    hooks = AnswerTableHooks()
-    hooks.register_unresolved(_hook)
-    loop, _ = _build_loop(
-        ScriptedModelClient([_answer("a1", answer="x", tables=[{"blueprint_id": "bp-never-ran"}])]),
-        hooks=hooks,
-    )
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert outcome.answer_sql == "SELECT 1 AS recovered"
-    assert [e.blueprint_id for e in seen] == ["bp-never-ran"]
-    # D5: a hook is never handed the raw session id or any credential.
-    assert seen[0].session_id_hash != SESSION_ID
-    assert not hasattr(seen[0], "jwt")
 
 
-async def test_an_ephemeral_hook_fires_for_a_scratch_backed_table() -> None:
-    """A scratch-backed designation works NOW and dies at the TTL. The seam exists
-    so a durable replacement can be swapped in without reopening the loop."""
-    scratch_sql = "SELECT * FROM scratch.s_abc_bp_0001"
-    seen: list[AnswerTableEvent] = []
-
-    def _hook(event: AnswerTableEvent) -> str:
-        seen.append(event)
-        return "SELECT * FROM durable.answer_1"
-
-    hooks = AnswerTableHooks()
-    hooks.register_ephemeral(_hook)
-    loop, _ = _build_loop(
-        ScriptedModelClient([_answer("a1", answer="x", tables=[{"sql": scratch_sql}])]), hooks=hooks
-    )
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-
-    assert outcome.answer_sql == "SELECT * FROM durable.answer_1"
-    assert [e.sql for e in seen] == [scratch_sql]
 
 
-async def test_an_ephemeral_hook_does_not_fire_for_an_ordinary_table() -> None:
-    calls: list[AnswerTableEvent] = []
-    hooks = AnswerTableHooks()
-    hooks.register_ephemeral(lambda e: calls.append(e) or None)  # type: ignore[func-returns-value]
-    loop, _ = _build_loop(
-        ScriptedModelClient([_answer("a1", answer="x", tables=[{"sql": _ANSWER_SQL}])]), hooks=hooks
-    )
-    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert calls == []
 
 
-async def test_a_raising_hook_never_breaks_the_turn() -> None:
-    """Degrade-not-fail: an extension point must not be able to fail a user's turn."""
-    hooks = AnswerTableHooks()
-    hooks.register_ephemeral(_boom)
-    loop, _ = _build_loop(
-        ScriptedModelClient(
-            [_answer("a1", answer="x", tables=[{"sql": "SELECT c FROM scratch.`s_sess-answer-with-table_bp_1`"}])]
-        ),
-        hooks=hooks,
-    )
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert outcome.status == "done"
-    assert outcome.answer_sql == "SELECT c FROM scratch.`s_sess-answer-with-table_bp_1`"  # unchanged, not lost
 
 
 def _boom(event: AnswerTableEvent) -> str:
@@ -544,55 +366,6 @@ class _StubBlueprintTool:
         )
 
 
-async def test_a_blueprint_id_resolves_to_that_blueprints_terminal_sql() -> None:
-    """The positive `blueprint_id` case: the model names the blueprint it ran and
-    the runtime resolves it to a concrete pageable query, so the model never has to
-    copy rendered SQL it may only partly see — and the UI still receives ONE field.
-    """
-    terminal = "SELECT month, hires FROM dbpcm_warehouse.employee_hires_by_month"
-    store = InMemorySessionStore()
-    model = ScriptedModelClient(
-        [
-            ModelTurnResult(
-                tool_calls=[
-                    ToolCallRequest(
-                        id="b1",
-                        name="runBlueprint",
-                        arguments={
-                            "id": "bp-hires-per-month",
-                            "slot_bindings": {"window_months": 6},
-                        },
-                    )
-                ]
-            ),
-            _answer(
-                "a1", answer="Six months of hires.", tables=[{"blueprint_id": "bp-hires-per-month"}]
-            ),
-        ]
-    )
-    loop = AgentLoop(
-        model_client=model,
-        tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store),
-        session_store=store,
-        tools_provider=_tools_provider,
-        max_loop_iterations=15,
-        max_wall_clock_seconds=60,
-        max_budget_windows=3,
-        runtime_tools={
-            "answerWithTable": AnswerWithTableTool(),
-            "runBlueprint": _StubBlueprintTool("bp-hires-per-month", terminal),
-        },
-    )
-    # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
-    await expand_blueprint(store, SESSION_ID, "bp-hires-per-month")
-
-    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="hires?")
-
-    assert outcome.answer_sql == terminal
-    assert outcome.assistant_text == "Six months of hires."
-    # The transparency list still records what RAN, distinctly from what the answer IS.
-    assert outcome.sql_executed == ["SELECT 1 /* an earlier node */", terminal]
 
 
 async def test_a_blueprint_designation_survives_a_pause_and_resume() -> None:

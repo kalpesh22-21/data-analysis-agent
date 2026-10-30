@@ -48,7 +48,7 @@ from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import live_analysis_state
 from data_agent.runtime.session.store import CASMismatchError
 from tests._blueprint_gate import expand_blueprint
-from tests.runtime.final_answer import final_answer
+from tests.runtime.final_answer import answer_arguments, final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
@@ -66,7 +66,7 @@ CATALOG = CatalogHandle(
 _BID = "bp-flag-departments"
 
 STATE = "updateAnalysisState"
-ANSWER = "answerWithTable"
+ANSWER = "answerWithText"
 HEADCOUNT = "headcount by department"
 ATTRITION = "attrition by department"
 
@@ -195,9 +195,9 @@ def _update_call(call_id: str, *updates: dict[str, Any]) -> ToolCallRequest:
     return ToolCallRequest(id=call_id, name=STATE, arguments={"intents": list(updates)})
 
 
-def _answer_call(call_id: str, answer: str = "Here is the answer.") -> ToolCallRequest:
+def _answer_call(call_id: str, answer: str = "I cannot answer from the available information.") -> ToolCallRequest:
     return ToolCallRequest(
-        id=call_id, name=ANSWER, arguments={"answer": answer, "tables": [{"sql": "SELECT 1"}]}
+        id=call_id, name="finalizeAnswer", arguments=answer_arguments(takeaway=answer)
     )
 
 
@@ -274,7 +274,7 @@ async def test_the_window_local_state_governs_after_a_blueprint_mid_dag_resume()
 
     # Refused, not finalized: the reloaded local governed the resumed window.
     assert _events(resume_events, "loop_finalization_refused") == [
-        {"exit": "answer_with_table", "pending_count": 2}
+        {"exit": "answer_with_text", "pending_count": 2}
     ]
     trail = await store.load_trail(SESSION_ID)
     refusal = next(e for e in trail if e.tool_call_id == "a1")
@@ -511,7 +511,7 @@ async def test_a_budget_cap_during_a_refused_round_terminally_disposes_a_live_tu
 
     assert paused.status == "paused_budget_cap"
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "answer_with_table", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
     state = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
     assert [(i.status, i.reason_code) for i in state.intents] == [
@@ -531,7 +531,7 @@ async def test_a_budget_cap_during_a_refused_round_terminally_disposes_a_live_tu
     # The user grants more budget. The disposition is NOT restored, and the next
     # window finalizes with no enforcement at all.
     resumed_loop, _s2, resume_events = _build(
-        [ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a2", answer="Done.")])],
+        [ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a2", answer="I cannot answer from the available information.")])],
         store=store,
         max_loop_iterations=5,
         max_budget_windows=3,
@@ -541,7 +541,7 @@ async def test_a_budget_cap_during_a_refused_round_terminally_disposes_a_live_tu
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == "Done."
+    assert outcome.assistant_text == "I cannot answer from the available information."
     assert not _events(resume_events, "loop_finalization_refused")
     final = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
     assert [(i.status, i.reason_code) for i in final.intents] == [
@@ -574,7 +574,7 @@ async def test_two_answers_in_one_batch_with_the_counter_spent_terminate_once() 
     assert outcome.status == "done"
     # Round 2 refused once (spending the window's block); round 3 exhausted once.
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "answer_with_table", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
     assert _events(events, "loop_enforcement_exhausted") == [{"intent_count": 1}]
     assert _events(events, "loop_intent_force_blocked") == [
@@ -623,7 +623,7 @@ async def test_a_failing_force_block_returns_the_answer_and_claims_no_transition
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
             ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a1")]),
-            ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a2", answer="Done.")]),
+            ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a2", answer="I cannot answer from the available information.")]),
         ],
         store=store,
     )
@@ -839,7 +839,7 @@ async def test_a_surplus_state_call_cannot_launder_a_pending_intent_past_the_ans
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two things")
 
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "answer_with_table", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
     surplus = [
         payload
@@ -953,7 +953,7 @@ async def test_a_second_turn_gets_its_own_forced_reround() -> None:
     await turn_one.run(session_id=SESSION_ID, credentials=_creds(), user_message="second ask")
 
     assert _events(one_events, "loop_finalization_refused") == [
-        {"exit": "answer_with_table", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ], (
         "the second turn's first finalization attempt was force-blocked without "
         "ever being refused once — its forced re-round was consumed by a PREVIOUS "

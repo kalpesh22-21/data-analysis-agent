@@ -58,7 +58,7 @@ def test_disabled_agent_routes_data_without_widget_instructions():
     for text in ("data widget", "UI option", "capability preparation", "getCapabilityTool"):
         assert text not in prompt
     # This is still part of the shared finalization contract.
-    assert "capability_refs" in prompt
+    assert "capability_ref" in prompt
     assert "blueprint first" in prompt
     enabled = RuntimeSettings(capability_tools_enabled=True).effective_agent_system_prompt()
     assert "first look for a matching data widget" in enabled

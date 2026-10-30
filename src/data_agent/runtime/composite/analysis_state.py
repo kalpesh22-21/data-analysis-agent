@@ -8,8 +8,6 @@ checks semantic support. Legacy reason_code/evidence_tool_call_id inputs are ign
 
 from __future__ import annotations
 
-from data_agent.sqlparse.scratch_namespace import scratch_databases
-
 import hashlib
 import logging
 from collections.abc import Sequence
@@ -17,6 +15,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
+from data_agent.runtime.dispatch.denial_mapping import ACCESS_DENIAL_CODES
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolObserver,
     ToolResult,
@@ -32,6 +31,7 @@ from data_agent.runtime.session.models import (
     TrailEntry,
     live_analysis_state,
 )
+from data_agent.sqlparse.scratch_namespace import scratch_databases
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -163,7 +163,7 @@ TAG_DROP_REASONS = frozenset({"no_live_state", "unknown_intent_id", "not_a_strin
 # BLUEPRINT-FIRST release the primary route could not produce access evidence at
 # all. Keying on the code is safe because the only `ok` entry that carries an
 # `error_code` is the idempotent-read guard marker, which is not in this set.
-NO_ACCESS_ERROR_CODES = frozenset({"COLUMN_SCOPE_VIOLATION", "SCRATCH_SESSION_VIOLATION"})
+NO_ACCESS_ERROR_CODES = ACCESS_DENIAL_CODES
 # The reason codes the runtime will DERIVE from a block's evidence. Taken from
 # `MODEL_REASON_CODES` rather than re-listed: derivation is defined as "the code
 # whose 04 §B validator accepts this call", so the set of derivable codes IS the

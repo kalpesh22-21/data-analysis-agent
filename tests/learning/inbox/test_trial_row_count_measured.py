@@ -176,7 +176,7 @@ async def test_a_grain_the_probe_cannot_map_leaves_the_row_count_unmeasured() ->
 async def test_a_grain_probe_whose_result_cannot_be_read_is_also_unmeasured() -> None:
     """The second None-producing path, and the one a declaration cannot see coming.
 
-    Here the grain column DOES map, so the COUNT(*)/COUNT(DISTINCT) query is genuinely
+    Here the grain column DOES map, so the null-preserving grouped-count query is genuinely
     dispatched — the flag cannot be derived from "did the second round-trip happen" either.
     `unpack_grain_probe` then fails to read counts out of what came back (a headerless or
     row-less result, a non-numeric cell) and returns `(None, None)`, which the probe turns
@@ -198,7 +198,9 @@ async def test_a_grain_probe_whose_result_cannot_be_read_is_also_unmeasured() ->
     assert result.ok is True, result.reason
     # The round-trip DID happen — this is not the unmappable path wearing a different hat.
     assert len(mcp.calls) == 2
-    assert "count(distinct" in mcp.calls[1].args["sql"].lower()
+    grain_sql = mcp.calls[1].args["sql"].lower()
+    assert 'group by "total_earnings"' in grain_sql
+    assert "count(*) as __bp_d" in grain_sql
     assert result.distinct_grain_count is None
     assert result.row_count == 0
     assert result.row_count_measured is False
@@ -206,7 +208,7 @@ async def test_a_grain_probe_whose_result_cannot_be_read_is_also_unmeasured() ->
 
 async def test_a_grain_probe_that_answered_is_the_one_case_that_reports_measured() -> None:
     """The positive control, without which every assertion above is satisfied by a constant
-    `False`. The COUNT(DISTINCT) round-trip completed and returned counts, so — and ONLY so —
+    `False`. The grouped-count round-trip completed and returned counts, so — and ONLY so —
     the row count on the card is a real reading of the warehouse.
     """
     env = _candidate(grain_columns=["total_earnings"])

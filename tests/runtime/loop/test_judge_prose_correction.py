@@ -5,13 +5,12 @@ import pytest
 from data_agent.runtime.loop.answer_judge import APPROVED, AnswerJudge, JudgeBrief, JudgeVerdict
 from data_agent.runtime.loop.proposal import ReviewState
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
+from tests.runtime.final_answer import final_answer
 from tests.runtime.loop.test_answer_judge_unit import _raw_turn
 from tests.runtime.test_harness_improvements import (
     CREDS,
     Judge,
-    batch,
     build,
-    call,
     discovery,
     query,
     run,
@@ -22,15 +21,7 @@ CORRECTED = "The ranking is shown. Employee names are unavailable in the returne
 
 
 def final(answer=ORIGINAL):
-    return batch(
-        call(
-            "finalizeAnswer",
-            "answer",
-            answer=answer,
-            tables=[{"result_id": "q", "caption": "Ranking"}],
-            evidence=["q"],
-        )
-    )
+    return final_answer(assistant_text=answer, tables=[{"result_id": "q", "caption": "Ranking"}], evidence=["q"])
 
 
 def correction(text=CORRECTED):

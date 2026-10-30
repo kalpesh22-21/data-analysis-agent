@@ -43,7 +43,7 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import FinalizationBlockKind
-from tests.runtime.final_answer import final_answer
+from tests.runtime.final_answer import answer_arguments, final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
@@ -164,8 +164,8 @@ def _query(call_id: str) -> ToolCallRequest:
 def _answer_table(call_id: str, answer: str) -> ToolCallRequest:
     return ToolCallRequest(
         id=call_id,
-        name=ANSWER,
-        arguments={"answer": answer, "tables": [{"sql": RAN_SQL, "caption": "By dept"}]},
+        name="finalizeAnswer",
+        arguments=answer_arguments(takeaway=answer, tables=[{"result_id": "q1", "caption": "By dept"}]),
     )
 
 

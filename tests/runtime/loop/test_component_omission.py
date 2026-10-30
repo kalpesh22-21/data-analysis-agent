@@ -9,6 +9,7 @@ from data_agent.runtime.loop.proposal import (
     omit_components,
 )
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import final_answer
 from tests.runtime.test_harness_improvements import (
     CREDS,
     SQL,
@@ -32,16 +33,9 @@ CARD = {
 
 
 def proposal(ident, text):
-    return batch(
-        call(
-            "finalizeAnswer",
-            ident,
-            answer=text,
-            tables=[{"result_id": "q", "caption": "Employee count"}],
-            capability_refs=["identifier"],
-            evidence=["q", "p"],
-        )
-    )
+    result = final_answer(assistant_text=text, tables=[{"result_id": "q", "caption": "Employee count"}], capability_refs=["identifier"], evidence=["q", "p"])
+    from dataclasses import replace
+    return replace(result, tool_calls=[replace(result.tool_calls[0], id=ident)])
 
 
 def refusal(*refs):
@@ -202,16 +196,8 @@ async def test_table_omission_preserves_another_table_and_history():
     judge = Judge([refusal("q"), JudgeVerdict(True, reviewed=True)])
 
     def both(ident):
-        return batch(
-            call(
-                "finalizeAnswer",
-                ident,
-                answer="There are 120 employees. The breakdown could not be verified.",
-                tables=[{"result_id": "q"}, {"result_id": "other"}],
-                capability_refs=[],
-                evidence=["q", "other"],
-            )
-        )
+        return final_answer(assistant_text="There are 120 employees. The breakdown could not be verified.",
+                            tables=[{"result_id": "q"}, {"result_id": "other"}], evidence=["q", "other"])
 
     loop, store, *_ = build(
         [

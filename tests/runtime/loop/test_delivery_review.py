@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 
@@ -9,6 +10,7 @@ from data_agent.runtime.loop.answer_judge import APPROVED, JudgeVerdict
 from data_agent.runtime.model.client import ModelTurnResult
 from data_agent.runtime.observability.progress import ProgressEmitter
 from data_agent.runtime.session_history import project_history
+from tests.runtime.final_answer import answer_arguments
 from tests.runtime.test_harness_improvements import (
     CREDS,
     Judge,
@@ -24,14 +26,7 @@ from tests.runtime.test_harness_improvements import (
 
 def hello():
     return batch(
-        call(
-            "finalizeAnswer",
-            "hello",
-            answer="Hello! How can I help?",
-            tables=[],
-            capability_refs=[],
-            evidence=[],
-        )
+        call("finalizeAnswer", "hello", **answer_arguments(takeaway="Hello! How can I help?", tables=[], capability_refs=[], evidence=[]))
     )
 
 

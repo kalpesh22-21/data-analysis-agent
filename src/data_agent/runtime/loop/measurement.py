@@ -10,6 +10,7 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
+from data_agent.runtime.dispatch.denial_mapping import ACCESS_DENIAL_CODES, classify_denial
 from data_agent.runtime.dispatch.sql_diagnostics import PREFIX, decode_diagnostic
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,16 @@ class AggregationIssue(str):
             retryable=self.retryable,
             retry="after_query_change" if self.retryable else "after_operator_action",
         )
-        if not self.retryable:
+        if self.code in ACCESS_DENIAL_CODES:
+            payload["retry"] = "after_access_change"
+            payload["guidance"] = (
+                "Access to the indicated field or dataset is denied in this session. "
+                "Do not retry the denied access through another query or blueprint. "
+                "If this prevents a requested part, bind this result_id with NO_ACCESS. "
+                "Continue independent accessible parts and retain successful results. "
+                "Do not infer that unrelated fields or datasets are also blocked, or that data is absent."
+            )
+        elif not self.retryable:
             payload["guidance"] = (
                 "Use other successful evidence. If this blocks an intent, bind this failed result_id with EXECUTION_FAILED and disclose the verification limitation, not data absence."
             )
@@ -562,6 +572,17 @@ async def validate_join_cardinality(
             )
             if result.status != "ok":
                 diagnostic = decode_diagnostic(result.denial_detail)
+                if result.error_code in ACCESS_DENIAL_CODES:
+                    # denial_detail has already passed the dispatcher's credential
+                    # scrub. Never substitute a raw backend exception/user message.
+                    message = result.denial_detail if not diagnostic else diagnostic.get("message")
+                    message = message or classify_denial(result.error_code).user_message
+                    return AggregationIssue(
+                        message + " The main query was not executed because its verification requires this access.",
+                        code=result.error_code,
+                        retryable=False,
+                        cause={"code": result.error_code, "message": message},
+                    )
                 return AggregationIssue(
                     "The join cardinality probe failed; this is not proof of duplicate rows. "
                     "The main query was not executed. Follow the probe diagnostic in ClickHouse SQL "

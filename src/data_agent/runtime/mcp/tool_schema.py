@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from data_agent.runtime.prompts import ANSWER_MARKDOWN_GUIDANCE
+from data_agent.runtime.composer import PROPOSAL_SCHEMA
 
 from .client import MCPClient, MCPToolSpec
 
@@ -276,7 +276,7 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
         "may be omitted to apply its declared default; omission does not always mean all values. "
         "Read each slot note: a supplied value overrides the default. Use an explicit all-values "
         "option only when the blueprint declares one and the request requires it. If a required "
-        "slot is missing or a value is ambiguous, the run pauses to ask the user. Every "
+        "slot is missing or a value is ambiguous, the run pauses to ask the user. Do not invent a required metric basis (for example gross earnings versus net pay); use an explicit user choice or documented default, otherwise clarify. Every "
         "result receives structural verification; this does not establish that its metric or "
         "scope matches the question. Check scope before execution; correct through declared "
         "slots, or choose another blueprint/targeted query if hard-coded SQL conflicts. "
@@ -668,48 +668,23 @@ GET_CAPABILITY_TOOL_SCHEMA: dict[str, Any] = {
 FINALIZE_ANSWER_SCHEMA = {
     "type": "function",
     "name": "finalizeAnswer",
-    "description": "Send the complete final answer after all work and preparation finishes. This is the only finalization tool. Select existing result IDs for paginated tables, including one-row counts/totals, and prepared capability refs for UI options. Cite successful current-turn result IDs in evidence. Preserve supported parts and disclose gaps. Be succinct: include only important findings and necessary caveats; do not rewrite values already displayed in tables. Column context from successful getTableSchema is valid evidence for its documented lookup scope.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "answer": {"type": "string", "description": ANSWER_MARKDOWN_GUIDANCE},
-            "tables": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {"result_id": {"type": "string"}, "caption": {"type": "string"}},
-                    "required": ["result_id"],
-                },
-            },
-            "capability_refs": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Prepared UI options to select. Omission selects none.",
-            },
-            "evidence": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Successful current-turn supporting result IDs. If omitted, use the explicitly selected table result IDs.",
-            },
-            "deliverables": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "intent_id": {"type": "string"},
-                        "answer": {"type": "string"},
-                        "result_ids": {"type": "array", "items": {"type": "string"}},
-                        "evidence_type": {
-                            "type": "string",
-                            "enum": ["warehouse", "product", "catalog", "capability"],
-                        },
-                    },
-                    "required": ["intent_id", "answer", "result_ids"],
-                },
-            },
-        },
-        "required": ["answer", "tables"],
-    },
+    "description": (
+        "Propose one coherent answer document: takeaway and ordered sections. Select exact "
+        "result IDs and returned column names; the backend builds values, never invent them. "
+        "Prefer zero or one visible table. Scalars use figures, charts use supporting_data "
+        "and fallback for their associated table. Extra visible tables require table_reason "
+        "explaining distinct requested value. Evidence-only queries stay hidden. Use only "
+        "prepared action references. The complete presentation will be reviewed before delivery. "
+        'Every section requires id, evidence_refs, presentation, caveats and actions (use [] when empty). '
+        'Comparison presentation example: {"kind":"bars","result_id":"<execution ID>",'
+        '"category_column":"<returned category column>","measure_column":"<returned numeric column>",'
+        '"label":"Active employees"}. Omit direction/ties for ordinary comparisons. '
+        'For compound bar groups use category_columns instead of category_column, preserving all grouping dimensions. '
+        'Line uses kind=line with a temporal category column; the backend orders points chronologically. '
+        'Figure uses kind, result_id, column and label. Text uses kind=text and markdown. '
+        'Do not invent type, axis_labels, value_field, sort_by or client rendering fields.'
+    ),
+    "parameters": PROPOSAL_SCHEMA,
 }
 
 DECLINE_OUT_OF_SCOPE_SCHEMA = {

@@ -51,14 +51,24 @@ def _validate_response(
             observer("loop_recovery_validation_failed", {"reason": reason, **details})
         return {}
 
-    if not isinstance(part, dict) or set(part) != {
-        "answer",
-        "evidence",
-        "table_result_ids",
-        "capability_refs",
-        "unfinished",
-    }:
+    from data_agent.runtime.composer import PresentationError, build_document, proposal_to_internal
+
+    if not isinstance(part, dict) or set(part) != {"takeaway", "sections", "evidence", "unfinished"}:
         return invalid("invalid_partial_shape")
+    if outcome not in {"full", "partial", "none"}:
+        return invalid("invalid_salvage_outcome")
+    try:
+        proposal = proposal_to_internal({k: v for k, v in part.items() if k != "unfinished"})
+    except (PresentationError, TypeError):
+        return invalid("invalid_presentation")
+    part = {
+        "answer": proposal["answer"], "evidence": proposal["evidence"],
+        "table_result_ids": [t["result_id"] for t in proposal["tables"]],
+        "capability_refs": proposal["capability_refs"], "unfinished": part["unfinished"],
+    }
+    if (outcome == "full" and part["unfinished"] or outcome == "none" and
+            (part["evidence"] or proposal["sections"])):
+        return invalid("invalid_salvage_outcome")
     answer = part["answer"]
     if not isinstance(answer, str) or not answer.strip():
         return invalid("empty_answer")
@@ -134,7 +144,11 @@ def _validate_response(
         found = [t for t in accum.answer_tables if t.sql == matches[0].get("sql")]
         if len(found) != 1:
             return invalid("table_candidate_missing")
-        tables.append(found[0].to_doc())
+        caption = next(t.get("caption") for t in proposal["tables"] if t["result_id"] == ref)
+        caption = normalize_approved_text(caption, provenance=eligible[ref].provenance) if caption else None
+        if caption and contains_sql(caption):
+            return invalid("sql_in_prose")
+        tables.append(replace(found[0], caption=caption).to_doc())
     for name in dict.fromkeys(part["capability_refs"]):
         matches = [
             c
@@ -145,9 +159,23 @@ def _validate_response(
         if len(matches) != 1 or len(found) != 1 or matches[0]["result_id"] not in part["evidence"]:
             return invalid("invalid_capability_reference")
         cards.append(dict(found[0]))
+    sql_by_id = {**{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
+                 **accum.result_sql_by_call_id}
+    try:
+        candidate = build_document(
+            {**proposal, "answer": text}, list(eligible.values()), turn_index=turn_index,
+            cards=cards, sql_by_id=sql_by_id, business_values=values,
+        )
+    except (PresentationError, TypeError, ValueError):
+        return invalid("invalid_presentation")
+    rendered_kinds = {section["id"]: section["presentation"]["kind"] for section in candidate["sections"]}
+    needs_review = any(rendered_kinds[section["id"]] != section["presentation"]["kind"] for section in proposal["sections"])
     return deepcopy(
         {
             "answer": text,
+            "answer_document": candidate,
+            "requires_presentation_review": needs_review,
+            "result_sql_by_call_id": {r: sql_by_id[r] for r in part["table_result_ids"] if r in sql_by_id},
             "completion": outcome,
             "request_context": [brief.question, *brief.clarification_answers],
             "evidence_receipts": {
@@ -166,10 +194,7 @@ def _validate_response(
                     for c in brief.selected_components
                     if c.get("capability_ref") in part["capability_refs"]
                 ],
-                sql_by_id={
-                    **{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
-                    **accum.result_sql_by_call_id,
-                },
+                sql_by_id=sql_by_id,
             ),
             "evidence": part["evidence"],
             "unfinished": part["unfinished"],
@@ -187,6 +212,8 @@ def restore_partial(snapshot):
     accum = TurnAccumulators(
         answer_tables=tables, sql=[t.sql for t in tables], capability_cards=snapshot["cards"]
     )
+    accum.answer_document = deepcopy(snapshot["answer_document"])
+    accum.result_sql_by_call_id.update(snapshot["result_sql_by_call_id"])
     accum.extra_evidence = snapshot.get("extra_evidence")
     accum.select_capabilities([c["name"] for c in snapshot["cards"]])
     return snapshot["answer"], accum, provenance
@@ -227,11 +254,19 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
             exclude_result_ids=frozenset(c["result_id"] for c in state.excluded_components),
         )
         current = [e for e in trail if e.turn_index == turn_index]
+        # Dependency failures can reach this path with a fresh accumulator. Restore
+        # blueprint SQL from persisted execution receipts, as resume does.
+        _, persisted_runs = await loop._compute_turn_answer_tables(session_id, turn_index)
         # All candidates come from successful scoped executions, never judge-authored SQL.
         for entry in current:
             if evidence_kind(entry) != "warehouse" or entry.provenance is None:
                 continue
-            sql = accum.result_sql_by_call_id.get(entry.tool_call_id) or entry.args.get("sql")
+            run = accum.blueprint_runs.get(entry.tool_call_id) or persisted_runs.get(entry.tool_call_id)
+            sql = (
+                accum.result_sql_by_call_id.get(entry.tool_call_id)
+                or (run.terminal_sql if run is not None else None)
+                or entry.args.get("sql")
+            )
             if sql:
                 accum.result_sql_by_call_id[entry.tool_call_id] = sql
                 if not any(t.sql == sql for t in accum.answer_tables):
@@ -325,34 +360,8 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                 analysis_state=live_analysis_state(doc, turn_index),
             )
             response = await loop._answer_judge.salvage(brief)
+            response = dict(response)
             outcome = response.pop("outcome")
-            captions = response.pop("captions", [])
-            for caption in captions:
-                ref, text = caption["result_id"], caption["caption"]
-                if ref not in response["table_result_ids"]:
-                    loop._observer("loop_salvage_caption_omitted", {"reason": "caption_not_selected"})
-                    continue
-                entry = next((e for e in current if e.tool_call_id == ref), None)
-                if entry is None:
-                    continue  # The mandatory reference validator below rejects it.
-                from .answer_rules import contains_sql
-
-                text = normalize_approved_text(text, provenance=entry.provenance)
-                if not text or contains_sql(text):
-                    loop._observer("loop_salvage_caption_omitted", {"reason": "invalid_caption"})
-                    text = None
-                accum._answer_tables = [
-                    replace(t, caption=text) if t.sql == accum.result_sql_by_call_id.get(ref) else t
-                    for t in accum.answer_tables
-                ]
-            if (
-                outcome == "full"
-                and response["unfinished"]
-                or outcome == "none"
-                and any(response[k] for k in ("evidence", "table_result_ids", "capability_refs"))
-            ):
-                loop._observer("loop_partial_answer_failed", {"reason": "invalid_salvage_outcome"})
-                return None
             snapshot = _validate_response(
                 response,
                 brief,
@@ -362,16 +371,40 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                 outcome=outcome,
                 observer=loop._observer,
             )
-            if snapshot:
-                loop._observer("loop_salvage_approved", {"status": outcome})
         if not snapshot:
             return None  # Validation already emitted the precise reason.
         text, recovered, provenance = restore_partial(snapshot)
+        if snapshot.get("requires_presentation_review"):
+            # Recovery chose selectors before materialization. Review the actual
+            # fallback table and its reason before this changed document can ship.
+            fallback_brief = loop._judge_brief(
+                "exit_table", question=questions[0] if questions else "",
+                accum=recovered, analysis_state=live_analysis_state(doc, turn_index),
+                draft=text, results=results, date_anchor=anchor,
+                designated_tables=tuple((t.caption, t.sql) for t in recovered.answer_tables),
+            )
+            fallback_brief = replace(
+                fallback_brief, clarification_answers=tuple(questions[1:]),
+                previous_rejection=state.feedback or state.violation,
+            )
+            fallback_brief = await enrich_brief(
+                fallback_brief, trail=trail, turn_index=turn_index, session_id=session_id,
+                store=loop._session_store, catalog_provider=loop._judge_catalog,
+                credentials=context.credentials, analysis_state=live_analysis_state(doc, turn_index),
+            )
+            approved = await loop._answer_judge.approve_presentation_fallback(fallback_brief)
+            loop._observer("loop_recovery_fallback_reviewed", {"status": "approved" if approved else "rejected"})
+            if not approved:
+                return None
+            snapshot["requires_presentation_review"] = False
+        loop._observer("loop_salvage_approved", {"status": snapshot.get("completion", "partial")})
         context.recovery_completion = snapshot.get("completion", "partial")
         loop._observer("loop_recovery_validated", {"status": "approved"})
         state.approved_partial = snapshot
         # This receipt approves ONLY the exact subset. Archive the rejected full
         # answer's reason in the snapshot, never treat it as approval of that answer.
+        # The exact materialized recovery document was validated before approval
+        # and is restored with its source bindings, without changing its presentation.
         approve_answer(state, text, recovered, current, turn_index)
         await loop._session_store.write_review_state(session_id, turn_index, state.to_doc())
         loop._observer(

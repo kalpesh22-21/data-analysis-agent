@@ -100,19 +100,12 @@ def test_turn_endpoint_streams_progress_and_result(monkeypatch) -> None:
     data = events[-1]["data"]
     # (a) the 4 original keys are unchanged (backward compat).
     assert data["status"] == "done"
-    assert data["assistant_text"] == "I don't have any information to answer your question."
+    assert data["answer_document"]["takeaway"] == "I don't have any information to answer your question."
     assert data["pending_question"] is None
     assert data["tool_calls_made"] == 1  # Includes the explicit final-answer call.
-    # (b) the 5 UI Slice 1 keys are present.
-    for key in ("sql_executed", "answer_sql", "blueprint_use", "verification", "provenance"):
-        assert key in data, f"missing enriched-result key {key!r}"
-    # Pure-chat turn (no tools): no SQL/table/blueprint, and a determined-empty
-    # provenance union (frozenset() -> []).
-    assert data["sql_executed"] is None
-    assert data["answer_sql"] is None
-    assert data["blueprint_use"] is None
-    assert data["verification"] is None
-    assert data["provenance"] == []
+    assert data["answer_document"]["sections"] == []
+    assert data["answer_document"]["sources"] == {}
+    assert not {"assistant_text", "answer_sql", "answer_tables", "capability_cards", "sql_executed", "provenance"} & data.keys()
 
 
 def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch) -> None:
@@ -173,7 +166,7 @@ def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch)
     data = _parse_sse(resp.text)[-1]["data"]
     assert data["status"] == "done"
     # The fixture-built catalog resolved employee.EmployeeCode → determined provenance.
-    assert data["provenance"] == ["dbpcm_warehouse.employee.employee_code"]
+    assert client.get("/session/history", headers=HEADERS).json()["turns"][-1]["provenance_union"] == ["dbpcm_warehouse.employee.employee_code"]
 
 
 @pytest.mark.parametrize("legacy_enabled", [False, True])
@@ -313,18 +306,15 @@ def test_full_ask_user_pause_then_resume_round_trip_over_http(monkeypatch) -> No
     paused = first_events[-1]["data"]
     assert paused["status"] == "paused_ask_user"
     assert paused["pending_question"]["question"] == "Which dept?"
-    # (e) a paused turn tolerates all-null enrichment (paused before any query
-    # ran) — the 5 keys are present but null.
-    for key in ("sql_executed", "answer_sql", "blueprint_use", "verification", "provenance"):
-        assert key in paused, f"missing enriched-result key {key!r}"
-        assert paused[key] is None
+    assert "answer_document" not in paused
+    assert "assistant_text" not in paused
 
     second = client.post("/turn/resume", json={"answer": "Sales"}, headers=HEADERS)
     assert second.status_code == 200
     second_events = _parse_sse(second.text)
     assert second_events[-1]["data"]["status"] == "done"
     assert (
-        second_events[-1]["data"]["assistant_text"]
+        second_events[-1]["data"]["answer_document"]["takeaway"]
         == "I don't have any information to answer your question."
     )
 
@@ -596,22 +586,8 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
     assert resp.status_code == 200
     data = _parse_sse(resp.text)[-1]["data"]
     assert data["status"] == "done"
-    # (c) a blueprint scenario yields the enriched fields: non-null blueprint_use
-    # (raw model slots) + a passing blueprint-gate verification badge + the
-    # per-node SQL + the result table + lineage.
-    assert data["blueprint_use"] == {"blueprint_id": "bp-avg", "slots": {"department": "Sales"}}
-    assert data["verification"] == {
-        "passed": True,
-        "method": "blueprint_gate",
-        "grain_checked": True,
-        "status": "structural checks passed",
-    }
-    assert data["sql_executed"] and all(isinstance(s, str) for s in data["sql_executed"])
-    # `result_table` is gone. A blueprint answer still reports what it EXECUTED;
-    # the answer TABLE would come from a `presentTable` designation, which this
-    # scripted model does not make.
-    assert data["answer_sql"] is None
-    assert data["provenance"] is not None
+    assert data["answer_document"]["takeaway"] == "The average salary in Sales is $60,000."
+    assert data["answer_document"]["sections"] == []  # Execution does not select a visual.
 
     import anyio
 
@@ -622,6 +598,7 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
     # BLUEPRINT_DEFINITION_NOT_READ refusal, since the expansion preceded it.
     assert trail[1].status == "ok"
     assert trail[1].error_code is None
+    assert trail[1].authoritative
     # The three inner runQuery probes went to the MCP; runBlueprint itself never did.
     assert [c.tool_name for c in mcp.calls] == ["runQuery", "runQuery", "runQuery"]
 
@@ -729,22 +706,14 @@ def test_raw_loop_turn_enriched_result_no_blueprint(monkeypatch) -> None:
     data = _parse_sse(resp.text)[-1]["data"]
 
     assert data["status"] == "done"
-    assert data["blueprint_use"] is None
-    assert data["verification"] is None
-    assert data["sql_executed"] == [_RAW_SQL]
-    # The rows themselves are no longer shipped on the result — the UI pages the
-    # designated `answer_sql` via POST /query/page instead. Not designated here.
-    assert data["answer_sql"] is None
-    # The scope-enforced extractor determined the USES set (sorted db.table.column).
-    assert data["provenance"] == [
-        "dbpcm_warehouse.employee.AnnualSalary",
-        "dbpcm_warehouse.employee.Department",
-    ]
+    assert data["answer_document"]["sections"] == []
+    history = client.get("/session/history", headers=HEADERS).json()["turns"][-1]
+    assert history["provenance_union"] == ["dbpcm_warehouse.employee.AnnualSalary", "dbpcm_warehouse.employee.Department"]
+    assert [t["sql"] for t in history["tool_calls"] if t["tool_name"] == "runQuery"] == [_RAW_SQL]
 
 
-def test_outcome_to_dict_projects_provenance_and_answer_sql() -> None:
-    """Unit test: `_outcome_to_dict` projects the frozenset provenance to sorted
-    `"db.table.column"` strings and passes the other fields through as-is."""
+def test_outcome_to_dict_emits_only_the_answer_document() -> None:
+    """Internal SQL/provenance fields never create parallel UI presentation fields."""
     from data_agent.runtime.app import _outcome_to_dict
     from data_agent.runtime.loop.agent_loop import TurnOutcome
 
@@ -757,28 +726,14 @@ def test_outcome_to_dict_projects_provenance_and_answer_sql() -> None:
         answer_sql="SELECT department, count() FROM hr.employees GROUP BY department",
         blueprint_use={"blueprint_id": "bp", "slots": {"period": "2026-05"}},
         verification={"passed": True, "method": "blueprint_gate", "grain_checked": True},
-        # Deliberately UNSORTED input to prove the projection sorts.
         provenance=frozenset({("hr.employees", "id"), ("hr.employees", "department")}),
     )
 
+    from dataclasses import replace
+    outcome = replace(outcome, answer_document={"schema_version": 1, "takeaway": "ans", "sections": [], "sources": {}})
     doc = _outcome_to_dict(outcome)
-
-    assert doc["status"] == "done"
-    assert doc["assistant_text"] == "ans"
-    assert doc["pending_question"] is None
-    assert doc["tool_calls_made"] == 1
-    assert doc["sql_executed"] == ["SELECT 1"]
-    assert doc["answer_sql"] == "SELECT department, count() FROM hr.employees GROUP BY department"
-    # The old `result_table` key is GONE, not merely null — an old client keying on
-    # it must fail loudly rather than silently render an empty table.
-    assert "result_table" not in doc
-    assert doc["blueprint_use"] == {"blueprint_id": "bp", "slots": {"period": "2026-05"}}
-    assert doc["verification"] == {
-        "passed": True,
-        "method": "blueprint_gate",
-        "grain_checked": True,
-    }
-    assert doc["provenance"] == ["hr.employees.department", "hr.employees.id"]
+    assert doc == {"status": "done", "pending_question": None, "tool_calls_made": 1,
+                   "answer_document": outcome.answer_document}
 
 
 _MULTI_SQL_A = (
@@ -858,22 +813,15 @@ def test_raw_loop_multi_query_sql_list_ordered_and_deduped(monkeypatch) -> None:
     data = _parse_sse(resp.text)[-1]["data"]
 
     assert data["status"] == "done"
-    # Execution order preserved; the duplicate A is collapsed to one occurrence.
-    assert data["sql_executed"] == [_MULTI_SQL_A, _MULTI_SQL_B]
-    assert data["answer_sql"] is None
-    assert data["blueprint_use"] is None
-    assert data["verification"] is None
-    # Fail-closed UNION across BOTH distinct queries' provenance (sorted).
-    assert data["provenance"] == [
-        "dbpcm_warehouse.employee.AnnualSalary",
-        "dbpcm_warehouse.employee.Department",
-        "dbpcm_warehouse.employee.EmployeeCode",
-    ]
+    assert data["answer_document"]["sections"] == []
+    history = client.get("/session/history", headers=HEADERS).json()["turns"][-1]
+    queries = [t["sql"] for t in history["tool_calls"] if t["tool_name"] == "runQuery"]
+    assert list(dict.fromkeys(queries)) == [_MULTI_SQL_A, _MULTI_SQL_B]
+    assert history["provenance_union"] == ["dbpcm_warehouse.employee.AnnualSalary", "dbpcm_warehouse.employee.Department", "dbpcm_warehouse.employee.EmployeeCode"]
 
 
-def test_outcome_to_dict_null_enrichment_projects_to_null() -> None:
-    """A bare `TurnOutcome` (all 5 new fields defaulting to None) serializes each
-    to JSON null — the backward-compatible / partial-turn shape."""
+def test_outcome_to_dict_omits_absent_document() -> None:
+    """An outcome without a document does not emit legacy enrichment fields."""
     from data_agent.runtime.app import _outcome_to_dict
     from data_agent.runtime.loop.agent_loop import TurnOutcome
 
@@ -886,7 +834,7 @@ def test_outcome_to_dict_null_enrichment_projects_to_null() -> None:
         )
     )
     for key in ("sql_executed", "answer_sql", "blueprint_use", "verification", "provenance"):
-        assert doc[key] is None
+        assert key not in doc
 
 
 # ---------------------------------------------------------------------------
@@ -1316,3 +1264,19 @@ def test_judge_thinking_budget_builds_only_a_dedicated_judge_client(monkeypatch,
     if enabled:
         assert calls[0]["model"] == "kimi"
         assert calls[0]["thinking_token_budget"] == 1024
+
+
+def test_selected_table_is_delivered_once_in_the_document(monkeypatch):
+    model = ScriptedModelClient([
+        ModelTurnResult(tool_calls=[ToolCallRequest(id="selected", name="runQuery", arguments={"sql": _RAW_SQL})]),
+        final_answer(assistant_text="The requested result is shown.", tables=[{"result_id": "selected", "caption": "Average salary"}]),
+    ])
+    client, _, _ = _raw_loop_app(monkeypatch, model)
+    response = client.post("/turn", json={"message": "Show average salary."}, headers=HEADERS)
+    data = _parse_sse(response.text)[-1]["data"]
+    assert data["answer_document"]["sections"][0]["title"] == "Average salary"
+    assert data["answer_document"]["sections"][0]["presentation"] == {"kind": "table", "result_id": "selected"}
+    assert data["answer_document"]["sources"]["selected"]["table_ref"] == "0:selected"
+    assert not {"assistant_text", "answer_tables", "answer_sql", "capability_cards"} & data.keys()
+    history = client.get("/session/history", headers=HEADERS).json()["turns"][0]
+    assert history["answer_tables"][0]["sql"] == _RAW_SQL

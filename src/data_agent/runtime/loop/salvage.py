@@ -7,7 +7,9 @@ from copy import deepcopy
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from .answer_judge import _estimate_tokens, begin_turn_client, build_judge_tool
+from data_agent.runtime.composer import RECOVERY_SCHEMA
+
+from .answer_judge import _estimate_tokens, begin_turn_client
 
 
 async def _call(judge, messages, name, schema):
@@ -87,44 +89,59 @@ async def _call(judge, messages, name, schema):
 
 
 async def salvage(judge, brief):
-    schema = deepcopy(
-        build_judge_tool(brief.site, capabilities_enabled=judge.capabilities_enabled)["parameters"][
-            "properties"
-        ]["partial_answer"]
-    )
-    schema["type"] = "object"
-    schema.pop("description", None)
+    schema = deepcopy(RECOVERY_SCHEMA)
     schema["properties"]["unfinished"].pop("minItems", None)
     schema["properties"]["outcome"] = {"type": "string", "enum": ["full", "partial", "none"]}
     schema["required"].append("outcome")
-    schema["properties"]["captions"] = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "result_id": {"type": "string"},
-                "caption": {"type": "string", "maxLength": 500},
-            },
-            "required": ["result_id", "caption"],
-            "additionalProperties": False,
-        },
-    }
-    schema["required"].append("captions")
+    schema["allOf"] = [
+        {"if": {"properties": {"outcome": {"const": "partial"}}},
+         "then": {"properties": {"unfinished": {"minItems": 1}, "evidence": {"minItems": 1}}}},
+        {"if": {"properties": {"outcome": {"const": "full"}}},
+         "then": {"properties": {"unfinished": {"maxItems": 0}, "evidence": {"minItems": 1}}}},
+        {"if": {"properties": {"outcome": {"const": "none"}}},
+         "then": {"properties": {"sections": {"maxItems": 0}, "evidence": {"maxItems": 0}}}},
+    ]
     messages = judge.messages_for(brief)
     messages[0]["content"] += (
-        "\nSALVAGE MODE overrides the ordinary verdict format. Return salvageAnswer, an independent "
-        "approval of exactly the response you provide: full, partial, or none. Use only supplied "
-        "evidence and component IDs. No new queries. Repair prose directly, keep it concise, and "
-        "omit unsupported claims. Aim for at most 80 words when selecting tables, without repeating their rows. Repair captions using captions entries keyed by selected result_id; "
-        "a caption cannot repair a wrong calculation. Full requires no unfinished parts; partial requires evidence "
-        "and concise unfinished reasons. None requires no evidence or components and a clear "
-        "limitation, not factual findings. Distinguish unavailable data, failed execution and "
-        "ambiguity only when established; otherwise say it could not be verified. Do not invent "
-        "reasons. Select only components that support the answer. Your response must satisfy all "
-        "the original judge evidence, scope and ranking rules. Return only the declared fields; "
-        "do not add outcome_notes or other commentary fields."
+        "\nSALVAGE MODE overrides the verdict format. Return salvageAnswer: an independently "
+        "approved answer document using takeaway, sections, evidence, unfinished and outcome. "
+        "Use only supplied evidence and selected_components; no new queries. Use the same "
+        "presentation selectors as finalizeAnswer, including figures, bars and line charts. "
+        "The backend builds values from referenced results; do not invent or aggregate cells. "
+        "Preserve the user's requested view when the evidence supports it. Full means every "
+        "requested substantive outcome is fulfilled, with evidence and unfinished=[]. "
+        "Partial requires evidence AND at least one specific unfinished requested outcome. "
+        "An explained table fallback for unsupported chart types is acceptable, not itself a partial answer. "
+        "Charts require complete previews of at most 25 rows; select a table explicitly when "
+        "those conditions fail. Backend fallbacks include a reason and receive a separate review before delivery. "
+        "None requires empty evidence and sections and an honest limitation. Never manufacture "
+        "a gap for a scope caveat or wording repair. Respect previous_rejection: do not approve "
+        "a rejected population/metric just by adding a caveat. If the correct result is already "
+        "available, select it. Clearly disclose genuinely unsupported portions. Prefer one "
+        "coherent answer and at most one visible table; extra tables need table_reason. "
+        "Review titles, explanations, caveats, actions and presentation together. Return only "
+        "the declared fields. Comparison bars require kind, result_id, category_column, "
+        "measure_column and label; line uses the same fields with chronological ISO dates/timestamps or consistent year, quarter, month periods. "
+        "Use supporting_data/fallback on the visual for View data, not another visible table."
     )
     return await _call(judge, messages, "salvageAnswer", schema)
+
+
+async def approve_presentation_fallback(judge, brief):
+    messages = judge.messages_for(brief)
+    messages[0]["content"] += (
+        "\nFALLBACK REVIEW overrides the verdict format. Review the exact materialized "
+        "answer_document, including the backend's reason for showing a table instead of "
+        "a requested visual. Approve when the findings, scope, sources and caveats are "
+        "supported. A chart datatype/completeness limitation alone is not grounds for "
+        "rejection. Do not propose queries, repairs, or a different document. Return "
+        "approvePresentationFallback with approved=true or false."
+    )
+    result = await _call(judge, messages, "approvePresentationFallback", {
+        "type": "object", "properties": {"approved": {"type": "boolean"}},
+        "required": ["approved"], "additionalProperties": False,
+    })
+    return result["approved"]
 
 
 async def relevant(judge, snapshot, current, questions):

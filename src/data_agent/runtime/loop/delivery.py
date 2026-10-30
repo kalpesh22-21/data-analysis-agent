@@ -110,6 +110,9 @@ def delivery_boundary(method):
 
 
 async def review_once(loop, brief, *, repair=False, terminal=False):
+    loop._observer("loop_presentation_review_started", {
+        "phase": "checking_information_need" if brief.site == "ask_user" else "checking_answer"
+    })
     import asyncio
 
     context = CURRENT_DELIVERY.get()
@@ -186,6 +189,7 @@ def delivery_version(text, accum, pending=None):
     return fingerprint(
         {
             "text": text or "",
+            "answer_document": accum.answer_document,
             "tables": [t.to_doc() for t in accum.answer_tables],
             "cards": accum.capability_cards,
             "assumptions": accum.assumptions,

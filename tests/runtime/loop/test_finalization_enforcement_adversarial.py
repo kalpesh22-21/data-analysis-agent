@@ -43,7 +43,7 @@ from data_agent.runtime.session.models import (
     live_analysis_state,
 )
 from data_agent.runtime.session.store import CASMismatchError
-from tests.runtime.final_answer import final_answer
+from tests.runtime.final_answer import answer_arguments, final_answer
 
 pytestmark = pytest.mark.usefixtures("answer_tools", "blueprint_consulted")
 
@@ -52,7 +52,7 @@ _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle({_E: {"EmployeeCode": "String", "Department": "Nullable(String)"}})
 
 STATE = "updateAnalysisState"
-ANSWER = "answerWithTable"
+ANSWER = "answerWithText"
 HEADCOUNT = "headcount by department"
 ATTRITION = "attrition by department"
 
@@ -142,9 +142,9 @@ def _update_call(call_id: str, *updates: dict[str, Any]) -> ToolCallRequest:
     return ToolCallRequest(id=call_id, name=STATE, arguments={"intents": list(updates)})
 
 
-def _answer_call(call_id: str, answer: str = "Here is the answer.") -> ToolCallRequest:
+def _answer_call(call_id: str, answer: str = "I cannot answer from the available information.") -> ToolCallRequest:
     return ToolCallRequest(
-        id=call_id, name=ANSWER, arguments={"answer": answer, "tables": [{"sql": "SELECT 1"}]}
+        id=call_id, name="finalizeAnswer", arguments=answer_arguments(takeaway=answer)
     )
 
 
@@ -329,7 +329,7 @@ async def test_completing_an_intent_on_a_search_result_is_rejected_and_still_ref
     assert refusal.status == "ok"
     assert refusal.error_code is None
     assert _events(events, "loop_finalization_refused") == [
-        {"exit": "answer_with_table", "pending_count": 1}
+        {"exit": "answer_with_text", "pending_count": 1}
     ]
 
 
