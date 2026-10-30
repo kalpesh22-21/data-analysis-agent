@@ -455,3 +455,19 @@ async def test_provenance_none_when_any_inner_undetermined() -> None:
     )
     assert isinstance(outcome, ExecCompleted)
     assert outcome.provenance is None  # fail-closed: drops from D44 replay
+
+
+async def test_authored_formats_are_applied_without_model_format_arguments():
+    from dataclasses import replace
+    formats = {'avg_salary': {'kind':'currency','currency':'USD'}, 'headcount': {'kind':'integer'}}
+    detail=replace(_detail(slots=[{'name':'department','type':'string','required':True,'binds_to':_DEPT_COL}]), column_formats=formats)
+    mcp=FakeMCPClient(scripted={'runQuery':[
+        _rq(['Department'],[['Warehouse']]),
+        _rq(['department','avg_salary','headcount'],[['Warehouse',50000.0,3]]),
+        _rq(['__bp_n','__bp_d'],[[1,1]]),
+    ]})
+    outcome=await _real_executor(mcp,detail).execute(blueprint_id=detail.id,slot_bindings={'department':'Warehouse'},credentials=_creds())
+    assert isinstance(outcome,ExecCompleted)
+    assert outcome.preview.column_formats==formats
+    assert outcome.result_full['column_formats']==formats
+    assert outcome.preview.preview_rows==[['Warehouse',50000.0,3]]

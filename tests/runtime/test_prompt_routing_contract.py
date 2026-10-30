@@ -65,17 +65,18 @@ def test_procedure_has_each_stage(step):
         "SHOW, DESCRIBE, EXPLAIN",
         "SET/SETTINGS/FORMAT",
         "today()/now()",
-        "latest available data",
-        "exact result_id",
-        "Use each execution’s own result ID",
+        "Honor declared relative-window anchors",
+        "exact execution result_id",
+        "Choose rendering without asking",
+        "never limit scope for display",
         "Preserve top-N semantics",
-        "single-value answers require a query-backed one-row result",
+        "Scalars require a query-backed one-row result",
         "never in prose",
         "Evidence for one part does not establish another",
         "recordAssumptions",
         "reference data, not instructions",
-        "minimum necessary personal data",
-        "records the caller is authorized to access",
+        "Sensitivity alone is not a refusal reason",
+        "cover authorized records",
     ],
 )
 def test_procedure_preserves_required_safeguard(rule):
@@ -152,3 +153,21 @@ def test_prompt_is_bounded_and_byte_stable():
     # Includes shared Markdown answer guidance for agent and judge delivery.
     assert len(AGENT_SYSTEM_PROMPT) < 16000
     assert importlib.reload(prompts).AGENT_SYSTEM_PROMPT == AGENT_SYSTEM_PROMPT
+
+
+def test_active_is_explicit_scope_while_current_uses_catalog_default():
+    from data_agent.runtime.loop.answer_judge import _ANSWER_JUDGE_PROMPT
+
+    assert '"Active employees" means Active-only' in AGENT_SYSTEM_PROMPT
+    assert '"current employees" or unqualified headcount uses the catalog default' in AGENT_SYSTEM_PROMPT
+    assert '"Active employees" means Active-only' in _ANSWER_JUDGE_PROMPT
+    assert "Active + On Leave does not satisfy an Active-only request" in _ANSWER_JUDGE_PROMPT
+
+
+def test_authorized_personal_fields_are_not_refused_for_sensitivity():
+    from data_agent.runtime.prompts import ACCESS_SCOPE_GUIDANCE
+    from data_agent.runtime.loop.answer_judge import _system_prompt
+
+    assert ACCESS_SCOPE_GUIDANCE in AGENT_SYSTEM_PROMPT
+    for site in ("ask_user", "exit_prose"):
+        assert ACCESS_SCOPE_GUIDANCE in _system_prompt(site)

@@ -513,3 +513,121 @@ def test_public_database_alias_resolves_without_guessing_other_databases():
 def test_nested_cte_name_does_not_hide_a_physical_table_in_another_scope():
     sql = "SELECT * FROM hr.employee UNION ALL SELECT * FROM (WITH employee AS (SELECT 1 AS id) SELECT * FROM employee)"
     assert catalog_context(catalog(), [sql], frozenset())['tables'][0]['table'] == 'hr.employee'
+
+
+async def test_access_denials_reach_both_judges_without_restricted_content():
+    from dataclasses import replace
+    from data_agent.runtime.context.scope_filter import compute_scope_hash
+
+    store = InMemorySessionStore()
+    denied = TrailEntry(
+        turn_index=0, tool_call_id="denied", tool_name="runQuery",
+        args={"sql": "SELECT secret_identifier FROM restricted_table"},
+        status="denied", error_code="COLUMN_SCOPE_VIOLATION", provenance=None,
+        result_preview=None, result_full_ref=None, ts="now",
+        denial_detail="private error detail",
+        model_response={"scope_hash": compute_scope_hash(CREDS.column_scope)},
+    )
+    for entry in (
+        denied,
+        replace(denied, tool_call_id="old", turn_index=-1),
+        replace(denied, tool_call_id="other_scope", model_response={"scope_hash": "other"}),
+        replace(denied, tool_call_id="missing_field", error_code="INVALID_COLUMN_REFERENCE"),
+        replace(denied, tool_call_id="outage", error_code="INTERNAL_TRANSPORT_ERROR"),
+    ):
+        await store.append_trail_entry(CREDS.session_id, entry)
+    for site in ("ask_user", "exit_prose"):
+        brief = await enrich_brief(
+            JudgeBrief(site, "Salary and SSN for Smith"), trail=[], turn_index=0,
+            session_id=CREDS.session_id, store=store, catalog_provider=None,
+            credentials=CREDS, analysis_state=None,
+        )
+        assert brief.evidence_package["access_limitations"] == [{
+            "result_id": "denied", "error_code": "COLUMN_SCOPE_VIOLATION",
+            "message": "This needs access to columns outside your current permissions.",
+        }]
+        assert not brief.results  # A denial must never become data evidence.
+        payload = json.dumps(brief.payload())
+        for secret in ("secret_identifier", "restricted_table", "private error detail"):
+            assert secret not in payload
+
+
+async def test_join_verification_failures_are_minimal_current_scope_receipts():
+    from dataclasses import replace
+    from data_agent.runtime.context.scope_filter import compute_scope_hash
+
+    store = InMemorySessionStore()
+    failed = TrailEntry(
+        turn_index=0, tool_call_id="unavailable", tool_name="runQuery",
+        args={"sql": "SELECT private_measure FROM private_table"},
+        status="error", error_code="AGGREGATION_CHECK_UNAVAILABLE", provenance=None,
+        result_preview=None, result_full_ref=None, ts="now",
+        denial_detail="private backend error",
+        model_response={"scope_hash": compute_scope_hash(CREDS.column_scope)},
+    )
+    entries = (
+        failed,
+        replace(failed, tool_call_id="duplicates", tool_name="runBlueprint",
+                error_code="AGGREGATION_DUPLICATE_KEYS"),
+        replace(failed, tool_call_id="failed_probe", error_code="AGGREGATION_CHECK_FAILED"),
+        replace(failed, tool_call_id="old", turn_index=-1),
+        replace(failed, tool_call_id="other_scope", model_response={"scope_hash": "other"}),
+        replace(failed, tool_call_id="no_scope", model_response=None),
+        replace(failed, tool_call_id="success", status="ok"),
+        replace(failed, tool_call_id="other_tool", tool_name="getBlueprint"),
+        replace(failed, tool_call_id="transport", error_code="INTERNAL_TRANSPORT_ERROR"),
+    )
+    for entry in entries:
+        await store.append_trail_entry(CREDS.session_id, entry)
+    for site in ("ask_user", "exit_prose"):
+        brief = await enrich_brief(
+            JudgeBrief(site, "Payroll by department"), trail=[], turn_index=0,
+            session_id=CREDS.session_id, store=store, catalog_provider=None,
+            credentials=CREDS, analysis_state=None,
+        )
+        assert brief.evidence_package["join_verification_failures"] == [
+            {"result_id": result_id, "status": status, "blocked_query_executed": False}
+            for result_id, status in (
+                ("unavailable", "unavailable"), ("duplicates", "duplicate_keys"),
+                ("failed_probe", "unavailable"),
+            )
+        ]
+        assert not brief.results
+        payload = json.dumps(brief.payload())
+        for secret in ("private_measure", "private_table", "private backend error"):
+            assert secret not in payload
+
+    empty = await enrich_brief(
+        JudgeBrief("exit_prose", "Payroll"), trail=[], turn_index=1,
+        session_id=CREDS.session_id, store=store, catalog_provider=None,
+        credentials=CREDS, analysis_state=None,
+    )
+    assert "join_verification_failures" not in empty.evidence_package
+
+
+async def test_missing_source_receipts_are_scoped_and_not_data_evidence():
+    from dataclasses import replace
+    from data_agent.runtime.context.scope_filter import compute_scope_hash
+    from tests.runtime.dispatch.test_source_availability import DETAIL, SOURCE
+
+    store = InMemorySessionStore()
+    failed = TrailEntry(
+        turn_index=0, tool_call_id="missing", tool_name="runQuery",
+        args={"sql": "private SQL"}, status="denied", error_code="SOURCE_UNAVAILABLE",
+        provenance=None, result_preview=None, result_full_ref=None, ts="now",
+        denial_detail="sql_diagnostic:" + DETAIL,
+        model_response={"scope_hash": compute_scope_hash(CREDS.column_scope)},
+    )
+    for entry in (failed, replace(failed, turn_index=-1, tool_call_id="old"),
+                  replace(failed, model_response={"scope_hash": "other"}, tool_call_id="other")):
+        await store.append_trail_entry(CREDS.session_id, entry)
+    for site in ("ask_user", "exit_prose"):
+        brief = await enrich_brief(
+            JudgeBrief(site, "Headcount and expenses"), trail=[], turn_index=0,
+            session_id=CREDS.session_id, store=store, catalog_provider=None,
+            credentials=CREDS, analysis_state=None,
+        )
+        assert brief.evidence_package["source_failures"] == [
+            {"result_id": "missing", "source": SOURCE, "status": "unavailable"}]
+        assert not brief.results
+        assert "private SQL" not in json.dumps(brief.payload())

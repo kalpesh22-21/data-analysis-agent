@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from data_agent.runtime.provenance.formats import capture_formats
 from data_agent.runtime.provenance.freshness import capture_freshness, ingestion_date, timestamp
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.dispatch.sql_diagnostics import (
@@ -462,6 +463,7 @@ def _build_preview(
             row_count=int(raw_result.get("row_count", len(rows))),
             truncated=truncated,
             preview_rows=[list(row) for row in preview_rows],
+            column_formats=capture_formats(raw_result.get("column_formats"), raw_result["columns"]),
         )
     if isinstance(raw_result, list):
         preview_rows = raw_result[:preview_row_count]
@@ -630,7 +632,10 @@ class ToolDispatcher:
         emit("tool_dispatch_start", start_payload)
         started_at_ns = time.time_ns()
 
+        from .source_availability import check_sources, remember_source
+
         try:
+            check_sources(tool_name, model_args)
             raw_result = await self._mcp_client.call_tool(
                 tool_name,
                 model_args,
@@ -670,6 +675,8 @@ class ToolDispatcher:
                     if len(self._query_provenance) > 128:
                         self._query_provenance.pop(next(iter(self._query_provenance)))
         except MCPToolError as exc:
+            if exc.code == "SOURCE_UNAVAILABLE":
+                remember_source(exc.message)
             denial: DenialInfo = classify_denial(exc.code)
             # Preserve actionable API errors for same-turn model recovery. The
             # progress/span channels still carry only the code. Failure history

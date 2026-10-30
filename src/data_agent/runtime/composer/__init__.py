@@ -14,7 +14,8 @@ from hashlib import sha256
 from datetime import date, datetime
 from decimal import Decimal
 
-from data_agent.runtime.answer_scrub import scrub_answer_prose
+from data_agent.runtime.answer_scrub import scrub_answer_prose, strip_redundant_identifier_annotations
+from data_agent.runtime.provenance.formats import display_value
 
 
 class PresentationError(ValueError):
@@ -196,9 +197,24 @@ def proposal_to_internal(raw):
     }
 
 
+_FRESHNESS_CLAIM = re.compile(
+    r"\b(?:data|dataset|results?|information|figures|records)\s+"
+    r"(?:(?:is|are|was|were)\s+(?:(?:currently|fully)\s+)?"
+    r"(?:live|real[ -]time|up[ -]to[ -]date|fresh|stale|outdated|current)\b|as\s+of\b)",
+    re.IGNORECASE,
+)
+
+
 def _text(value, business_values=frozenset()):
     if not isinstance(value, str):
         return ""
+    if _FRESHNESS_CLAIM.search(re.sub(r"[*`_]", "", value)):
+        raise PresentationError(
+            "Freshness belongs only in code-provided metadata. Remove freshness prose; "
+            "if recorded as an assumption, call recordAssumptions with the corrected full list "
+            "or [] to clear it. Reuse existing results and preserve requested reporting dates."
+        )
+    value = strip_redundant_identifier_annotations(value, business_values=business_values)
     clean, redactions = scrub_answer_prose(value, provenance=None, business_values=business_values)
     if redactions:
         raise PresentationError(
@@ -372,6 +388,7 @@ def build_document(
         complete = not preview.truncated and preview.row_count == len(rows)
         source = {
             "retrieved_at": entry.retrieved_at or entry.ts,
+            "column_formats": deepcopy(preview.column_formats),
             "row_count": preview.row_count,
             "completeness": "complete" if complete else "partial",
         }
@@ -404,7 +421,7 @@ def build_document(
                     raise PresentationError(
                         "A visual requires the complete result, at most 25 rows; select a table without rerunning the query."
                     )
-                rendered = _visual(p, columns, rows, business_values=business_values)
+                rendered = _visual(p, columns, rows, business_values=business_values, column_formats=preview.column_formats)
             except PresentationError as exc:
                 if "table_ref" not in source:
                     raise
@@ -414,27 +431,42 @@ def build_document(
                 rendered = {"kind": "table", "result_id": rid}
                 section.pop("fallback_table", None)
                 section.pop("supporting_table", None)
+        if rendered["kind"] in {"bars", "line"}:
+            fmt = preview.column_formats.get(p.get("measure_column"))
+            if fmt:
+                rendered["format"] = deepcopy(fmt)
         section["presentation"] = rendered
         sections.append(section)
-    # Assumptions remain user-visible and are reviewed with the candidate.
-    if assumptions:
+    # Keep one visible occurrence of each recorded interpretation. Only normalize
+    # presentation differences; semantic paraphrases are consolidated by the model.
+    from data_agent.runtime.composite.record_assumptions import assumption_key, clean_assumptions
+    assumptions = clean_assumptions([text(a) for a in (assumptions or ())])
+    keys = {assumption_key(a) for a in assumptions}
+    seen = set()
+    for section in sections:
+        caveats = []
+        local_keys = set()
+        for caveat in section["caveats"]:
+            key = assumption_key(caveat)
+            if not key or key in local_keys:
+                continue
+            local_keys.add(key)
+            if key in keys:
+                if key in seen:
+                    continue
+                seen.add(key)
+            caveats.append(caveat)
+        section["caveats"] = caveats
+    remaining = [a for a in assumptions if assumption_key(a) not in seen]
+    if remaining:
         if sections:
-            sections[0]["caveats"] = list(
-                dict.fromkeys([*sections[0]["caveats"], *[text(a) for a in assumptions]])
-            )
+            sections[0]["caveats"].extend(remaining)
         else:
-            sections.append(
-                {
-                    "id": "scope",
-                    "evidence_refs": [],
-                    "presentation": {
-                        "kind": "text",
-                        "markdown": "\n\n".join(text(a) for a in assumptions),
-                    },
-                    "caveats": [],
-                    "actions": [],
-                }
-            )
+            sections.append({
+                "id": "scope", "evidence_refs": [],
+                "presentation": {"kind": "text", "markdown": "\n\n".join(remaining)},
+                "caveats": [], "actions": [],
+            })
     return {
         "takeaway": text(args.get("answer", args.get("takeaway", ""))),
         "sections": sections,
@@ -442,7 +474,12 @@ def build_document(
     }
 
 
-def _visual(p, columns, rows, *, business_values=frozenset()):
+def _visual(p, columns, rows, *, business_values=frozenset(), column_formats=None):
+    formats = column_formats or {}
+
+    def formatted(value, column):
+        return display_value(value, formats[column]) if column in formats else _format(value)
+
     kind, rid = p["kind"], p["result_id"]
     label = _text(p.get("label", ""), business_values)
     if any(len(r) != len(columns) for r in rows):
@@ -460,7 +497,8 @@ def _visual(p, columns, rows, *, business_values=frozenset()):
                 "kind": kind,
                 "result_id": rid,
                 "label": label,
-                "value": _format(rows[0][index]),
+                "value": formatted(rows[0][index], columns[index]),
+                **({"format": formats[columns[index]]} if columns[index] in formats else {}),
             }
         names = p.get("columns", [])
         if not names:
@@ -469,13 +507,15 @@ def _visual(p, columns, rows, *, business_values=frozenset()):
             "kind": kind,
             "result_id": rid,
             "items": [
-                {"label": _text(c.replace("_", " "), business_values), "value": _format(rows[0][_index(columns, c)])}
+                {"label": _text(c.replace("_", " "), business_values), "value": formatted(rows[0][_index(columns, c)] , c), **({"format": formats[c]} if c in formats else {})}
                 for c in names
             ],
         }
     category_names = p.get("category_columns") or [p.get("category_column")]
     xs = [_index(columns, name) for name in category_names]
     y = _index(columns, p.get("measure_column"))
+    if formats.get(columns[y], {}).get("kind") in {"identifier", "text", "date", "datetime", "boolean"}:
+        raise PresentationError("The selected measure is not a quantitative value; show it in a table.")
     if y in xs or not rows:
         raise PresentationError(
             "The visual needs distinct category and measure columns with rectangular rows."
@@ -516,7 +556,7 @@ def _visual(p, columns, rows, *, business_values=frozenset()):
             if i == 0 or value != values[i - 1]:
                 dense += 1
                 rank = dense if p.get("ties") == "dense" else i + 1
-            item = {"label": category, "raw": value, "value": _format(original_values[i])}
+            item = {"label": category, "raw": value, "value": formatted(original_values[i], columns[y])}
             if direction:
                 item["rank"] = rank
             rendered["items"].append(item)
@@ -548,7 +588,7 @@ def _visual(p, columns, rows, *, business_values=frozenset()):
                 "time": time,
                 "label": t,
                 "value": v,
-                "formatted_value": _format(raw) if v is not None else None,
+                "formatted_value": formatted(raw, columns[y]) if v is not None else None,
             }
             for time, t, v, raw in ((times[i], labels[i], values[i], original_values[i]) for i in order)
         ],

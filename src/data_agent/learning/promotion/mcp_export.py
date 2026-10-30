@@ -144,6 +144,8 @@ def _blueprint_doc(env: CandidateEnvelope, node_id: str) -> dict[str, Any]:
     # canon field order (clickhouse-api `app/corpus/data/blueprints/bp-hires-per-month.
     # yaml`). Omitted when absent: `None` means the blueprint makes NO window claim, and
     # a `window_anchor: null` key in canon would read as a declaration that isn't one.
+    if seed.column_formats:
+        doc["column_formats"] = seed.column_formats
     if seed.window_anchor:
         doc["window_anchor"] = seed.window_anchor
     if seed.sql_template:

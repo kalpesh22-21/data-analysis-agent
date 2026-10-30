@@ -474,7 +474,7 @@ def test_capability_prompt_keeps_navigation_and_action_out_of_the_sql_fallback()
     prompt = RuntimeSettings(capability_tools_enabled=True).effective_agent_system_prompt()
 
     assert "follow the blueprint-first path" in prompt
-    assert "SQL only if no blueprint fits" in prompt
+    assert "SQL for uncovered work or unusable blueprints" in prompt
     assert "rather than substituting SQL" in prompt
 
 

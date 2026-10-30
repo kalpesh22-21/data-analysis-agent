@@ -543,6 +543,7 @@ class Blueprint:
     sql_template: str | None = None
     composes: tuple[Node, ...] = ()
     result_grain: ResultGrain = field(default_factory=ResultGrain)
+    column_formats: dict = field(default_factory=dict)
     # J7 — the OPTIONAL window-anchor declaration (`WINDOW_ANCHORS`). `None` is the
     # default and means the blueprint makes NO claim about its window: nothing is
     # surfaced and behaviour is identical to before the field existed, which is what
@@ -569,6 +570,7 @@ class Blueprint:
         sql_template: Any = None,
         composes: Any = None,
         result_grain: Any = None,
+        column_formats: Any = None,
         window_anchor: Any = None,
     ) -> Blueprint:
         resolves_map: dict[str, str] = {}
@@ -632,6 +634,11 @@ class Blueprint:
                 f"'window_anchor' must be one of {sorted(WINDOW_ANCHORS)} when declared, "
                 f"got {window_anchor!r}"
             )
+        from data_agent.runtime.provenance.formats import validate_formats
+        try:
+            formats = validate_formats(column_formats if column_formats is not None else {})
+        except ValueError as exc:
+            raise BlueprintParseError(str(exc)) from exc
         nodes = tuple(Node.parse(n) for n in (composes or []))
         rules = tuple(uses_rules or ())
         return cls(
@@ -643,5 +650,6 @@ class Blueprint:
             sql_template=sql_template,
             composes=nodes,
             result_grain=ResultGrain.parse(result_grain),
+            column_formats=formats,
             window_anchor=window_anchor,
         )

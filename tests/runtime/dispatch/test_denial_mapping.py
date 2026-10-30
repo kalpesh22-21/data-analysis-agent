@@ -183,6 +183,7 @@ _MODEL_QUERY_CODES = {
 }
 _MODEL_SERVICE_CODES = {
     "EXECUTION_SERVICE_UNAVAILABLE", "EXECUTION_CONFIGURATION_ERROR", "EXECUTION_IDENTITY_REQUIRED",
+    "SOURCE_UNAVAILABLE",  # Confirmed missing source is infrastructure, not bad blueprint work.
 }
 _EXPECTED_RETRYABLE.update({c: True for c in _MODEL_QUERY_CODES})
 _EXPECTED_RETRYABLE.update({c: False for c in _MODEL_SERVICE_CODES})

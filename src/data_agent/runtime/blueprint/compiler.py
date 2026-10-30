@@ -1003,6 +1003,7 @@ def dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
         "sql_template": bp.sql_template,
         "composes_json": json.dumps(bp.composes) if bp.composes else None,
         "result_grain_json": (json.dumps(bp.result_grain) if bp.result_grain is not None else None),
+        "column_formats_json": json.dumps(bp.column_formats) if bp.column_formats else None,
         # J7: `or None` so an undeclared anchor writes `null` — neo4j REMOVES a
         # null-valued SET, which is what makes a re-seed that DROPS the declaration
         # actually clear the stale property instead of leaving the old claim behind. The
@@ -1350,6 +1351,7 @@ def validate_blueprint_dag(bp: BlueprintSeed) -> None:
             sql_template=bp.sql_template,
             composes=bp.composes,
             result_grain=bp.result_grain,
+            column_formats=bp.column_formats,
             # J7: threaded so the closed-set check runs at WRITE, for every write path
             # (fixture seed, MCP-export hydration, the learning landing writer all reach
             # here from `load_corpus`'s pre-write pass). The read side then never has to

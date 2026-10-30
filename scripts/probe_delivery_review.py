@@ -9,7 +9,8 @@ import uuid
 from pathlib import Path
 
 import httpx
-from _e2e_harness import mint_bound_token, parse_sse
+from _e2e_harness import mint_bound_token
+from _probe_transport import capture_turn
 from probe_runtime_acceptance import SCOPE, write_results
 
 CASES = {
@@ -28,37 +29,29 @@ async def main(args):
             token = await mint_bound_token(SCOPE, sid)
             headers = {"Authorization": "Bearer " + token, "X-Session-Id": sid}
             started = time.monotonic()
-            response = await client.post(
-                args.base_url + "/turn", headers=headers, json={"message": CASES[name]}
-            )
-            _, outcome, error = parse_sse(response.text)
+            status, events, outcome, error = await capture_turn(
+                client, args.base_url, headers=headers, message=CASES[name])
+            document = (outcome or {}).get("answer_document") or {}
+            sections = document.get("sections", [])
             checks = {
-                "structured_result": response.status_code == 200 and bool(outcome) and not error,
+                "structured_result": status == 200 and bool(outcome) and not error,
                 "review_approved": (outcome or {}).get("review", {}).get("status") == "approved",
                 "no_dependency_failure": not (outcome or {}).get("failure"),
             }
             if name == "conversation":
-                checks["text_only"] = bool(outcome and outcome.get("assistant_text")) and not any(
-                    (outcome or {}).get(k)
-                    for k in (
-                        "sql_executed",
-                        "answer_tables",
-                        "capability_cards",
-                        "pending_question",
-                    )
-                )
+                checks["text_only"] = bool(document.get("takeaway")) and not sections
             elif name == "table":
-                checks["table_delivered"] = bool((outcome or {}).get("answer_tables"))
+                checks["table_delivered"] = any(s.get("presentation", {}).get("kind") == "table" for s in sections)
             elif name == "capability":
-                checks["card_delivered"] = bool((outcome or {}).get("capability_cards"))
+                checks["card_delivered"] = any(s.get("actions") for s in sections)
             else:
                 checks["question_delivered"] = (outcome or {}).get("status") == "paused_ask_user"
-            history = (await client.get(args.base_url + "/session/history", headers=headers)).json()
+            history = (await client.get(args.base_url.rstrip("/") + "/session/history", headers=headers)).json()
             if outcome and outcome.get("status") == "done":
                 turns = history.get("turns", [])
                 checks["history_parity"] = (
                     bool(turns)
-                    and turns[-1].get("answer") == outcome.get("assistant_text")
+                    and turns[-1].get("answer_document") == outcome.get("answer_document")
                     and turns[-1].get("review") == outcome.get("review")
                 )
             results.append(
@@ -68,6 +61,8 @@ async def main(args):
                     "seconds": round(time.monotonic() - started, 2),
                     "checks": checks,
                     "result": outcome,
+                    "http_status": status,
+                    "sse_events": events,
                     "error": error,
                     "history": history,
                 }

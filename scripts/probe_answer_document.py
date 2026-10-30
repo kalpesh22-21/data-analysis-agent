@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import socket
 import time
 import uuid
@@ -405,7 +406,7 @@ async def run_case(name, question, fault, settings, *, resume_answer=None, refre
         "persisted_document": bool(outcome.get("answer_document"))
         and any(m.answer_document == outcome["answer_document"] for m in doc.messages),
         "no_speculative_progress": not any(
-            "finaliz" in f["data"].get("message", "").lower()
+            re.search(r"\bfinaliz(?:e|ing)\b", f["data"].get("message", ""), re.I)
             for x in exchanges
             for f in x["events"]
             if f["event"] == "progress"
@@ -513,7 +514,7 @@ async def main(args):
         data_as_of_enabled=base.data_as_of_enabled,
         answer_judge_enabled=True,
         answer_judge_timeout_seconds=30,
-        progress_summary_enabled=False,
+        progress_summary_enabled=args.progress_summaries,
         max_loop_iterations=18,
         max_wall_clock_seconds=180,
         max_budget_windows=2,
@@ -553,6 +554,8 @@ async def main(args):
             use_reasoning_metadata=True,
         )
     settings = RuntimeSettings(**config)
+    if args.progress_summaries:
+        settings.openai_summary_model = settings.openai_model
     if args.hydrate:
         from data_agent.runtime.retrieval.hydrator import build_hydrator
         hydrator = build_hydrator(settings)
@@ -625,6 +628,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hydrate", action="store_true")
+    parser.add_argument("--progress-summaries", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--cases", nargs="+")
     parser.add_argument("--questions", type=Path)

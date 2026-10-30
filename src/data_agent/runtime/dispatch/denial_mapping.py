@@ -119,9 +119,10 @@ UNKNOWN_TOOL_CODE = "UNKNOWN_TOOL"
 BLUEPRINT_NOT_SEARCHED_CODE = "BLUEPRINT_NOT_SEARCHED"
 BLUEPRINT_NOT_SEARCHED_MESSAGE = (
     "Blueprint-first check: no blueprint has been searched or used this turn. "
-    "Call searchBlueprints to look for an expert-authored blueprint first. If nothing "
-    "covers a requested part, use it for that part: users prefer scoped, user-friendly blueprints. "
-    "Use runQuery only for uncovered work or when the corpus is unavailable. Do not force a semantic mismatch."
+    "Call searchBlueprints first. If a blueprint correctly covers a requested part, "
+    "execute it for that part and retain its result. "
+    "Use runQuery for uncovered work or unusable blueprints. Correct invalid bindings when possible; "
+    "do not bypass access restrictions or force a semantic mismatch."
 )
 
 # Authoritative permission receipts shared by direct queries, blueprint probes and intents.
@@ -635,6 +636,7 @@ MODEL_QUERY_ERROR_CODES = frozenset({
 })
 MODEL_SERVICE_ERROR_CODES = frozenset({
     "EXECUTION_SERVICE_UNAVAILABLE", "EXECUTION_CONFIGURATION_ERROR", "EXECUTION_IDENTITY_REQUIRED",
+    "SOURCE_UNAVAILABLE",
 })
 for _code in MODEL_QUERY_ERROR_CODES:
     _DENIAL_TABLE[_code] = DenialInfo(
@@ -655,6 +657,10 @@ for _code in AGGREGATION_QUERY_CODES:
 _DENIAL_TABLE["AGGREGATION_CHECK_UNAVAILABLE"] = DenialInfo(
     code="AGGREGATION_CHECK_UNAVAILABLE", retryable=False, kind=DenialKind.INFRA_FAILED,
     user_message="Aggregation verification is unavailable. Use supported results or disclose this limitation; ask the operator to investigate.")
+
+_DENIAL_TABLE["SOURCE_UNAVAILABLE"] = DenialInfo(
+    code="SOURCE_UNAVAILABLE", retryable=False, kind=DenialKind.INFRA_FAILED,
+    user_message="A required data source is unavailable. Use independent sources or deliver verified portions with a limitation; do not retry this source during this turn.")
 
 KNOWN_DENIAL_CODES = frozenset(_DENIAL_TABLE)
 

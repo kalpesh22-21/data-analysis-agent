@@ -249,7 +249,7 @@ async def _selected_table(credentials, ref):
     assert credentials.session_id == "session-1"
     if ref != "0:selected":
         raise PermissionError
-    return "SELECT 1"
+    return {"sql": "SELECT 1", "column_formats": {}}
 
 
 def test_snapshot_creation_resolves_approved_table_reference(monkeypatch):
@@ -263,10 +263,31 @@ def test_snapshot_creation_resolves_approved_table_reference(monkeypatch):
     api, _ = client(monkeypatch, upstream, resolver=_selected_table)
     response = api.post("/query/snapshots", json={"table_ref": "0:selected"}, headers=AUTH)
     assert response.status_code == 201
-    assert seen == [{"sql": "SELECT 1"}]
+    assert seen == [{"sql": "SELECT 1", "column_formats": {}}]
     response = api.post("/query/snapshots", json={"table_ref": "0:unselected"}, headers=AUTH)
     assert response.status_code == 404
     assert len(seen) == 1
     response = api.post("/query/snapshots", json={"table_ref": "0:selected", "sql": "SELECT 2"}, headers=AUTH)
     assert response.status_code == 400
     assert len(seen) == 1
+
+
+def test_snapshot_uses_approved_formats_instead_of_caller_overrides(monkeypatch):
+    import json
+    trusted = {"ZIP": {"kind": "identifier"}}
+
+    async def resolve(credentials, ref):
+        assert ref == "approved"
+        return {"sql": "SELECT zip_code AS ZIP FROM employee", "column_formats": trusted}
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["column_formats"] == trusted
+        assert "table_ref" not in body
+        return httpx.Response(201, json={"column_formats": trusted})
+
+    api, _ = client(monkeypatch, handler, resolver=resolve)
+    response = api.post('/query/snapshots', headers=AUTH,
+                        json={"table_ref":"approved", "column_formats":{"ZIP":{"kind":"integer"}}})
+    assert response.status_code == 201
+    assert response.json()["column_formats"] == trusted

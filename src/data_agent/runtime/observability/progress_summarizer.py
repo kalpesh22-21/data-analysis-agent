@@ -4,8 +4,8 @@ results) into a natural-language UI progress line. Opt-in behind
 The turn owns producer tasks; the progress stream holds an ordered slot for each summary.
 
 D25 relaxation for this channel only: the line MAY carry BUSINESS values (a period, a
-department) but never internal database structure. It reaches the UI VERBATIM as the
-progress event's `step`, bypassing the `shape` allowlist, so the guard is at the INPUT
+department) and readable table/column names, but never database qualifiers or SQL. It reaches the UI VERBATIM as the
+progress event's `message`, so the guard is at the INPUT
 and is default-deny — `_project_args` passes only per-tool allowlisted arguments, and
 nothing at all for an unlisted tool. Two deterministic checks then drop a line back to
 the tool's static phrasing: `_looks_structural` and `_leaks_identifiers`.
@@ -68,8 +68,11 @@ _SYSTEM_PROMPT = (
     "data-analysis assistant's UI, describing in plain business English what the "
     "assistant is doing. Write for a business user who has never seen the database: "
     "Describe the user's business goal, never the implementation. The line MUST NOT "
-    "mention SQL, queries, databases, schemas, tables, columns, blueprints, tools, "
-    "capabilities, widgets, retrieval, or analysis machinery. You MAY include "
+    "mention SQL, queries, database dialects or engines, databases, schemas, blueprints, tools, "
+    "capabilities, widgets, retrieval, or analysis machinery. You may use the supplied table "
+    "and column names to explain the current work. Replace underscores with spaces (pay_date "
+    "becomes pay date), never include database qualifiers, and prefer clear business meaning "
+    "when supported. Do not guess the meaning of opaque names or recite a list of fields. You MAY include "
     "business-level parameters that "
     "appear in the arguments you are given (a department, a period, a search "
     "phrase). No preamble, no quotes, no trailing period, no fluff. Output only "
@@ -91,9 +94,9 @@ _SYSTEM_PROMPT = (
 # Every entry below is an argument whose VALUE is business language or a corpus
 # identifier — never a database, table or column name, and never SQL.
 #
-# Deliberately absent (name-only), with the physical identifiers they carry:
-#   runQuery / explainQuery   -> `sql`
-#   listTables / getTableSchema / sampleRows -> `database`, `table`
+# Raw technical arguments remain withheld; _progress_names projects vetted names:
+#   runQuery / explainQuery   -> raw `sql` (parsed column names are projected separately)
+#   listTables / getTableSchema / sampleRows -> database qualifiers
 #   listDatabases             -> nothing to say beyond "what data is available"
 #   answerWithTable           -> `tables[].sql`, plus the whole written answer
 #   updateAnalysisState       -> intent bookkeeping, nothing to narrate
@@ -165,8 +168,8 @@ _MODEL_SUMMARIZED_TOOLS = frozenset(_ARG_ALLOWLIST) | frozenset(
 )
 
 _MECHANICAL_LANGUAGE = re.compile(
-    r"\b(?:sql|quer(?:y|ies|ying)|database|schema|tables?|columns?|blueprints?|"
-    r"tools?|capabilit(?:y|ies)|widgets?|mcp|retriev(?:al|ing)|rerank(?:ing)?|"
+    r"\b(?:sql|quer(?:y|ies|ying)|database|schema|blueprints?|"
+    r"clickhouse|trino|mysql|postgres(?:ql)?|sqlite|tsql|spark|dialect|tools?|capabilit(?:y|ies)|widgets?|mcp|retriev(?:al|ing)|rerank(?:ing)?|"
     r"hydrat(?:e|ing|ion)|warehouse|data analysis|system|features?|business insights?|"
     r"reporting options?)\b",
     re.IGNORECASE,
@@ -250,14 +253,54 @@ def _compact_args(arguments: dict[str, Any]) -> str:
     return blob
 
 
+def _progress_names(tool_name: str, arguments: dict[str, Any]) -> dict[str, list[str]]:
+    """Bounded unqualified table/column names; no SQL, literals or database qualifiers."""
+    names = []
+    tables = []
+    if tool_name in {"runQuery", "explainQuery"}:
+        sql = arguments.get("sql")
+        if not isinstance(sql, str) or not sql.strip() or len(sql) > 16000:
+            return {}
+        try:
+            tree = sqlglot.parse_one(sql, dialect="clickhouse")
+            if not isinstance(tree, exp.Select):
+                return {}
+            relations = {part.name.lower() for table in tree.find_all(exp.Table)
+                         for part in table.parts}
+            tables = [table.name for table in tree.find_all(exp.Table)]
+            names = [column.name for column in tree.find_all(exp.Column)
+                     if column.name.lower() not in relations]
+        except Exception:
+            return {}
+    elif tool_name == "resolveValues":
+        names = [arguments.get("column")]
+    elif tool_name == "getTableSchema":
+        names = arguments.get("columns", [])
+        if not isinstance(names, list):
+            return {}
+    if tool_name in {"resolveValues", "getTableSchema", "sampleRows"}:
+        table = arguments.get("table")
+        if isinstance(table, str):
+            tables = [table.rsplit(".", 1)[-1]]
+    result = {}
+    for key, values in (("fields", names), ("tables", tables)):
+        safe = list(dict.fromkeys(name for name in values
+                                 if isinstance(name, str) and len(name) <= 64
+                                 and _BARE_IDENTIFIER.fullmatch(name)))[:12]
+        if safe:
+            result[key] = safe
+    return result
+
+
 def _project_args(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """The arguments the summarizer prompt may see — allowlisted per tool, EMPTY for any
-    tool not in `_ARG_ALLOWLIST` (default-deny).
-    """
+    """Business arguments plus vetted column names/operation; unknown tools stay empty."""
     allowed = _ARG_ALLOWLIST.get(tool_name)
-    if not allowed:
-        return {}
-    projected = {key: value for key, value in arguments.items() if key in allowed}
+    projected = {key: value for key, value in arguments.items() if key in (allowed or ())}
+    projected.update(_progress_names(tool_name, arguments))
+    if tool_name in {"runQuery", "explainQuery"}:
+        operation = _query_kind(arguments.get("sql"))
+        if operation:
+            projected["operation"] = operation
     if tool_name == "searchBlueprints" and "deliverables" in projected:
         parts = projected["deliverables"]
         projected["deliverables"] = [
@@ -348,10 +391,9 @@ def _looks_structural(line: str) -> bool:
         return True
     if _STRUCTURAL_DOTTED.search(line):
         return True
-    if _UPPERCASE_SQL_SOURCE.search(line):
+    if _UPPERCASE_SQL_SOURCE.search(line) or re.search(r"\bSELECT\s|\b(?:GROUP|ORDER) BY\b", line):
         return True
-    # Any standalone token that is identifier-shaped — `payroll_detail`,
-    # `EmployeeMaster` — with no SQL keyword needed in front of it.
+    # Technical column names remain internal even when projected to the summarizer.
     return any(_is_identifier_shaped(token) for token in _WORD_TOKEN.findall(line))
 
 
@@ -477,7 +519,12 @@ class ProgressSummarizer:
         ]
         # B3: never mutate the shared client's fallback stickiness directly.
         turn_client = begin_turn_client(self._model_client)
-        result = await turn_client.send_turn(messages, tools=[])
+        # Progress copy is auxiliary UI work, not an agent reasoning step.
+        # Suppression is task-local; agent, judge and tool spans remain traced.
+        from openinference.instrumentation import suppress_tracing
+
+        with suppress_tracing():
+            result = await turn_client.send_turn(messages, tools=[])
         text = (result.assistant_text or "").strip()
         # Strip a wrapping pair of quotes the model sometimes adds despite the prompt.
         if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
@@ -490,10 +537,19 @@ class ProgressSummarizer:
         #     provenance (this is what covers the allowlisted free-text args, which
         #     the schema-aware main model authored);
         #   - PROVENANCE: the line repeats an identifier out of the WITHHELD args.
+        names = {name.lower() for key in ("fields", "tables")
+                 for name in projected.get(key, ())}
+        # Only known unqualified names may be made readable. Keep qualifiers intact
+        # so the structural guard rejects them rather than disguising a database name.
+        for name in sorted(names, key=len, reverse=True):
+            text = re.sub(r"(?<![\w.])" + re.escape(name) + r"(?![\w.])",
+                          lambda match: match[0].replace("_", " "), text, flags=re.IGNORECASE)
+        tool_names = set(_STATIC_LINES) | {tool_name}
         if (
             _MECHANICAL_LANGUAGE.search(text)
+            or any(name.lower() in text.lower() for name in tool_names)
             or _looks_structural(text)
-            or _leaks_identifiers(text, _forbidden_tokens(tool_name, arguments))
+            or _leaks_identifiers(text, _forbidden_tokens(tool_name, arguments) - names)
         ):
             return _static_line(tool_name, arguments)
         return text

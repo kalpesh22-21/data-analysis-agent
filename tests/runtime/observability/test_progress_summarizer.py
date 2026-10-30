@@ -6,8 +6,8 @@ model error, a timeout, or empty output — never raising into the caller.
 
 The second half of the file guards the DISCLOSURE boundary: this line reaches the
 UI verbatim (`progress.py` bypasses the `shape` allowlist for it), so the model
-must never be SHOWN a physical identifier (default-deny argument projection), and
-a line that repeats one anyway must be replaced by the tool's static phrasing.
+may see bounded unqualified column names, but not raw SQL or relation names.
+Lines exposing implementation details fall back to static phrasing.
 """
 
 from __future__ import annotations
@@ -105,8 +105,8 @@ async def test_summarize_passes_tool_name_and_allowlisted_args_to_prompt() -> No
     user_content = messages[-1]["content"]
     assert "resolveValues" in user_content
     assert "earnings" in user_content
-    assert "payroll" not in user_content
-    assert "EarnCode" not in user_content
+    assert "payroll" in user_content
+    assert "EarnCode" in user_content
 
 
 async def test_summarize_truncates_huge_arg_to_bound_tokens() -> None:
@@ -142,9 +142,7 @@ async def test_summarize_returns_none_on_timeout() -> None:
 
 
 async def test_run_query_sql_never_reaches_the_model_payload() -> None:
-    """The core rule: `runQuery` contributes its NAME ONLY. The whole prompt is
-    inspected (not just the args blob), because anything the model is shown can
-    come back in a line that goes to the UI verbatim."""
+    """Only unqualified fields and operation reach the model, never raw SQL or relations."""
     fake = _FakeModelClient("Running a query against the warehouse")
     summarizer = ProgressSummarizer(fake)
     sql = (
@@ -157,28 +155,20 @@ async def test_run_query_sql_never_reaches_the_model_payload() -> None:
     messages, _tools = fake.calls[0]
     user_content = str(messages[-1]["content"])
     payload = " ".join(str(message["content"]) for message in messages)
-    for fragment in ("SELECT", "payroll", "department", "OvertimePay", "DeptId"):
+    for fragment in ("SELECT", "dbpcm_warehouse", "p.OvertimePay", "d.DeptId"):
         assert fragment not in user_content, f"{fragment!r} reached the summarizer prompt"
     # The distinctive identifiers are absent from the WHOLE payload, system
     # instruction included (the word "department" appears there as an example of a
     # business-level parameter, which is why the scan above is user-message-scoped).
     assert "dbpcm_warehouse" not in payload
-    assert "OvertimePay" not in payload
-    # The tool name is all it gets.
+    assert "OvertimePay" in payload
+    # Column names and calculation shape now provide useful context.
     assert "runQuery" in user_content
-    assert "{}" in user_content
+    assert '"operation": "grouped"' in user_content
 
 
 async def test_run_query_sql_never_reaches_the_model_for_any_argument_shape() -> None:
-    """The rule above holds for the SHAPE of the arguments too, not just the one
-    well-formed call the model usually makes.
-
-    `_project_args` denies `runQuery` wholesale, so it never inspects the value of
-    `sql` — this pins that, because a guard written the other way round (find
-    `sql`, drop it) breaks on every one of these: a non-string `sql`, a missing
-    `sql`, one buried under another key, one too long to have been read, one
-    written in quoted or non-ASCII identifiers.
-    """
+    """Malformed or unsupported SQL never exposes raw arguments."""
     shapes: list[tuple[str, dict]] = [
         ("well-formed", {"sql": "SELECT 1 FROM dbpcm_warehouse.employee", "limit": 100}),
         ("sql as a dict", {"sql": {"text": "SELECT 1 FROM dbpcm_warehouse.employee"}}),
@@ -202,10 +192,13 @@ async def test_run_query_sql_never_reaches_the_model_for_any_argument_shape() ->
 
         messages, _tools = fake.calls[0]
         user_content = str(messages[-1]["content"])
-        # Name only, every time — the argument blob is the empty object.
-        assert user_content == "Tool: runQuery. Arguments: {}", label
+        assert user_content in {
+            "Tool: runQuery. Arguments: {}",
+            'Tool: runQuery. Arguments: {"operation": "lookup"}',
+            'Tool: runQuery. Arguments: {"tables": ["employee"], "operation": "lookup"}',
+        }, label
         payload = " ".join(str(message["content"]) for message in messages)
-        for fragment in ("SELECT", "dbpcm_warehouse", "employee", "payroll", "Mitarbeiter"):
+        for fragment in ("SELECT", "dbpcm_warehouse", "Mitarbeiter"):
             assert fragment not in payload, f"{fragment!r} reached the prompt for {label}"
 
 
@@ -235,7 +228,7 @@ async def test_unknown_tool_uses_generic_static_line_without_calling_model() -> 
     assert fake.calls == []
 
 
-async def test_listing_and_schema_tools_never_show_database_or_table_names() -> None:
+async def test_listing_and_schema_tools_hide_database_but_allow_table_names() -> None:
     fake = _FakeModelClient("Checking what data is available")
     summarizer = ProgressSummarizer(fake)
 
@@ -250,7 +243,7 @@ async def test_listing_and_schema_tools_never_show_database_or_table_names() -> 
         messages, _tools = fake.calls[0]
         payload = " ".join(str(message["content"]) for message in messages)
         assert "dbpcm_warehouse" not in payload, tool
-        assert "employee" not in payload, tool
+        assert ("employee" in payload) == ("table" in args), tool
 
 
 async def test_run_blueprint_slot_values_and_id_pass_through() -> None:
@@ -310,7 +303,7 @@ async def test_the_post_filter_catches_a_bare_table_name_from_a_withheld_arg() -
     assert line == "Checking which details can answer your question"
 
 
-async def test_the_post_filter_catches_a_bare_table_name_from_the_withheld_sql() -> None:
+async def test_the_post_filter_makes_known_table_names_readable() -> None:
     """The other half of the bare-name case: the name is not a whole argument
     value here, it is a `FROM` target inside a `sql` string the model never saw."""
     fake = _FakeModelClient("Counting rows in employee_master")
@@ -320,7 +313,7 @@ async def test_the_post_filter_catches_a_bare_table_name_from_the_withheld_sql()
         "runQuery", {"sql": "SELECT count() FROM employee_master WHERE Active = 1"}
     )
 
-    assert line in _QUERY_FALLBACKS["count"]
+    assert line == "Counting rows in employee master"
 
 
 async def test_the_post_filter_is_case_insensitive() -> None:
@@ -330,7 +323,6 @@ async def test_the_post_filter_is_case_insensitive() -> None:
     for produced in (
         "Reading DBPCM_WAREHOUSE.EMPLOYEE for active staff",
         "Reading Dbpcm_Warehouse.Employee for active staff",
-        "Counting rows in EMPLOYEE",
     ):
         fake = _FakeModelClient(produced)
         line = await ProgressSummarizer(fake).summarize("runQuery", {"sql": sql})
@@ -482,7 +474,8 @@ async def test_the_shape_check_leaves_ordinary_business_prose_alone() -> None:
 def test_the_system_prompt_forbids_internal_identifiers() -> None:
     """The instruction half of the guard (the projection is the enforcing half)."""
     assert "MUST NOT" in _SYSTEM_PROMPT
-    assert "databases, schemas, tables, columns, blueprints, tools" in _SYSTEM_PROMPT
+    assert "databases, schemas, blueprints, tools" in _SYSTEM_PROMPT
+    assert "Replace underscores with spaces" in _SYSTEM_PROMPT
     assert "plain business English" in _SYSTEM_PROMPT
     # The bounds the feature depends on are still stated.
     assert "about 12–22 words" in _SYSTEM_PROMPT
@@ -518,8 +511,8 @@ async def test_summary_has_request_context_without_sql_or_results():
     )
     prompt = fake.calls[0][0][-1]["content"]
     assert "Compare overtime by department for September" in prompt
-    assert "HiddenAmount" not in prompt
-    assert "internal_payroll" not in prompt
+    assert "HiddenAmount" in prompt
+    assert "internal_payroll" in prompt
     assert line == "Comparing overtime totals across departments for September"
 
 
@@ -549,3 +542,62 @@ async def test_request_context_is_bounded_and_cannot_license_internal_progress()
     line = await ProgressSummarizer(fake).summarize("runQuery", {}, user_request="x" * 10000)
     assert len(fake.calls[0][0][-1]["content"]) < 1400
     assert line == "Finding the requested information"
+
+
+async def test_progress_explains_column_meanings_without_sql_or_filter_literals():
+    copy = "Calculating gross earnings by payment date for the requested year"
+    fake = _FakeModelClient(copy)
+    line = await ProgressSummarizer(fake).summarize("runQuery", {
+        "sql": "SELECT sum(p.gross_earnings) FROM private_db.payroll p WHERE p.pay_date >= '2026-01-01'"
+    })
+    assert line == copy
+    prompt = fake.calls[0][0][-1]["content"]
+    assert "gross_earnings" in prompt and "pay_date" in prompt
+    for hidden in ("private_db", "2026-01-01", "SELECT", "p.pay_date"):
+        assert hidden not in prompt
+
+
+@pytest.mark.parametrize("copy", [
+    "Running runQuery using pay_date",
+    "Calculating earnings with ClickHouse",
+    "Calculating earnings with Trino",
+    "Calculating earnings with MySQL",
+    "Reading private_db.payroll using pay_date",
+    "Calculating using invented_column",
+    "SELECT pay_date",
+])
+async def test_column_permission_does_not_allow_tools_dialects_or_sql(copy):
+    from data_agent.runtime.observability.progress_summarizer import _static_line
+
+    args = {"sql": "SELECT pay_date FROM private_db.payroll"}
+    assert await ProgressSummarizer(_FakeModelClient(copy)).summarize("runQuery", args) == _static_line("runQuery", args)
+
+
+@pytest.mark.parametrize("copy,expected", [
+    ("Calculating earnings using pay_date", "Calculating earnings using pay date"),
+    ("Reviewing payroll_summary using pay_date", "Reviewing payroll summary using pay date"),
+    ("Reviewing PAYROLL_SUMMARY using PAY_DATE", "Reviewing PAYROLL SUMMARY using PAY DATE"),
+])
+async def test_known_column_and_table_underscores_are_replaced_before_delivery(copy, expected):
+    args = {"sql": "SELECT pay_date FROM private_db.payroll_summary"}
+    assert await ProgressSummarizer(_FakeModelClient(copy)).summarize("runQuery", args) == expected
+
+
+async def test_summary_trace_suppression_is_task_local_and_restored():
+    from opentelemetry.context import get_value, _SUPPRESS_INSTRUMENTATION_KEY
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class CheckingClient:
+        async def send_turn(self, messages, tools):
+            assert get_value(_SUPPRESS_INSTRUMENTATION_KEY)
+            entered.set()
+            await release.wait()
+            raise RuntimeError('summary unavailable')
+
+    task = asyncio.create_task(ProgressSummarizer(CheckingClient()).summarize('runQuery', {'sql': 'SELECT 1'}))
+    await entered.wait()
+    assert not get_value(_SUPPRESS_INSTRUMENTATION_KEY)
+    release.set()
+    assert await task is None
+    assert not get_value(_SUPPRESS_INSTRUMENTATION_KEY)

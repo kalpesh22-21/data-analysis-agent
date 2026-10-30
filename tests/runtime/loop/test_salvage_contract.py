@@ -25,7 +25,10 @@ async def test_salvage_has_explicit_outcome_and_non_reasoning_transport(outcome)
     assert await judge.salvage(JudgeBrief("exit_prose", "Headcount?")) == response
     assert client.non_reasoning
     assert client.calls[0].tools[0]["name"] == "salvageAnswer"
-    assert "SALVAGE MODE" in client.calls[0].messages[0]["content"]
+    system = client.calls[0].messages[0]["content"]
+    assert "SALVAGE MODE" in system
+    assert '"Active employees" means Active-only' in system
+    assert "Active + On Leave does not satisfy an Active-only request" in system
 
 
 async def test_invalid_salvage_response_is_not_approval():
@@ -418,3 +421,34 @@ async def test_fallback_approval_uses_non_reasoning_model_and_exact_document():
     assert await judge.approve_presentation_fallback(JudgeBrief("exit_table", "Counts as bars", answer_document=candidate))
     assert client.non_reasoning
     assert "missing is not zero" in str(client.calls[0].messages)
+
+
+async def test_missing_source_keeps_verified_partial_answer_and_blocks_repeat():
+    import json
+    from data_agent.runtime.mcp.client import MCPToolError
+    from tests.runtime.dispatch.test_source_availability import DETAIL
+
+    class SalvageJudge(Judge):
+        async def salvage(self, brief):
+            assert brief.evidence_package["source_failures"]
+            return {**PART, "outcome": "partial",
+                    "unfinished": ["Expense data is unavailable."]}
+
+    judge = SalvageJudge([JudgeVerdict(
+        False, "unsupported_by_evidence", "Expense data is unavailable.",
+        reviewed=True, repair_type="prose",
+    )])
+    missing = batch(call("runQuery", "missing", sql="SELECT count(*) FROM dbpcm_warehouse.expense"))
+    repeat = batch(call("runQuery", "repeat", sql="SELECT employee_code FROM dbpcm_warehouse.expense"))
+    detail = json.loads(DETAIL)
+    detail["source"] = "dbpcm_warehouse.expense"
+    loop, store, _, mcp, _ = build(
+        [discovery(), query(), missing, repeat, final()], judge,
+        rows=[{"columns": ["Department", "n"], "rows": [["Sales", 120]], "row_count": 1},
+              MCPToolError("SOURCE_UNAVAILABLE", json.dumps(detail))],
+    )
+    out = await run(loop, "Give me headcount and expenses.")
+    assert out.review["completion"] == "partial"
+    assert out.answer_document is not None
+    assert "120" in out.assistant_text and "Expense data is unavailable" in out.assistant_text
+    assert len(mcp.calls) == 2

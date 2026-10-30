@@ -1,18 +1,8 @@
-"""record_assumptions.py — the `recordAssumptions` runtime tool.
+"""Replace the current turn's model-declared assumptions; [] clears them.
 
-The model calls `recordAssumptions(assumptions=[...])` ONCE, just before its final answer,
-to surface the plain-English assumptions behind that answer as a first-class field on the
-turn result. A RUNTIME tool: intercepted in the agent loop, never dispatched to the MCP
-under its own name, counting as exactly one `tool_calls_made`.
-
-The tool itself is stateless and does NOT hold the turn's assumptions — it only returns a
-small confirmation. The loop folds `clean_assumptions(arguments["assumptions"])` into the
-window's `TurnAccumulators` on a SUCCESSFUL call, and `session_history.project_history`
-reconstructs the same set from the trail using the SAME helper.
-
-The plain-English contract (short sentences in the user's own terms, never SQL, codes or
-column names) is enforced by the SCHEMA and the PROMPT, not the runtime: `clean_assumptions`
-deliberately does not try to detect or strip SQL.
+The loop, resume and history use the same normalization and last-successful-write
+fold. The tool is stateless. Assumptions are business interpretations, not data
+facts or freshness claims.
 """
 
 from __future__ import annotations
@@ -35,6 +25,11 @@ TOOL_NAME = "recordAssumptions"
 # verbatim into the turn result / history.
 _MAX_ASSUMPTIONS = 50
 _MAX_ASSUMPTION_LEN = 2000
+
+
+def assumption_key(text: str) -> str:
+    """Ignore case, whitespace and a terminal period, never semantic differences."""
+    return " ".join(text.split()).casefold().rstrip(".")
 
 
 def clean_assumptions(raw: Any) -> list[str]:
@@ -62,9 +57,10 @@ def clean_assumptions(raw: Any) -> list[str]:
             continue
         if len(text) > _MAX_ASSUMPTION_LEN:
             text = text[:_MAX_ASSUMPTION_LEN]
-        if text in seen:
+        key = assumption_key(text)
+        if key in seen:
             continue
-        seen.add(text)
+        seen.add(key)
         cleaned.append(text)
         if len(cleaned) >= _MAX_ASSUMPTIONS:
             break
@@ -72,14 +68,9 @@ def clean_assumptions(raw: Any) -> list[str]:
 
 
 def fold_assumptions(target: list[str], raw: Any) -> None:
-    """Clean *raw* and append each assumption to *target* IN PLACE, skipping any already
-    present (dedupe, first-occurrence order). The SINGLE fold used by the loop's
-    accumulation, the loop's blueprint-resume trail reconstruction and `session_history`, so
-    all three stay in lockstep.
-    """
-    for assumption in clean_assumptions(raw):
-        if assumption not in target:
-            target.append(assumption)
+    """Replace in place so live, resume and history agree; [] explicitly clears."""
+    target[:] = clean_assumptions(raw)
+
 
 
 class RecordAssumptionsTool(RuntimeToolBase):

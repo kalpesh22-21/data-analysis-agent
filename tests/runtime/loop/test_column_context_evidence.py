@@ -186,9 +186,9 @@ def test_behavior_instructions_and_guard_agree():
         "applicable catalog defaults"
         in _ANSWER_JUDGE_PROMPT
     )
-    assert "useful part of the request" in AGENT_SYSTEM_PROMPT
-    assert "use it for that part" in BLUEPRINT_NOT_SEARCHED_MESSAGE
-    assert "do not repeat their rows/totals" in AGENT_SYSTEM_PROMPT
+    assert "execute the independently correct part" in AGENT_SYSTEM_PROMPT
+    assert "execute it for that part" in BLUEPRINT_NOT_SEARCHED_MESSAGE
+    assert "omit repetition of supporting metrics, table rows" in AGENT_SYSTEM_PROMPT
 
 
 async def test_empty_lookup_is_evidence_of_no_returned_values():

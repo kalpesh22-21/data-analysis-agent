@@ -310,10 +310,8 @@ async def test_loop_single_recordassumptions_counts_as_exactly_one_tool_call() -
     assert outcome.assumptions == ["Assumed the fiscal year is 2026"]
 
 
-async def test_loop_multiple_recordassumptions_calls_union_and_dedupe() -> None:
-    # Two separate recordAssumptions calls across two model turns: the turn
-    # accumulator UNIONS them, deduping by first-occurrence. Each call is its own
-    # tool_calls_made increment (2), but the assumptions merge into one list.
+async def test_loop_multiple_recordassumptions_calls_replace() -> None:
+    # A correction replaces the previous list across model rounds.
     model = ScriptedModelClient(
         [
             ModelTurnResult(
@@ -341,17 +339,15 @@ async def test_loop_multiple_recordassumptions_calls_union_and_dedupe() -> None:
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
     assert outcome.status == "done"
     assert outcome.tool_calls_made == 3  # Includes the explicit final-answer call.
-    # UNION across both calls, "Shared assumption" appears once (first-occurrence).
+    # The latest full list replaces the earlier interpretation.
     assert outcome.assumptions == [
-        "First assumption",
         "Shared assumption",
         "Second assumption",
     ]
 
 
-async def test_loop_two_recordassumptions_calls_in_one_turn_union_and_dedupe() -> None:
-    # Both recordAssumptions calls emitted in a SINGLE model turn (the schema says
-    # "call once", but the loop must still union+dedupe if the model over-calls).
+async def test_loop_two_recordassumptions_calls_last_wins() -> None:
+    # For two writes in a batch, the last successful write wins.
     model = ScriptedModelClient(
         [
             ModelTurnResult(
@@ -375,7 +371,7 @@ async def test_loop_two_recordassumptions_calls_in_one_turn_union_and_dedupe() -
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
     assert outcome.status == "done"
     assert outcome.tool_calls_made == 3  # Includes the explicit final-answer call.
-    assert outcome.assumptions == ["A", "B", "C"]
+    assert outcome.assumptions == ["B", "C"]
 
 
 async def test_loop_empty_and_all_blank_recordassumptions_yields_null() -> None:
@@ -704,3 +700,13 @@ async def test_the_drop_is_context_only_history_and_resume_still_see_them() -> N
     trail = await store.load_trail(SESSION_ID)
     assert [e.tool_name for e in trail] == ["recordAssumptions"]
     assert trail[0].args["assumptions"] == [_SECRETISH]
+
+
+def test_normalized_duplicates_do_not_merge_different_meanings():
+    from data_agent.runtime.composite.record_assumptions import fold_assumptions
+    target = ['Obsolete interpretation']
+    fold_assumptions(target, ['Active employees only.', ' active   employees ONLY ',
+                              'Not active employees only.', 'Active and On Leave employees.'])
+    assert target == ['Active employees only.', 'Not active employees only.', 'Active and On Leave employees.']
+    fold_assumptions(target, [])
+    assert target == []

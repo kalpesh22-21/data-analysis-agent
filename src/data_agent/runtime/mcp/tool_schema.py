@@ -19,7 +19,8 @@ ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "name": "askUser",
     "description": (
-        "Pause and ask the user one clarifying question, then resume with their answer. "
+        "Pause and ask the user one clarifying question about unresolved business meaning, then resume with their answer. "
+        "Never ask about presentation format, chart/table choice, CSV, or reducing records solely for display; choose the presentation yourself and use a table for large results. "
         "Offer no more than five choices. Put every choice in `options`; never embed a "
         "choice list in `question`. Consolidate choices when more than five exist. Never "
         "offer a bare code or ID: pair every code with its human-readable label, such as "
@@ -309,7 +310,7 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
 
 
 # `recordAssumptions` (docs/decisions/ui-assumptions-contract.md) — a runtime
-# tool the model calls ONCE, just before its final answer, to surface the
+# tool the model calls before its final answer (and to correct/clear it), to surface the
 # plain-English assumptions behind that answer as a first-class response field
 # (alongside `sql`/`result_table`). MODEL-DECLARED, PLAIN ENGLISH ONLY — never
 # SQL, codes, or column names. Declares NO session_id/jwt/scope (D5); it carries
@@ -321,13 +322,13 @@ RECORD_ASSUMPTIONS_TOOL_SCHEMA: dict[str, Any] = {
         "Record the plain-English assumptions behind your answer so the user can see "
         "them. Use this when you interpreted an ambiguous term a particular way, applied "
         "a default filter or time period, or resolved a fuzzy concept to specific values. "
-        "Call this exactly ONCE, just before you give your final answer, listing every "
-        "assumption you made. Each item must be a short, plain-English sentence stated in "
-        "the user's own terms — describe WHAT you assumed, never HOW you implemented it. "
-        "NEVER include SQL, code, column names, or raw codes. "
-        "Good: \"'Active employees' was taken to mean currently-employed staff.\" "
-        "Bad: \"EmployeeStatus = 'A'\". "
-        "If you did not make any assumptions, do not call this tool."
+        "Each call replaces the entire current-turn list; send [] to clear it. During repair, "
+        "resubmit only assumptions that still apply. Consolidate paraphrases into one short "
+        "business sentence per interpretation. Do not repeat them in answer prose or caveats; "
+        "the backend displays this list. Section caveats add only distinct data limitations, not "
+        "another wording of the recorded interpretation. Short metric/population labels are fine. "
+        "Never include freshness claims, SQL or internal identifiers. "
+        "Example: Salary means recorded annual salary. Skip the call if none were recorded or needed."
     ),
     "parameters": {
         "type": "object",
@@ -674,7 +675,8 @@ FINALIZE_ANSWER_SCHEMA = {
         "Prefer zero or one visible table. Scalars use figures, charts use supporting_data "
         "and fallback for their associated table. Extra visible tables require table_reason "
         "explaining distinct requested value. Evidence-only queries stay hidden. Use only "
-        "prepared action references. The complete presentation will be reviewed before delivery. "
+        "prepared action references. A blocked field needs no section: state its limitation once in takeaway, "
+        "retain its evidence, and omit duplicate text sections/caveats. The complete presentation will be reviewed before delivery. "
         'Every section requires id, evidence_refs, presentation, caveats and actions (use [] when empty). '
         'Comparison presentation example: {"kind":"bars","result_id":"<execution ID>",'
         '"category_column":"<returned category column>","measure_column":"<returned numeric column>",'
@@ -694,6 +696,8 @@ DECLINE_OUT_OF_SCOPE_SCHEMA = {
         "Record a refusal for a request outside HR, payroll, and product usage. "
         "Use only for an out-of-domain part of the original ask, never for missing data, "
         "disabled features, unavailable services, access denials, or failed execution. "
+        "An incomplete topic/entity name is not an out-of-domain request: resolve it from "
+        "conversation context or ask what the user wants to know before classifying its scope. "
         "Supply that part verbatim as request. Tag only its matching declared intents. "
         "The result is a scope refusal receipt, not data or an execution failure. "
         "Do not retry this refusal; finish supported parts and explain the scope in finalizeAnswer."

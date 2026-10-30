@@ -175,7 +175,7 @@ def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
             denial_detail=(
                 outcome.user_message
                 if outcome.error_code in ACCESS_DENIAL_CODES
-                or (outcome.error_code in AGGREGATION_QUERY_CODES | {"AGGREGATION_CHECK_UNAVAILABLE", "SQL_SYNTAX_ERROR"}
+                or (outcome.error_code in AGGREGATION_QUERY_CODES | {"AGGREGATION_CHECK_UNAVAILABLE", "SQL_SYNTAX_ERROR", "SOURCE_UNAVAILABLE"}
                     and decode_diagnostic(outcome.user_message))
                 else None
             ),

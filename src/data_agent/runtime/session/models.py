@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from data_agent.runtime.provenance.capture import capture_data_as_of
+from data_agent.runtime.provenance.formats import capture_formats
 from data_agent.runtime.provenance.freshness import capture_freshness, timestamp
 
 
@@ -29,6 +30,7 @@ class ResultPreview:
     row_count: int
     truncated: bool
     preview_rows: list[list[Any]]
+    column_formats: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -36,6 +38,7 @@ class ResultPreview:
             "row_count": self.row_count,
             "truncated": self.truncated,
             "preview_rows": [list(row) for row in self.preview_rows],
+            **({"column_formats": self.column_formats} if self.column_formats else {}),
         }
 
     @classmethod
@@ -45,6 +48,7 @@ class ResultPreview:
             row_count=int(doc["row_count"]),
             truncated=bool(doc["truncated"]),
             preview_rows=[list(row) for row in doc["preview_rows"]],
+            column_formats=capture_formats(doc.get("column_formats"), doc["columns"]),
         )
 
 

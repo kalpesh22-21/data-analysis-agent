@@ -90,6 +90,21 @@
     \             WHEN 'plan' THEN b.accrual_code\n             ELSE 'Company'\n         END\nORDER BY\
     \ CASE\n             WHEN {order_direction} = 'DESC' THEN \"Group\"\n         END DESC, CASE\n   \
     \                    WHEN {order_direction} = 'ASC' THEN \"Group\"\n                   END ASC\n"
+  column_formats:
+    Group:
+      kind: text
+    Beginning Balance:
+      kind: number
+    Accrued Amount:
+      kind: number
+    Awarded Amount:
+      kind: number
+    Taken Amount:
+      kind: number
+    Source Balance Rows:
+      kind: integer
+    Employee Count:
+      kind: integer
 - id: bp-accrual-code-dictionary
   intent: Distinct accrual codes with descriptions and counts of employees who hold each bank type
   status: validated
@@ -115,6 +130,13 @@
   - dbpcm_warehouse.time_off_balance.accrual_code
   - dbpcm_warehouse.time_off_balance.accrual_description
   - dbpcm_warehouse.time_off_balance.employee_code
+  column_formats:
+    Accrual Code:
+      kind: identifier
+    Accrual Description:
+      kind: text
+    Holder Count:
+      kind: integer
 - id: bp-accrual-event-summary
   intent: Accrual event/day row counts, event hours and distinct employees by company, department, workflow
     status, event type, event-date month or department_status (department and status together). Includes
@@ -239,6 +261,19 @@
     \ THEN a.status\n             ELSE 'All selected statuses'\n         END\nORDER BY CASE\n        \
     \     WHEN {order_direction} = 'DESC' THEN \"Group\"\n         END DESC, CASE\n                  \
     \     WHEN {order_direction} = 'ASC' THEN \"Group\"\n                   END ASC, \"Event Status\"\n"
+  column_formats:
+    Group:
+      kind: text
+    Event Status:
+      kind: text
+    Event Day Rows:
+      kind: integer
+    Event Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Employee Count:
+      kind: integer
 - id: bp-active-headcount-by-department
   intent: Employee headcount by department, including departments with no matching employees. Defaults
     to Active + On Leave; employee_status selects another status or All to remove the filter.
@@ -259,8 +294,7 @@
     binds_to: dbpcm_warehouse.department.department_name
     optional_pattern: 'TRUE'
   - name: employee_status
-    description: Omit for Active + On Leave; select a status to override, or All to remove the status
-      filter.
+    description: Select Active for active employees. Omit for current employees (Active + On Leave); All removes the status filter.
     type: enum
     binds_to: dbpcm_warehouse.employee.employee_status
     required: false
@@ -297,6 +331,13 @@
     ORDER BY CASE\n             WHEN {order_direction} = 'DESC' THEN headcount\n         END DESC, CASE\n\
     \                       WHEN {order_direction} = 'ASC' THEN headcount\n                   END ASC,\
     \ department,\n                            department_code\n"
+  column_formats:
+    department_code:
+      kind: identifier
+    department:
+      kind: text
+    headcount:
+      kind: integer
 - id: bp-adjustment-line-volume
   intent: Volume of negative payroll register earnings lines per month, counting adjustment and reversal
     activity over the last N pay periods
@@ -327,6 +368,14 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Month:
+      kind: text
+    Adjustment Lines:
+      kind: integer
+    Adjustment Amount:
+      kind: currency
+      currency: USD
 - id: bp-age-band-distribution
   intent: Active employee headcount by age band with average and median workforce age, computed from date
     of birth at query time
@@ -353,6 +402,19 @@
   - dbpcm_warehouse.employee.date_of_birth
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Age Band:
+      kind: text
+    Headcount:
+      kind: integer
+    Avg Age In Band:
+      kind: number
+      unit: years
+      precision: 2
+    Median Age In Band:
+      kind: number
+      unit: years
+      precision: 2
 - id: bp-approved-timeoff-hours
   intent: Approved time-off hours by department or company-wide for a request-date window, counting only
     Approved status leave events
@@ -392,6 +454,13 @@
   - dbpcm_warehouse.time_off_request.request_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Approved Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-approved-timeoff-ranking
   intent: Rank employees by approved time-off request hours in a half-open requested-for-date period.
     Assume approved requests were taken and disclose that assumption. Include all accessible request records,
@@ -444,6 +513,21 @@
     \       r.hours_rank AS `Rank`\nFROM ranked r\nLEFT JOIN dbpcm_warehouse.employee e ON e.employee_code\
     \ = r.employee_code\nWHERE r.hours_rank <= {top_n}\nORDER BY r.hours_rank,\n         r.employee_code\n"
   uses_rules: []
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Approved Time-Off Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Requested Days:
+      kind: integer
+    Rank:
+      kind: integer
 - id: bp-average-annual-salary-by-status
   intent: Average annual compensation by pay type, filtered by employee status. Salary uses annual_salary;
     Hourly uses hourly_salary and estimated annual compensation = hourly_salary * 2080 (40 hours/week,
@@ -490,6 +574,20 @@
   - Pay Type
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    Average Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Average Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
 - id: bp-average-salary-by-department
   intent: Average annual compensation and headcount by department and pay type. Averages exclude unknown
     compensation; headcount includes it. Salary uses annual_salary; Hourly uses hourly_salary and estimated
@@ -548,6 +646,24 @@
     \       OR {employee_status} = 'All')\nGROUP BY employee_pay_type,\n         department_name\n"
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    department:
+      kind: text
+    average_annual_compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    headcount:
+      kind: integer
+    Average Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
 - id: bp-avg-request-size
   intent: Average approved time-off request hours per row by leave type over a request-date window
   status: validated
@@ -580,6 +696,17 @@
   - dbpcm_warehouse.time_off_request.earn_description
   - dbpcm_warehouse.time_off_request.status
   - dbpcm_warehouse.time_off_request.request_date
+  column_formats:
+    Leave Type:
+      kind: text
+    Earn Code:
+      kind: identifier
+    Average Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Request Rows:
+      kind: integer
 - id: bp-avg-shift-length
   intent: Average shift duration in hours from In/Out punch timestamps per punch pair by employee home
     department, using punch_pair event data only
@@ -620,6 +747,15 @@
   - dbpcm_warehouse.punch_pair.punch_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Avg Shift Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Pair Count:
+      kind: integer
 - id: bp-break-gap-median
   intent: Median break gap in hours between consecutive punch pairs on the same employee-day using punch_pair
     event timestamps only
@@ -663,6 +799,17 @@
   - dbpcm_warehouse.punch_pair.punch_date
   - dbpcm_warehouse.punch_pair.in_punch_time
   - dbpcm_warehouse.punch_pair.out_punch_time
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Punch Date:
+      kind: date
+    Median Break Gap Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Gap Count:
+      kind: integer
 - id: bp-card-vs-personal-split
   intent: Corporate card versus personal expense split for a payment period
   status: validated
@@ -695,6 +842,13 @@
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Expense Type:
+      kind: text
+    Approved Amount:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-category-by-department
   intent: Earnings dollars by department for a specific earning category or all categories combined, for
     a punch date window, ranked by department
@@ -741,6 +895,12 @@
   - dbpcm_warehouse.earning_category.category_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Total Dollars:
+      kind: currency
+      currency: USD
 - id: bp-category-earnings-per-employee
   intent: Per-employee earnings dollars for a specific earning category over a date window, including
     all employees with matching earnings, ranked by amount
@@ -788,6 +948,16 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Total Dollars:
+      kind: currency
+      currency: USD
 - id: bp-category-hours-monthly
   intent: Monthly trend of paid hours for a specific earning category (such as Sick or Vacation) from
     timecard earnings, bucketed by punch date month
@@ -825,6 +995,13 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Month:
+      kind: text
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-category-mom-volatility
   intent: Month-over-month earnings dollar volatility by earning category, comparing the last two completed
     punch-date months via adjacent month self-join
@@ -865,6 +1042,22 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Category:
+      kind: text
+    Current Month Dollars:
+      kind: currency
+      currency: USD
+    Prior Month Dollars:
+      kind: currency
+      currency: USD
+    Dollar Change:
+      kind: currency
+      currency: USD
+    Pct Change:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-category-spend-over-threshold
   intent: Employees whose earnings in a specific category exceed a dollar threshold over a date window,
     from timecard earnings
@@ -912,6 +1105,16 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Total Dollars:
+      kind: currency
+      currency: USD
 - id: bp-change-actor-mix
   intent: Monthly counts of employee master-data changes grouped by the actor user type, distinguishing
     client administrators from employee users and regular users
@@ -945,6 +1148,13 @@
   uses:
   - dbpcm_warehouse.employee_change.change_by_usertype
   - dbpcm_warehouse.employee_change.change_time_added
+  column_formats:
+    Month:
+      kind: text
+    User Type:
+      kind: text
+    Change Events:
+      kind: integer
 - id: bp-change-velocity-spikes
   intent: Days with unusually high employee master-data change volume within a trailing window, flagged
     when daily counts exceed one standard deviation above the mean
@@ -979,6 +1189,15 @@
   slots_summary: win, max_rows, order_direction
   uses:
   - dbpcm_warehouse.employee_change.change_time_added
+  column_formats:
+    Day:
+      kind: date
+    Change Events:
+      kind: integer
+    Daily Mean:
+      kind: number
+    Daily Std Dev:
+      kind: number
 - id: bp-clock-time-profile
   intent: Time-of-day clock-in and clock-out distribution per employee home department using punch_pair
     event timestamps, showing typical shift start and end profiles
@@ -1021,6 +1240,19 @@
   - dbpcm_warehouse.punch_pair.punch_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Median Clock-In Min:
+      kind: number
+      unit: minutes after midnight
+      precision: 2
+    Median Clock-Out Min:
+      kind: number
+      unit: minutes after midnight
+      precision: 2
+    Pair Count:
+      kind: integer
 - id: bp-commission-by-employee
   intent: Commission earnings per employee for a date period, ranked by total dollars, resolved via the
     Commission earning category
@@ -1062,6 +1294,14 @@
   - dbpcm_warehouse.earning_category.category_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Total Commission:
+      kind: currency
+      currency: USD
 - id: bp-comp-range-exceptions
   intent: Active employees paid outside their salary range or below a compa-ratio cap
   status: validated
@@ -1105,6 +1345,27 @@
   - dbpcm_warehouse.employee.salary_mid
   - dbpcm_warehouse.employee.salary_max
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Department:
+      kind: text
+    Annual Salary:
+      kind: currency
+      currency: USD
+      precision: 2
+    Range Min:
+      kind: currency
+      currency: USD
+    Range Mid:
+      kind: currency
+      currency: USD
+    Range Max:
+      kind: currency
+      currency: USD
+    Compa Ratio:
+      kind: number
+      precision: 3
 - id: bp-compare-employee-check-detail-two-periods
   intent: Compare a single employee's two paychecks line-item by line-item across two pay periods, with
     per-item deltas
@@ -1174,6 +1435,33 @@
       \ AS a\nFULL OUTER JOIN scratch.detail_b AS b ON a.register_type = b.register_type\nAND a.type_code\
       \ = b.type_code\nORDER BY coalesce(a.register_type, b.register_type),\n         coalesce(a.type_code,\
       \ b.type_code)\n"
+  column_formats:
+    register_type:
+      kind: text
+    type_code:
+      kind: identifier
+    type_code_description:
+      kind: text
+    amount_a:
+      kind: currency
+      currency: USD
+      precision: 2
+    amount_b:
+      kind: currency
+      currency: USD
+      precision: 2
+    amount_delta:
+      kind: currency
+      currency: USD
+      precision: 2
+    hours_a:
+      kind: number
+      unit: hours
+      precision: 2
+    hours_b:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-compare-employee-paychecks-two-periods
   intent: Compare a single employee's paychecks line-item by line-item across two given pay periods, with
     per-item amounts, hours, and period-over-period change
@@ -1226,6 +1514,37 @@
   - dbpcm_warehouse.payroll.type_code_description
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.type_hours
+  column_formats:
+    Pay Category:
+      kind: text
+    Pay Code:
+      kind: identifier
+    Description:
+      kind: text
+    Recent Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Recent Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Prior Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Prior Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Amount Change:
+      kind: currency
+      currency: USD
+      precision: 2
+    Hours Change:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-compensation-ranking
   intent: Top N highest-paid employees separately within Salary and Hourly pay types. Salary uses recorded
     annual salary; Hourly uses hourly_salary * 2080 estimated annual compensation (40 hours/week, 52 weeks/year,
@@ -1306,6 +1625,26 @@
   uses_rules:
   - default_employee_population
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Rank:
+      kind: integer
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
 - id: bp-consecutive-day-streaks
   intent: Employees with N or more consecutive calendar days containing at least one punch pair, showing
     streak length and date range
@@ -1349,6 +1688,17 @@
   - dbpcm_warehouse.punch_pair.punch_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Streak Start:
+      kind: date
+    Streak End:
+      kind: date
+    Streak Length:
+      kind: integer
 - id: bp-deduction-breakdown
   intent: Total payroll deductions and breakdown by deduction type code for a pay period, from register
     deduction lines
@@ -1384,6 +1734,12 @@
   - dbpcm_warehouse.payroll.type_code
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Deduction Code:
+      kind: identifier
+    Total Deductions:
+      kind: currency
+      currency: USD
 - id: bp-denied-expenses
   intent: Denied expense total and denial rate by department for a payment date window
   status: validated
@@ -1423,6 +1779,19 @@
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.department_description
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Department:
+      kind: text
+    Denied Count:
+      kind: integer
+    Denied Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Denial Rate:
+      kind: percent
+      scale: ratio
+      precision: 2
 - id: bp-department-directory
   intent: Complete department dictionary with codes, names, active headcount and total headcount including
     zero-employee departments
@@ -1452,6 +1821,15 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_code
+  column_formats:
+    Department Code:
+      kind: identifier
+    Department:
+      kind: text
+    Active Headcount:
+      kind: integer
+    Total Headcount:
+      kind: integer
 - id: bp-department-label-audit
   intent: Department label normalization audit showing employee department names not present in the official
     department dimension with affected employee counts
@@ -1479,6 +1857,11 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.department.department_name
+  column_formats:
+    Department Name:
+      kind: text
+    Affected Employees:
+      kind: integer
 - id: bp-department-ot-share
   intent: Department overtime dollars as a percentage of department gross payroll earnings, ranked by
     share, combining timecard overtime with register gross
@@ -1533,6 +1916,19 @@
   - dbpcm_warehouse.earning_category.category_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Overtime Dollars:
+      kind: currency
+      currency: USD
+    Gross Earnings:
+      kind: currency
+      currency: USD
+    OT Share %:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-department-scorecard
   intent: Per-department KPI scorecard covering active headcount, pay, tenure, demographics and long-running
     leaves
@@ -1580,6 +1976,31 @@
   - dbpcm_warehouse.employee.direct_deposit
   - dbpcm_warehouse.employee.leave_absence_start
   - dbpcm_warehouse.employee.leave_absence_end
+  column_formats:
+    Department:
+      kind: text
+    Active Headcount:
+      kind: integer
+    Avg Salary (Active):
+      kind: currency
+      currency: USD
+      precision: 2
+    Avg Tenure Years (Active):
+      kind: number
+      unit: years
+      precision: 2
+    Pct Female (Active):
+      kind: percent
+      scale: percent
+      precision: 2
+    Pct Direct Deposit (Active):
+      kind: percent
+      scale: percent
+      precision: 2
+    On Leave:
+      kind: integer
+    On Leave Over 1 Year No End:
+      kind: integer
 - id: bp-department-turnover-rate
   intent: Department turnover rate for a window using terms divided by current active headcount, ranked
     by rate
@@ -1618,6 +2039,15 @@
   - dbpcm_warehouse.employee.most_recent_hire_date
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Department:
+      kind: text
+    Terms:
+      kind: integer
+    Turnover Rate Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-departments-above-company-average-salary
   intent: Departments above the corresponding company average, separately for Salary annual salaries and
     Hourly annual estimates (hourly rate * 2080, 40 hours/week, 52 weeks/year). Defaults to Active + On
@@ -1688,6 +2118,22 @@
     optional_pattern: employee_status IN ('Active', 'On Leave')
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Department:
+      kind: text
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    Department Average Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Average Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
 - id: bp-dol-status-per-work-location
   intent: Pivoted Full Time / Part Time / Seasonal / None active counts per work location
   status: validated
@@ -1719,6 +2165,19 @@
   - dbpcm_warehouse.employee.work_location_description
   - dbpcm_warehouse.employee.dol_status_description
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Work Location:
+      kind: text
+    Full Time:
+      kind: integer
+    Part Time:
+      kind: integer
+    Seasonal:
+      kind: integer
+    None:
+      kind: integer
+    Total:
+      kind: integer
 - id: bp-duplicate-expense-flag-list
   intent: Expense lines flagged as potential duplicate for a payment date window
   status: validated
@@ -1752,6 +2211,15 @@
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.employee_code
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Flagged Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Flagged Lines:
+      kind: integer
 - id: bp-earning-category-dictionary
   intent: Full earning category dimension mapping with each earn code and its assigned category label,
     zero-slot static lookup
@@ -1776,6 +2244,11 @@
   uses:
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Earn Code:
+      kind: identifier
+    Category:
+      kind: text
 - id: bp-earnings-by-category
   intent: Total timecard earnings and paid hours for a specific earning category resolved via the earning
     category dimension, for a punch date window
@@ -1805,6 +2278,15 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Total Earnings:
+      kind: currency
+      currency: USD
+      precision: 2
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-earnings-by-department-via-scratch-join
   intent: Total earnings by department, materializing per-employee earnings and joining departments
   slots_summary: department
@@ -1842,6 +2324,13 @@
     sql_template: "SELECT e.department_name AS department,\n       SUM(x.earnings) AS total_earnings\n\
       FROM scratch.emp_earnings AS x\nJOIN dbpcm_warehouse.employee AS e ON e.employee_code = x.employee_code\n\
       WHERE e.department_name = {department}\nGROUP BY e.department_name\n"
+  column_formats:
+    department:
+      kind: text
+    total_earnings:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-earnings-by-dol-status
   intent: Gross earnings by employee DOL status for a pay period, joining the current employee roster
   status: validated
@@ -1876,6 +2365,12 @@
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.dol_status_description
+  column_formats:
+    DOL Status:
+      kind: text
+    Gross Earnings:
+      kind: currency
+      currency: USD
 - id: bp-earnings-by-pay-basis
   intent: Gross earnings by employee pay basis for a pay period, joining the current employee roster
   status: validated
@@ -1910,6 +2405,12 @@
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.pay_basis
+  column_formats:
+    Pay Basis:
+      kind: text
+    Gross Earnings:
+      kind: currency
+      currency: USD
 - id: bp-earnings-by-work-state
   intent: Gross earnings by employee works-in-state for a pay period, with optional state filter, reflecting
     tax-situs work location
@@ -1950,6 +2451,12 @@
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.works_in_state
+  column_formats:
+    Work State:
+      kind: text
+    Gross Earnings:
+      kind: currency
+      currency: USD
 - id: bp-earnings-category-mix
   intent: Category mix showing percent share of total earnings dollars and paid hours by earning category
     for a punch date window, preserving uncategorized rows
@@ -1999,6 +2506,24 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Category:
+      kind: text
+    Total Dollars:
+      kind: currency
+      currency: USD
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Dollar Pct:
+      kind: percent
+      scale: percent
+      precision: 2
+    Hours Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-earnings-category-trend
   intent: Monthly trend of earnings dollars for a specific earning category over the last N months, bucketed
     by punch date month
@@ -2036,6 +2561,12 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Month:
+      kind: text
+    Total Dollars:
+      kind: currency
+      currency: USD
 - id: bp-earnings-monthly-trend
   intent: Monthly trend of gross or net payroll earnings over the last N completed pay periods, bucketed
     by pay-period end month
@@ -2072,6 +2603,13 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.payroll.register_type
+  column_formats:
+    Month:
+      kind: text
+    Total Earnings:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-earnings-quarter-to-date
   intent: Quarter-to-date gross and net earnings from the payroll register, matching pay periods that
     fall within the selected calendar quarter
@@ -2092,6 +2630,13 @@
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_start_date
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Gross Earnings:
+      kind: currency
+      currency: USD
+    Net Pay:
+      kind: currency
+      currency: USD
 - id: bp-effective-mileage-rate
   intent: Effective mileage rate by expense rule for a payment date window
   status: validated
@@ -2130,6 +2675,22 @@
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
   - dbpcm_warehouse.expense.submitted_miles
+  column_formats:
+    Expense Rule:
+      kind: text
+    Total Approved:
+      kind: currency
+      currency: USD
+      precision: 2
+    Total Miles:
+      kind: number
+      unit: miles
+      precision: 2
+    Effective Rate:
+      kind: currency
+      currency: USD
+      unit: per mile
+      precision: 4
 - id: bp-employee-benefits-summary
   intent: Total employee benefit contributions and breakdown by benefit type code for a pay period, from
     payroll register benefit lines
@@ -2162,6 +2723,12 @@
   - dbpcm_warehouse.payroll.type_code
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Benefit Code:
+      kind: identifier
+    Total Benefit Contributions:
+      kind: currency
+      currency: USD
 - id: bp-employee-change-timeline
   intent: Chronological audit timeline of master-data changes for a single employee, showing changed field,
     record time, effective date, and change actor
@@ -2201,6 +2768,19 @@
   - dbpcm_warehouse.employee_change.effective_date
   - dbpcm_warehouse.employee_change.change_by_username
   - dbpcm_warehouse.employee_change.change_by_usertype
+  column_formats:
+    Changed Field:
+      kind: text
+    Record Date:
+      kind: datetime
+    Effective Date:
+      kind: date
+    Changed By:
+      kind: text
+    User Type:
+      kind: text
+    Description:
+      kind: text
 - id: bp-employee-change-volume
   intent: Monthly counts of employee master-data changes by changed field, including both effective and
     non-effective logged changes
@@ -2234,6 +2814,13 @@
   uses:
   - dbpcm_warehouse.employee_change.changed_field
   - dbpcm_warehouse.employee_change.change_time_added
+  column_formats:
+    Month:
+      kind: text
+    Changed Field:
+      kind: text
+    Change Events:
+      kind: integer
 - id: bp-employee-check-detail-for-period
   intent: A single employee's paycheck line items for one pay period, with per-item amount and hours
   slots_summary: employee, period
@@ -2271,6 +2858,25 @@
     \ dbpcm_warehouse.employee e ON e.employee_code = p.employee_code\nWHERE p.employee_code = {employee}\n\
     \  AND p.pay_period_end_date = {period}\nGROUP BY p.register_type,\n         p.type_code,\n      \
     \   e.employee_name,\n         e.department_name\n"
+  column_formats:
+    register_type:
+      kind: text
+    type_code:
+      kind: identifier
+    type_code_description:
+      kind: text
+    employee_name:
+      kind: text
+    department_name:
+      kind: text
+    amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-employee-coverage-matrix
   intent: Multi-source employee coverage matrix showing which employees have roster entries, punch pairs,
     payroll lines, and timecard earnings, ordered by coverage gap count descending
@@ -2315,6 +2921,27 @@
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.total_earning.employee_code
   - dbpcm_warehouse.total_earning.punch_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Employee Status:
+      kind: text
+    Has Roster:
+      kind: integer
+    Has Punches:
+      kind: integer
+    Has Payroll:
+      kind: integer
+    Has Earnings:
+      kind: integer
+    Coverage Score:
+      kind: integer
+    Gap Count:
+      kind: integer
 - id: bp-employee-date-summary
   intent: Counts of distinct employees with recorded original hire, most recent hire or termination dates
     in an explicit half-open period. Group by company, department, current status or event month. These
@@ -2406,6 +3033,11 @@
     GROUP BY `Group`\nORDER BY CASE\n             WHEN {order_direction} = 'DESC' THEN `Group`\n     \
     \    END DESC, CASE\n                       WHEN {order_direction} = 'ASC' THEN `Group`\n        \
     \           END ASC\n"
+  column_formats:
+    Group:
+      kind: text
+    Employee Count:
+      kind: integer
 - id: bp-employee-day-clock-span
   intent: Employee-day first recorded In time, last recorded Out time and matched-pair count, with paid
     hours. Clock span may contain unpaid gaps; it is not hours worked, a single shift or a lateness finding.
@@ -2509,6 +3141,25 @@
     ORDER BY CASE\n             WHEN {order_direction} = 'DESC' THEN p.employee_code\n         END DESC,\
     \ CASE\n                       WHEN {order_direction} = 'ASC' THEN p.employee_code\n             \
     \      END ASC, p.punch_date\n"
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Punch Date:
+      kind: date
+    First Recorded In:
+      kind: datetime
+    Last Recorded Out:
+      kind: datetime
+    Pair Count:
+      kind: integer
+    Paid Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-employee-directory
   intent: Filtered active-employee directory with identity, contact, title and pay columns
   status: validated
@@ -2568,6 +3219,25 @@
   - dbpcm_warehouse.employee.employment_type
   - dbpcm_warehouse.employee.primary_supervisor_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Work Email:
+      kind: text
+    Title:
+      kind: text
+    Department:
+      kind: text
+    Badge:
+      kind: identifier
+    Pay Basis:
+      kind: text
+    Employment Type:
+      kind: text
+    Supervisor:
+      kind: text
 - id: bp-employee-record-dq-flags
   intent: Per-employee data-quality flags across SUI state, hire date and date of birth
   status: validated
@@ -2623,6 +3293,23 @@
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.date_of_birth
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Works In State:
+      kind: text
+    SUI State:
+      kind: text
+    Hire Date:
+      kind: datetime
+    Date Of Birth:
+      kind: datetime
+    DQ Flag:
+      kind: text
 - id: bp-employee-summary
   intent: Headcount and annual compensation sum, average, minimum, maximum and known-compensation count
     by company, department or status, separately by pay type. Unknown compensation is NULL; headcount
@@ -2719,6 +3406,38 @@
     \         WHEN {order_direction} = 'ASC' THEN `Group`\n                   END ASC\n"
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    Group:
+      kind: text
+    Employee Count:
+      kind: integer
+    Known Compensation Count:
+      kind: integer
+    Annual Compensation Sum:
+      kind: currency
+      currency: USD
+      precision: 2
+    Average Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Minimum Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Maximum Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Average Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
 - id: bp-employee-tax-withheld
   intent: Total employee tax withholding and breakdown by tax type code for a pay period, from payroll
     register employee-tax lines
@@ -2751,6 +3470,12 @@
   - dbpcm_warehouse.payroll.type_code
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Tax Code:
+      kind: identifier
+    Total Tax Withheld:
+      kind: currency
+      currency: USD
 - id: bp-employee-tenure-summary
   intent: Elapsed years from original or most recent hire date to a supplied ISO YYYY-MM-DD reference_date,
     using calendar days / 365.25. Company/department/current-status groups, average/min/max and valid-date
@@ -2848,6 +3573,23 @@
     \             ELSE 'Company'\n         END\nORDER BY CASE\n             WHEN {order_direction} = 'DESC'\
     \ THEN `Group`\n         END DESC, CASE\n                       WHEN {order_direction} = 'ASC' THEN\
     \ `Group`\n                   END ASC\n"
+  column_formats:
+    Group:
+      kind: text
+    Valid Hire Date Count:
+      kind: integer
+    Average Elapsed Years:
+      kind: number
+      unit: years
+      precision: 2
+    Minimum Elapsed Years:
+      kind: number
+      unit: years
+      precision: 2
+    Maximum Elapsed Years:
+      kind: number
+      unit: years
+      precision: 2
 - id: bp-employees-in-inactive-seats
   intent: Active employees assigned to position seats with inactive or disabled seat status
   status: validated
@@ -2887,6 +3629,19 @@
   - dbpcm_warehouse.employee.position_seat_number
   - dbpcm_warehouse.employee.status_position_seat
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Position Code:
+      kind: identifier
+    Seat Number:
+      kind: identifier
+    Seat Status:
+      kind: text
 - id: bp-employer-tax-summary
   intent: Total employer payroll tax and breakdown by tax type code for a pay period, from payroll register
     employer-tax lines
@@ -2919,6 +3674,12 @@
   - dbpcm_warehouse.payroll.type_code
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Tax Code:
+      kind: identifier
+    Total Employer Tax:
+      kind: currency
+      currency: USD
 - id: bp-expense-approval-backlog
   intent: Expenses awaiting approval longest, by submission age, with optional minimum wait threshold
   status: validated
@@ -2953,6 +3714,19 @@
   - dbpcm_warehouse.expense.date_time_submitted
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.employee_code
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Pending Lines:
+      kind: integer
+    Pending Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Avg Days Pending:
+      kind: number
+      unit: days
+      precision: 2
 - id: bp-expense-approval-trim
   intent: Submitted versus approved amount delta by expense rule for a payment date window
   status: validated
@@ -2990,6 +3764,23 @@
   - dbpcm_warehouse.expense.expense_rule_description
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Expense Rule:
+      kind: text
+    Approved Total:
+      kind: currency
+      currency: USD
+      precision: 2
+    Submitted Total:
+      kind: currency
+      currency: USD
+      precision: 2
+    Trimmed Total:
+      kind: currency
+      currency: USD
+      precision: 2
+    Line Count:
+      kind: integer
 - id: bp-expense-by-account-category
   intent: Approved spend by expense account code category for a payment date window
   status: validated
@@ -3026,6 +3817,15 @@
   - dbpcm_warehouse.expense.expense_account_description
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Account Code:
+      kind: identifier
+    Account Description:
+      kind: text
+    Approved Spend:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-expense-by-policy
   intent: Approved expense spend by policy description ranked for a payment date window
   status: validated
@@ -3060,6 +3860,15 @@
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Policy:
+      kind: text
+    Approved Spend:
+      kind: currency
+      currency: USD
+      precision: 2
+    Line Count:
+      kind: integer
 - id: bp-expense-concept-spend
   intent: Expense spend matched to a user-supplied concept via rule or account descriptions for a payment
     date window
@@ -3102,6 +3911,15 @@
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Matched Description:
+      kind: text
+    Approved Spend:
+      kind: currency
+      currency: USD
+      precision: 2
+    Line Count:
+      kind: integer
 - id: bp-expense-cycle-time
   intent: Median expense reimbursement cycle time by month, submission to approval and approval to payment
   status: validated
@@ -3142,6 +3960,19 @@
   - dbpcm_warehouse.expense.approved_date
   - dbpcm_warehouse.expense.expense_paid_date
   - dbpcm_warehouse.expense.expense_status
+  column_formats:
+    Month:
+      kind: text
+    Line Count:
+      kind: integer
+    Median Submission To Approval:
+      kind: number
+      unit: days
+      precision: 2
+    Median Approval To Payment:
+      kind: number
+      unit: days
+      precision: 2
 - id: bp-expense-line-size-distribution
   intent: Distribution of expense line amounts into bands by account description for a payment date window
   status: validated
@@ -3178,6 +4009,15 @@
   - dbpcm_warehouse.expense.expense_account_description
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Account Description:
+      kind: text
+    Band Start:
+      kind: currency
+      currency: USD
+      precision: 2
+    Line Count:
+      kind: integer
 - id: bp-expense-monthly-trend
   intent: Monthly approved expense spend trend over the last N months with top account slice
   status: validated
@@ -3212,6 +4052,13 @@
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
   - dbpcm_warehouse.expense.expense_account_description
+  column_formats:
+    Month:
+      kind: text
+    Total Approved Spend:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-expense-payroll-recon
   intent: Reconcile approved expense amounts against payroll deduction reimbursement lines by payroll
     transaction number for a pay period
@@ -3256,6 +4103,25 @@
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Transaction Number:
+      kind: identifier
+    Expense Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Payroll Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Difference:
+      kind: currency
+      currency: USD
+      precision: 2
+    Pct Diff:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-expense-per-capita
   intent: Per-capita approved expense spend by department for a payment date window
   status: validated
@@ -3294,16 +4160,29 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Department:
+      kind: text
+    Approved Spend:
+      kind: currency
+      currency: USD
+      precision: 2
+    Active Headcount:
+      kind: integer
+    Per Capita Spend:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-expense-senders-no-punches
   intent: Employees who submitted expense activity but have zero punched timecard records over the trailing
-    N months — a cross-check audit of expense submitters with no timecards
+    N months — based on expense submission time, not payment time; includes unpaid submissions
   status: validated
   drift_status: clean
   catalog_sha: ''
   sql_template: "SELECT \"Employee Code\",\n       \"Employee Name\",\n       \"Department\"\nFROM\n \
     \ (SELECT DISTINCT e.employee_code AS \"Employee Code\",\n                   e.employee_name AS \"\
     Employee Name\",\n                   e.department_name AS \"Department\"\n   FROM dbpcm_warehouse.expense\
-    \ AS ex\n   JOIN dbpcm_warehouse.employee AS e ON e.employee_code = ex.employee_code\n   WHERE ex.expense_paid_date\
+    \ AS ex\n   JOIN dbpcm_warehouse.employee AS e ON e.employee_code = ex.employee_code\n   WHERE toDate(ex.date_time_submitted)\
     \ >= addMonths(today(), -{win})\n     AND ex.employee_code NOT IN\n       (SELECT DISTINCT employee_code\n\
     \        FROM dbpcm_warehouse.punch_pair\n        WHERE punch_date >= addMonths(today(), -{win})))\
     \ AS results\nORDER BY CASE\n             WHEN {order_direction} = 'DESC' THEN \"Employee Code\"\n\
@@ -3325,12 +4204,19 @@
   slots_summary: win, order_direction
   uses:
   - dbpcm_warehouse.expense.employee_code
-  - dbpcm_warehouse.expense.expense_paid_date
+  - dbpcm_warehouse.expense.date_time_submitted
   - dbpcm_warehouse.punch_pair.employee_code
   - dbpcm_warehouse.punch_pair.punch_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
 - id: bp-expenses-unreconciled-to-payroll
   intent: Paid expenses that lack a payroll transaction tie for a payment date window
   status: validated
@@ -3365,6 +4251,15 @@
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Expense Status:
+      kind: text
+    Line Count:
+      kind: integer
+    Total Amount:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-fica-medicare-totals
   intent: Combined employee and employer tax totals with type-code breakdown for a pay period, showing
     both employee-tax and employer-tax register lines
@@ -3398,6 +4293,14 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Tax Code:
+      kind: identifier
+    Tax Side:
+      kind: text
+    Total Tax:
+      kind: currency
+      currency: USD
 - id: bp-future-dated-position-changes
   intent: Active employees with position or seat effective dates inside a forward window
   status: validated
@@ -3435,6 +4338,19 @@
   - dbpcm_warehouse.employee.effective_date_position_info
   - dbpcm_warehouse.employee.effective_date_position_seat
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Position Code:
+      kind: identifier
+    Seat Number:
+      kind: identifier
+    Position Effective:
+      kind: datetime
+    Seat Effective:
+      kind: datetime
 - id: bp-future-hire-roster
   intent: Employees with future hire dates already on the roster, pre-hires on the books whose start date
     is after today
@@ -3463,6 +4379,17 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.position_title_position_info
   - dbpcm_warehouse.employee.hire_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Title:
+      kind: text
+    Hire Date:
+      kind: datetime
 - id: bp-future-termination-roster
   intent: Employees with future termination dates already on the roster, upcoming planned departures
   status: validated
@@ -3492,6 +4419,17 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.termination_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Status:
+      kind: text
+    Termination Date:
+      kind: date
 - id: bp-gross-earnings-period-compare
   intent: Compare gross earnings between two pay periods company-wide or filtered by employee home department
   status: validated
@@ -3536,6 +4474,12 @@
   - dbpcm_warehouse.payroll.employee_code
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Period:
+      kind: date
+    Gross Earnings:
+      kind: currency
+      currency: USD
 - id: bp-gross-earnings-summary
   intent: Total gross earnings for a single pay period, summed from payroll register earnings lines by
     pay-period bounds
@@ -3556,6 +4500,10 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Total Gross Earnings:
+      kind: currency
+      currency: USD
 - id: bp-gross-wages-date-window
   intent: Gross wages from payroll register for a custom date window, matching pay periods that overlap
     the requested date range
@@ -3576,6 +4524,10 @@
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_start_date
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Total Gross Wages:
+      kind: currency
+      currency: USD
 - id: bp-headcount-by-dol-status
   intent: Active headcount by DOL status (Full/Part-time DOL status) from employee.dol_status_description
   status: validated
@@ -3606,6 +4558,11 @@
   - dbpcm_warehouse.employee.dol_status_description
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    DOL Status:
+      kind: text
+    Headcount:
+      kind: integer
 - id: bp-headcount-by-hire-era
   intent: Active headcount and average tenure split by hire era around a supplied window
   status: validated
@@ -3636,6 +4593,15 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Hire Era:
+      kind: text
+    Headcount:
+      kind: integer
+    Avg Tenure Years:
+      kind: number
+      unit: years
+      precision: 2
 - id: bp-headcount-by-pay-frequency
   intent: Active employee headcount grouped by pay frequency schedule with optional department filter
   status: validated
@@ -3666,6 +4632,11 @@
   - dbpcm_warehouse.employee.pay_frequency
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Pay Frequency:
+      kind: text
+    Headcount:
+      kind: integer
 - id: bp-headcount-by-union
   intent: Headcount of employees by union membership — break down the workforce by union code affiliation
     (labor-relations lens)
@@ -3691,6 +4662,11 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.union_code
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Union Code:
+      kind: identifier
+    Headcount:
+      kind: integer
 - id: bp-headcount-by-work-city-country
   intent: Active headcount by work-location country, state and city
   status: validated
@@ -3724,6 +4700,15 @@
   - dbpcm_warehouse.employee.work_location_state
   - dbpcm_warehouse.employee.work_location_city
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Country:
+      kind: text
+    State:
+      kind: text
+    City:
+      kind: text
+    Headcount:
+      kind: integer
 - id: bp-headcount-by-works-in-state
   intent: Active headcount per works-in state with a lives-elsewhere breakdown
   status: validated
@@ -3756,6 +4741,13 @@
   - dbpcm_warehouse.employee.works_in_state
   - dbpcm_warehouse.employee.lives_in_state
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Works In State:
+      kind: text
+    Headcount:
+      kind: integer
+    Lives Elsewhere:
+      kind: integer
 - id: bp-headcount-growth-rate
   intent: Monthly hires, terminations and net headcount delta over the last N months
   status: validated
@@ -3801,6 +4793,15 @@
   uses:
   - dbpcm_warehouse.employee.most_recent_hire_date
   - dbpcm_warehouse.employee.termination_date
+  column_formats:
+    Month:
+      kind: text
+    Hires:
+      kind: integer
+    Terms:
+      kind: integer
+    Net Delta:
+      kind: integer
 - id: bp-headcount-monthly-trend
   intent: End-of-month active headcount and monthly termination trend reconstructed from hire and termination
     dates over the last N months
@@ -3838,6 +4839,13 @@
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.most_recent_hire_date
+  column_formats:
+    Month:
+      kind: text
+    Active Headcount:
+      kind: integer
+    Terms In Month:
+      kind: integer
 - id: bp-hires-in-range
   intent: New hires per month within an explicit start/end date range — counts by original hire date;
     rehires are not re-counted
@@ -3860,6 +4868,11 @@
   sql_template: "SELECT toStartOfMonth(hire_date) AS month,\n       COUNT(DISTINCT employee_code) AS hires\n\
     FROM dbpcm_warehouse.employee\nWHERE hire_date >= {hire_window_start}\n  AND hire_date < {hire_window_end}\n\
     \  AND (employee_status != 'Not Hired'\n       OR employee_status IS NULL)\nGROUP BY toStartOfMonth(hire_date)\n"
+  column_formats:
+    month:
+      kind: date
+    hires:
+      kind: integer
 - id: bp-hires-per-month
   intent: New hires per month over a trailing window of the last N months — counts by original hire date;
     rehires are not re-counted
@@ -3885,6 +4898,11 @@
     \   FROM dbpcm_warehouse.employee\n     WHERE employee_status != 'N'\n       OR employee_status IS\
     \ NULL) - INTERVAL {window_months} MONTH\n  AND (employee_status != 'N'\n       OR employee_status\
     \ IS NULL)\nGROUP BY toStartOfMonth(hire_date)\n"
+  column_formats:
+    month:
+      kind: date
+    hires:
+      kind: integer
 - id: bp-hires-projection
   intent: Projected number of hires over the next N months at the current hiring pace (run-rate over a
     trailing window) — counts by original hire date; rehires are not re-counted
@@ -3916,6 +4934,13 @@
     \                                FROM dbpcm_warehouse.employee\n                                WHERE\
     \ employee_status != 'N'\n                                  OR employee_status IS NULL), 1) - INTERVAL\
     \ {window_months} MONTH\n  AND (employee_status != 'N'\n       OR employee_status IS NULL)\n"
+  column_formats:
+    hires_in_window:
+      kind: integer
+    avg_monthly_hires:
+      kind: number
+    projected_next_n_hires:
+      kind: number
 - id: bp-holiday-work-audit
   intent: Total paid hours and employee counts on company-observed holiday dates from total_earning using
     runtime-resolved holiday earn codes
@@ -3957,6 +4982,17 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Punch Date:
+      kind: date
+    Employees:
+      kind: integer
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Line Count:
+      kind: integer
 - id: bp-inactive-supervisor-audit
   intent: Active employees whose primary supervisor status is not active, supervisor inactivity audit
   status: validated
@@ -3987,6 +5023,19 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.primary_supervisor_ee_code
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Supervisor Code:
+      kind: identifier
+    Supervisor Name:
+      kind: text
+    Supervisor Status:
+      kind: text
 - id: bp-inactive-without-leave-start
   intent: Inactive employees missing a valid leave-of-absence start date
   status: validated
@@ -4025,6 +5074,17 @@
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.last_worked_date
   - dbpcm_warehouse.employee.leave_absence_start
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Last Worked:
+      kind: datetime
+    Leave Absence Start:
+      kind: datetime
 - id: bp-labor-allocation-coverage
   intent: Coverage audit comparing active employees with and without labor allocation key 1 populated
   status: validated
@@ -4052,6 +5112,11 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.labor_allocation_key_1
+  column_formats:
+    Mapping Status:
+      kind: text
+    Headcount:
+      kind: integer
 - id: bp-labor-allocation-dictionary
   intent: Distinct labor allocation codes and descriptions for a chosen slot ranked by active employee
     usage count
@@ -4118,6 +5183,13 @@
   - dbpcm_warehouse.labor_allocation.join_key
   - dbpcm_warehouse.labor_allocation.code
   - dbpcm_warehouse.labor_allocation.description
+  column_formats:
+    Allocation Code:
+      kind: identifier
+    Allocation Description:
+      kind: text
+    Usage Count:
+      kind: integer
 - id: bp-labor-allocation-resolution
   intent: Resolve labor allocation slots 1-3 to codes and descriptions for active employees
   status: validated
@@ -4166,6 +5238,25 @@
   - dbpcm_warehouse.labor_allocation.join_key
   - dbpcm_warehouse.labor_allocation.code
   - dbpcm_warehouse.labor_allocation.description
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Department:
+      kind: text
+    Allocation 1 Code:
+      kind: identifier
+    Allocation 1 Description:
+      kind: text
+    Allocation 2 Code:
+      kind: identifier
+    Allocation 2 Description:
+      kind: text
+    Allocation 3 Code:
+      kind: identifier
+    Allocation 3 Description:
+      kind: text
+    Unallocated:
+      kind: integer
 - id: bp-labor-allocation-rollup
   intent: Active headcount and average salary grouped by a chosen labor allocation slot value, ranked
     by headcount
@@ -4235,6 +5326,17 @@
   - dbpcm_warehouse.labor_allocation.join_key
   - dbpcm_warehouse.labor_allocation.code
   - dbpcm_warehouse.labor_allocation.description
+  column_formats:
+    Allocation Code:
+      kind: identifier
+    Allocation Description:
+      kind: text
+    Active Headcount:
+      kind: integer
+    Avg Salary:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-latest-hired-employees
   intent: Latest hired employee list ordered by most recent hire date, including rehires. Defaults to
     Active + On Leave. Excludes missing/sentinel and future hire dates. row_limit is the requested top
@@ -4302,6 +5404,17 @@
   uses_rules:
   - default_employee_population
   - missing_date_sentinel
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Status:
+      kind: text
+    Most Recent Hire Date:
+      kind: datetime
 - id: bp-long-shift-days
   intent: Employees whose total paid hours across all timecard entries in a single day exceed a configurable
     threshold, using total_ earning as the authoritative hours source, ranked by daily hours
@@ -4343,6 +5456,19 @@
   - dbpcm_warehouse.total_earning.earn_hours
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Punch Date:
+      kind: date
+    Daily Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Line Count:
+      kind: integer
 - id: bp-longest-tenured-employees
   intent: Top-N longest-tenured active employees by original hire date
   status: validated
@@ -4363,6 +5489,19 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Hire Date:
+      kind: datetime
+    Tenure Years:
+      kind: number
+      unit: years
+      precision: 2
 - id: bp-manager-span-of-control
   intent: Top-N primary supervisors by number of active direct reports
   status: validated
@@ -4392,6 +5531,13 @@
   - dbpcm_warehouse.employee.primary_supervisor_ee_code
   - dbpcm_warehouse.employee.primary_supervisor_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Manager Code:
+      kind: identifier
+    Manager:
+      kind: text
+    Direct Reports:
+      kind: integer
 - id: bp-median-annual-salary
   intent: True median annual salary of active employees, overall or per department
   status: validated
@@ -4413,6 +5559,13 @@
   - dbpcm_warehouse.employee.annual_salary
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Median Annual Salary:
+      kind: currency
+      currency: USD
+      precision: 2
+    Headcount:
+      kind: integer
 - id: bp-median-hourly-rate-by-state-union
   intent: True median base hourly rate per works-in state and union flag for active employees
   status: validated
@@ -4448,6 +5601,18 @@
   - dbpcm_warehouse.employee.union_code
   - dbpcm_warehouse.employee.rate_1
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Works In State:
+      kind: text
+    Union Flag:
+      kind: text
+    Median Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
+    Headcount:
+      kind: integer
 - id: bp-median-salary-by-position-level
   intent: True median annual salary per position level for active employees
   status: validated
@@ -4475,6 +5640,15 @@
   - dbpcm_warehouse.employee.position_level
   - dbpcm_warehouse.employee.annual_salary
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Position Level:
+      kind: identifier
+    Median Annual Salary:
+      kind: currency
+      currency: USD
+      precision: 2
+    Headcount:
+      kind: integer
 - id: bp-mileage-summary
   intent: Total approved mileage reimbursement and miles for a payment period
   status: validated
@@ -4498,6 +5672,19 @@
   - dbpcm_warehouse.expense.amount_approved
   - dbpcm_warehouse.expense.expense_status
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Approved Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Approved Miles:
+      kind: number
+      unit: miles
+      precision: 2
+    Submitted Miles:
+      kind: number
+      unit: miles
+      precision: 2
 - id: bp-missing-emergency-contacts
   intent: Active employees missing a primary emergency contact phone
   status: validated
@@ -4535,6 +5722,15 @@
   - dbpcm_warehouse.employee.primary_phone
   - dbpcm_warehouse.employee.primary_emergency_contact_phone
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Primary Phone:
+      kind: identifier
 - id: bp-missing-receipts
   intent: Missing receipt count and share by expense rule for a payment date window
   status: validated
@@ -4569,6 +5765,17 @@
   - dbpcm_warehouse.expense.expense_rule
   - dbpcm_warehouse.expense.expense_rule_description
   - dbpcm_warehouse.expense.expense_paid_date
+  column_formats:
+    Expense Rule:
+      kind: text
+    Rule Description:
+      kind: text
+    Missing Receipts:
+      kind: integer
+    Missing Share:
+      kind: percent
+      scale: ratio
+      precision: 2
 - id: bp-missing-supervisor-exceptions
   intent: Active employees missing a primary supervisor assignment
   status: validated
@@ -4609,6 +5816,19 @@
   - dbpcm_warehouse.employee.primary_supervisor_ee_code
   - dbpcm_warehouse.employee.primary_supervisor_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Title:
+      kind: text
+    Work Email:
+      kind: text
+    Supervisor:
+      kind: text
 - id: bp-name-identity-audit
   intent: Active employees whose preferred name differs from their legal name
   status: validated
@@ -4650,6 +5870,15 @@
   - dbpcm_warehouse.employee.last_name
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Legal Name:
+      kind: text
+    Preferred Name:
+      kind: text
+    Department:
+      kind: text
 - id: bp-negative-paycheck-employees
   intent: Employees and pay periods where net pay is negative, flagging reversals and adjustments that
     result in a negative net-pay amount
@@ -4687,6 +5916,21 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Pay Period End:
+      kind: date
+    Gross Earnings:
+      kind: currency
+      currency: USD
+    Net Pay:
+      kind: currency
+      currency: USD
 - id: bp-negative-pto-balances
   intent: Employees with negative accrual balances per bank, ranked by most overdrawn
   status: validated
@@ -4714,6 +5958,20 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Accrual Code:
+      kind: identifier
+    Accrual Description:
+      kind: text
+    Balance Hours:
+      kind: number
+      precision: 2
 - id: bp-net-pay-summary
   intent: Total net pay distributed for a single pay period or date window, from payroll register net-pay-distribution
     lines by pay-period bounds
@@ -4734,6 +5992,10 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Total Net Pay:
+      kind: currency
+      currency: USD
 - id: bp-new-hire-90d-attrition
   intent: New hires in a window who terminated within 90 days of hire, with the 90-day attrition rate
     as a ratio
@@ -4766,6 +6028,15 @@
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.most_recent_hire_date
+  column_formats:
+    Hires In Window:
+      kind: integer
+    Terms Within 90 Days:
+      kind: integer
+    90-Day Attrition Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-night-shift-share
   intent: Night-shift hours share by department using total_earning earn_hours where the shift date is
     identified by In punch time between configurable night-start and night-end hours
@@ -4824,6 +6095,21 @@
   - dbpcm_warehouse.punch_pair.punch_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Night Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Night Share Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-orphan-register-codes
   intent: Payroll register employee codes that have no match in the employee roster, a data-quality orphan
     audit
@@ -4856,6 +6142,11 @@
   - dbpcm_warehouse.payroll.employee_code
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.employee.employee_code
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Register Lines:
+      kind: integer
 - id: bp-ot-two-basis-tieout
   intent: Reconcile payroll register overtime dollars against timecard overtime category dollars per pay
     period per employee, with variance and percentage difference
@@ -4925,6 +6216,29 @@
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Pay Period End:
+      kind: date
+    Register OT:
+      kind: currency
+      currency: USD
+      precision: 2
+    Timecard OT:
+      kind: currency
+      currency: USD
+      precision: 2
+    Difference:
+      kind: currency
+      currency: USD
+      precision: 2
+    Pct Diff:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-overtime-by-department
   intent: Earnings by department for a given pay period, filtered to a specific pay type (type_code) such
     as overtime
@@ -4965,6 +6279,12 @@
     \ AS p\nJOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code\nWHERE p.register_type\
     \ = 'EARN'\n  AND p.type_code = {type_code}\n  AND e.department_name = {department}\n  AND p.pay_period_end_date\
     \ = {pay_period}\nGROUP BY e.department_name\n"
+  column_formats:
+    department:
+      kind: text
+    earnings:
+      kind: currency
+      currency: USD
 - id: bp-overtime-hours-dollars
   intent: Overtime dollars and hours by department from timecard earnings, resolved via the Overtime earning
     category, for a date window
@@ -5004,6 +6324,16 @@
   - dbpcm_warehouse.earning_category.category_name
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Overtime Dollars:
+      kind: currency
+      currency: USD
+    Overtime Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-paid-hours-summary
   intent: Total paid hours from the payroll register for a pay period, optionally filtered by employee
     home department
@@ -5033,6 +6363,11 @@
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Total Paid Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-pairs-per-day-distribution
   intent: Distribution of punch pair counts per employee per day showing how many days had 1 pair, 2 pairs,
     or 3 or more pairs
@@ -5071,6 +6406,11 @@
   uses:
   - dbpcm_warehouse.punch_pair.employee_code
   - dbpcm_warehouse.punch_pair.punch_date
+  column_formats:
+    Pairs Per Day:
+      kind: integer
+    Employee-Days:
+      kind: integer
 - id: bp-pay-timing-exceptions
   intent: Employees paid after termination or active employees not paid within N days
   status: validated
@@ -5119,6 +6459,19 @@
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.most_recent_hire_date
   - dbpcm_warehouse.employee.last_check_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Department:
+      kind: text
+    Status:
+      kind: text
+    Termination Date:
+      kind: date
+    Last Check Date:
+      kind: datetime
+    Exception Type:
+      kind: text
 - id: bp-payout-request-summary
   intent: Payout request summary of counts and hours over a request-date window, returning empty when
     no payout rows exist
@@ -5141,6 +6494,15 @@
   - dbpcm_warehouse.time_off_request.status
   - dbpcm_warehouse.time_off_request.request_date
   - dbpcm_warehouse.time_off_request.employee_code
+  column_formats:
+    Payout Requests:
+      kind: integer
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Employees:
+      kind: integer
 - id: bp-payroll-codes-unmapped
   intent: Payroll register earning type codes that have no corresponding mapping in the earning category
     dimension, flagged as uncategorized for timecard mapping
@@ -5175,6 +6537,9 @@
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.earning_category.earn_code
+  column_formats:
+    Type Code:
+      kind: identifier
 - id: bp-payroll-duplicate-line-audit
   intent: Candidate duplicate payroll register lines grouped by employee, period, register type, type
     code, and amount, with occurrence counts
@@ -5210,6 +6575,21 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Pay Period End:
+      kind: date
+    Register Type:
+      kind: text
+    Type Code:
+      kind: identifier
+    Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Duplicate Count:
+      kind: integer
 - id: bp-payroll-line-counts
   intent: Count of payroll register lines and distinct employee-check combinations for a pay period
   status: validated
@@ -5229,6 +6609,11 @@
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.employee_code
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Register Lines:
+      kind: integer
+    Distinct Checks:
+      kind: integer
 - id: bp-payroll-setup-gap-scorecard
   intent: Missing-payroll-setup flags and gap count per active employee
   status: validated
@@ -5303,6 +6688,29 @@
   - dbpcm_warehouse.employee.pay_frequency
   - dbpcm_warehouse.employee.schedule_group
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    No Badge:
+      kind: integer
+    No GL Code:
+      kind: identifier
+    No Paycode Profile:
+      kind: integer
+    No Earning Profile:
+      kind: integer
+    No Pay Class:
+      kind: integer
+    No Pay Frequency:
+      kind: integer
+    No Schedule Group:
+      kind: integer
+    Gap Count:
+      kind: integer
 - id: bp-payroll-summary
   intent: Payroll amount, source line count and distinct employee count by company, department or pay-date
     month. Required register_type enum and half-open pay-date period [start,end); select EARN for gross
@@ -5405,6 +6813,17 @@
     \             WHEN {group_by} = 'month' THEN toString(p.month)\n             ELSE 'Company'\n         END\nORDER\
     \ BY CASE\n             WHEN {order_direction} = 'DESC' THEN `Group`\n         END DESC, CASE\n  \
     \                     WHEN {order_direction} = 'ASC' THEN `Group`\n                   END ASC\n"
+  column_formats:
+    Group:
+      kind: text
+    Payroll Amount:
+      kind: currency
+      currency: USD
+      precision: 2
+    Source Line Count:
+      kind: integer
+    Employee Count:
+      kind: integer
 - id: bp-pending-timeoff-queue
   intent: Pending time-off requests queue with days waiting since submission, optionally filtered by department;
     Days Waiting is the oldest pending submission in each employee/request-date group
@@ -5448,6 +6867,23 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Request Date:
+      kind: date
+    Pending Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Days Waiting:
+      kind: number
+      unit: days
+      precision: 2
 - id: bp-placeholder-category-audit
   intent: Total timecard earnings dollars and paid hours flowing through the Select Category placeholder
     bucket for a punch date window
@@ -5473,6 +6909,16 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Distinct Earn Codes:
+      kind: integer
+    Total Dollars:
+      kind: currency
+      currency: USD
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-position-change-activity
   intent: Employee master-data change counts by department and changed field, useful for auditing position
     seat, title, level, and family churn
@@ -5516,6 +6962,13 @@
   - dbpcm_warehouse.employee_change.change_time_added
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Changed Field:
+      kind: text
+    Change Events:
+      kind: integer
 - id: bp-post-termination-accrual-audit
   intent: Terminated employees with time-off balance accrual activity dated after their termination date,
     rehire-aware
@@ -5561,6 +7014,19 @@
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.most_recent_hire_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Accrual Code:
+      kind: identifier
+    Accrual Date:
+      kind: datetime
+    Termination Date:
+      kind: date
+    Accrual Amount:
+      kind: number
 - id: bp-post-termination-changes
   intent: Employee master-data changes with an effective date after the employee's termination date, flagged
     as a post-termination audit anomaly
@@ -5604,6 +7070,15 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Changed Field:
+      kind: text
+    Post-Termination Changes:
+      kind: integer
 - id: bp-post-termination-pay-audit
   intent: Terminated employees who received payroll earnings after their termination date, rehire-aware,
     for a given pay-date window
@@ -5647,6 +7122,21 @@
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.most_recent_hire_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Register Lines:
+      kind: integer
+    Total Earnings:
+      kind: currency
+      currency: USD
+      precision: 2
+    Termination Date:
+      kind: date
+    Last Pay Date:
+      kind: date
 - id: bp-punch-anomalies
   intent: Matched In/Out punch pairs with a missing In punch or missing Out punch edge detected via sentinel
     timestamps
@@ -5697,6 +7187,15 @@
   - dbpcm_warehouse.punch_pair.out_punch_time
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Punch Date:
+      kind: date
+    Anomaly Type:
+      kind: text
 - id: bp-punch-coverage-gap
   intent: Coverage metric showing the share of active employees who had at least one punch in the last
     N days, with counts of punchers and non-punchers
@@ -5719,6 +7218,17 @@
   - dbpcm_warehouse.punch_pair.punch_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Active Employees:
+      kind: integer
+    Employees With Punches:
+      kind: integer
+    Employees Without Punches:
+      kind: integer
+    Coverage Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-punch-pair-summary
   intent: Matched punch-pair counts, distinct employees, observed days, paid hours and pair earning amount
     by company, employee, allocated department, day, month or hours type. Did this employee have punches
@@ -5830,6 +7340,26 @@
     \ THEN hours_type\n             ELSE 'Company'\n         END\nORDER BY CASE\n             WHEN {order_direction}\
     \ = 'DESC' THEN `Group`\n         END DESC, CASE\n                       WHEN {order_direction} =\
     \ 'ASC' THEN `Group`\n                   END ASC\n"
+  column_formats:
+    Group:
+      kind: text
+    Pair Count:
+      kind: integer
+    Employee Count:
+      kind: integer
+    Observed Days:
+      kind: integer
+    Paid Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Pair Earning Amount:
+      kind: currency
+      currency: USD
+    First Observed Date:
+      kind: date
+    Last Observed Date:
+      kind: date
 - id: bp-punch-plus-timeoff-overlap
   intent: Employees with punch pair entries on days that also have approved time-off requests, a same-day
     double-dip audit with configurable overlap-day threshold
@@ -5877,6 +7407,15 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Overlap Days:
+      kind: integer
 - id: bp-punch-source-audit
   intent: Monthly count of punch pairs by ingestion source ARCHIVED versus FREEZE, showing pair counts
     per source per month
@@ -5905,6 +7444,13 @@
   uses:
   - dbpcm_warehouse.punch_pair.table_source
   - dbpcm_warehouse.punch_pair.punch_date
+  column_formats:
+    Month:
+      kind: text
+    Table Source:
+      kind: text
+    Pair Count:
+      kind: integer
 - id: bp-punch-type-mix
   intent: Breakdown of punch pair counts by In punch type and Out punch type for a given date window,
     using punch-level event data only
@@ -5938,6 +7484,13 @@
   - dbpcm_warehouse.punch_pair.in_punch_type
   - dbpcm_warehouse.punch_pair.out_punch_type
   - dbpcm_warehouse.punch_pair.punch_date
+  column_formats:
+    In Punch Type:
+      kind: text
+    Out Punch Type:
+      kind: text
+    Pair Count:
+      kind: integer
 - id: bp-quarterly-terminations-with-top-reasons
   intent: Terminations per quarter within a window, ranked to the top-N termination reasons per quarter
   status: validated
@@ -5979,6 +7532,15 @@
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.most_recent_hire_date
   - dbpcm_warehouse.employee.term_reason
+  column_formats:
+    Quarter:
+      kind: date
+    Term Reason:
+      kind: text
+    Terms:
+      kind: integer
+    Quarter Total:
+      kind: integer
 - id: bp-records-per-status
   intent: Record counts per employee status including Not Hired records
   status: validated
@@ -6006,6 +7568,11 @@
   uses:
   - dbpcm_warehouse.employee.employee_status
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Status:
+      kind: text
+    Records:
+      kind: integer
 - id: bp-register-type-breakdown
   intent: Split of the payroll register across register types for a pay period — EARN earnings, EETAX
     employee taxes, DDUCT deductions, EEBEN benefits, ERTAX employer taxes, NETPAYDIST net pay — showing
@@ -6038,6 +7605,13 @@
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Register Type:
+      kind: text
+    Total Amount:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-regular-vs-premium-hours-ratio
   intent: Monthly regular versus premium paid hours ratio from timecard earnings, bucketed by punch date
     month, showing regular share and premium share
@@ -6076,6 +7650,21 @@
   - dbpcm_warehouse.total_earning.earn_code
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Month:
+      kind: text
+    Regular Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Premium Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Regular Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-rehired-employees
   intent: Terminated-then-rehired employees with rehire event history — employees who left and came back,
     showing previous termination and rehire dates within a calendar window
@@ -6115,6 +7704,21 @@
   - dbpcm_warehouse.employee.old_termination_date
   - dbpcm_warehouse.employee.rehire_date
   - dbpcm_warehouse.employee.most_recent_hire_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Old Termination Date:
+      kind: datetime
+    Rehire Date:
+      kind: datetime
+    Days Between:
+      kind: number
+      unit: days
+      precision: 2
 - id: bp-retroactive-change-share
   intent: Count and share of retroactive employee master-data changes where the effective date precedes
     the record date by more than a specified number of days, grouped by changed field
@@ -6155,6 +7759,15 @@
   - dbpcm_warehouse.employee_change.effective_date
   - dbpcm_warehouse.employee_change.change_time_added
   - dbpcm_warehouse.employee_change.changed_field
+  column_formats:
+    Changed Field:
+      kind: text
+    Retroactive Changes:
+      kind: integer
+    Share Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-salary-distribution
   intent: Annual compensation histogram by pay type with positive whole-currency band_width. Lower inclusive,
     upper exclusive; percentages use the selected known-compensation population within each pay type.
@@ -6258,6 +7871,25 @@
     \ = 'ASC' THEN `Lower Bound`\n                   END ASC\n"
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    Lower Bound:
+      kind: currency
+      currency: USD
+      precision: 2
+    Upper Bound Exclusive:
+      kind: currency
+      currency: USD
+      precision: 2
+    Employee Count:
+      kind: integer
+    Percent Within Pay Type:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-salary-exact-median
   intent: Exact middle-pair median, mean, min, max and known-compensation count by company, department
     or status, separately by pay type. salary_population selects recorded values (including zero) or positive
@@ -6371,6 +8003,36 @@
     \    END ASC\n"
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    Group:
+      kind: text
+    Known Compensation Count:
+      kind: integer
+    Exact Median Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Average Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Minimum Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Maximum Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Average Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
 - id: bp-salary-histogram
   intent: Active employee salary distribution histogram in configurable dollar bands, excluding zero or
     null salary placeholders
@@ -6392,6 +8054,11 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.annual_salary
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Salary Band:
+      kind: text
+    Headcount:
+      kind: integer
 - id: bp-salary-threshold-count
   intent: Employee counts by pay type above, below, at least or exactly a whole-currency annual compensation
     threshold. Empty results mean no matches. Salary uses annual_salary; Hourly uses hourly_salary and
@@ -6475,6 +8142,13 @@
     \ * 2080\n                    ELSE NULL\n                END) < {salary}))\nGROUP BY e.employee_pay_type\n"
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    Employee Count:
+      kind: integer
 - id: bp-salary-threshold-directory
   intent: Employee directory filtered by a whole-currency annual compensation threshold, ordered by pay
     type then annual compensation. row_limit caps the entire directory; this is not a top-N-per-pay-type
@@ -6581,6 +8255,26 @@
     \    ELSE NULL\n                             END) DESC, e.employee_code\nLIMIT {row_limit}\n"
   uses_rules:
   - compensation_by_pay_type
+  column_formats:
+    Pay Type:
+      kind: text
+    Compensation Basis:
+      kind: text
+    Employee Code:
+      kind: identifier
+    Department:
+      kind: text
+    Status:
+      kind: text
+    Annual Compensation:
+      kind: currency
+      currency: USD
+      precision: 2
+    Hourly Rate:
+      kind: currency
+      currency: USD
+      precision: 2
+      unit: per hour
 - id: bp-shift-differential-spend
   intent: Shift-differential dollars and hours from the payroll register, resolving earn codes dynamically
     against type_code for a date window
@@ -6613,6 +8307,14 @@
   - dbpcm_warehouse.payroll.pay_period_end_date
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Shift Differential Dollars:
+      kind: currency
+      currency: USD
+    Shift Differential Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-supervision-anomalies
   intent: Self-supervising and missing-primary-supervisor anomaly audit for active employees
   status: validated
@@ -6648,6 +8350,19 @@
   - dbpcm_warehouse.employee.primary_supervisor_ee_code
   - dbpcm_warehouse.employee.primary_supervisor_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Supervisor Code:
+      kind: identifier
+    Supervisor Name:
+      kind: text
+    Anomaly Type:
+      kind: text
 - id: bp-supervisor-chain-depth
   intent: Distribution of populated supervisor-level counts (0-4) across active employees
   status: validated
@@ -6683,6 +8398,15 @@
   - dbpcm_warehouse.employee.tertiary_supervisor_ee_code
   - dbpcm_warehouse.employee.quaternary_supervisor_ee_code
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Chain Depth:
+      kind: integer
+    Headcount:
+      kind: integer
+    Share Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-tenure-band-distribution
   intent: Active headcount by seniority-date tenure band
   status: validated
@@ -6707,6 +8431,11 @@
   - dbpcm_warehouse.employee.seniority_date
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Tenure Band:
+      kind: text
+    Headcount:
+      kind: integer
 - id: bp-termination-family
   intent: Employees with a recorded termination date in a half-open period, with total matching record
     count before the display limit. Includes same-day/later rehires and employees no longer currently
@@ -6778,6 +8507,19 @@
     \ = 'ASC' THEN e.termination_date\n                   END ASC, e.employee_code\nLIMIT {row_limit}\n"
   uses_rules:
   - terminations_in_period
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Current Status:
+      kind: text
+    Termination Date:
+      kind: date
+    Total Matching Records:
+      kind: integer
 - id: bp-timecard-earnings-all-history
   intent: All-history timecard earnings and hours per earn code from total_earning, spanning all available
     punch dates, with optional employee or date-window filter
@@ -6815,6 +8557,17 @@
   - dbpcm_warehouse.total_earning.earn_hours
   - dbpcm_warehouse.total_earning.punch_date
   - dbpcm_warehouse.total_earning.employee_code
+  column_formats:
+    Earn Code:
+      kind: identifier
+    Total Earnings:
+      kind: currency
+      currency: USD
+      precision: 2
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-timecard-earnings-summary
   intent: 'Total timecard earnings, paid hours, entry counts and employee counts by company, employee,
     allocated department, day, month or earning code. Supports per-person hours and pay in a period and
@@ -6906,6 +8659,26 @@
     \ 1, 7)\n             WHEN 'earning_code' THEN earn_code\n             ELSE 'Company'\n         END\n\
     ORDER BY CASE\n             WHEN {order_direction} = 'DESC' THEN `Group`\n         END DESC, CASE\n\
     \                       WHEN {order_direction} = 'ASC' THEN `Group`\n                   END ASC\n"
+  column_formats:
+    Group:
+      kind: text
+    Timecard Earning Amount:
+      kind: currency
+      currency: USD
+    Paid Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Entry Count:
+      kind: integer
+    Employee Count:
+      kind: integer
+    Observed Days:
+      kind: integer
+    First Observed Date:
+      kind: date
+    Last Observed Date:
+      kind: date
 - id: bp-timecard-vs-register-recon
   intent: Reconcile total_earning timecard hours against payroll register paid hours per employee for
     a single pay period, showing variance and percentage difference
@@ -6962,6 +8735,29 @@
   - dbpcm_warehouse.payroll.type_hours
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Pay Period End:
+      kind: date
+    Register Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Timecard Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Difference:
+      kind: number
+      unit: hours
+      precision: 2
+    Pct Diff:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-timeoff-by-leave-type
   intent: Approved time-off hours grouped by earn code concept resolved dynamically via earn_code, or
     all earn codes when no concept is provided
@@ -7001,6 +8797,15 @@
   - dbpcm_warehouse.time_off_request.hours
   - dbpcm_warehouse.time_off_request.status
   - dbpcm_warehouse.time_off_request.request_date
+  column_formats:
+    Earn Description:
+      kind: text
+    Earn Code:
+      kind: identifier
+    Approved Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-timeoff-denial-rate
   intent: Time-off denial rate by department for decided requests (Approved plus Denied) over a request-date
     window
@@ -7037,6 +8842,17 @@
   - dbpcm_warehouse.time_off_request.request_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Decided Requests:
+      kind: integer
+    Denied Requests:
+      kind: integer
+    Denial Rate Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-timeoff-funnel
   intent: Time-off request lifecycle funnel counts by status over a request-date window
   status: validated
@@ -7064,6 +8880,11 @@
   uses:
   - dbpcm_warehouse.time_off_request.status
   - dbpcm_warehouse.time_off_request.request_date
+  column_formats:
+    Status:
+      kind: text
+    Request Count:
+      kind: integer
 - id: bp-timeoff-lead-time
   intent: Median days from submission date to requested leave date by leave type for approved requests
   status: validated
@@ -7098,6 +8919,17 @@
   - dbpcm_warehouse.time_off_request.earn_code
   - dbpcm_warehouse.time_off_request.earn_description
   - dbpcm_warehouse.time_off_request.status
+  column_formats:
+    Leave Type:
+      kind: text
+    Earn Code:
+      kind: identifier
+    Median Lead Days:
+      kind: number
+      unit: days
+      precision: 2
+    Request Rows:
+      kind: integer
 - id: bp-timeoff-seasonality
   intent: Approved time-off hours bucketed by month and by day-of-week over a trailing N-month window
     based on request date
@@ -7127,6 +8959,13 @@
   - dbpcm_warehouse.time_off_request.request_date
   - dbpcm_warehouse.time_off_request.hours
   - dbpcm_warehouse.time_off_request.status
+  column_formats:
+    Month:
+      kind: text
+    Approved Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-timeoff-vs-paid-leave-tieout
   intent: Reconcile approved time-off request hours against paid leave hours from total_earning per employee
     per month, showing variance and percentage difference
@@ -7192,6 +9031,29 @@
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Month:
+      kind: text
+    Approved Timeoff Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Paid Leave Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Difference:
+      kind: number
+      unit: hours
+      precision: 2
+    Pct Diff:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-timeoff-withdrawal-rate
   intent: Removed or withdrawn time-off request rate by department, with denominator counting all active
     workflow statuses
@@ -7227,6 +9089,17 @@
   - dbpcm_warehouse.time_off_request.employee_code
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Department:
+      kind: text
+    Total Requests:
+      kind: integer
+    Removed Requests:
+      kind: integer
+    Withdrawal Rate Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-top-changed-fields
   intent: Top employee master-data changed fields ranked by total change-event count within a trailing
     month window
@@ -7258,6 +9131,11 @@
   uses:
   - dbpcm_warehouse.employee_change.changed_field
   - dbpcm_warehouse.employee_change.change_time_added
+  column_formats:
+    Changed Field:
+      kind: text
+    Change Events:
+      kind: integer
 - id: bp-top-codes-in-category
   intent: Top-N earn codes by earnings dollars within a specific earning category, using earn descriptions
     for display labels
@@ -7299,6 +9177,18 @@
   - dbpcm_warehouse.total_earning.punch_date
   - dbpcm_warehouse.earning_category.earn_code
   - dbpcm_warehouse.earning_category.category_name
+  column_formats:
+    Earn Code:
+      kind: identifier
+    Description:
+      kind: text
+    Total Dollars:
+      kind: currency
+      currency: USD
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-top-expense-spenders
   intent: Top N employees by approved expense spend for a payment date window
   status: validated
@@ -7336,6 +9226,15 @@
   - dbpcm_warehouse.expense.expense_paid_date
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Approved Spend:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-top-home-zip-city
   intent: Top-N employee home zip codes by active headcount
   status: validated
@@ -7366,6 +9265,15 @@
   - dbpcm_warehouse.employee.city
   - dbpcm_warehouse.employee.state
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Zip Code:
+      kind: identifier
+    City:
+      kind: text
+    State:
+      kind: text
+    Headcount:
+      kind: integer
 - id: bp-top-payroll-codes
   intent: Top-N payroll type codes by dollar amount within a chosen register family for a pay period
   status: validated
@@ -7410,6 +9318,13 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Type Code:
+      kind: identifier
+    Total Amount:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-top-timeoff-users
   intent: Top-N employees by approved time-off hours in a window, joined with their current accrual balance
     totals
@@ -7457,6 +9372,20 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Approved Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Current Balance Hours:
+      kind: number
+      precision: 2
 - id: bp-total-earnings-by-department
   intent: Total earnings for a department, resolving the earnings register codes dynamically
   slots_summary: department
@@ -7487,6 +9416,13 @@
   sql_template: "SELECT e.department_name AS department,\n       SUM(p.amount) AS total_earnings\nFROM\
     \ dbpcm_warehouse.payroll AS p\nJOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code\n\
     WHERE p.register_type IN {earn_codes}\n  AND e.department_name = {department}\nGROUP BY e.department_name\n"
+  column_formats:
+    department:
+      kind: text
+    total_earnings:
+      kind: currency
+      currency: USD
+      precision: 2
 - id: bp-unpaid-active-employees
   intent: Active employees who have no payroll earnings register line in a given pay period, identifying
     unpaid active roster entries
@@ -7525,6 +9461,13 @@
   - dbpcm_warehouse.payroll.employee_code
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
 - id: bp-unused-leave-roster
   intent: Employees holding positive accrual balances who have zero approved time-off requests year-to-date
   status: validated
@@ -7561,6 +9504,16 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Balance Hours:
+      kind: number
+      precision: 2
 - id: bp-upcoming-anniversaries
   intent: Active employees with upcoming work anniversaries based on hire date month and day within the
     next N days
@@ -7595,6 +9548,19 @@
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.hire_date
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Hire Date:
+      kind: datetime
+    Years of Service:
+      kind: number
+      unit: years
+      precision: 2
 - id: bp-upcoming-timeoff-roster
   intent: Roster of employees with approved time-off requests in the next N days for coverage planning,
     optionally filtered by department
@@ -7628,6 +9594,21 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Department:
+      kind: text
+    Request Date:
+      kind: date
+    Leave Type:
+      kind: text
+    Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-weekend-work-share
   intent: Weekend versus weekday paid hours share by month from total_earning, the authoritative hours
     source, showing weekend percentage and totals
@@ -7658,6 +9639,25 @@
   uses:
   - dbpcm_warehouse.total_earning.punch_date
   - dbpcm_warehouse.total_earning.earn_hours
+  column_formats:
+    Month:
+      kind: text
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Weekend Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Weekday Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Weekend Share Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-weekly-overtime-hours
   intent: Overtime hours per employee per work week based on total_earning earn_hours, the authoritative
     hours source, with a configurable weekly threshold
@@ -7701,6 +9701,21 @@
   - dbpcm_warehouse.total_earning.earn_hours
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Week Start:
+      kind: date
+    Weekly Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Overtime Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-worked-hours-daily
   intent: Total timecard-grade paid hours per calendar day from total_earning, the authoritative hours
     source, for a date window
@@ -7733,6 +9748,15 @@
   uses:
   - dbpcm_warehouse.total_earning.punch_date
   - dbpcm_warehouse.total_earning.earn_hours
+  column_formats:
+    Punch Date:
+      kind: date
+    Total Hours:
+      kind: number
+      unit: hours
+      precision: 2
+    Line Count:
+      kind: integer
 - id: bp-workforce-composition
   intent: Active workforce composition by employment type and DOL status with percent share of active
     headcount
@@ -7767,6 +9791,17 @@
   - dbpcm_warehouse.employee.dol_status_description
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Employment Type:
+      kind: text
+    DOL Status:
+      kind: text
+    Headcount:
+      kind: integer
+    Share Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-workforce-diversity-profile
   intent: Active headcount distribution across gender, marital status, age band, EEO-1 category and leadership
     cohort
@@ -7811,6 +9846,23 @@
   - dbpcm_warehouse.employee.eeo1_category
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
+  column_formats:
+    Gender:
+      kind: text
+    Marital Status:
+      kind: text
+    Age Band:
+      kind: text
+    EEO-1 Category:
+      kind: text
+    Leadership Cohort:
+      kind: text
+    Headcount:
+      kind: integer
+    Share Pct:
+      kind: percent
+      scale: percent
+      precision: 2
 - id: bp-workforce-kpi-bundle
   intent: Single-row executive KPI bundle with current-state metrics plus hires, terms and turnover for
     one window
@@ -7892,6 +9944,43 @@
   - dbpcm_warehouse.employee.termination_date
   - dbpcm_warehouse.employee.most_recent_hire_date
   - dbpcm_warehouse.employee.primary_emergency_contact_phone
+  column_formats:
+    Active Headcount:
+      kind: integer
+    Total Records:
+      kind: integer
+    W2 Share Pct:
+      kind: percent
+      scale: percent
+      precision: 2
+    Median Annual Salary:
+      kind: currency
+      currency: USD
+      precision: 2
+    Avg Tenure Years:
+      kind: number
+      unit: years
+      precision: 2
+    Pct Full Time:
+      kind: percent
+      scale: percent
+      precision: 2
+    Pct Direct Deposit:
+      kind: percent
+      scale: percent
+      precision: 2
+    Hires In Window:
+      kind: integer
+    Terms In Window:
+      kind: integer
+    Turnover Rate In Window:
+      kind: percent
+      scale: ratio
+      precision: 2
+    On Leave:
+      kind: integer
+    Missing Emergency Contacts:
+      kind: integer
 - id: bp-workforce-movements
   intent: Recent-hire, boomerang-return and full-to-part-time movements within one window
   status: validated
@@ -7957,6 +10046,21 @@
   - dbpcm_warehouse.employee.most_recent_hire_date
   - dbpcm_warehouse.employee.old_termination_date
   - dbpcm_warehouse.employee.full_time_to_part_time_date
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Name:
+      kind: text
+    Department:
+      kind: text
+    Movement Type:
+      kind: text
+    Movement Date:
+      kind: date
+    Gap Days:
+      kind: number
+      unit: days
+      precision: 2
 - id: bp-ytd-earnings-per-employee
   intent: Year-to-date gross earnings, net pay, and paid hours per employee from the payroll register,
     optionally filtered by employee or department
@@ -8003,6 +10107,21 @@
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.employee_name
   - dbpcm_warehouse.employee.department_name
+  column_formats:
+    Employee Code:
+      kind: identifier
+    Employee Name:
+      kind: text
+    Gross Earnings:
+      kind: currency
+      currency: USD
+    Net Pay:
+      kind: currency
+      currency: USD
+    Paid Hours:
+      kind: number
+      unit: hours
+      precision: 2
 - id: bp-zero-net-pay-employees
   intent: Employees with exactly $0.00 net pay in a pay period, distinguishing those with no net-pay-distribution
     rows from those with a zero net-pay amount
@@ -8036,3 +10155,6 @@
   - dbpcm_warehouse.payroll.amount
   - dbpcm_warehouse.payroll.register_type
   - dbpcm_warehouse.payroll.pay_period_end_date
+  column_formats:
+    Employee Code:
+      kind: identifier

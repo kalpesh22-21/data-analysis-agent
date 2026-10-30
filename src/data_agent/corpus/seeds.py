@@ -65,6 +65,7 @@ class BlueprintSeed:
     sql_template: str | None = None
     composes: list[dict[str, Any]] = field(default_factory=list)
     result_grain: list[str] | dict[str, Any] | None = None
+    column_formats: dict[str, dict[str, Any]] | None = None
     # J7 — the OPTIONAL window-anchor declaration (`blueprint.models.WINDOW_ANCHORS`:
     # `"data"` | `"calendar"`). Meaningful only for a WINDOWED blueprint; `None` (the
     # default) means the blueprint makes no claim, nothing is stored, and the read path

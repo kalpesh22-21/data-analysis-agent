@@ -395,8 +395,8 @@ def create_app(
     # (its own lightweight instance sharing the OpenAI api_key/base_url). Wired ONLY
     # when the flag is on AND an OpenAI key is present — absent either it stays
     # `None`, the AgentLoop skips summarization, and behavior is byte-identical to
-    # today (no extra LLM call, no D25 relaxation). The extra call is auto-covered by
-    # `instrument_openai` below, like every other OpenAI round-trip.
+    # today (no extra LLM call, no D25 relaxation). ProgressSummarizer suppresses
+    # tracing for this auxiliary call; agent and judge calls remain instrumented.
     progress_summarizer: ProgressSummarizer | None = None
     if settings.progress_summary_enabled and (
         settings.openai_summary_api_key or settings.openai_api_key
@@ -1364,7 +1364,8 @@ def create_app(
                 from data_agent.runtime.answer_access import resolve_table
                 doc = await session_store.get_or_create_session(credentials.session_id)
                 try:
-                    sql = await resolve_table(doc, body.table_ref, credentials, session_store)
+                    resolved = await resolve_table(doc, body.table_ref, credentials, session_store)
+                    sql = resolved["sql"]
                 except PermissionError:
                     raise HTTPException(404, detail="The selected answer data is unavailable.") from None
             page_sql = build_page_sql(sql, limit=limit, offset=offset)

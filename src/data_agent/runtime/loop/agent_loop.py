@@ -77,6 +77,7 @@ from data_agent.runtime.context.assembly import (
 )
 from data_agent.runtime.context.budget import fit_request_to_budget, render_entry
 from data_agent.runtime.dispatch.denial_mapping import UNKNOWN_TOOL_CODE
+from data_agent.runtime.dispatch.source_availability import source_availability_boundary, restore_sources
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -1053,6 +1054,7 @@ class AgentLoop:
         self._progress_summarizer = progress_summarizer
         self._answer_table_hooks = answer_table_hooks or AnswerTableHooks()
 
+    @source_availability_boundary
     @observe_turn_abort
     @progress_summary_boundary
     @delivery_boundary
@@ -1084,6 +1086,7 @@ class AgentLoop:
             question=user_message,
         )
 
+    @source_availability_boundary
     @observe_turn_abort
     @progress_summary_boundary
     @delivery_boundary
@@ -1100,6 +1103,7 @@ class AgentLoop:
         checkpoint = doc.pause_checkpoint  # may be None/consumed; resume_checkpoint enforces D45
         updated_doc = await self._session_store.resume_checkpoint(session_id, cas, answer)
         turn_index = updated_doc.messages[-1].turn_index if updated_doc.messages else 0
+        restore_sources(updated_doc, turn_index, scope_filter.compute_scope_hash(credentials.column_scope))
 
         if CURRENT_DELIVERY.get():
             CURRENT_DELIVERY.get().turn_index = turn_index
@@ -1502,7 +1506,7 @@ class AgentLoop:
 
     async def _compute_turn_assumptions(self, session_id: str, turn_index: int) -> list[str]:
         """Reconstruct the plain-English assumptions recorded at *turn_index* from the
-        persisted `recordAssumptions` entries (deduped, first-occurrence order, via the
+        latest successful `recordAssumptions` entry (normalized via the
         SAME `fold_assumptions` the loop and `session_history` use). Seeds a resumed
         window on BOTH resume paths, so assumptions recorded in an earlier window are not
         dropped and the live result matches what `project_history` reconstructs.

@@ -427,17 +427,23 @@ def validate_block_evidence(
             entry.status != "ok"
             and (entry.tool_name == "runQuery" and entry.error_code == "SQL_REPAIR_EXHAUSTED"
                  or entry.tool_name in {"runQuery", "runBlueprint"}
-                 and entry.error_code == "AGGREGATION_CHECK_UNAVAILABLE")
+                 and entry.error_code in {"AGGREGATION_CHECK_UNAVAILABLE", "SOURCE_UNAVAILABLE"})
         ):
             return None
-        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED or AGGREGATION_CHECK_UNAVAILABLE receipt; other SQL errors do not establish exhaustion."
+        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED or AGGREGATION_CHECK_UNAVAILABLE/SOURCE_UNAVAILABLE receipt; other SQL errors do not establish exhaustion."
 
-    # REQUIRED_DATA_UNAVAILABLE — a SUCCESSFUL call that returned no rows.
+    # A targeted, complete schema check can establish unavailable fields
+    # without executing speculative SQL. It says nothing about other datasets.
+    from data_agent.runtime.provenance.field_availability import field_availability
+    if field_availability(entry):
+        return None
+
+    # REQUIRED_DATA_UNAVAILABLE — otherwise a successful call with no rows.
     if entry.status != "ok":
         return (
             f"tool call '{tool_call_id}' did not succeed, so it does not show that the "
             "data is absent. REQUIRED_DATA_UNAVAILABLE needs a successful query that "
-            "returned no rows."
+            "returned no rows, or a complete targeted schema check with columns_not_found."
         )
     if entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE:
         return _deduped_original_reason(entry, trail)
@@ -941,7 +947,7 @@ def _bind_evidence_against_trail(
                 if reason_code is None:
                     raise _reject(
                         "unresolved_evidence",
-                        "This result does not establish a blocked intent. Scope refusal receipts support OUT_OF_SCOPE_REQUEST; permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
+                        "This result does not establish a blocked intent. Scope refusal receipts support OUT_OF_SCOPE_REQUEST; permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED or SOURCE_UNAVAILABLE supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
                     )
             tool_call_id, binding = explicit, EVIDENCE_BINDING_TAGGED
         else:

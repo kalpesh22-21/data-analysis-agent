@@ -15,6 +15,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
+from data_agent.runtime.context.scope_filter import compute_scope_hash
+from data_agent.runtime.dispatch.denial_mapping import ACCESS_DENIAL_CODES, classify_denial
 from data_agent.runtime.dispatch.tool_dispatcher import resolve_catalog
 
 from .answer_judge import evidence_ids
@@ -339,6 +341,60 @@ async def enrich_brief(
             if entry.result_preview:
                 definitions.extend(entry.result_preview.preview_rows)
     package = coverage_package(brief, results, analysis_state, credentials.column_scope)
+    # Denied calls are absent from the authorized data trail. Expose only static
+    # limitation receipts from this turn/scope, never denied SQL, previews or text.
+    scope_hash = compute_scope_hash(credentials.column_scope)
+    from data_agent.runtime.provenance.field_availability import field_availability
+    field_limitations = [
+        {"result_id": e.tool_call_id, **receipt}
+        for e in doc.tool_trail
+        if e.turn_index == turn_index
+        and (e.model_response or {}).get("scope_hash") == scope_hash
+        and (receipt := field_availability(e))
+    ]
+    if field_limitations:
+        package["field_limitations"] = field_limitations
+    access_limitations = [
+        {"result_id": e.tool_call_id, "error_code": e.error_code,
+         "message": classify_denial(e.error_code).user_message}
+        for e in doc.tool_trail
+        if e.turn_index == turn_index and e.status != "ok"
+        and e.error_code in ACCESS_DENIAL_CODES
+        and (e.model_response or {}).get("scope_hash") == scope_hash
+    ]
+    if access_limitations:
+        package["access_limitations"] = access_limitations
+    from data_agent.runtime.dispatch.source_availability import source_receipt
+    source_failures = [
+        {"result_id": e.tool_call_id, "source": source_receipt(e.denial_detail),
+         "status": "unavailable"}
+        for e in doc.tool_trail
+        if e.turn_index == turn_index and e.status != "ok"
+        and e.tool_name in {"runQuery", "runBlueprint"}
+        and e.error_code == "SOURCE_UNAVAILABLE"
+        and (e.model_response or {}).get("scope_hash") == scope_hash
+        and source_receipt(e.denial_detail)
+    ]
+    if source_failures:
+        package["source_failures"] = source_failures
+    # These codes originate before the guarded query executes. A composed
+    # blueprint may have executed earlier steps; only its blocked query is meant.
+    verification_status = {
+        "AGGREGATION_DUPLICATE_KEYS": "duplicate_keys",
+        "AGGREGATION_CHECK_FAILED": "unavailable",
+        "AGGREGATION_CHECK_UNAVAILABLE": "unavailable",
+    }
+    verification_failures = [
+        {"result_id": e.tool_call_id, "status": verification_status[e.error_code],
+         "blocked_query_executed": False}
+        for e in doc.tool_trail
+        if e.turn_index == turn_index and e.status != "ok"
+        and e.tool_name in {"runQuery", "runBlueprint"}
+        and e.error_code in verification_status
+        and (e.model_response or {}).get("scope_hash") == scope_hash
+    ]
+    if verification_failures:
+        package["join_verification_failures"] = verification_failures
     receipts = await resolution_receipts(
         trail=trail,
         results=results,

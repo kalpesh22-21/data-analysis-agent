@@ -54,6 +54,11 @@ def sql_diagnostic(message: str, sql: str) -> dict:
         result = {key: payload[key][:3000] for key in
                   ("code", "message", "input_dialect", "guidance", "retry", "candidate_expression")
                   if isinstance(payload.get(key), str)}
+        if payload.get("code") == "SOURCE_UNAVAILABLE":
+            from .source_availability import source_receipt
+            source = source_receipt(message)
+            if source:
+                result["source"] = source
         result["retryable"] = payload.get("retry") in {"after_query_change", "after_scope_or_capacity_change"}
         return result
     return _legacy_sql_diagnostic(message, sql)

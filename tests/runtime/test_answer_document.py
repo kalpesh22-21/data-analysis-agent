@@ -284,10 +284,10 @@ async def test_multiple_requested_results_keep_order_scope_and_snapshot_bindings
     assert [s["presentation"]["result_id"] for s in document["sections"]] == ["total", "q"]
     doc = await store.get_or_create_session(CREDS.session_id)
     assert (
-        await resolve_table(doc, document["sources"]["total"]["table_ref"], CREDS, store)
+        (await resolve_table(doc, document["sources"]["total"]["table_ref"], CREDS, store))["sql"]
         == total_sql
     )
-    assert await resolve_table(doc, document["sources"]["q"]["table_ref"], CREDS, store) == SQL
+    assert (await resolve_table(doc, document["sources"]["q"]["table_ref"], CREDS, store))["sql"] == SQL
 
 
 @pytest.mark.parametrize("selector", [{"sql": "SELECT 1"}, {"blueprint_id": "unexecuted"}])
@@ -391,3 +391,86 @@ async def test_unsupported_chart_cell_delivers_exact_reviewed_table_without_quer
     assert out.answer_document["sections"] == approved_sections
     assert out.answer_document["sources"]["q"]["table_ref"] .startswith("tbl_")
     assert len(mcp.calls) == 1
+
+
+async def test_missing_primary_figure_can_be_repaired_without_querying_again():
+    judge = Judge([
+        JudgeVerdict(False, "unexplained_gap", "Retain the primary employee-count figure using the existing result.",
+                     True, repair_type="presentation"),
+        JudgeVerdict(True, reviewed=True),
+    ])
+    loop, _, _, mcp, _ = build([
+        discovery(), query(), final(takeaway="There are 120 employees."),
+        final(section("figure", column="n", label="Employees"),
+              takeaway="There are 120 employees.", ident="fixed"),
+    ], judge)
+    out = await run(loop)
+    assert judge.briefs[0].answer_document["sections"] == []
+    sections = out.answer_document["sections"]
+    assert len(sections) == 1
+    assert sections[0]["presentation"]["kind"] == "figure"
+    assert sections[0]["presentation"]["value"] == "120"
+    assert out.review["status"] == "approved"
+    assert len(mcp.calls) == 1
+
+
+async def test_trend_delivers_one_primary_chart_without_extra_visible_table():
+    choice = section("line", category_column="Month", measure_column="n", label="Employees")
+    loop, _, _, mcp, _ = build(
+        [discovery(), query(), final(choice)], Judge(),
+        rows=[{"columns": ["Month", "n"], "rows": [["2026-01", 100], ["2026-02", 120]],
+               "row_count": 2, "truncated": False}],
+    )
+    out = await run(loop)
+    assert out.review["status"] == "approved"
+    assert len(out.answer_document["sections"]) == 1
+    assert out.answer_document["sections"][0]["presentation"]["kind"] == "line"
+    assert len(mcp.calls) == 1
+
+
+@pytest.mark.parametrize('replacement', [[], ['Salary means recorded annual salary.']])
+async def test_assumption_replacement_repairs_freshness_and_replays(replacement):
+    from data_agent.runtime.session_history import project_history
+    judge = Judge()
+    loop, store, _, mcp, _ = build([
+        discovery(), query(),
+        batch(call('recordAssumptions', 'old-assumptions', assumptions=['Data is up to date as of today.'])),
+        final(section()),
+        batch(call('recordAssumptions', 'new-assumptions', assumptions=replacement)),
+        final(section(), ident='fixed'),
+    ], judge)
+    out = await run(loop)
+    assert out.review['status'] == 'approved'
+    assert len(judge.briefs) == 1  # Invalid freshness is caught before review.
+    assert out.answer_document['sections'][0]['caveats'] == replacement
+    assert len(mcp.calls) == 1
+    assert await loop._compute_turn_assumptions(CREDS.session_id, 0) == replacement
+    doc = await store.get_or_create_session(CREDS.session_id)
+    history = project_history(doc.messages, doc.tool_trail, CREDS.column_scope, None)['turns'][0]
+    assert history['assumptions'] == (replacement or None)
+    assert history['answer_document'] == out.answer_document
+
+
+async def test_recorded_assumptions_are_not_redisplayed_across_sections():
+    one = section()
+    one['caveats'] = ['Only accessible records are included.', 'Only  accessible records are included']
+    two = section()
+    two['presentation'] = {'kind': 'text', 'markdown': 'The selected records are shown.'}
+    two['id'] = 'notes'
+    two['caveats'] = ['ONLY ACCESSIBLE RECORDS ARE INCLUDED.']
+    loop, _, _, _, _ = build([
+        discovery(), query(),
+        batch(call('recordAssumptions', 'assumptions', assumptions=['Only accessible records are included.'])),
+        final(one, two),
+    ], Judge())
+    out = await run(loop)
+    assert [c for s in out.answer_document['sections'] for c in s['caveats']] == ['Only accessible records are included.']
+
+
+async def test_caveat_deduplication_preserves_distinct_long_qualifications():
+    caveat = 'A material qualification. ' * 100 + 'Only the listed records are covered.'
+    selected = section()
+    selected['caveats'] = [caveat, caveat]
+    loop, _, _, _, _ = build([discovery(), query(), final(selected)], Judge())
+    out = await run(loop)
+    assert out.answer_document['sections'][0]['caveats'] == [caveat]

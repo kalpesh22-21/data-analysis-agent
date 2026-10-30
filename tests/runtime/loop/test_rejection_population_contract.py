@@ -19,7 +19,7 @@ def test_every_answer_violation_has_specific_public_copy(violation):
 
 
 def test_population_default_does_not_authorize_fact_record_filters():
-    assert "blueprint defaults must fit that scope" in AGENT_SYSTEM_PROMPT
+    assert "If a blueprint conflicts with scope, use a declared slot override first" in AGENT_SYSTEM_PROMPT
     assert "default active/on-leave" not in AGENT_SYSTEM_PROMPT
     assert "explicit user scope overrides defaults" in AGENT_SYSTEM_PROMPT
     assert "Do not invent a status default" in _ANSWER_JUDGE_PROMPT

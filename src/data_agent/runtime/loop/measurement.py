@@ -558,6 +558,15 @@ def cardinality_probes(sql: str, *, schema=None) -> list[str]:
 async def validate_join_cardinality(
     sql, dispatcher, credentials, *, emit_progress=True
 ) -> AggregationIssue | None:
+    from data_agent.runtime.dispatch.source_availability import check_sources
+    from data_agent.runtime.mcp.client import MCPToolError
+    try:
+        check_sources("runQuery", {"sql": sql})
+    except MCPToolError as exc:
+        return AggregationIssue(
+            "A required source is unavailable; the main query was not executed.",
+            code="SOURCE_UNAVAILABLE", retryable=False, cause=json.loads(exc.message),
+        )
     try:
         schema = None
         from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
@@ -572,6 +581,11 @@ async def validate_join_cardinality(
             )
             if result.status != "ok":
                 diagnostic = decode_diagnostic(result.denial_detail)
+                if result.error_code == "SOURCE_UNAVAILABLE":
+                    return AggregationIssue(
+                        "A required source is unavailable; the main query was not executed.",
+                        code="SOURCE_UNAVAILABLE", retryable=False, cause=diagnostic,
+                    )
                 if result.error_code in ACCESS_DENIAL_CODES:
                     # denial_detail has already passed the dispatcher's credential
                     # scrub. Never substitute a raw backend exception/user message.

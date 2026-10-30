@@ -46,11 +46,13 @@ async def resolve_table(doc, table_ref, credentials, store):
         ):
             continue
         if entry.tool_name == "runQuery" and isinstance(entry.args.get("sql"), str):
-            return entry.args["sql"]
+            sql = entry.args["sql"]
+            return {"sql": sql, "column_formats": deepcopy(source.get("column_formats", {}))}
         if entry.tool_name == "runBlueprint" and entry.authoritative and entry.result_full_ref:
             full = await store.read_full_result(credentials.session_id, entry.result_full_ref)
             if isinstance(full, dict) and isinstance(full.get("terminal_sql"), str):
-                return full["terminal_sql"]
+                sql = full["terminal_sql"]
+                return {"sql": sql, "column_formats": deepcopy(source.get("column_formats", {}))}
     raise PermissionError(_UNAVAILABLE)
 
 

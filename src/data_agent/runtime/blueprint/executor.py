@@ -963,6 +963,9 @@ class BlueprintExecutor:
             truncated=truncated,
         )
         preview = _build_preview(terminal_result, self._preview_row_count)
+        formats = {**preview.column_formats, **{k: v for k, v in blueprint.column_formats.items() if k in columns}}
+        preview = replace(preview, column_formats=formats)
+        result_full["column_formats"] = formats
         return ExecCompleted(
             result_full=result_full,
             preview=preview,
@@ -1438,6 +1441,7 @@ def _parse_detail(detail: BlueprintDetail) -> Blueprint:
         sql_template=detail.sql_template,
         composes=detail.composes,
         result_grain=detail.result_grain,
+        column_formats=detail.column_formats,
         window_anchor=detail.window_anchor,
     )
 

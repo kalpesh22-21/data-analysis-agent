@@ -1077,3 +1077,13 @@ def test_redact_tool_args_redacts_query_keeps_id_and_k() -> None:
     assert gb["id"] == "bp-overtime"  # non-PII structural id, kept
     sk = redact_tool_args("searchKnowledge", {"query": "how is overtime defined"})
     assert sk["query"] == "<redacted>"
+
+
+async def test_get_blueprint_does_not_ask_model_to_copy_stored_formats():
+    from dataclasses import replace
+    detail=replace(_detail(),column_formats={'Total':{'kind':'currency','currency':'USD'}})
+    tool=GetBlueprintTool(vector_index=FakeVectorIndex(details={'bp-x':detail}))
+    result=await tool.run({'id':'bp-x'},_creds(frozenset({_A,_B})))
+    assert result.status=='ok'
+    assert 'column_formats' not in result.result_full
+    assert 'column_formats' not in str(result.result_preview.to_doc())

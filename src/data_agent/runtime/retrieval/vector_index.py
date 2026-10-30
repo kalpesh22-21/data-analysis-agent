@@ -338,7 +338,7 @@ RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
        b.hit_count AS hit_count, b.catalog_sha AS catalog_sha,
        b.resolves_json AS resolves_json, b.slots_json AS slots_json,
        b.uses_rules_json AS uses_rules_json, b.sql_template AS sql_template,
-       b.composes_json AS composes_json, b.result_grain_json AS result_grain_json,
+       b.composes_json AS composes_json, b.result_grain_json AS result_grain_json, b.column_formats_json AS column_formats_json,
        b.window_anchor AS window_anchor
 """
 
@@ -416,6 +416,7 @@ def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
         sql_template=sql_template if isinstance(sql_template, str) else None,
         composes=composes if isinstance(composes, list) else None,
         result_grain=result_grain if isinstance(result_grain, (list, dict)) else None,
+        column_formats=_decode_json(record.get("column_formats_json")),
         # J7: coerced against the CLOSED anchor set, not merely type-checked. The write
         # side already rejects an unknown anchor (`compiler.validate_blueprint_dag`), so this is
         # the read-side backstop for a hand-edited/foreign-written node — and the guard is

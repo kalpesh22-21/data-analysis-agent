@@ -290,6 +290,7 @@ SET b.name = $id,
     b.sql_template = $sql_template,
     b.composes_json = $composes_json,
     b.result_grain_json = $result_grain_json,
+    b.column_formats_json = $column_formats_json,
     b.window_anchor = $window_anchor,
     b.structural_key = $structural_key,
     b.structural_key_recipe = $structural_key_recipe

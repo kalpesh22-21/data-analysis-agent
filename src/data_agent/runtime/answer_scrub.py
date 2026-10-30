@@ -246,9 +246,42 @@ def scrub_answer_prose(
     return _SCRUB.sub(_replace, text), count
 
 
+_IDENTIFIER_ANNOTATION = re.compile(
+    r"[ \t]+\((?P<quote>[`\"]?)(?P<identifier>[A-Za-z][A-Za-z_]*"
+    r"(?:\.[A-Za-z][A-Za-z_]*)*)(?P=quote)\)"
+)
+
+
+def strip_redundant_identifier_annotations(text: str, *, business_values=frozenset()) -> str:
+    """Drop identifier-only parentheses only when the preceding words name it.
+
+    No deletion of standalone identifiers, predicates, values or mixed caveats.
+    Only word separators, simple plurals and pay/payment equivalence are normalized
+    for comparison; the surviving business wording is never rewritten.
+    """
+    def words(value):
+        return ["pay" if word in {"payment", "payments"} else
+                word[:-1] if len(word) > 3 and word.endswith("s") else word
+                for word in re.findall(r"[a-z]+", value.lower())]
+
+    def replace(match):
+        identifier = match["identifier"]
+        _, redactions = scrub_answer_prose(match.group(0), business_values=business_values)
+        if not redactions:
+            return match.group(0)
+        expected = words(identifier.rsplit(".", 1)[-1].replace("_", " "))
+        preceding = re.search(r"[A-Za-z]+(?:[ \t]+[A-Za-z]+)*$", text[:match.start()])
+        if preceding and words(preceding[0])[-len(expected):] == expected:
+            return ""
+        return match.group(0)
+
+    return _IDENTIFIER_ANNOTATION.sub(replace, text)
+
+
 __all__ = [
     "ANSWER_PROSE_REDACTED_EVENT",
     "SAVED_ANALYSIS_MARKER",
     "SCHEMA_DETAIL_MARKER",
     "scrub_answer_prose",
+    "strip_redundant_identifier_annotations",
 ]

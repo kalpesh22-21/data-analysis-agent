@@ -243,9 +243,9 @@ class TurnAccumulators:
         # so an evidence call from an earlier window simply does not contribute —
         # which is why it is the ONE accumulator with no seed parameter.
         self._result_sql_by_call_id: dict[str, str] = {}
-        # recordAssumptions accumulator (mirrors `_sql`): the deduped,
-        # first-occurrence list of plain-English assumptions the model recorded
-        # this turn. Folded from each SUCCESSFUL recordAssumptions call's ARGUMENTS,
+        # Current assumption list, replaced by each SUCCESSFUL recordAssumptions
+        # call (including [] to clear), reconstructed identically on resume and
+        # history reads from the call ARGUMENTS,
         # read at every `TurnOutcome(...)` return site.
         self._assumptions: list[str] = list(assumptions) if assumptions else []
         self.answer_document: dict[str, Any] | None = None
@@ -345,8 +345,7 @@ class TurnAccumulators:
     def note_assumptions(
         self, tool_name: str, arguments: dict[str, Any], tool_result: ToolResult
     ) -> None:
-        """Fold one SUCCESSFUL `recordAssumptions` call into the assumptions list (deduped,
-        first-occurrence order, mirroring `note_enrichment`'s SQL discipline). Read from
+        """Replace the list after a SUCCESSFUL `recordAssumptions` call. Read from
         the call ARGUMENTS via the SAME `fold_assumptions` helper `session_history` uses,
         so the loop and the history read-surface agree exactly. A no-op for any other call.
         """
@@ -368,7 +367,7 @@ class TurnAccumulators:
         LAST designation wins, and it wins over the WHOLE SET. A second `answerWithTable`
         means the model changed its mind about which query is the answer, and appending
         instead would make "changed its mind" unexpressible. (`recordAssumptions`
-        accumulates because assumptions are additive; an answer is one answer.) A
+        also replaces its current list; an answer is one answer.) A
         designation that resolves to nothing leaves the previous set intact, so a
         malformed retry cannot silently drop a good table.
         """

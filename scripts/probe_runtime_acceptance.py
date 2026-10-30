@@ -15,7 +15,8 @@ import uuid
 from pathlib import Path
 
 import httpx
-from _e2e_harness import mint_bound_token, parse_sse, span_attrs
+from _e2e_harness import mint_bound_token, span_attrs
+from _probe_transport import capture_turn, tool_telemetry
 
 QUESTIONS = [
     "How do I update my direct deposit information?",
@@ -35,15 +36,16 @@ SCOPE = [f"dbpcm_warehouse.employee.{column}" for column in (
 )] + ["dbpcm_warehouse.department.department_code", "dbpcm_warehouse.department.department_name"]
 
 
-async def traces(client, session_ids):
-    projects = (await client.get("http://localhost:6006/v1/projects")).json()["data"]
+async def traces(client, session_ids, phoenix_url="http://localhost:6006"):
+    phoenix_url = phoenix_url.rstrip("/")
+    projects = (await client.get(phoenix_url + "/v1/projects")).json()["data"]
     project = next(p for p in projects if p["name"] == "data-agent-runtime")
     query = '''query($id: ID!) { node(id: $id) { ... on Project {
       spans(first: 400, sort: {col: startTime, dir: desc}) { edges { node {
-        name attributes context { traceId spanId } events { name attributes }
+        name startTime attributes context { traceId spanId } events { name attributes }
       } } }
     } } }'''
-    response = (await client.post("http://localhost:6006/graphql", json={"query": query, "variables": {"id": project["id"]}})).json()
+    response = (await client.post(phoenix_url + "/graphql", json={"query": query, "variables": {"id": project["id"]}})).json()
     if response.get("errors"):
         return {"error": response["errors"]}
     nodes = [edge["node"] for edge in response["data"]["node"]["spans"]["edges"]]
@@ -55,7 +57,7 @@ async def traces(client, session_ids):
             continue
         attrs = span_attrs(node)
         # Preserve shape-only diagnostics, excluding prompts, tool arguments and results.
-        captured[sid].append({"name": node["name"], "trace_id": node["context"]["traceId"],
+        captured[sid].append({"name": node["name"], "start_time": node["startTime"], "trace_id": node["context"]["traceId"],
             "attributes": {key: value for key, value in attrs.items() if key.startswith(("judge.", "answer_judge.", "guardrail.", "session.")) or key in ("tool.name", "tool.status", "tool.error_code", "approved", "reviewed", "site", "violation", "disposition", "reason", "tokens", "rule")},
             "events": [{"name": event["name"], "attributes": event.get("attributes")} for event in node.get("events", []) if event["name"].startswith("loop_")],
         })
@@ -73,20 +75,26 @@ async def main(args):
                 jwt = await mint_bound_token(SCOPE, session_id)
                 headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
                 started = time.monotonic()
-                response = await client.post(args.base_url + "/turn", json={"message": questions[index-1]}, headers=headers)
-                progress, outcome, error = parse_sse(response.text)
-                history = await client.get(args.base_url + "/session/history", headers=headers)
+                status, events, outcome, error = await capture_turn(
+                    client, args.base_url, headers=headers, message=questions[index-1])
+                progress = [e["data"] for e in events if e["event"] == "progress"]
+                history = await client.get(args.base_url.rstrip("/") + "/session/history", headers=headers)
                 item = {"number": index, "question": questions[index-1], "session_id": session_id,
-                        "seconds": round(time.monotonic()-started, 2), "http_status": response.status_code,
-                        "result": outcome, "error": error, "history": history.json(), "progress": progress}
+                        "seconds": round(time.monotonic()-started, 2), "http_status": status,
+                        "result": outcome, "error": error, "history": history.json(), "progress": progress, "sse_events": events}
                 results.append(item)
                 write_results(args.output, {"scope": SCOPE, "results": sorted(results, key=lambda item: item["number"])})
-                print(f"Q{index}: HTTP {response.status_code}, status={(outcome or {}).get('status')}, seconds={item['seconds']}", flush=True)
+                print(f"Q{index}: HTTP {status}, status={(outcome or {}).get('status')}, seconds={item['seconds']}", flush=True)
         indices = list(args.questions or range(1, 8)) + list(range(8, len(questions) + 1))
         await asyncio.gather(*(probe(i) for i in indices))
         # The default exporter batches every five seconds.
         await asyncio.sleep(6)
-        captured = await traces(client, {item["session_id"] for item in results})
+        try:
+            captured = await traces(client, {item["session_id"] for item in results}, args.phoenix_url)
+        except Exception as exc:
+            captured = {"error": {"exception_type": type(exc).__name__}}
+        for item in results:
+            item["tool_telemetry"] = tool_telemetry(captured.get(item["session_id"], []))
         write_results(args.output, {"scope": SCOPE, "results": sorted(results, key=lambda item:item["number"]), "traces": captured})
         print(f"Saved results and judge traces to {args.output}", flush=True)
 
@@ -102,6 +110,7 @@ def write_results(path, data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--phoenix-url", default="http://localhost:6006")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--extra-question", action="append", help="Additional question to probe after the selected acceptance questions.")
     parser.add_argument("--questions", nargs="+", type=int, choices=range(1,8))

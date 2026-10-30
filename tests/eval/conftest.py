@@ -289,6 +289,7 @@ def blueprint_detail(seed: BlueprintSeed) -> BlueprintDetail:
         # both read it off THIS object, so dropping it here disables the feature for
         # the whole eval while every other assertion keeps passing.
         window_anchor=seed.window_anchor,
+        column_formats=seed.column_formats,
     )
 
 

@@ -392,7 +392,6 @@ def test_assumptions_accumulate_deduped_in_first_occurrence_order() -> None:
 
     assert accum.assumptions == [
         "excludes contractors",
-        "headcount is FTE",
         "as of the latest load",
     ]
 

@@ -65,10 +65,10 @@ def export_router(settings, extract_credentials, session_catalog, *, transport=N
                 if resolve_table_sql is None or "sql" in payload or not isinstance(payload["table_ref"], str):
                     return JSONResponse(status_code=400, content={"error": "Select one approved table reference."})
                 try:
-                    sql = await resolve_table_sql(credentials, payload.pop("table_ref"))
+                    resolved = await resolve_table_sql(credentials, payload.pop("table_ref"))
                 except PermissionError:
                     return JSONResponse(status_code=404, content={"error": "The selected answer data is unavailable."})
-                body = json.dumps({**payload, "sql": sql}).encode()
+                body = json.dumps({**payload, **resolved}).encode()
         timeout = 150.0 if request.method == "POST" else 120.0 if download else 60.0
         client = httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False)
         upstream = None

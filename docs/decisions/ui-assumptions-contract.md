@@ -1,6 +1,6 @@
 # UI Assumptions — `recordAssumptions` + the `assumptions` result field
 
-**Status:** Contract-locked. Additive amendment to
+**Status:** Updated 2026-10-30: last successful assumption list replaces prior lists. Historical wire-field references below predate answer_document; current live display is section caveats. Amendment to
 `docs/decisions/ui-slice1-enriched-result-contract.md` (the enriched `/turn`
 `result` event). Backend + frontend build against *this file*.
 
@@ -16,9 +16,11 @@ additive field on the final turn result (SSE `result` event + `GET
 - Assumptions are **PLAIN ENGLISH**, stated in the user's own terms — **never**
   SQL, codes, column names, or raw stored values.
 - They are surfaced via a dedicated runtime tool, **`recordAssumptions`**.
-- The new field **mirrors the existing `sql` accumulator ("UI Slice 1") in every
-  respect** — additive, nullable, `[] -> null` fork, accumulated across budget
-  windows, populated best-effort at every `TurnOutcome` return site.
+- Each successful call supplies the complete current-turn list. It replaces the
+  previous list across rounds and resume windows; `[]` explicitly clears it.
+- The composer displays each normalized recorded assumption once. The model
+  consolidates semantic paraphrases; code never merges different meanings.
+
 
 ## 1. The field
 
@@ -26,7 +28,7 @@ additive field on the final turn result (SSE `result` event + `GET
 (`_outcome_to_dict`) and on each `GET /session/history` turn.
 
 - A **list of short plain-English sentences**, in the order the model recorded
-  them, deduped preserving **first-occurrence** order.
+  them, normalized and deduped within the latest list, preserving first-occurrence order.
 - **`null`-not-`[]` fork (identical to `sql`):** a turn that recorded **no**
   assumptions serializes as `null`, not `[]`, so the UI treats "no assumptions
   panel" and "empty" identically. The internal accumulator is a `list[str]`; the
@@ -49,19 +51,19 @@ additive field on the final turn result (SSE `result` event + `GET
   `tool_calls_made`. It is stateless — it returns a tiny confirmation
   `ToolResult` (`result_preview` = the accepted count, `result_full = None`) and
   never raises on malformed args.
-- **Prompt contract:** the model is instructed (tool description + system prompt)
-  to call it **once, just before the final answer**, with each assumption a short
-  plain-English sentence; and to **skip the call** when it made no assumptions.
-  Good: `"'Active employees' was taken to mean currently-employed staff."` Bad:
-  `"EmployeeStatus = 'A'"`.
+- **Prompt contract:** provide the full list before finalizing; replace it during
+  repair when an interpretation changes, or send `[]` to remove all assumptions.
+  Keep one short business sentence per interpretation and do not repeat it in
+  takeaway or caveats. Do not record freshness claims. Skip the call when no
+  assumptions have been recorded or are needed.
 
 ## 3. Cleaning (`clean_assumptions` / `fold_assumptions`) — the plain-English rule is NOT runtime-enforced
 
 `clean_assumptions(raw) -> list[str]` is the SINGLE normalizer, and
 `fold_assumptions(target, raw)` is the SINGLE in-place fold, used by ALL three
-sites (loop accumulation, loop blueprint-resume trail reconstruction, and
+sites (loop replacement, loop blueprint-resume trail reconstruction, and
 `session_history` history reconstruction), so they agree byte-for-byte. Cleaning:
-drops non-strings and blank (`.strip()`) items; dedupes first-occurrence; applies
+drops non-strings and blank (`.strip()`) items; dedupes case/whitespace/terminal-period variants; applies
 lenient safety caps (max items / max length).
 
 It **deliberately does NOT** detect or strip SQL/codes. The plain-English / no-SQL
@@ -69,12 +71,12 @@ rule is enforced by the **tool description + system prompt**, not the runtime �
 the runtime does not second-guess the model's own text (consistent with how the
 loop treats `answer` / `pending_question` text).
 
-## 4. Accumulation (loop) — mirrors `turn_sql`
+## 4. Replacement and replay
 
 - `AgentLoop._run_loop` holds a turn-window-local `turn_assumptions: list[str]`
   accumulator next to `turn_sql`, seeded from a `seed_assumptions` param.
 - On each **successful** `recordAssumptions` call, `clean_assumptions(args
-  ["assumptions"])` is folded in place (deduped, first-occurrence) — no-op for
+  ["assumptions"])` replaces the previous list in place — no-op for
   any other tool / non-`ok` result.
 - `assumptions = turn_assumptions or None` is threaded into **every**
   `TurnOutcome(...)` return: `done`, the `askUser` `paused_ask_user`,
