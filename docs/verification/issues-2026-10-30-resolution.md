@@ -35,7 +35,7 @@ one deployed hydrator pod. I12 is not established as concurrent-writer contentio
 | A3 / A6 / A7 clarification | Use prior agreement and applicable catalog defaults. A bare topic such as Sales is not proof of an out-of-domain request. Clarify unresolved material choices rather than inventing a metric or period. Model behavior still requires live evaluation. |
 | A5 denominator | Explicit Active-only requests remain Active-only; catalog defaults do not override explicit scope. An Active-only denominator is not automatically wrong for the report's explicitly active-employee question. Disclose the chosen population; compare like definitions. |
 | A4 / A8–A10 presentation | Guide one primary presentation per information need; preserve requested numeric content through repair/salvage. Do not require an unrequested status breakdown or a duplicate visible table beneath every chart. Zero sections remain valid for text-only answers. Variation alone is not a correctness defect. |
-| A11 formatting | Added catalog/query/blueprint format metadata through result previews, documents and snapshots. All 188 blueprints and 770 terminal outputs were audited. Identifiers remain text; currencies and percentages carry explicit units/scales. Figures/facts are formatted server-side. CSV cells intentionally remain raw with unit-bearing headers. Ember table/axis adapters still need the handoff contract. |
+| A11 formatting | Added catalog/query/blueprint format metadata through result previews, documents and snapshots. All 188 blueprints and 770 terminal outputs were audited. Identifiers remain text; currencies and percentages carry explicit units/scales. In the final v2 contract figures/facts are formatted by the UI from source metadata. CSV cells retain the existing raw export behavior; UI-only formats are not forwarded to snapshot storage. Ember table/axis adapters still need the handoff contract. |
 | A12 blueprint preference | Corrected the expense blueprint's submission window, which previously filtered payment date. Prompt guidance now retains independently correct partial-blueprint results, uses definitions as SQL context rather than evidence, and queries gaps. Do not force a semantically mismatched retrieved blueprint. |
 | A13 visible row counts | UI owns pagination counts such as “Showing 20 of 211.” Complete paginated results differ from incomplete execution. The latter still needs a truthful limitation. See the UI handoff. |
 | A14 headline totals | Directly requested scalar answers belong in the takeaway; supporting table metrics need not all be repeated. Agent/judge guidance aligned. |
@@ -487,3 +487,100 @@ API repository-wide suite: **2,896 passed / 83 skipped / 1 xfailed**
 manifest hashes verified. Both repositories pass whitespace checks. Previously
 listed deployment, Trino, ingestion-receipt and resume-403 follow-ups remain open;
 this push does not claim those external checks passed.
+
+## 2026-10-30 — ad-hoc formatting call (local, not yet pushed)
+
+Lane5 now enriches unresolved ad-hoc display formats before answer review using a
+bounded, structured non-reasoning call. Blueprint formats and known catalog
+semantics remain authoritative. Formatting attempts are cached across presentation
+repairs; failed enrichment preserves existing metadata. Recovery materializes and
+reviews the enriched document before shipping. See the updated
+[UI value formatting contract](../decisions/ui-value-formatting-contract.md).
+
+Validation:
+
+- 1,450 focused runtime, model, review/recovery, tracing, streaming and configuration
+  tests passed. Added checks cover invalid/timeout fallback, blueprint exclusion,
+  repair reuse, sample bounds, and format parity across judge/history/export access.
+- Two local HTTP `/turn` cases passed with real DeepSeek, MCP and Phoenix. This is
+  local fixture validation, not a production-data or Ember rendering certification.
+- Ad-hoc active share by department: one formatter call, approximately 1.1 seconds,
+  792 input / 97 output tokens, zero reasoning tokens. The SQL computed `100 * share`;
+  the UI received `kind: percent, scale: percent, precision: 1` rather than generic
+  number. Trace: `92a51de17a6e5ca517d176cbf863501e`.
+- Blueprint payroll control: `bp-payroll-summary`, zero formatter calls, existing
+  USD formatting preserved, figure `$8,100.00`.
+  Trace: `076bfbc2605ba65091760bd2802b75e4`.
+- Both Phoenix `loop_response_emitted` payloads exactly matched captured terminal
+  SSE responses. Artifacts: `/tmp/formatting-live.json`, `/tmp/formatting-audit.log`,
+  `/tmp/formatting-regression-final.log`.
+- Workgate remains excluded in `stash@{0}`. No workgate code was restored.
+
+
+## SQL-only presentation contract (schema v2)
+
+Supersedes the embedded figure values and chart points described above. See
+[the UI contract](../ui-answer-document-spec.md) for all presentation kinds.
+Sources now carry executed SQL and column formats; presentations carry source IDs
+and column selectors. No table handles, rows, or formatted data values are embedded.
+Ember must adopt v2; the local reference UI has been adapted.
+
+`POST /query/page` accepts SQL to create/reuse a snapshot and return its first page,
+or a snapshot ID to page without rerunning SQL. Refresh uses `refresh_of`. The
+existing download-urls endpoint supplies separate CSV parts; no full-file stream is added. Snapshot/export
+storage must be configured; no direct-query paging fallback is retained.
+
+Verification: runtime suite 6,611 passed (5 skipped); UI suite 304 passed; API suite
+2,906 passed (83 skipped, 1 xfailed). Subsequent targeted runtime checks passed
+1,885 tests; final API route/service checks passed 62 tests.
+
+Live real-model KPI probe passed, including judge approval, persisted schema-v2
+SQL source, figure column selector, and connected Phoenix delivery tracing:
+`b9f829261a8405f80f8877c86687de00` (`/tmp/sql-v2-kpi-live.json`). The source SQL
+matched the successful query; zero was represented as a numeric count source.
+This explicit contract probe is not a production battery certification.
+
+Live payroll line/figure probes were not successful chart validations: the MCP
+scope returned no payroll records, although the physical local table contains
+rows. A less explicit employee-count probe also chose text only despite a scalar
+zero result. Model presentation consistency remains a live follow-up; no host-side
+widget invention or authorization bypass was added. Remote Ember and live object
+storage download were not verified in this run. Repeated progress messages remain
+visible; SSE-boundary suppression was not introduced. Workgate remains stashed.
+
+
+### Final transport simplification
+
+The clickhouse-api changes for this contract were removed. Lane5 alone implements
+`POST /query/page` by calling existing snapshot-create and snapshot-page APIs;
+subsequent pages call only snapshot-page. The UI retains column formats from the
+answer document and does not send them to paging/refresh. CSV uses existing part
+URLs: S3 bytes download directly; authenticated part streams pass through Lane5.
+The earlier API test counts describe the intermediate implementation, not a new
+clickhouse-api change to ship.
+
+
+## Final review fixes and control ownership
+
+Generic integer ad-hoc columns are eligible for semantic formatting (for example,
+numeric ZIP codes); explicit count projections and specific formats remain protected.
+Blueprints still skip the formatting call. The reference UI preserves fractional
+integer values and unspecified numeric precision, retains source freshness during
+paging, resets replaced snapshots once, and offers explicit recreation on expiry.
+Unsupported views fall back to their table without duplicating its controls.
+
+Table and CSV-part options are mandatory for every data result except figures.
+Facts, bars and lines expose their source table and CSV parts; tables expose the
+grid and download. Text has no data controls. Backend value rendering and unused
+agent fallback flags were removed. Active integration/formatting/handoff documents
+now point to the same SQL-source schema-v2 contract. Historical test counts and
+live artifacts above remain records of their respective runs, not new live proof.
+
+Final local validation: **6,927 runtime/UI tests passed, 5 skipped**
+(`/tmp/review-fixes-final-full.log`). This includes browser checks for numeric
+formatting, figure control exclusion, freshness retention, bounded snapshot
+replacement, expiry and denial. The initial sweep exposed obsolete fallback-flag
+fixtures (updated) and an unrelated inbox browser flake (passed on isolated and
+full reruns). Focused lint and working-tree whitespace checks passed. No new live
+model or remote Ember verification is claimed. clickhouse-api remains clean;
+workgate remains stashed. These changes are not committed or pushed.

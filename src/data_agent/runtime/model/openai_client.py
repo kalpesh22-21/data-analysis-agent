@@ -349,6 +349,18 @@ class OpenAIModelClient:
         client._max_retries = 0
         return client
 
+    async def format_columns(self, messages, schema, *, model=None):
+        """One structured, non-reasoning call; no provider retry or tool execution."""
+        selected = model or self._model
+        options = {} if selected.startswith(("gpt-4.1", "gpt-4o")) else {"reasoning_effort": "none"}
+        response = await self._client.with_options(max_retries=0).chat.completions.create(
+            model=selected, messages=messages, max_tokens=2048,
+            response_format={"type": "json_schema", "json_schema": {
+                "name": "column_formats", "strict": True, "schema": schema,
+            }}, **options,
+        )
+        return json.loads(response.choices[0].message.content or "")
+
     async def send_turn(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurnResult:

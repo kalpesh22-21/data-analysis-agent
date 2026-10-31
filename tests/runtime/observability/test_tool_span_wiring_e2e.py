@@ -628,7 +628,7 @@ async def test_the_answer_prose_scrub_event_survives_the_observer_without_its_to
         f"the `loop_` prefix on {ANSWER_PROSE_REDACTED_EVENT!r}"
     )
     attributes = dict(redacted[0].attributes)
-    assert attributes["redaction_count"] == 2, (
+    assert attributes["redaction_count"] == 1, (
         "the span exported no `redaction_count` — the key is missing from "
         "_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST, so the span carries nothing"
     )

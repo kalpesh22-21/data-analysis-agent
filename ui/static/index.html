@@ -946,7 +946,7 @@
 
   // Field 1 — `sql: string[] | null`: one <pre> code block per statement, in
   // order. null / [] → hide the panel.
-  function fillGrid(head, body, columns, rows) {
+  function fillGrid(head, body, columns, rows, formats) {
     clearNode(head);
     clearNode(body);
     if (Array.isArray(columns) && columns.length > 0) {
@@ -962,9 +962,9 @@
     rows.forEach(function (row) {
       var tr = document.createElement("tr");
       var cells = Array.isArray(row) ? row : [row];
-      cells.forEach(function (cell) {
+      cells.forEach(function (cell, index) {
         var td = document.createElement("td");
-        td.textContent = cellText(cell);
+        td.textContent = window.formatAnswerCell(cell, (formats || {})[columns[index]]);
         tr.appendChild(td);
       });
       body.appendChild(tr);
@@ -1029,9 +1029,10 @@
     element.hidden = !valid;
   }
 
-  function wireTablePaging(panelEls, tableRef, autoOpen) {
+  function wireTablePaging(panelEls, source, autoOpen) {
     var offset = 0;
     var loaded = false;
+    var recoveryAttempted = false;
 
     function setBusy(busy) {
       panelEls.prev.disabled = busy || offset === 0;
@@ -1047,40 +1048,101 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: sessionId,
-          table_ref: tableRef,
+          ...(source.snapshot_id ? {snapshot_id:source.snapshot_id} : {sql:source.sql}),
           limit: PAGE_SIZE,
           offset: offset,
         }),
       })
         .then(function (r) {
           return r.json().then(function (payload) {
-            return { ok: r.ok, payload: payload };
+            return { ok: r.ok, status: r.status, retryAfter: r.headers.get("Retry-After"), payload: payload };
           });
         })
         .then(function (res) {
           if (!res.ok) {
-            // A denial (403) or an unparseable query (400) is shown in place of THIS
-            // grid rather than swallowed — the user should see why this table is
-            // missing, not an empty panel, and the other panels are unaffected.
+            var detail = res.payload.detail || res.payload;
+            var code = detail.code || res.payload.error_code;
             clearNode(panelEls.head);
             clearNode(panelEls.body);
-            panelEls.caption.textContent =
-              "Could not load the table: " + cellText(res.payload.error || "unknown error");
+            if (panelEls.downloadParts) panelEls.downloadParts.remove();
+            panelEls.dataAsOf.hidden = true;
+            if (panelEls.download) panelEls.download.hidden = true;
+            if (res.payload.reset_table) offset = 0;
+            if (res.status === 409 && code === "SNAPSHOT_REPLACED" && res.payload.snapshot && !recoveryAttempted) {
+              source.snapshot_id = res.payload.snapshot.snapshot_id;
+              delete source.data_as_of;
+              delete source.freshness;
+              offset = 0;
+              recoveryAttempted = true;
+              var seconds = Number(res.retryAfter);
+              var retryAt = Date.parse(res.retryAfter);
+              var delay = Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : Number.isFinite(retryAt) ? Math.max(0, retryAt-Date.now()) : 0;
+              setTimeout(function () { load(); }, delay);
+              return;
+            }
+            panelEls.caption.replaceChildren();
+            panelEls.caption.appendChild(document.createTextNode("Could not load the table: " + cellText(detail.error || res.payload.error || "result unavailable") + " "));
+            if ([404,410].includes(res.status)) {
+              delete source.snapshot_id;
+              offset = 0;
+              var retry = document.createElement("button");
+              retry.textContent = "Refresh data";
+              retry.onclick = function () {
+                retry.disabled = true;
+                recoveryAttempted = false;
+                delete source.data_as_of;
+                delete source.freshness;
+                // Expired/missing storage may not retain metadata for refresh_of.
+                load();
+              };
+              panelEls.caption.appendChild(retry);
+            } else if (res.status === 403 || res.payload.reset_table) {
+              delete source.snapshot_id;
+            }
             panelEls.caption.hidden = false;
             panelEls.pager.hidden = true;
             return;
           }
-          // A successful fresh page supersedes history, including unknown freshness.
-          renderDataAsOf(panelEls.dataAsOf, res.payload.data_as_of, res.payload);
+          recoveryAttempted = false;
+          // Paging has no freshness receipt: retain the answer source's metadata.
+          renderDataAsOf(panelEls.dataAsOf, source.data_as_of, source);
           var rows = Array.isArray(res.payload.rows) ? res.payload.rows : [];
-          fillGrid(panelEls.head, panelEls.body, res.payload.columns, rows);
+          source.snapshot_id = res.payload.snapshot_id;
+          fillGrid(panelEls.head, panelEls.body, res.payload.columns, rows, source.column_formats || {});
+          if (panelEls.download) panelEls.download.hidden = false;
+          if (!panelEls.download) {
+            panelEls.download = document.createElement("button");
+            panelEls.download.textContent = "Download CSV parts";
+            panelEls.panel.appendChild(panelEls.download);
+            panelEls.download.onclick = async function () {
+              var button = panelEls.download;
+              button.disabled = true;
+              try {
+                var response = await fetch("/api/query/snapshots/" + encodeURIComponent(source.snapshot_id) + "/download-urls?session_id=" + encodeURIComponent(sessionId));
+                if (!response.ok) throw new Error("Download unavailable");
+                var payload = await response.json();
+                if (panelEls.downloadParts) panelEls.downloadParts.remove();
+                panelEls.downloadParts = document.createElement("div");
+                (payload.files || []).forEach(function (file) {
+                  var link = document.createElement("a");
+                  link.textContent = file.filename || ("CSV part " + file.part);
+                  link.href = /^https:\/\//.test(file.url) ? file.url : "/api/query/snapshots/" + encodeURIComponent(source.snapshot_id) + "/download?part=" + encodeURIComponent(file.part) + "&session_id=" + encodeURIComponent(sessionId);
+                  panelEls.downloadParts.appendChild(link);
+                  panelEls.downloadParts.appendChild(document.createElement("br"));
+                });
+                if (!(payload.files || []).length) panelEls.downloadParts.textContent = "No CSV parts available.";
+                panelEls.panel.appendChild(panelEls.downloadParts);
+              } catch (error) {
+                button.textContent = "Retry CSV download";
+              } finally { button.disabled = false; }
+            };
+          }
           panelEls.caption.hidden = true;
           panelEls.caption.textContent = "";
           var first = rows.length === 0 ? offset : offset + 1;
           panelEls.status.textContent = "rows " + first + "–" + (offset + rows.length);
           panelEls.prev.disabled = offset === 0;
-          // `has_more` is a hint derived from a full page, not a total count —
-          // there is no row count to show without a second aggregate query.
+          // Saved-result paging returns an exact row count and has_more.
           panelEls.next.disabled = res.payload.has_more !== true;
           panelEls.pager.hidden = false;
         })
@@ -1131,7 +1193,12 @@
     window.renderAnswerDocument(container, doc, function (parent, ref, title, source) {
       var panel = cloneTablePanel(parent, title);
       renderDataAsOf(panel.dataAsOf, source.data_as_of, source);
-      wireTablePaging(panel, ref, false);
+      wireTablePaging(panel, source, false);
+    }, async function(source) {
+      var response=await fetch("/api/query/page", {method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({session_id:sessionId,sql:source.sql,limit:1000,offset:0})});
+      if(!response.ok) throw new Error("Result unavailable");
+      return response.json();
     });
     if (!doc) return;
     var refresh = document.createElement("button");

@@ -412,8 +412,10 @@ async def test_a_pause_exit_writes_its_checkpoint_before_it_announces_it() -> No
     paused = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="go")
 
     assert paused.status == "paused_ask_user"
-    tail = [name for name, _p in events][-2:]
-    assert tail == ["store:write_pause_checkpoint", "loop_paused_ask_user"]
+    tail = [name for name, _p in events][-4:]
+    assert tail == ["store:write_pause_checkpoint", "store:append_message", "loop_response_persisted", "loop_paused_ask_user"]
+    doc = await _store.get_or_create_session(SESSION_ID)
+    assert doc.messages[-1].content == paused.pending_question["question"]
 
 
 async def test_a_done_exit_persists_its_answer_before_it_announces_it() -> None:

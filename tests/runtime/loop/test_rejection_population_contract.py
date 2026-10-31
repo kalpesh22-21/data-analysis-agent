@@ -60,13 +60,13 @@ def test_ranking_review_checks_ui_selected_execution():
     assert "ORDER BY, limit, and tie handling" in _ANSWER_JUDGE_PROMPT
     assert "A different unselected query cannot justify" in _ANSWER_JUDGE_PROMPT
     assert "LIMIT applied before ranking" in _ANSWER_JUDGE_PROMPT
-    assert "existing correct result can be selected, request presentation repair" in _ANSWER_JUDGE_PROMPT
+    assert "existing correct result can be selected unambiguously, approve corrected_document" in _ANSWER_JUDGE_PROMPT
     assert "measurement_mismatch and repair_type=analysis" in _ANSWER_JUDGE_PROMPT
 
 
 def test_population_copy_uses_actual_direction_without_echoing_freeform_feedback():
-    from data_agent.runtime.loop.proposal import ReviewState
     from data_agent.runtime.loop.judge_ship_guard import JudgeShipGuard
+    from data_agent.runtime.loop.proposal import ReviewState
     verdict = JudgeVerdict(False, 'unrequested_employee_status_filter',
                            'Internal feedback with SQL must not be copied to users.',
                            measured_population='Active', required_population='Active + On Leave')

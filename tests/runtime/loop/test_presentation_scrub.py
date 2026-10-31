@@ -65,15 +65,15 @@ async def test_sql_is_blocked_before_presentation_cleanup(route, sql):
     ('Based on payment date (pay_date). Total: $8,100.00.', 'Based on payment date. Total: $8,100.00.'),
     ('Payment dates (`pay_date`) in 2026, not work periods.', 'Payment dates in 2026, not work periods.'),
     ('Employee codes (employee_code), within authorized records.', 'Employee codes, within authorized records.'),
-    ('Based on payment dates (payroll.pay_date) and submission dates (date_time_submitted).', None),
-    ('Gross earnings (salary_amount).', None),
-    ('Based on (pay_date).', None),
-    ('Based on payment date (pay_date > 2026-01-01).', None),
-    ('Payment date (pay_date, not period end).', None),
-    ('Payment date (pay_date) excluding employee_status.', None),
+    ('Based on payment dates (payroll.pay_date) and submission dates (date_time_submitted).', 'Based on payment dates and submission dates (date time submitted).'),
+    ('Gross earnings (salary_amount).', 'Gross earnings (salary amount).'),
+    ('Based on (pay_date).', 'Based on (pay date).'),
+    ('Based on payment date (pay_date > 2026-01-01).', 'Based on payment date (pay date > 2026-01-01).'),
+    ('Payment date (pay_date, not period end).', 'Payment date (pay date, not period end).'),
+    ('Payment date (pay_date) excluding employee_status.', 'Payment date excluding employee status.'),
 ])
 def test_presentation_repairs_only_redundant_identifier_annotations(original, expected):
-    from data_agent.runtime.composer import _text, PresentationError
+    from data_agent.runtime.composer import PresentationError, _text
 
     if expected is None:
         with pytest.raises(PresentationError):
@@ -93,8 +93,8 @@ def test_parenthetical_business_values_and_material_caveats_are_preserved():
 
 async def test_guard_repaired_salvage_retains_data_and_approval_without_another_call():
     from data_agent.runtime.loop.answer_judge import JudgeVerdict
-    from tests.runtime.loop.test_partial_answer import PART
     from tests.runtime.final_answer import recovery_sections
+    from tests.runtime.loop.test_partial_answer import PART
     from tests.runtime.test_harness_improvements import CREDS
 
     class SalvageJudge(Judge):
@@ -128,7 +128,7 @@ async def test_guard_repaired_salvage_retains_data_and_approval_without_another_
     'Information is current.', '**Data** as of October 30.',
 ])
 def test_explicit_freshness_claim_requires_presentation_repair(text):
-    from data_agent.runtime.composer import _text, PresentationError
+    from data_agent.runtime.composer import PresentationError, _text
     with pytest.raises(PresentationError, match='recordAssumptions'):
         _text(text)
 

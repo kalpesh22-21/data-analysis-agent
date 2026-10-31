@@ -592,7 +592,8 @@ def recall_span(
 # user-supplied/warehouse-derived PII (D25); a bare `isinstance(v, str | int |
 # float | bool)` filter would let it straight through into a span attribute
 # (and from there, Phoenix). Only these non-sensitive scalar counters/labels
-# are ever forwarded.
+# are forwarded by this allowlist. Explicit delivery/clarification handlers below
+# separately trace UI content under the configured Phoenix export policy.
 #
 # The `tool_name`/`tool_call_id`/`deduped`/`guard_reason`/`dedup_target`/`note`/
 # `database`/`table` labels make the repeated-idempotent-read guard's
@@ -604,7 +605,8 @@ def recall_span(
 # `sql` are NEVER placed on these events by the emitter, so no literal can leak).
 #
 # EMITTING AN EVENT DOES NOT PUBLISH ITS PAYLOAD (Release 1, 06). Every key an
-# emitter sends that is not listed here is silently dropped — a correctly-named
+# emitter sends that is not listed here (or handled by an explicit UI-content
+# branch below) is silently dropped — a correctly-named
 # GUARDRAIL span carrying nothing. The `analysisState` keys below are therefore
 # each a DELIBERATE D25 DECLARATION that the key is shape-only:
 #
@@ -809,6 +811,27 @@ def guardrail_observer(tracer: Tracer) -> Callable[[str, dict[str, Any]], None]:
             for key in _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST
             if key in payload and isinstance(payload[key], str | int | float | bool)
         }
+        if event == "loop_response_emitted" and isinstance(payload.get("response"), dict):
+            # The exact terminal SSE envelope, not a draft or reconstructed answer.
+            # Phoenix export applies its existing secret masking/redaction/size bounds.
+            import hashlib
+
+            response = payload["response"]
+            encoded = json.dumps(response)
+            document = response.get("answer_document") or {}
+            sources = document.get("sources", {})
+            sections = document.get("sections", [])
+            attributes.update({
+                "output.value": encoded,
+                "output.mime_type": "application/json",
+                "ui.result.bytes": len(encoded.encode("utf-8")),
+                "ui.result.sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                "ui.answer_document.present": bool(document),
+                "ui.section.count": len(sections),
+                "ui.source.count": len(sources),
+                "ui.column_format.count": sum(len(s.get("column_formats", {})) for s in sources.values()),
+                "ui.presentation.kinds": ",".join(s.get("presentation", {}).get("kind", "") for s in sections),
+            })
         with guardrail_span(tracer, event, attributes=attributes):
             pass
 

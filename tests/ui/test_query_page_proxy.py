@@ -109,13 +109,13 @@ def test_query_page_proxy_forwards_paging_params(
     assert fake_httpx[0]["json"]["offset"] == 75
 
 
-def test_query_page_proxy_omitted_paging_params_ride_through_as_null(
+def test_query_page_proxy_omits_unspecified_paging_params(
     fake_httpx: list[dict], client: TestClient
 ) -> None:
-    """The runtime clamps `None` to its own defaults — the BFF does not invent
+    """The API applies its own paging defaults — the BFF does not invent
     values, so there is one place paging bounds are decided."""
     client.post("/api/query/page", json={"session_id": _SESSION_ID, "sql": _ANSWER_SQL})
-    assert fake_httpx[0]["json"] == {"sql": _ANSWER_SQL, "limit": None, "offset": None}
+    assert fake_httpx[0]["json"] == {"sql": _ANSWER_SQL}
 
 
 @pytest.mark.parametrize(

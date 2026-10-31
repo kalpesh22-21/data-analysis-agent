@@ -161,15 +161,19 @@ def _validate_response(
         cards.append(dict(found[0]))
     sql_by_id = {**{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
                  **accum.result_sql_by_call_id}
+    from data_agent.runtime.provenance.answer_formats import cached_formats
+
+    format_overrides = cached_formats(list(eligible.values()), turn_index)
     try:
         candidate = build_document(
             {**proposal, "answer": text}, list(eligible.values()), turn_index=turn_index,
             cards=cards, sql_by_id=sql_by_id, business_values=values,
+            format_overrides=format_overrides,
         )
     except (PresentationError, TypeError, ValueError):
         return invalid("invalid_presentation")
     rendered_kinds = {section["id"]: section["presentation"]["kind"] for section in candidate["sections"]}
-    needs_review = any(rendered_kinds[section["id"]] != section["presentation"]["kind"] for section in proposal["sections"])
+    needs_review = bool(format_overrides.keys() & candidate["sources"].keys()) or any(rendered_kinds[section["id"]] != section["presentation"]["kind"] for section in proposal["sections"])
     return deepcopy(
         {
             "answer": text,
@@ -359,6 +363,8 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                 credentials=context.credentials,
                 analysis_state=live_analysis_state(doc, turn_index),
             )
+            if loop._answer_formatter is not None:
+                await loop._answer_formatter.resolve(brief.question, current, turn_index)
             response = await loop._answer_judge.salvage(brief)
             response = dict(response)
             outcome = response.pop("outcome")

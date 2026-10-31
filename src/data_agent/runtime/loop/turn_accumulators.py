@@ -351,7 +351,11 @@ class TurnAccumulators:
         """
         if tool_result.status != "ok" or tool_name != "recordAssumptions":
             return
-        fold_assumptions(self._assumptions, arguments.get("assumptions"))
+        self.replace_assumptions(arguments.get("assumptions"))
+
+    def replace_assumptions(self, assumptions) -> None:
+        """Apply a successful tool write or an approved judge correction."""
+        fold_assumptions(self._assumptions, assumptions)
 
     def note_answer_tables(
         self, tool_name: str, tool_result: ToolResult, resolved: Sequence[AnswerTable]

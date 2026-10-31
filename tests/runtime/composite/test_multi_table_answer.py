@@ -1036,14 +1036,7 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
     assert len(replayed) == 1
     assert "result withheld" not in json.dumps(replayed[0])
 
-    # 4. Still pageable. `POST /query/page` wraps the designated SQL rather than
-    #    splicing a LIMIT onto it, so a reconstruction that cannot be wrapped is a
-    #    table the user cannot scroll — which is the whole point of keeping it.
-    from data_agent.runtime.query_page import build_page_sql
 
-    paged = build_page_sql(turn["answer_sql"], limit=50, offset=0)
-    assert HEADCOUNT_SQL in paged
-    assert "LIMIT 50" in paged.upper()
 
 
 @pytest.mark.parametrize(

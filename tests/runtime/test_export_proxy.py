@@ -22,15 +22,14 @@ class Catalog:
         return "server-scope"
 
 
-def client(monkeypatch, handler, *, base="http://snapshot.test", catalog=True, resolver=None):
+def client(monkeypatch, handler, *, base="http://snapshot.test", catalog=True):
     monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **kw: frozenset())
     settings = RuntimeSettings(clickhouse_api_rest_base_url=base)
     scope = Catalog() if catalog else None
     app = FastAPI()
     app.include_router(
         export_router(
-            settings, app_module._extract_credentials, scope, transport=httpx.MockTransport(handler),
-            resolve_table_sql=resolver
+            settings, app_module._extract_credentials, scope, transport=httpx.MockTransport(handler)
         )
     )
     return TestClient(app), scope
@@ -245,49 +244,75 @@ def test_recovery_denial_is_returned_without_retry_loop(monkeypatch, status, cod
     assert len(calls) == 2
 
 
-async def _selected_table(credentials, ref):
-    assert credentials.session_id == "session-1"
-    if ref != "0:selected":
-        raise PermissionError
-    return {"sql": "SELECT 1", "column_formats": {}}
-
-
-def test_snapshot_creation_resolves_approved_table_reference(monkeypatch):
+@pytest.mark.parametrize('body', [
+    {'sql':'SELECT 1','limit':50},
+    {'snapshot_id':SID,'offset':50,'limit':50},
+    {'sql':'SELECT 1','refresh_of':SID},
+])
+def test_unified_page_uses_existing_snapshot_routes_and_verified_scope(monkeypatch, body):
     import json
-    seen = []
-
+    seen=[]
     def upstream(request):
-        seen.append(json.loads(request.content))
-        return httpx.Response(201, json={"snapshot_id": SID})
+        seen.append(request)
+        if request.method == 'POST':
+            return httpx.Response(201,json={'snapshot_id':SID,'created_at':'2026-10-30T00:00:00Z'})
+        return httpx.Response(200,json={'snapshot_id':SID,'rows':[[1]],'column_formats':{'n':{'kind':'integer'}}})
+    api,_=client(monkeypatch,upstream)
+    response=api.post('/query/page',headers=AUTH,json=body)
+    assert response.status_code==200 and response.json()['rows']==[[1]]
+    assert len(seen) == (2 if 'sql' in body else 1)
+    assert seen[-1].method == 'GET'
+    assert seen[-1].url.path == f'/query/snapshots/{SID}/page'
+    assert seen[-1].url.params['offset'] == str(body.get('offset',0))
+    assert seen[-1].url.params['limit'] == str(body.get('limit',100))
+    if 'sql' in body:
+        assert seen[0].url.path == '/query/snapshots'
+        assert json.loads(seen[0].content) == {k:v for k,v in body.items() if k in {'sql','refresh_of'}}
+    assert all(r.headers['X-Catalog-Scope']=='server-scope' for r in seen)
+    assert response.json()['reset_table'] == bool(body.get('refresh_of'))
 
-    api, _ = client(monkeypatch, upstream, resolver=_selected_table)
-    response = api.post("/query/snapshots", json={"table_ref": "0:selected"}, headers=AUTH)
-    assert response.status_code == 201
-    assert seen == [{"sql": "SELECT 1", "column_formats": {}}]
-    response = api.post("/query/snapshots", json={"table_ref": "0:unselected"}, headers=AUTH)
-    assert response.status_code == 404
-    assert len(seen) == 1
-    response = api.post("/query/snapshots", json={"table_ref": "0:selected", "sql": "SELECT 2"}, headers=AUTH)
-    assert response.status_code == 400
-    assert len(seen) == 1
+
+def test_removed_table_handle_rejected_before_upstream(monkeypatch):
+    seen=[]
+    api,_=client(monkeypatch,lambda request:seen.append(request))
+    assert api.post('/query/page',headers=AUTH,json={'table_ref':'old'}).status_code==400
+    assert not seen
 
 
-def test_snapshot_uses_approved_formats_instead_of_caller_overrides(monkeypatch):
-    import json
-    trusted = {"ZIP": {"kind": "identifier"}}
+def test_unified_saved_page_recovers_scope_once_and_resets_offset(monkeypatch):
+    calls=[]
+    async def ensure(self, **kwargs):
+        return {'scope_token':'new-scope'}
+    monkeypatch.setattr(Catalog,'ensure',ensure,raising=False)
+    def upstream(request):
+        calls.append(request)
+        if request.url.path==f'/query/snapshots/{SID}/page':
+            return httpx.Response(409,json={'detail':{'code':'SNAPSHOT_SCOPE_CHANGED'}})
+        assert request.url.path==f'/query/snapshots/{SID}/rebuild'
+        assert request.headers['X-Catalog-Scope']=='new-scope'
+        return httpx.Response(201,json={'snapshot_id':'22222222-2222-4222-8222-222222222222'})
+    api,_=client(monkeypatch,upstream)
+    response=api.post('/query/page',headers=AUTH,json={'snapshot_id':SID,'offset':500})
+    assert response.status_code==409
+    assert response.json()['detail']['code']=='SNAPSHOT_REPLACED'
+    assert response.json()['reset_table'] is True
+    assert len(calls)==2
 
-    async def resolve(credentials, ref):
-        assert ref == "approved"
-        return {"sql": "SELECT zip_code AS ZIP FROM employee", "column_formats": trusted}
 
-    def handler(request):
-        body = json.loads(request.content)
-        assert body["column_formats"] == trusted
-        assert "table_ref" not in body
-        return httpx.Response(201, json={"column_formats": trusted})
+@pytest.mark.parametrize('body', [{}, {'sql':' '}, {'sql':'SELECT 1','snapshot_id':SID}, {'sql':'SELECT 1','column_formats':{}}, {'snapshot_id':'bad'}, {'snapshot_id':SID,'limit':1001}, {'sql':'SELECT 1','refresh_of':SID,'offset':1}])
+def test_page_rejects_invalid_request_before_upstream(monkeypatch, body):
+    seen=[]
+    api,_=client(monkeypatch,lambda r:seen.append(r))
+    assert api.post('/query/page',headers=AUTH,json=body).status_code==422
+    assert not seen
 
-    api, _ = client(monkeypatch, handler, resolver=resolve)
-    response = api.post('/query/snapshots', headers=AUTH,
-                        json={"table_ref":"approved", "column_formats":{"ZIP":{"kind":"integer"}}})
-    assert response.status_code == 201
-    assert response.json()["column_formats"] == trusted
+
+def test_page_creation_error_does_not_fetch_rows(monkeypatch):
+    seen=[]
+    def upstream(request):
+        seen.append(request)
+        return httpx.Response(409,json={'detail':{'code':'SNAPSHOT_IN_PROGRESS'}},headers={'Retry-After':'2'})
+    api,_=client(monkeypatch,upstream)
+    response=api.post('/query/page',headers=AUTH,json={'sql':'SELECT 1'})
+    assert response.status_code==409 and response.headers['Retry-After']=='2'
+    assert len(seen)==1

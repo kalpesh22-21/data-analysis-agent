@@ -98,8 +98,8 @@ def test_business_prose_is_returned_byte_identical(prose: str) -> None:
         # R3, snake_case, twice in one sentence.
         (
             "Joined employee_master on check_detail.",
-            f"Joined {SCHEMA_DETAIL_MARKER} on {SCHEMA_DETAIL_MARKER}.",
-            2,
+            "Joined employee master on check detail.",
+            0,
         ),
         # R4, the backtick arm: a bare word that only its QUOTING marks as an
         # identifier. Unconditional — a backtick is ClickHouse identifier quoting
@@ -127,8 +127,8 @@ def test_business_prose_is_returned_byte_identical(prose: str) -> None:
         # A model that pasted its SQL into the prose still loses the identifier.
         (
             "I ran SELECT count() FROM employee_master.",
-            f"I ran SELECT count() FROM {SCHEMA_DETAIL_MARKER}.",
-            1,
+            "I ran SELECT count() FROM employee master.",
+            0,
         ),
         # THREE PARTS, ONE MARKER. A two-segment dotted rule redacts only
         # `dbpcm_warehouse.employee` and leaves `.EmployeeCode` dangling behind
@@ -244,8 +244,8 @@ def test_a_quoted_identifier_that_is_not_bare_is_caught_by_the_other_rules() -> 
     character later by the rules that need no quoting at all. The quotes are left
     behind as decoration; the identifier is gone either way."""
     scrubbed, count = scrub_answer_prose('Read `employee_master` and "db.table".', provenance=None)
-    assert scrubbed == f"Read `{SCHEMA_DETAIL_MARKER}` and \"{SCHEMA_DETAIL_MARKER}\"."
-    assert count == 2
+    assert scrubbed == f"Read `employee master` and \"{SCHEMA_DETAIL_MARKER}\"."
+    assert count == 1
 
 
 def test_a_quoted_value_survives_even_when_provenance_is_rich() -> None:
@@ -272,8 +272,8 @@ def test_a_scrubbed_answer_is_never_scrubbed_into_nothing() -> None:
     """Every replacement is a non-empty marker, so a prose-only-identifiers answer
     still leaves a message behind rather than silently becoming an empty bubble."""
     scrubbed, count = scrub_answer_prose("employee_master")
-    assert scrubbed == SCHEMA_DETAIL_MARKER
-    assert count == 1
+    assert scrubbed == "employee master"
+    assert count == 0
 
 
 def test_the_markers_are_themselves_unscrubbable() -> None:
@@ -298,5 +298,15 @@ def test_it_is_deterministic_and_linear_on_a_large_answer() -> None:
     second, second_count = scrub_answer_prose(prose, provenance=PROVENANCE)
 
     assert first == second
-    assert (first_count, second_count) == (1, 1)
-    assert first.endswith(SCHEMA_DETAIL_MARKER)
+    assert (first_count, second_count) == (0, 0)
+    assert first.endswith("employee master")
+
+
+def test_clarification_humanizes_labels_but_preserves_business_values():
+    from data_agent.runtime.loop.clarification import normalize_clarification
+
+    assert normalize_clarification(
+        "Should employee_status be Active or On Leave?", ["Active", "On Leave"]
+    ) == {"question": "Should employee status be Active or On Leave?", "options": ["Active", "On Leave"]}
+    assert scrub_answer_prose("Use annual__salary and employee_status.") == ("Use annual salary and employee status.", 0)
+    assert scrub_answer_prose("Pay code REG_PAY", business_values=frozenset({"REG_PAY"})) == ("Pay code REG_PAY", 0)

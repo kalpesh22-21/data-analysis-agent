@@ -77,7 +77,10 @@ from data_agent.runtime.context.assembly import (
 )
 from data_agent.runtime.context.budget import fit_request_to_budget, render_entry
 from data_agent.runtime.dispatch.denial_mapping import UNKNOWN_TOOL_CODE
-from data_agent.runtime.dispatch.source_availability import source_availability_boundary, restore_sources
+from data_agent.runtime.dispatch.source_availability import (
+    restore_sources,
+    source_availability_boundary,
+)
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -975,6 +978,7 @@ class AgentLoop:
         # would also approve everything, but it would still be an object on the
         # terminal path; `None` is the stronger statement and the cheaper one.
         answer_judge: AnswerJudge | None = None,
+        answer_formatter: Any = None,
         judge_catalog: Any = None,
         answer_judge_review_budget_seconds: float | None = None,
         # Seconds of wall clock a judge rejection needs to be worth making (09 §H).
@@ -1037,6 +1041,7 @@ class AgentLoop:
         # while K protects the D94 re-fetch/self-correct loop. Default 3.
         self._request_budget_pinned_recent_tool_pairs = request_budget_pinned_recent_tool_pairs
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
+        self._answer_formatter = answer_formatter
         self._judge_catalog = judge_catalog
         self._answer_judge = answer_judge
         self._answer_judge_review_budget_seconds = answer_judge_review_budget_seconds
@@ -2342,8 +2347,17 @@ class AgentLoop:
             # this assignment is an identity for them and fail-closed for anything
             # else: an unscrubbed string can never be the thing that gets written.
             persist_text = assistant_text
+        message_provenance = provenance
         if checkpoint is not None:
             await self._session_store.write_pause_checkpoint(session_id, checkpoint)
+            if checkpoint.reason in {"askUser", "blueprint_slot", "blueprint_when_ask", "blueprint_approval"} and checkpoint.pending_question:
+                # The next model turn must see the question the user actually answered,
+                # including judge edits, rather than the intercepted askUser draft.
+                pending = checkpoint.pending_question
+                message_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
+                persist_text = str(pending.get("question", ""))
+                if pending.get("options"):
+                    persist_text += "\nOptions: " + "; ".join(pending["options"])
         if persist_text is not None:
             await self._session_store.append_message(
                 session_id,
@@ -2352,7 +2366,7 @@ class AgentLoop:
                     role="assistant",
                     content=persist_text,
                     ts=_now_iso(),
-                    provenance=provenance,
+                    provenance=message_provenance,
                     ship_disposition=ship_disposition,
                     retained_assumption_count=retained_assumption_count,
                     review=review,
@@ -4537,8 +4551,10 @@ class AgentLoop:
                             "exit": "ask_user_question",
                         },
                     )
+                corrected_question = ask_verdict.corrected_question if ask_verdict.approved and ask_verdict.reviewed else None
                 normalized = normalize_clarification(
-                    question, ask_user_call.arguments.get("options")
+                    corrected_question["question"] if corrected_question else question,
+                    corrected_question["options"] if corrected_question else ask_user_call.arguments.get("options"),
                 )
                 question, options = normalized["question"], normalized["options"]
                 if ask_verdict.reviewed or not ask_verdict.approved:
@@ -4678,7 +4694,14 @@ class AgentLoop:
                     },
                 ) if not evidence_error else None
                 from data_agent.runtime.composer import PresentationError, build_document
+                from data_agent.runtime.provenance.answer_formats import cached_formats
 
+                if self._answer_formatter is not None:
+                    await self._answer_formatter.resolve(
+                        question, evidence_trail, turn_index,
+                        selected={s.get("presentation", {}).get("result_id")
+                                  for s in proposal_args.get("sections", [])},
+                    )
                 accum.answer_document = None
                 try:
                     accum.answer_document = build_document(
@@ -4686,6 +4709,7 @@ class AgentLoop:
                         turn_index=turn_index, cards=accum.capability_cards,
                         assumptions=accum.assumptions,
                         business_values=presentation_business_values,
+                        format_overrides=cached_formats(evidence_trail, turn_index),
                         sql_by_id={**{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
                                    **accum.result_sql_by_call_id},
                     )
@@ -4914,6 +4938,48 @@ class AgentLoop:
                                 },
                             )
                             verdict = APPROVED
+                    if verdict.reviewed and verdict.approved and verdict.corrected_document is not None:
+                        from data_agent.runtime.composer import proposal_to_internal
+
+                        try:
+                            replacement = dict(verdict.corrected_document)
+                            assumptions = replacement.pop("assumptions", accum.assumptions)
+                            corrected = proposal_to_internal(replacement)
+                            visible = {r.get("tool_call_id") for r in brief.results}
+                            if not set(corrected["evidence"]) <= visible:
+                                raise PresentationError("Correction references evidence not visible to the judge.")
+                            cards = [c for c in (accum.capability_cards or []) if c.get("name") in corrected["capability_refs"]]
+                            if {c.get("name") for c in cards} != set(corrected["capability_refs"]):
+                                raise PresentationError("Correction selects an unprepared action.")
+                            tables, correction_refusal, _ = await self._resolve_answer_tables(
+                                corrected, blueprint_runs=dict(accum.blueprint_runs),
+                                credentials=credentials, session_id=session_id, turn_index=turn_index,
+                            )
+                            if correction_refusal:
+                                raise PresentationError("Correction selects an unavailable result.")
+                            candidate = build_document(
+                                corrected, evidence_trail, turn_index=turn_index,
+                                cards=cards, assumptions=assumptions,
+                                business_values=presentation_business_values,
+                                format_overrides=cached_formats(evidence_trail, turn_index),
+                                sql_by_id={**{key: run.terminal_sql for key, run in accum.blueprint_runs.items()}, **accum.result_sql_by_call_id},
+                            )
+                            # No LLM-authored SQL or values: the normal materializer owns sources.
+                            accum.answer_document = candidate
+                            accum.replace_assumptions(assumptions or [])
+                            accum.select_answer_tables(tables)
+                            accum.select_capabilities(corrected["capability_refs"])
+                            proposal_args = corrected
+                            final_text = candidate["takeaway"]
+                            complete = {**complete, "answer": final_text, "answer_document": candidate,
+                                        "tables": [t.to_doc() for t in tables], "assumptions": accum.assumptions, "capabilities": cards}
+                            version = fingerprint(complete)
+                            self._observer("loop_answer_judge_document_corrected", {"site": site})
+                        except (PresentationError, TypeError, ValueError):
+                            verdict = JudgeVerdict(
+                                False, "contradicts_result", "The correction could not be bound to verified results. Fix the source/column selection using existing evidence.",
+                                reviewed=True, repair_type="presentation",
+                            )
                     if verdict.reviewed:
                         from .partial_answer import capture_partial
 

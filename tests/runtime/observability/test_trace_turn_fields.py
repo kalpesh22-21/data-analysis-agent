@@ -185,3 +185,61 @@ def test_request_context_inherits_to_children_without_cross_session_leakage():
         assert metadata["jti"] == "request-123"
         assert metadata["catalog_sha"] == "catalog-456"
         assert metadata["turn_index"] == 2
+
+
+@pytest.mark.parametrize('status', ['done', 'paused_ask_user'])
+@pytest.mark.parametrize('redact', [False, True])
+async def test_delivery_span_contains_the_actual_wire_object_and_formats(status, redact):
+    import hashlib
+    from copy import deepcopy
+
+    from data_agent.runtime.app import _stream_turn
+    from data_agent.runtime.loop.agent_loop import TurnOutcome
+    from data_agent.runtime.observability.progress import ProgressEmitter
+
+    document = {
+        'takeaway': 'Salary is $120,000.00.',
+        'sections': [{'presentation': {'kind': 'table', 'result_id': 'result'}}],
+        'sources': {'result': {'column_formats': {
+            'ZIP Code': {'kind': 'identifier'},
+            'Annual Salary': {'kind': 'currency', 'currency': 'USD', 'precision': 2},
+        }}},
+    }
+    original = deepcopy(document)
+    outcome = TurnOutcome(status, None, {'question': 'Which period?'} if status.startswith('paused') else None,
+                          3, answer_document=document)
+    sink = InMemorySpanExporter()
+    provider = tracing.configure_tracing(otlp_endpoint='', service_name='delivery-test',
+                                        span_exporter=sink, phoenix_export=True,
+                                        selective_redaction=redact)
+    observer = tracing.guardrail_observer(tracing.get_tracer(provider))
+
+    async def execute():
+        return outcome
+
+    frames = [f async for f in _stream_turn(execute, ProgressEmitter(), delivery_observer=observer)]
+    wire = json.loads(next(f for f in frames if f.startswith('event: result')).split('data: ', 1)[1])
+    emitted = next(s for s in sink.get_finished_spans() if s.name == 'loop_response_emitted')
+    attrs = emitted.attributes
+    captured = json.loads(attrs['output.value'])
+    assert attrs['output.mime_type'] == 'application/json'
+    encoded = json.dumps(wire).encode('utf-8')
+    assert attrs['ui.result.sha256'] == hashlib.sha256(encoded).hexdigest()
+    assert attrs['ui.result.bytes'] == len(encoded)
+    assert document == original  # tracing cannot change the delivered answer
+    if not redact:
+        assert captured == wire
+    if status == 'done':
+        assert attrs['ui.answer_document.present'] is True
+        assert attrs['ui.column_format.count'] == 2
+        assert attrs['ui.source.count'] == 1
+        assert attrs['ui.presentation.kinds'] == 'table'
+        formats = captured['answer_document']['sources']['result']['column_formats']
+        assert formats['ZIP Code']['kind'] == 'identifier'
+        assert formats['Annual Salary']['currency'] == 'USD'
+        if redact:
+            assert '120,000' not in attrs['output.value']
+    else:
+        assert 'answer_document' not in captured
+        assert attrs['ui.answer_document.present'] is False
+        assert attrs['ui.column_format.count'] == 0

@@ -3,7 +3,6 @@ from dataclasses import replace
 
 import pytest
 
-from data_agent.runtime.answer_access import resolve_table
 from data_agent.runtime.session.answer_refresh import (
     RefreshRejectedError,
     RefreshStore,
@@ -56,12 +55,8 @@ async def test_refresh_stages_then_atomically_replaces_document_and_resolves_new
     assert approved.answer_document["revision"] == 2
     assert approved.answer_document["takeaway"] == "Fresh counts."
     source = next(iter(approved.answer_document["sources"].values()))
-    assert source["table_ref"] != target.answer_document["sources"]["q"]["table_ref"]
-    assert await resolve_table(current, source["table_ref"], CREDS, store)
-    with pytest.raises(PermissionError):
-        await resolve_table(
-            current, target.answer_document["sources"]["q"]["table_ref"], CREDS, store
-        )
+    assert source["sql"] == target.answer_document["sources"]["q"]["sql"]
+    assert "table_ref" not in source
     winner = deepcopy(current.to_doc())
     with pytest.raises(CASMismatchError):
         await store.publish_answer_refresh(

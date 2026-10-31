@@ -200,13 +200,13 @@ async def test_the_answer_with_table_exit_scrubs_prose_and_leaves_the_sql_alone(
     )
 
     assert outcome.status == "done"
-    assert outcome.assistant_text == (f"Grouped {SCHEMA_DETAIL_MARKER} by {SCHEMA_DETAIL_MARKER}.")
+    assert outcome.assistant_text == (f"Grouped {SCHEMA_DETAIL_MARKER} by department name.")
     assert await _assistant_messages(store) == [outcome.assistant_text]
     # I2: the structured payload still names exactly what ran.
     assert outcome.answer_sql == _SQL
     assert outcome.answer_tables is not None
     assert outcome.answer_tables[0]["sql"] == _SQL
-    assert _redactions(events) == [{"redaction_count": 2, "exit": "answer_with_table"}]
+    assert _redactions(events) == [{"redaction_count": 1, "exit": "answer_with_table"}]
 
 
 class _FakeBlueprintTool:
@@ -336,9 +336,9 @@ async def test_a_runtime_tool_pause_scrubs_its_partial_prose() -> None:
 
     assert paused.status == "paused_ask_user"
     assert paused.assistant_text == (
-        f"Started from {SAVED_ANALYSIS_MARKER} over {SCHEMA_DETAIL_MARKER}."
+        f"Started from {SAVED_ANALYSIS_MARKER} over employee master."
     )
-    assert _redactions(events) == [{"redaction_count": 2, "exit": "pause"}]
+    assert _redactions(events) == [{"redaction_count": 1, "exit": "pause"}]
 
 
 async def test_the_ask_user_question_is_scrubbed_in_both_the_outcome_and_the_checkpoint() -> None:
@@ -372,7 +372,7 @@ async def test_the_ask_user_question_is_scrubbed_in_both_the_outcome_and_the_che
         session_id=SESSION_ID, credentials=_credentials(), user_message="headcount?"
     )
 
-    expected = f"Which {SCHEMA_DETAIL_MARKER} did you mean?"
+    expected = "Which department id did you mean?"
     assert paused.status == "paused_ask_user"
     assert paused.pending_question == {"question": expected, "options": ["Sales", "Engineering"]}
 
@@ -383,7 +383,7 @@ async def test_the_ask_user_question_is_scrubbed_in_both_the_outcome_and_the_che
         # The OPTIONS are untouched: they are the values the user clicks.
         "options": ["Sales", "Engineering"],
     }
-    assert _redactions(events) == [{"redaction_count": 1, "exit": "ask_user_question"}]
+    assert _redactions(events) == []
 
 
 # --- the event ---------------------------------------------------------------
@@ -402,7 +402,7 @@ async def test_the_event_carries_a_count_and_a_label_and_never_a_token() -> None
 
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q?")
 
-    assert _redactions(events) == [{"redaction_count": 3, "exit": "answer_with_text"}]
+    assert _redactions(events) == [{"redaction_count": 2, "exit": "answer_with_text"}]
     blob = repr(events)
     assert "employee_master" not in blob
     assert _BP not in blob

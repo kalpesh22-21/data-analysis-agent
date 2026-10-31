@@ -16,11 +16,12 @@ def case_id(case):
 def test_every_blueprint_projection_has_a_valid_reviewable_presentation(case, variant):
     options = {} if variant == 'native' else {variant: True}
     result = materialize(case, **options)
-    expected = 'table' if variant == 'truncated' or variant == 'null_measure' and case['kind'] == 'bars' else case['kind']
+    expected = 'table' if variant == 'truncated' and case['kind'] in {'figure', 'facts'} else case['kind']
     assert result['rendered'] == expected, result['reasons']
     if expected == 'table' and case['kind'] != 'table':
         assert result['reasons'] and 'shown as a table' in result['reasons'][0]
-    assert result['document']['sources']['audit']['table_ref'].startswith("tbl_")
+    assert result['document']['sources']['audit']['sql'] == 'SELECT synthetic_audit'
+    assert not {'points', 'items', 'value', 'rows'} & result['document']['sections'][0]['presentation'].keys()
     json.dumps(result['document'], allow_nan=False)
 
 
@@ -29,6 +30,6 @@ def test_every_blueprint_projection_has_a_valid_reviewable_presentation(case, va
 def test_temporal_blueprints_accept_reverse_order_and_two_period_comparisons(case, options):
     result = materialize(case, **options)
     assert result['rendered'] == 'line', result['reasons']
-    points = result['document']['sections'][0]['presentation']['points']
-    assert [p['time'] for p in points] == sorted(p['time'] for p in points)
-    assert [p['value'] for p in points] == list(range(1, len(points) + 1))
+    presentation = result['document']['sections'][0]['presentation']
+    assert presentation['x_column'] and presentation['y_column']
+    assert 'points' not in presentation

@@ -671,9 +671,9 @@ FINALIZE_ANSWER_SCHEMA = {
     "name": "finalizeAnswer",
     "description": (
         "Propose one coherent answer document: takeaway and ordered sections. Select exact "
-        "result IDs and returned column names; the backend builds values, never invent them. "
-        "Prefer zero or one visible table. Scalars use figures, charts use supporting_data "
-        "and fallback for their associated table. Extra visible tables require table_reason "
+        "result IDs and returned column names; the UI fetches rows and builds visuals; never invent values. "
+        "Prefer zero or one visible table. Scalars use figures. The UI owns table and CSV options for every data result except figures; do not add a visible table of the same result. "
+        "Extra visible tables require table_reason "
         "explaining distinct requested value. Evidence-only queries stay hidden. Use only "
         "prepared action references. A blocked field needs no section: state its limitation once in takeaway, "
         "retain its evidence, and omit duplicate text sections/caveats. The complete presentation will be reviewed before delivery. "
@@ -682,7 +682,7 @@ FINALIZE_ANSWER_SCHEMA = {
         '"category_column":"<returned category column>","measure_column":"<returned numeric column>",'
         '"label":"Active employees"}. Omit direction/ties for ordinary comparisons. '
         'For compound bar groups use category_columns instead of category_column, preserving all grouping dimensions. '
-        'Line uses kind=line with a temporal category column; the backend orders points chronologically. '
+        'Line uses kind=line with a temporal category column; the UI orders points chronologically. '
         'Figure uses kind, result_id, column and label. Text uses kind=text and markdown. '
         'Do not invent type, axis_labels, value_field, sort_by or client rendering fields.'
     ),

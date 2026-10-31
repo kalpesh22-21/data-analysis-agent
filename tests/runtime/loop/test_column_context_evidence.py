@@ -88,7 +88,7 @@ async def test_unavailable_or_out_of_scope_context_is_not_evidence(change, scope
     assert receipts == []
 
 
-async def test_business_codes_survive_but_metadata_does_not():
+async def test_business_codes_survive_while_metadata_is_humanized():
     store, entry = await fixture()
     receipts = await column_context_evidence(
         [entry], turn_index=1, session_id="s", store=store, column_scope=frozenset()
@@ -96,9 +96,9 @@ async def test_business_codes_survive_but_metadata_does_not():
     text, count = scrub_answer_prose(
         "VAC_CTX uses earn_code and active_earnings.", business_values=business_values(receipts)
     )
-    assert text == "VAC_CTX uses [schema detail withheld] and [schema detail withheld]."
-    assert count == 2
-    assert scrub_answer_prose("OTHER_CTX", business_values=business_values(receipts))[1] == 1
+    assert text == "VAC_CTX uses earn code and active earnings."
+    assert count == 0
+    assert scrub_answer_prose("OTHER_CTX", business_values=business_values(receipts)) == ("OTHER CTX", 0)
 
 
 def test_context_without_api_receipt_fails_closed():

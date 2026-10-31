@@ -33,7 +33,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from ui.entitlements import resolve_caller_identity, resolve_column_scope
 
@@ -228,18 +228,12 @@ class ResumeBody(BaseModel):
 
 
 class QueryPageBody(BaseModel):
-    """`POST /api/query/page` — one page of a turn's designated answer table.
-
-    `sql` is the `answer_sql` the runtime returned on that turn's `result` event, echoed
-    back by the browser. It is NOT trusted on the strength of that echo: the runtime
-    re-parses it and runs it through the SAME scope-enforced dispatch path the agent
-    uses, under the JWT this BFF attaches server-side — so a tampered `sql` can only
-    reach what the same session's own scope already permits.
-    """
+    """SQL creates/reuses a saved result; snapshot_id pages it under session authorization."""
 
     session_id: str
     sql: str | None = None
-    table_ref: str | None = None
+    snapshot_id: str | None = None
+    refresh_of: str | None = None
     limit: int | None = None
     offset: int | None = None
 
@@ -585,12 +579,8 @@ async def query_page(body: QueryPageBody) -> JSONResponse:
     scope denial) reaches the browser's error branch unflattened."""
     jwt = await _jwt_for_session(body.session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": body.session_id}
-    payload = {"limit": body.limit, "offset": body.offset}
-    if body.sql is not None:
-        payload["sql"] = body.sql
-    if body.table_ref is not None:
-        payload["table_ref"] = body.table_ref
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    payload = body.model_dump(exclude={"session_id"}, exclude_none=True)
+    async with httpx.AsyncClient(timeout=150.0) as client:
         try:
             r = await client.post(f"{RUNTIME_URL}/query/page", headers=headers, json=payload)
         except httpx.HTTPError as exc:
@@ -600,6 +590,47 @@ async def query_page(body: QueryPageBody) -> JSONResponse:
     except ValueError:
         content = {"detail": r.text}
     return JSONResponse(status_code=r.status_code, content=content)
+
+
+@app.get("/api/query/snapshots/{snapshot_id}/download-urls")
+async def answer_csv_parts(snapshot_id: uuid.UUID, session_id: str):
+    jwt = await _jwt_for_session(session_id)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"{RUNTIME_URL}/query/snapshots/{snapshot_id}/download-urls",
+            headers={"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id},
+        )
+    return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.get("/api/query/snapshots/{snapshot_id}/download")
+async def download_answer_csv(snapshot_id: uuid.UUID, session_id: str, part: int):
+    jwt = await _jwt_for_session(session_id)
+    client = httpx.AsyncClient(timeout=120.0)
+    try:
+        response = await client.send(client.build_request(
+            "GET", f"{RUNTIME_URL}/query/snapshots/{snapshot_id}/download", params={"part": part},
+            headers={"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id},
+        ), stream=True)
+    except BaseException:
+        await client.aclose()
+        raise
+    if not response.is_success:
+        body = await response.aread()
+        await response.aclose()
+        await client.aclose()
+        return Response(body, status_code=response.status_code, media_type="application/json")
+    async def chunks():
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+    return StreamingResponse(chunks(), media_type="text/csv", headers={
+        "Content-Disposition": response.headers.get("content-disposition", 'attachment; filename="query-export.csv"'),
+        "Cache-Control": "no-store",
+    })
 
 
 # --- review-inbox BFF (UI Slice 2, §3) ---------------------------------------

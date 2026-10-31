@@ -289,8 +289,5 @@ async def test_stop_persists_the_reviewed_terminal_message() -> None:
     await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer="stop")
 
     doc = await store.get_or_create_session(SESSION_ID)
-    assert [m.role for m in doc.messages] == ["user", "user", "user", "assistant"], (
-        "the question and the two resume answers ('EMEA', 'stop') — the resume "
-        "consumes a checkpoint by appending the answer as a user message — and NO "
-        "assistant message"
-    )
+    assert [m.role for m in doc.messages] == ["user", "assistant", "user", "user", "assistant"]
+    assert doc.messages[1].content == "Which region?"

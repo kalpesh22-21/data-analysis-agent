@@ -4,7 +4,6 @@ import json
 from copy import deepcopy
 from uuid import uuid4
 
-from data_agent.runtime.composer import table_reference
 from data_agent.runtime.context.scope_filter import filter_messages
 
 from .memory_store import InMemorySessionStore
@@ -129,8 +128,5 @@ class RefreshStore(InMemorySessionStore):
         message = TurnMessage.from_doc(remap(message.to_doc()))
         document = message.answer_document
         document.update(answer_id=answer_id, revision=expected_revision + 1)
-        for rid, source in document.get("sources", {}).items():
-            if "table_ref" in source:
-                source["table_ref"] = table_reference(self.turn_index, rid)
         trail = [TrailEntry.from_doc(remap(e.to_doc())) for e in entries]
         return message, trail

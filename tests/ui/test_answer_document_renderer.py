@@ -17,33 +17,36 @@ def page():
 def test_document_renderer_charts_missing_points_and_safe_fallback(page):
     page.set_content('<main id="answer"></main>')
     page.add_script_tag(path=str(ROOT / "ui/static/answer-document.js"))
-    page.evaluate("""() => {
+    page.evaluate("""async () => {
+      const source={sql:'SELECT Month, Amount FROM t', column_formats:{Amount:{kind:'currency',currency:'USD'}}};
       const sections = [
-        {title:'Figure',presentation:{kind:'figure',label:'Employees',value:'7'}},
-        {title:'Facts',presentation:{kind:'facts',items:[{label:'Count',value:'7'}]}},
-        {title:'Bars',presentation:{kind:'bars',measure_label:'Employees',items:[{label:'Sales',raw:3,value:'3'},{label:'Engineering',raw:4,value:'4'}]}},
-        {title:'Line',presentation:{kind:'line',measure_label:'Salary',points:[
-          {time:'2026-01-01',label:'Jan',value:1,formatted_value:'1'},
-          {time:'2026-02-01',label:'Feb',value:null,formatted_value:null},
-          {time:'2026-03-01',label:'Mar',value:3,formatted_value:'3'}]}},
-        {title:'Broken',presentation:{kind:'bars',items:[{raw:'3'}]},fallback_table:{result_id:'q'}},
+        {title:'Figure',presentation:{kind:'figure',result_id:'one',column:'Amount',label:'Pay'}},
+        {title:'Facts',presentation:{kind:'facts',result_id:'one',columns:['Amount']}},
+        {title:'Bars',presentation:{kind:'bars',result_id:'bars',x_column:'Month',y_column:'Amount',label:'Pay'}},
+        {title:'Line',presentation:{kind:'line',result_id:'line',x_column:'Month',y_column:'Amount',label:'Pay'}},
+        {title:'Broken',presentation:{kind:'bars',result_id:'broken',x_column:'Month',y_column:'missing',label:'Pay'}},
         {title:'Unavailable',presentation:{kind:'unknown'}},
       ];
-      window.renderAnswerDocument(document.querySelector('main'),{
-        schema_version:1,takeaway:'<img src=x onerror="window.pwned=true">',sections,
-        sources:{q:{table_ref:'opaque'}}
-      }, (parent,ref) => {const el=document.createElement('p');el.textContent='Table '+ref;parent.appendChild(el);});
+      const sources={one:{...source,sql:'one'},bars:{...source,sql:'bars'},line:{...source,sql:'line'},broken:{...source,sql:'broken'}};
+      window.loads=[];
+      await window.renderAnswerDocument(document.querySelector('main'),{
+        schema_version:2,takeaway:'<img src=x onerror="window.pwned=true">',sections,sources
+      }, (parent,sql) => {const el=document.createElement('p');el.textContent='Table '+sql;parent.appendChild(el);}, async source => {
+        window.loads.push(source.sql);
+        return {snapshot_id:'saved',columns:['Month','Amount'],column_formats:{},rows:source.sql==='one'?[['2026-01',7]]:source.sql==='line'?[['2026-01',1],['2026-02',null],['2026-03',3]]:[['2026-01',3],['2026-02',4]],has_more:false};
+      });
     }""")
+    assert page.locator(".answer-section").nth(0).locator("details").count() == 0
+    assert page.locator(".answer-section").nth(1).get_by_text("View data / CSV").count() == 1
     assert page.locator("svg").count() == 2
     assert page.locator("svg").nth(1).locator("circle").count() == 2
-    assert (
-        page.locator("svg").nth(1).locator("line").count() == 1
-    )  # axis only; no bridge across null
-    assert page.get_by_text("Feb: Missing").count() == 1
-    assert page.get_by_text("Table opaque").count() == 1
+    assert page.locator("svg").nth(1).locator("line").count() == 1
+    assert page.get_by_text("2026-02: Missing").count() == 1
     assert page.get_by_text("This view is unavailable.", exact=True).count() == 1
     assert page.locator("img").count() == 0
     assert page.evaluate("window.pwned === undefined")
+    assert page.evaluate("window.loads.filter(x=>x==='one').length") == 1
+    assert page.get_by_text("$7.00", exact=True).count() == 2
 
 
 def test_history_and_refresh_replace_whole_document_without_legacy_fields(page):
@@ -52,7 +55,7 @@ def test_history_and_refresh_replace_whole_document_without_legacy_fields(page):
     from playwright.sync_api import expect
 
     old = {
-        "schema_version": 1,
+        "schema_version": 2,
         "answer_id": "answer-0",
         "revision": 1,
         "takeaway": "Original answer",
@@ -62,11 +65,12 @@ def test_history_and_refresh_replace_whole_document_without_legacy_fields(page):
     fresh = {
         **old,
         "revision": 2,
+        "sources": {"q": {"sql": "SELECT 7 AS n", "column_formats": {"n": {"kind": "integer"}}}},
         "takeaway": "Refreshed answer",
         "sections": [
             {
                 "title": "Headcount",
-                "presentation": {"kind": "figure", "label": "Employees", "value": "7"},
+                "presentation": {"kind": "figure", "result_id": "q", "label": "Employees", "column": "n"},
             }
         ],
     }
@@ -85,6 +89,8 @@ def test_history_and_refresh_replace_whole_document_without_legacy_fields(page):
             request.fulfill(json={"session_id": "test-session"})
         elif path.startswith("/api/history"):
             request.fulfill(json={"turns": [{"question": "Headcount?", "answer_document": old}]})
+        elif path == "/api/query/page":
+            request.fulfill(json={"snapshot_id":"saved","columns":["n"],"rows":[[7]],"has_more":False})
         elif path == "/api/answer/refresh":
             refreshes.append(request.request.post_data_json)
             if len(refreshes) == 1:
@@ -124,3 +130,20 @@ def test_mixed_freshness_does_not_assign_payroll_date_to_live_employee(page):
     page.add_script_tag(path=str(ROOT / 'ui/static/answer-document.js'))
     label = page.evaluate('''() => window.answerFreshnessLabel({retrieved_at:'2026-10-30T12:00:00Z',data_as_of:'2026-10-12T05:30:00Z',freshness:{mode:'mixed',sources:[{table:'dbpcm_warehouse.employee',kind:'live'},{table:'dbpcm_warehouse.payroll',kind:'ingested',data_as_of:'2026-10-12T05:30:00Z'}]}})''')
     assert label == 'employee: live; payroll: data as of 2026-10-12T05:30:00Z'
+
+
+@pytest.mark.parametrize("value,fmt,expected", [
+    (1.5,{"kind":"integer"},"1.5"),
+    ("",{"kind":"number"},""),
+    (True,{"kind":"number"},"true"),
+    ("1.123456789",{"kind":"number"},"1.123456789"),
+    (75039,{"kind":"identifier"},"75039"),
+    ("02108",{"kind":"identifier"},"02108"),
+    ("1766987.30",{"kind":"currency","currency":"USD"},"$1,766,987.30"),
+    (0.25,{"kind":"percent","scale":"ratio"},"25%"),
+    ("9007199254740993",{"kind":"identifier"},"9007199254740993"),
+    (None,{"kind":"integer"},"Not available"),
+])
+def test_source_formatting_preserves_values(page,value,fmt,expected):
+    page.add_script_tag(path=str(ROOT / "ui/static/answer-document.js"))
+    assert page.evaluate("([value,fmt]) => formatAnswerCell(value,fmt)",[value,fmt]) == expected

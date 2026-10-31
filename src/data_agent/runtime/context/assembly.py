@@ -18,6 +18,7 @@ needs `column_scope`, never the JWT.
 
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date
@@ -422,7 +423,17 @@ class ContextAssembler:
                     message.turn_index,
                     message.ts,
                     rank,
-                    {"role": message.role, "content": message.content},
+                    {
+                        "role": message.role,
+                        "content": (
+                            message.content + "\n\nDelivered answer document:\n" + json.dumps(
+                                {k: v for k, v in message.answer_document.items() if k in {"sections", "sources"}},
+                                ensure_ascii=False,
+                            )
+                            if message.role == "assistant" and message.answer_document
+                            else message.content
+                        ),
+                    },
                 )
             )
 

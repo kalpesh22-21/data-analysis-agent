@@ -140,9 +140,18 @@ class RecordingModel:
     def without_thinking(self, kwargs):
         return RecordingModel(self.inner.without_thinking(kwargs), self.state)
 
+    async def format_columns(self, messages, schema, *, model=None):
+        result = await self.inner.format_columns(messages, schema, model=model)
+        self.state["model_calls"].append({"role": "format", "formats": result, "input": messages})
+        return result
+
     async def send_turn(self, messages, tools):
         names = {t["name"] for t in tools}
         agent = "finalizeAnswer" in names
+        if agent:
+            self.state.setdefault("agent_contexts", []).append([
+                m for m in messages if m.get("role") == "assistant" and m.get("content")
+            ])
         if agent and self.state["fault"] == "agent_failure" and self.state["queries"]:
             self.state["injections"].append("agent_failure")
             trace.get_current_span().add_event(
@@ -182,14 +191,49 @@ class RecordingModel:
                         call = replace(call, arguments=args)
                 calls.append(call)
             result = replace(result, tool_calls=calls)
+        fault = self.state["fault"]
+        if agent and fault == "wrong_population" and fault not in self.state["injections"]:
+            calls = []
+            for call in result.tool_calls:
+                args = deepcopy(call.arguments)
+                if call.name == "runBlueprint" and args.get("id") == "bp-active-headcount-by-department":
+                    args["slot_bindings"] = {**args.get("slot_bindings", {}), "employee_status": "Terminated"}
+                    self.state["injections"].append(fault)
+                    trace.get_current_span().add_event("battery.injected_failure", {"fault": fault})
+                    call = replace(call, arguments=args)
+                calls.append(call)
+            result = replace(result, tool_calls=calls)
+        if agent and fault == "question_wording" and fault not in self.state["injections"]:
+            calls = []
+            for call in result.tool_calls:
+                if call.name == "askUser":
+                    args = {**call.arguments, "question": "Should employee_status be Active or On Leave?", "options": ["Active", "On Leave"]}
+                    self.state["injections"].append(fault)
+                    self.state["queries_at_repair"] = len(self.state["queries"])
+                    trace.get_current_span().add_event("battery.injected_failure", {"fault": fault})
+                    call = replace(call, arguments=args)
+                calls.append(call)
+            result = replace(result, tool_calls=calls)
         return result
 
 
 def judge_factory(state):
     class FaultJudge(AnswerJudge):
         async def _review(self, brief, span):
-            state["reviews"].append({"site": brief.site, "document": brief.answer_document})
             fault = state["fault"]
+            if fault in {"wrong_caption", "wrong_takeaway"} and fault not in state["injections"] and brief.answer_document and brief.answer_document.get("sections"):
+                # Inject at the review seam, after intent/finalization gates, so an
+                # earlier draft cannot be superseded before the judge sees the fault.
+                if fault == "wrong_caption":
+                    brief.answer_document["sections"][0]["title"] = "Terminated employees by department"
+                else:
+                    wrong = "There are 999 active employees in the accessible records."
+                    brief.answer_document["takeaway"] = wrong
+                    brief = replace(brief, draft=wrong)
+                state["injections"].append(fault)
+                state["queries_at_repair"] = len(state["queries"])
+                trace.get_current_span().add_event("battery.injected_failure", {"fault": fault})
+            state["reviews"].append({"site": brief.site, "document": deepcopy(brief.answer_document)})
             inject = (
                 fault in {"judge_timeout", "all_reviews_fail", "salvage_chart_type_unsupported"}
                 or fault == "judge_reject"
@@ -252,7 +296,7 @@ def events(body):
     return frames
 
 
-async def run_case(name, question, fault, settings, *, resume_answer=None, refresh=False):
+async def run_case(name, question, fault, settings, *, resume_answer=None, refresh=False, followup_question=None, truth_sql=None):
     # Each sequential case owns a fresh app/provider. Do not leave the global SDK
     # instrumentor attached to the preceding case's shut-down exporter.
     instrumentor = OpenAIInstrumentor()
@@ -366,6 +410,19 @@ async def run_case(name, question, fault, settings, *, resume_answer=None, refre
                         and refreshed.get("revision") == prior["revision"] + 1
                         and any(t.get("answer_document") == refreshed for t in history.get("turns", []))
                     )
+                if settings.clickhouse_api_rest_base() and outcome.get("answer_document"):
+                    from _ui_contract_probe import verify_saved_results
+                    state["transport_checks"], state["saved_results"] = await verify_saved_results(
+                        client, headers, outcome["answer_document"])
+                if followup_question and outcome.get("status") == "done":
+                    state["first_turn_document"] = deepcopy(outcome.get("answer_document"))
+                    outcome = await exchange("/turn", {"message": followup_question})
+                if truth_sql:
+                    oracle = RealMCPClient(settings.mcp_url)
+                    oracle.scope_token_provider = warehouse.scope_token_provider
+                    state["independent_truth"] = await oracle.call_tool(
+                        "runQuery", {"sql": truth_sql}, jwt=token, session_id=sid)
+                    state["truth_sql"] = truth_sql
                 if name == "scalar" and outcome.get("status") == "done":
                     outcome = await exchange(
                         "/turn", {"message": "And how many of those are in Sales?"}
@@ -417,9 +474,34 @@ async def run_case(name, question, fault, settings, *, resume_answer=None, refre
         and all(s.context.trace_id in root_ids for s in emitted),
         "model_spans_present": any(s.name in {"Response", "ChatCompletion"} for s in spans),
     }
+    from _ui_contract_probe import validate_document
+    try:
+        validate_document(outcome.get("answer_document", {}), {q["sql"] for q in state["queries"]})
+        checks["schema_v2_sql_only_contract"] = True
+    except (AssertionError, KeyError, TypeError) as exc:
+        checks["schema_v2_sql_only_contract"] = False
+        state["contract_error"] = str(exc)
+    checks.update(state.get("transport_checks", {}))
+    checks["trace_matches_terminal_response"] = len(emitted) == len(result_frames) and all(
+        json.loads(span.attributes.get("output.value", "null")) == frame["data"]
+        for span, frame in zip(emitted, result_frames, strict=True))
     if fault in {"judge_reject", "invalid_source", "question_reject"}:
         checks["fault_exercised"] = fault in state["injections"]
         checks["approved_after_repair"] = outcome.get("review", {}).get("status") == "approved"
+    if fault in {"wrong_takeaway", "wrong_caption", "question_wording"}:
+        checks["fault_exercised"] = fault in state["injections"]
+        corrections = [c.get("arguments", {}) for m in state["model_calls"] for c in m.get("calls", []) if c.get("name") == "record_judgement"]
+        key = {"wrong_takeaway": "corrected_answer", "wrong_caption": "corrected_document", "question_wording": "corrected_question"}[fault]
+        checks["judge_corrected_directly"] = any(c.get("approved") is True and c.get(key) for c in corrections)
+        checks["no_salvage_for_correction"] = state["salvage_calls"] == 0
+        if fault != "question_wording" and not followup_question:
+            checks["correction_reuses_queries"] = len(state["queries"]) == state.get("queries_at_repair")
+    if followup_question:
+        first = state.get("first_turn_document")
+        checks["followup_received_delivered_document"] = bool(first) and any(
+            first["takeaway"] in str(m.get("content", "")) and "Delivered answer document:" in str(m.get("content", ""))
+            for context in state.get("agent_contexts", []) for m in context
+        )
     if refresh:
         checks["atomic_refresh_and_history"] = state.get("refresh_verified", False)
     if fault in {"judge_reject", "invalid_source"}:
@@ -522,7 +604,8 @@ async def main(args):
         otlp_project_name="answer-document-battery",
         otlp_drop_span_names=[],
         otlp_disable_redaction=True,
-        mcp_url="http://localhost:18090/mcp",
+        mcp_url=getattr(args, "mcp_url", "http://localhost:18090/mcp"),
+        clickhouse_api_rest_base_url=getattr(args, "export_base_url", ""),
         mcp_service_key="test-key-abc123",
         jwks_url="http://localhost:19000/.well-known/jwks.json",
         jwt_issuer="http://token:8000/",
@@ -582,7 +665,7 @@ async def main(args):
         question, fault = cases[name]
         print("START", name, flush=True)
         try:
-            result = await run_case(name, question, fault, settings, resume_answer=question_specs.get(name, {}).get("resume_answer", "Sales" if name.startswith("clarification") else None), refresh=question_specs.get(name, {}).get("refresh", False))
+            result = await run_case(name, question, fault, settings, resume_answer=question_specs.get(name, {}).get("resume_answer", "Sales" if name.startswith("clarification") else None), refresh=question_specs.get(name, {}).get("refresh", False), followup_question=question_specs.get(name, {}).get("followup_question"), truth_sql=question_specs.get(name, {}).get("truth_sql"))
         except Exception as exc:
             result = {
                 "case": name,
@@ -628,6 +711,8 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hydrate", action="store_true")
+    parser.add_argument("--mcp-url", default="http://localhost:18090/mcp")
+    parser.add_argument("--export-base-url", default="")
     parser.add_argument("--progress-summaries", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--cases", nargs="+")

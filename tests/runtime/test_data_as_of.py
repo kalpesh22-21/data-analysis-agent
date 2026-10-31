@@ -27,7 +27,6 @@ from tests.runtime.blueprint.test_executor import (
 )
 from tests.runtime.dispatch.test_tool_dispatcher import CATALOG, _credentials
 from tests.runtime.final_answer import answer_arguments
-from tests.runtime.test_query_page import HEADERS, _client
 from tests.runtime.test_session_history import _assistant, _run_query_entry, _user
 
 OLDER = "2026-10-12T06:00:00.000Z"
@@ -163,20 +162,6 @@ def test_history_uses_selected_execution_even_when_sql_is_identical():
     assert [c.get("data_as_of") for c in turn["tool_calls"]] == [OLDER, NEWER, None]
 
 
-@pytest.mark.parametrize("stamp", [NEWER, None])
-def test_page_uses_fresh_dispatch_timestamp(monkeypatch, stamp):
-    raw = {"columns": ["n"], "rows": [[1]], "row_count": 1, "truncated": False}
-    if stamp:
-        raw["data_as_of"] = stamp
-    if stamp:
-        raw["freshness"] = receipt(stamp)
-    client, _ = _client(monkeypatch, scripted={"runQuery": [raw]})
-    response = client.post("/query/page", json={"sql": "SELECT 1 AS n"}, headers=HEADERS)
-    assert response.status_code == 200
-    if stamp:
-        assert response.json()["data_as_of"] == stamp
-    else:
-        assert "data_as_of" not in response.json()
 
 
 async def test_live_answer_and_replay_keep_serving_timestamp():
@@ -271,22 +256,6 @@ async def test_disabled_runtime_discards_incoming_metadata():
     assert "data_as_of" not in result.result_full
 
 
-def test_disabled_environment_hides_page_metadata(monkeypatch):
-    from data_agent.runtime.config import RuntimeSettings
-
-    monkeypatch.setenv("DATA_AS_OF_ENABLED", "false")
-    assert RuntimeSettings(_env_file=None).data_as_of_enabled is False
-    client, _ = _client(
-        monkeypatch,
-        scripted={
-            "runQuery": [
-                {"columns": ["n"], "rows": [[1]], "row_count": 1, "data_as_of": NEWER, "freshness": receipt(NEWER)},
-            ]
-        },
-    )
-    result = client.post("/query/page", json={"sql": "SELECT 1 AS n"}, headers=HEADERS)
-    assert result.status_code == 200
-    assert "data_as_of" not in result.json()
 
 
 def test_disabled_flag_hides_persisted_history_without_mutating_receipts():

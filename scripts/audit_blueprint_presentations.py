@@ -119,7 +119,7 @@ def audit():
         for variant, options in variants:
             result = materialize(case, **options)
             result.pop('document', None)
-            expected = 'table' if options.get('truncated') or options.get('null_measure') and case['kind'] == 'bars' else case['kind']
+            expected = 'table' if options.get('truncated') and case['kind'] in {'figure', 'facts'} else case['kind']
             results.append({k: v for k, v in case.items() if k != 'sql'} | {
                 'variant': variant, 'expected': expected, **result, 'passed': result['rendered'] == expected,
             })
@@ -144,7 +144,7 @@ def write_markdown(path, results):
         'Candidate families: ' + ', '.join(f'{value} {key}' for key, value in sorted(counts.items())) + '.', '',
         '## Adaptations', '',
         '- Compound bar selectors preserve all chosen dimensions as one label, without merging rows.',
-        '- Line points are ordered chronologically as complete value/label pairs; two distinct periods are sufficient.',
+        '- Lines carry x/y column selectors; the UI fetches rows and orders points chronologically.',
         '- Facts accept up to 16 selected fields, including the 12-metric workforce KPI result; underscores in fact labels become spaces.',
         '- The UI object shapes remain unchanged. The agent has a new optional category_columns selector for compound bars.', '',
         '## Deliberate table fallbacks', '',

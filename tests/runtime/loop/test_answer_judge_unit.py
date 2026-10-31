@@ -84,6 +84,17 @@ def _raw_turn(arguments: Any, name: str = JUDGE_TOOL_NAME) -> ModelTurnResult:
 # --- the vocabulary ---------------------------------------------------------
 
 
+def test_repeated_caveat_cannot_block_delivery():
+    verdict = parse_verdict(_raw_turn({
+        "approved": False,
+        "violation": "repeated_caveat",
+        "repair_type": "presentation",
+        "feedback": "Keep the accessible-records caveat once; reuse the results.",
+    }), "exit_table")
+    assert verdict is APPROVED
+    assert "repeated_caveat" not in ANSWER_VIOLATIONS
+
+
 def test_site_selects_the_violation_vocabulary() -> None:
     """The two answer exits share one set; the pause branch has its own. A slug offered at
     the wrong site is not a smaller mistake than an invented one — `non_contextual_question`
@@ -541,3 +552,18 @@ async def test_no_retry_on_a_malformed_response() -> None:
     verdict = await judge.review(_brief())
     assert verdict.approved and not verdict.reviewed
     assert client.calls_made == 1
+
+
+def test_document_correction_is_approved_and_cannot_contain_sql():
+    part = {'takeaway': 'Results.', 'sections': [], 'evidence': []}
+    arguments = {'approved': True, 'violation': '', 'feedback': '', 'repair_type': 'presentation', 'corrected_document': part}
+    assert parse_verdict(_raw_turn(arguments), 'exit_table').corrected_document == part
+    arguments['corrected_document'] = {**part, 'sql': 'SELECT 1'}
+    assert parse_verdict(_raw_turn(arguments), 'exit_table') is APPROVED
+
+
+def test_question_correction_is_only_valid_on_clarification():
+    question = {'question': 'Which department?', 'options': ['Sales', 'Engineering']}
+    arguments = {'approved': True, 'violation': '', 'feedback': '', 'repair_type': 'prose', 'corrected_question': question}
+    assert parse_verdict(_raw_turn(arguments), 'ask_user').corrected_question == question
+    assert parse_verdict(_raw_turn(arguments), 'exit_table') is APPROVED

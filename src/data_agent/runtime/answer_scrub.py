@@ -18,7 +18,8 @@ redact any token that is a column name in this turn's provenance — destroys th
 rule exists to produce, because the catalog carries bare-word columns (`department`,
 `amount`, `status`, `name`) and a correct business answer MUST be able to say "department"
 in a sentence. So the rules match SHAPES ordinary English does not produce: a corpus id, a
-dotted qualification, a snake_case token, a quoted identifier.
+dotted qualification or a quoted identifier. Standalone snake_case tokens are
+humanized by replacing underscores with spaces; this preserves their business meaning.
 
 NEVER REFUSES, NEVER NUDGES, ALWAYS COMPLETES. Unlike the answer-shape gate, this does not
 hand the round back — it redacts in place and the turn finishes, so there is no allowance to
@@ -52,14 +53,13 @@ KNOWN EATEN — false positives accepted with open eyes, not oversights:
   | input                  | output                        |
   |------------------------|-------------------------------|
   | `intranet.company.com` | `[schema detail withheld]`    |
-  | `bp-active_headcount`  | `bp-[schema detail withheld]` |
+  | `bp-active_headcount`  | `bp-active headcount`         |
 
 A URL or hostname is a dotted identifier by SHAPE and neither carve-out reaches it; accepted
 because URLs are rare in answer prose and an internal hostname is closer to infrastructure
 detail than to the answer a user asked for. The second is the BP-UNDERSCORE HYBRID: R1's
 trailing word boundary cannot sit in front of an underscore, so R1 declines the whole token,
-R3 takes the tail, and the result carries the SCHEMA marker plus a surviving `bp-` prefix.
-The id itself is still gone; only the marker's claim and the stub prefix are wrong.
+R3 humanizes the tail and leaves the `bp-` prefix.
 
 OUT OF SCOPE — UNICODE LOOKALIKES. Every rule is ASCII, so a full-width `．` or a Cyrillic
 `а` inside an identifier passes straight through. The model is not the adversary here, the
@@ -84,7 +84,7 @@ SAVED_ANALYSIS_MARKER = "[saved analysis]"
 # deliberately not on the D25 attribute allowlist.
 ANSWER_PROSE_REDACTED_EVENT = "loop_answer_prose_redacted"
 
-# Everything else — a qualified name, a snake_case token, a quoted identifier —
+# Qualified names and quoted bare identifiers
 # is physical schema. The marker is deliberately visible rather than a silent
 # deletion: a user reading "the [schema detail withheld] table" can tell that the
 # agent withheld something and ask, where a silent drop would read as a typo.
@@ -142,7 +142,7 @@ _R2_QUALIFIED = (
 )
 
 # R3 — SNAKE_CASE TOKEN. `employee_master`, `check_detail`. English prose does
-# not contain underscores; SQL identifiers are full of them. Minimum four
+# not contain underscores; humanize these labels instead of hiding their meaning. Minimum four
 # identifier characters overall (the lookahead), so a stray `a_b` in prose is not
 # worth a marker. A leading-underscore token (`_private`) is deliberately NOT
 # matched: the pattern anchors on a letter, and a word-boundary before `_` only
@@ -200,12 +200,12 @@ def scrub_answer_prose(
     text: str | None, *, provenance: frozenset[tuple[str, str]] | None = None,
     business_values: frozenset[str] = frozenset()
 ) -> tuple[str | None, int]:
-    """Redact identifier-shaped tokens from user-facing prose.
+    """Humanize snake_case labels and redact internal identifiers in prose.
 
         Returns `(scrubbed_text, redaction_count)`. `None` and `""` pass through untouched with a
         count of 0 — an absent answer has nothing to disclose. Deterministic, never raises, and
         never returns `None` for a non-`None` input, since every replacement is a non-empty
-        marker.
+        marker or humanized label.
 
         *provenance* is this turn's `(database.table, column)` USES set — the same frozenset that
         tags the persisted assistant message. It is CONSULTED BY ONE ARM ONLY (R4's double-quoted
@@ -240,6 +240,8 @@ def scrub_answer_prose(
                 return match.group(0)
             count += 1
             return SCHEMA_DETAIL_MARKER
+        if match.group("underscored") is not None:
+            return re.sub(r"_+", " ", match.group(0)).strip()
         count += 1
         return SCHEMA_DETAIL_MARKER
 
@@ -266,8 +268,8 @@ def strip_redundant_identifier_annotations(text: str, *, business_values=frozens
 
     def replace(match):
         identifier = match["identifier"]
-        _, redactions = scrub_answer_prose(match.group(0), business_values=business_values)
-        if not redactions:
+        cleaned, redactions = scrub_answer_prose(match.group(0), business_values=business_values)
+        if not redactions and cleaned == match.group(0):
             return match.group(0)
         expected = words(identifier.rsplit(".", 1)[-1].replace("_", " "))
         preceding = re.search(r"[A-Za-z]+(?:[ \t]+[A-Za-z]+)*$", text[:match.start()])

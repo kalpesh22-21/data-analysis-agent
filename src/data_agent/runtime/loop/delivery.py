@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import wraps
 
 import httpx
@@ -24,6 +24,7 @@ class DeliveryContext:
     terminal_reserve_seconds: float = 0.0
     partial_review_attempted: bool = False
     review_failure_reason: str = ""
+    result_formats: dict = field(default_factory=dict)
     recovery_accum: object = None
     recovery_draft: str = ""
     recovery_completion: str = "partial"

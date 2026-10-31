@@ -95,13 +95,8 @@ from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
+from data_agent.runtime.provenance.answer_formats import AnswerFormatter
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
-from data_agent.runtime.query_page import (
-    QueryPageError,
-    build_page_sql,
-    clamp_page_params,
-    page_rows,
-)
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -155,18 +150,6 @@ class ResumeRequest(BaseModel):
     answer: str
 
 
-class QueryPageRequest(BaseModel):
-    """`POST /query/page` — one page of the model-designated answer table.
-
-    `limit`/`offset` are permissive (`Any`, clamped by `clamp_page_params`) rather
-    than validated ints: a bad paging param is UI plumbing, not a reason to 422 a
-    user's scroll. Supply exactly one approved `table_ref` or generic `sql`.
-    """
-
-    sql: str | None = None
-    table_ref: str | None = None
-    limit: Any = None
-    offset: Any = None
 
 
 def _extract_credentials(
@@ -261,15 +244,14 @@ async def _stream_turn(
             )
             return
 
-        yield _format_sse(
-            "result", _outcome_to_dict(outcome)
-        )
+        response = _outcome_to_dict(outcome)
+        yield _format_sse("result", response)
         if delivery_observer:
             # The worker's agent.turn has ended; retain its parentage for delivery.
             context = tracing.context_from_traceparent(outcome.delivery_traceparent)
             token = otel_context.attach(context) if context is not None else None
             try:
-                delivery_observer("loop_response_emitted", {"status": outcome.status})
+                delivery_observer("loop_response_emitted", {"status": outcome.status, "response": response})
             finally:
                 if token is not None:
                     otel_context.detach(token)
@@ -659,11 +641,7 @@ def create_app(
         )
 
     def _build_dispatcher(observer: ToolObserver) -> ToolDispatcher:
-        """The ONE `ToolDispatcher` construction, shared by the agent loop and the
-        `/query/page` endpoint. Extracted so the paging endpoint provably runs the
-        SAME enforced path the model does — same catalog provider, same scope
-        enforcement, same denial mapping, same telemetry — rather than a
-        near-identical copy that could drift apart from it."""
+        """Construct the agent's scoped tool dispatcher; UI paging uses the snapshot proxy."""
         return ToolDispatcher(
             mcp_client,
             catalog_provider,
@@ -974,6 +952,14 @@ def create_app(
                 if judge_model_client is not None
                 else None
             ),
+            answer_formatter=(
+                AnswerFormatter(
+                    model_client, model=settings.answer_format_model,
+                    timeout=settings.answer_format_timeout_seconds, tracer=tracer,
+                )
+                if settings.answer_format_enabled and callable(getattr(model_client, "format_columns", None))
+                else None
+            ),
             judge_catalog=catalog_provider,
             answer_judge_review_budget_seconds=settings.answer_judge_review_budget_seconds,
             answer_judge_min_headroom_seconds=settings.answer_judge_min_headroom_seconds,
@@ -1000,15 +986,7 @@ def create_app(
                 await asyncio.to_thread(tracing.shutdown_tracing, tracer_provider)
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
-    async def _resolve_snapshot_table(credentials, table_ref):
-        from data_agent.runtime.answer_access import resolve_table
-
-        credentials = await _session_credentials(credentials)
-        doc = await session_store.get_or_create_session(credentials.session_id)
-        return await resolve_table(doc, table_ref, credentials, session_store)
-
-    app.include_router(export_router(settings, _extract_credentials, session_catalog,
-                                    resolve_table_sql=_resolve_snapshot_table))
+    app.include_router(export_router(settings, _extract_credentials, session_catalog))
 
 
     # Readiness gate (singleton-hydrator redesign): an UNAUTHENTICATED probe the runtime
@@ -1328,87 +1306,7 @@ def create_app(
         except PermissionError:
             return JSONResponse(status_code=404, content={"error": "The prepared action is unavailable."})
 
-    @app.post("/query/page")
-    async def query_page(
-        body: QueryPageRequest,
-        authorization: str | None = Header(default=None),
-        x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
-    ) -> JSONResponse:
-        """Execute the model-designated `answer_sql` and return ONE page of rows.
-
-        This replaced the fixed ~20-row `ResultPreview` the user could not page past: the
-        model designates the answer query and the UI pages through it here.
-
-        It adds NO authority. The query runs through the SAME
-        `ToolDispatcher.dispatch("runQuery", ...)` the model uses, with THIS caller's
-        credentials, so column scope (D57/D80), read-only enforcement, row caps, denial
-        mapping and provenance capture are the identical code path — a designated query can
-        never read a column the same caller could not already reach by asking the agent.
-
-        Paging is applied by WRAPPING the SQL via sqlglot, never by splicing a LIMIT onto
-        model text, which also rejects multi-statement and non-SELECT payloads before
-        dispatch. A rejection is a 400 with a STATIC message — never the offending SQL, never
-        a raw parser message. A denial from the MCP is returned as the dispatcher's own
-        canned `user_message`, exactly as the model would have seen it.
-        """
-        credentials = _extract_credentials(
-            authorization=authorization, session_id=x_session_id, settings=settings
-        )
-        credentials = await _session_credentials(credentials)
-        limit, offset = clamp_page_params(body.limit, body.offset)
-        try:
-            if bool(body.sql) == bool(body.table_ref):
-                raise HTTPException(400, detail="Supply exactly one of table_ref or sql.")
-            sql = body.sql
-            if body.table_ref:
-                from data_agent.runtime.answer_access import resolve_table
-                doc = await session_store.get_or_create_session(credentials.session_id)
-                try:
-                    resolved = await resolve_table(doc, body.table_ref, credentials, session_store)
-                    sql = resolved["sql"]
-                except PermissionError:
-                    raise HTTPException(404, detail="The selected answer data is unavailable.") from None
-            page_sql = build_page_sql(sql, limit=limit, offset=offset)
-        except QueryPageError as exc:
-            return JSONResponse(status_code=400, content={"error": str(exc)})
-
-        dispatcher = _build_dispatcher(_tracing_observer)
-        result = await dispatcher.dispatch("runQuery", {"sql": page_sql}, credentials)
-        if result.status != "ok" or result.result_preview is None:
-            # Denied/errored: surface the dispatcher's canned, PII-safe message —
-            # the same one the model would have received. Never the raw backend text.
-            return JSONResponse(
-                status_code=403 if result.status == "denied" else 502,
-                content={
-                    "error": result.user_message or "The query could not be run.",
-                    "error_code": result.error_code,
-                },
-            )
-        preview = result.result_preview
-        # Rows come from `result_full`, NOT `preview.preview_rows`: the preview is
-        # truncated to `preview_row_count` (the MODEL-CONTEXT cap, default 20), which
-        # silently capped every page at 20 rows and — via `has_more` below — made the
-        # rest of the table unreachable at any page size above it. `result_full` is the
-        # same authorized result, bounded by our own wrapped LIMIT. Columns still come
-        # from the preview: that field is a shape, never row-truncated.
-        rows = page_rows(result.result_full, preview.preview_rows, limit=limit)
-        return JSONResponse(
-            content={
-                "columns": list(preview.columns),
-                "rows": rows,
-                "limit": limit,
-                "offset": offset,
-                # `has_more` is a HINT derived from a full page, not a total count:
-                # counting all rows would mean a second aggregate query per page.
-                # The UI shows "next" while a page comes back full.
-                "has_more": len(rows) >= limit,
-                **({"data_as_of": result.data_as_of} if result.data_as_of is not None else {}),
-                **({"freshness": result.freshness} if result.freshness is not None else {}),
-                **({"retrieved_at": result.retrieved_at} if result.retrieved_at is not None else {}),
-            }
-        )
-
     return app
 
 
-__all__ = ["QueryPageRequest", "ResumeRequest", "TurnRequest", "create_app"]
+__all__ = ["ResumeRequest", "TurnRequest", "create_app"]

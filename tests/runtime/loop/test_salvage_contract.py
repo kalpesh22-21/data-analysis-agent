@@ -346,7 +346,6 @@ async def test_salvage_materializes_selected_visual_and_persists_it(kind, select
 
     section = recovery_sections(['q'])[0]
     section['presentation'] = {'kind': kind, 'result_id': 'q', **selectors}
-    section['supporting_data'] = True
 
     class VisualJudge(Judge):
         async def salvage(self, brief):
@@ -361,11 +360,12 @@ async def test_salvage_materializes_selected_visual_and_persists_it(kind, select
     assert out.review['completion'] == 'full'
     rendered = out.answer_document['sections'][0]
     assert rendered['presentation']['kind'] == kind
-    assert rendered['supporting_table'] == {'result_id': 'q'}
-    assert out.answer_document['sources']['q']['table_ref'].startswith("tbl_")
+    assert 'supporting_table' not in rendered
+    assert out.answer_document['sources']['q']['sql']
     assert len(mcp.calls) == 1
     doc = await store.get_or_create_session(CREDS.session_id)
     assert doc.messages[-1].answer_document == out.answer_document
+
 
 
 @pytest.mark.parametrize('patch', [
@@ -380,13 +380,11 @@ async def test_salvage_schema_rejects_contradictory_completion(patch):
         await judge.salvage(JudgeBrief('exit_table', 'Show a chart'))
 
 
-@pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("approved", [False, True])
-async def test_salvage_falls_back_to_table_and_reviews_exact_document(fallback, approved):
+async def test_salvage_falls_back_to_table_and_reviews_exact_document(approved):
     section = recovery_sections(['q'])[0]
-    section['fallback'] = fallback
     section['presentation'] = {'kind': 'bars', 'result_id': 'q', 'category_column': 'Department',
-                               'measure_column': 'n', 'label': 'Employees'}
+                               'measure_column': 'Department', 'label': 'Employees'}
 
     class VisualJudge(Judge):
         async def approve_presentation_fallback(self, brief):
@@ -402,7 +400,7 @@ async def test_salvage_falls_back_to_table_and_reviews_exact_document(fallback, 
     out = await run(loop)
     candidate = judge.briefs[-1].answer_document
     assert candidate['sections'][0]['presentation']['kind'] == 'table'
-    assert any('shown as a table' in c and 'complete result' in c for c in candidate['sections'][0]['caveats'])
+    assert any('shown as a table' in c and 'distinct category' in c for c in candidate['sections'][0]['caveats'])
     assert len(mcp.calls) == 1
     assert ('loop_recovery_fallback_reviewed', {'status': 'approved' if approved else 'rejected'}) in events
     if approved:
@@ -425,6 +423,7 @@ async def test_fallback_approval_uses_non_reasoning_model_and_exact_document():
 
 async def test_missing_source_keeps_verified_partial_answer_and_blocks_repeat():
     import json
+
     from data_agent.runtime.mcp.client import MCPToolError
     from tests.runtime.dispatch.test_source_availability import DETAIL
 

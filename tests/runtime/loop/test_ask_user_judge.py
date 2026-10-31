@@ -473,3 +473,36 @@ async def test_prequery_clarification_receives_authoritative_catalog_defaults():
     assert brief.sql_executed == ()
     table = brief.evidence_package["catalog"]["tables"][0]
     assert table["rules"][0]["predicate"] == "status = 'A'"
+
+
+async def test_judge_rewrites_necessary_clarification_without_agent_round():
+    corrected = {'question': _HUMAN_QUESTION, 'options': ['Annual salary', 'Hourly rate']}
+    judge = _ScriptedJudge([JudgeVerdict(True, reviewed=True, repair_type='prose', corrected_question=corrected)])
+    loop, store, events, model = _build([_turn(_ask(_SCHEMA_QUESTION)), _turn(_ask('Which employees should I include?', call_id='a2'))], judge)
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message='Show compensation in Sales')
+    assert outcome.status == 'paused_ask_user'
+    assert outcome.pending_question == corrected
+    assert model.calls_made == 1
+    assert not store.claims
+
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert doc.pause_checkpoint.pending_question == corrected
+    assert doc.messages[-1].content == _HUMAN_QUESTION + '\nOptions: Annual salary; Hourly rate'
+    await loop.resume(session_id=SESSION_ID, credentials=_credentials(), answer='Annual salary')
+    previous = [m.get('content', '') for m in model.calls[1].messages if m.get('role') == 'assistant']
+    assert any(_HUMAN_QUESTION in str(text) for text in previous)
+    assert not any(_SCHEMA_QUESTION in str(text) for text in previous)
+
+
+async def test_approved_snake_case_question_is_humanized_and_persisted():
+    judge = _ScriptedJudge([APPROVED])
+    loop, store, _, model = _build([
+        _turn(_ask("Should employee_status be Active or On Leave?", options=["Active", "On Leave"]))
+    ], judge)
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="Which employees should I include?"
+    )
+    expected = {"question": "Should employee status be Active or On Leave?", "options": ["Active", "On Leave"]}
+    assert outcome.pending_question == expected
+    assert (await store.get_or_create_session(SESSION_ID)).pause_checkpoint.pending_question == expected
+    assert model.calls_made == 1

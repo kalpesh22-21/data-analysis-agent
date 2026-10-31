@@ -235,3 +235,58 @@ async def test_approved_presentation_survives_normalization_and_reaches_history(
     assert out.assistant_text == normalize_approved_text(text, provenance=frozenset(), has_tables=True)
     assert (await store.get_or_create_session(CREDS.session_id)).messages[-1].content == out.assistant_text
     assert not any(name == "loop_answer_judge_refused" for name, _ in events)
+
+
+def rejected_takeaway_correction():
+    """Shape from Phoenix trace aafdd070a40fd1ee45e78121825ee055."""
+    return response(
+        approved=False,
+        violation="internal_process_narration",
+        feedback="Remove processed-to-date freshness claims from the takeaway and section caveat; preserve the payment-date basis and existing result.",
+        corrected_answer="There are 120 employees in the accessible records.",
+        intent_id="i1",
+        result_ids=["q"],
+    )
+
+
+@pytest.mark.parametrize("allow_correction", [True, False])
+async def test_narration_rejection_does_not_block_or_apply_unapproved_replacement(allow_correction):
+    raw = rejected_takeaway_correction()
+    events = []
+    client = ScriptedModelClient([raw])
+    judge = AnswerJudge(client, token_budget=100000, observer=lambda e, p: events.append((e, p)))
+    verdict = await judge.review(
+        JudgeBrief("exit_table", "Headcount?", allow_prose_correction=allow_correction)
+    )
+    assert verdict.reviewed and verdict.approved
+    assert verdict.corrected_answer is None
+    assert verdict.violation == ""
+    assert raw.tool_calls[0].arguments["corrected_answer"] is not None
+    assert client.calls_made == 1
+    assert not any(e == "loop_answer_judge_failed" for e, _ in events)
+    assert any(p.get("outcome") == "approved" and p.get("reviewed") for _, p in events)
+
+
+async def test_judge_correction_repairs_caveat_without_query_or_agent_round():
+    from tests.runtime.test_answer_document import final as document_final
+    from tests.runtime.test_answer_document import section
+
+    bad_section = {**section(), "caveats": ["Data through the current date."]}
+    judge_client = ScriptedModelClient([_raw_turn({
+        "approved": True, "violation": "", "feedback": "", "repair_type": "presentation",
+        "corrected_document": {"takeaway": "There are 120 employees in the accessible records.",
+                               "sections": [section()], "evidence": ["q"]},
+    })])
+    judge = AnswerJudge(judge_client, token_budget=100000)
+    loop, store, model, mcp, events = build([
+        discovery(), query(),
+        document_final(bad_section, takeaway="There are 120 employees, processed to date."),
+    ], judge)
+    out = await run(loop)
+    assert out.review["status"] == "approved"
+    assert out.answer_document["takeaway"] == "There are 120 employees in the accessible records."
+    assert out.answer_document["sections"][0]["caveats"] == []
+    assert len(mcp.calls) == 1 and model.calls_made == 3 and judge_client.calls_made == 1
+    assert not any("salvage" in name for name, _ in events)
+    doc = await store.get_or_create_session(CREDS.session_id)
+    assert doc.messages[-1].answer_document == out.answer_document

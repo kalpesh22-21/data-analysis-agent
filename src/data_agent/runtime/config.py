@@ -367,6 +367,9 @@ class RuntimeSettings(BaseSettings):
         description="Provider tool-choice mode. Use auto for thinking endpoints that reject required; runtime finalization remains enforced.",
     )
     openai_model: str = Field("gpt-4.1", description="Model name for Responses/Chat Completions.")
+    answer_format_enabled: bool = True
+    answer_format_model: str = ""  # Empty uses the main endpoint/model without reasoning.
+    answer_format_timeout_seconds: float = Field(8.0, gt=0, le=30)
     openai_base_url: str = Field("", description="Optional OpenAI-compatible base URL override.")
     model_context_window: int = Field(
         128_000,

@@ -2,7 +2,6 @@
 
 import pytest
 
-from data_agent.runtime.answer_access import resolve_table
 from data_agent.runtime.composer import PresentationError, proposal_to_internal
 from data_agent.runtime.loop.answer_judge import JudgeVerdict
 from tests.runtime.test_harness_improvements import (
@@ -43,10 +42,9 @@ async def test_approved_document_persisted_and_table_authorized():
     doc = await store.get_or_create_session(CREDS.session_id)
     assert doc.messages[-1].answer_document == out.answer_document
     assert judge.briefs[0].answer_document["sections"] == out.answer_document["sections"]
-    ref = out.answer_document["sources"]["q"]["table_ref"]
-    assert await resolve_table(doc, ref, CREDS, store)
-    with pytest.raises(PermissionError):
-        await resolve_table(doc, "0:unselected", CREDS, store)
+    from tests.runtime.test_harness_improvements import SQL
+    assert out.answer_document["sources"]["q"]["sql"] == SQL
+    assert "table_ref" not in out.answer_document["sources"]["q"]
     assert len(mcp.calls) == 1
 
 
@@ -58,7 +56,8 @@ async def test_figure_exact_values_without_visible_table():
     assert out.review["status"] == "approved"
     presentation = out.answer_document["sections"][0]["presentation"]
     assert presentation["kind"] == "figure"
-    assert presentation["value"] == "120"
+    assert presentation["column"] == "n"
+    assert "value" not in presentation
 
 
 async def test_presentation_repair_reuses_result():
@@ -115,8 +114,8 @@ def test_ranks_use_ties_without_reordering_or_aggregation(ties, expected):
         ["Department", "n"],
         [["Sales", 10], ["Finance", 10], ["Operations", 4]],
     )
-    assert [i["rank"] for i in result["items"]] == expected
-    assert [i["raw"] for i in result["items"]] == [10, 10, 4]
+    assert result["ranking"] == {"direction": "descending", "ties": ties}
+    assert "items" not in result
 
 
 def test_line_preserves_missing_values_when_normalizing_period_order():
@@ -131,14 +130,13 @@ def test_line_preserves_missing_values_when_normalizing_period_order():
     }
     rows = [["2026-01-01", 1], ["2026-02-01", None], ["2026-03-01", 3]]
     rendered = _visual(plan, ["Date", "n"], rows)
-    assert rendered["points"][1]["value"] is None
+    assert rendered["x_column"] == "Date"
+    assert "points" not in rendered
     assert _visual(plan, ["Date", "n"], rows[::-1]) == rendered
 
 
-@pytest.mark.parametrize("fallback", [False, True])
-async def test_partial_result_automatically_falls_back_before_judge_review(fallback):
+async def test_partial_preview_does_not_limit_ui_chart():
     choice = section("bars", category_column="Department", measure_column="n", label="Employees")
-    choice["fallback"] = fallback
     judge = Judge()
     loop, _, _, mcp, _ = build(
         [discovery(), query(), final(choice)],
@@ -153,10 +151,9 @@ async def test_partial_result_automatically_falls_back_before_judge_review(fallb
         ],
     )
     out = await run(loop)
-    assert out.answer_document["sections"][0]["presentation"]["kind"] == "table"
-    assert "fallback_table" not in out.answer_document["sections"][0]
+    assert out.answer_document["sections"][0]["presentation"]["kind"] == "bars"
     assert judge.briefs[0].answer_document["sources"]["q"]["completeness"] == "partial"
-    assert any("shown as a table" in c for c in judge.briefs[0].answer_document["sections"][0]["caveats"])
+    assert not judge.briefs[0].answer_document["sections"][0]["caveats"]
     assert len(mcp.calls) == 1
 
 
@@ -179,22 +176,21 @@ async def test_prose_correction_keeps_document_and_receipt_consistent():
     assert doc.messages[-1].answer_document == out.answer_document
 
 
-async def test_current_scope_cannot_resolve_previously_approved_table():
-    from dataclasses import replace
-
+async def test_current_scope_hides_previously_approved_sql():
+    from data_agent.runtime.session_history import project_history
     loop, store, _, _, _ = build([discovery(), query(), final(section())], Judge())
-    out = await run(loop)
+    await run(loop)
     doc = await store.get_or_create_session(CREDS.session_id)
-    narrowed = replace(CREDS, column_scope=frozenset({"hr.employee.Salary"}))
-    with pytest.raises(PermissionError):
-        await resolve_table(doc, out.answer_document["sources"]["q"]["table_ref"], narrowed, store)
+    history = project_history(doc.messages, doc.tool_trail, frozenset({"hr.employee.Salary"}), None)
+    assert "answer_document" not in history["turns"][0]
+
 
 
 def test_excluded_result_drops_dependent_section_and_fallback():
     from data_agent.runtime.loop.proposal import filter_excluded_components
 
     proposed = proposal_to_internal(
-        {"takeaway": "Counts", "sections": [{**section(), "fallback": False}]}
+        {"takeaway": "Counts", "sections": [section()]}
     )
     filtered = filter_excluded_components(proposed, [{"result_id": "q", "kind": "warehouse"}])
     assert filtered["sections"] == []
@@ -282,12 +278,9 @@ async def test_multiple_requested_results_keep_order_scope_and_snapshot_bindings
     document = out.answer_document
     assert [s["title"] for s in document["sections"]] == ["Total", "Departments"]
     assert [s["presentation"]["result_id"] for s in document["sections"]] == ["total", "q"]
-    doc = await store.get_or_create_session(CREDS.session_id)
-    assert (
-        (await resolve_table(doc, document["sources"]["total"]["table_ref"], CREDS, store))["sql"]
-        == total_sql
-    )
-    assert (await resolve_table(doc, document["sources"]["q"]["table_ref"], CREDS, store))["sql"] == SQL
+    assert document["sources"]["total"]["sql"] == total_sql
+    assert document["sources"]["q"]["sql"] == SQL
+
 
 
 @pytest.mark.parametrize("selector", [{"sql": "SELECT 1"}, {"blueprint_id": "unexecuted"}])
@@ -357,22 +350,19 @@ def test_chart_accepts_serialized_decimals_and_preserves_display_precision(kind)
         ["month", "amount"],
         [["2026-01-01", "1100.00"], ["2026-02-01", "1200.25"], ["2026-03-01", "0.00"]],
     )
-    if kind == "line":
-        assert visual["points"][0]["value"] == 1100
-        assert visual["points"][0]["formatted_value"] == "1100.00"
-    else:
-        assert visual["items"][0]["raw"] == 1100
-        assert visual["items"][0]["value"] == "1100.00"
+    assert visual["x_column"] == "month" and visual["y_column"] == "amount"
+    assert not {"points", "items", "value", "formatted_value"} & visual.keys()
+
 
 
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "1,200.00", "9007199254740993", "0.1234567890123456789", True])
-def test_chart_rejects_ambiguous_or_lossy_numbers(value):
+def test_chart_does_not_coerce_cells_before_ui_fetch(value):
     from data_agent.runtime.composer import _visual
 
-    with pytest.raises(PresentationError):
-        _visual({"kind": "bars", "result_id": "q", "category_column": "category",
+    result = _visual({"kind": "bars", "result_id": "q", "category_column": "category",
                  "measure_column": "amount", "label": "Amount"},
                 ["category", "amount"], [["Sales", value]])
+    assert result["y_column"] == "amount" and "items" not in result
 
 
 @pytest.mark.parametrize("value", ["12 employees", "NaN", True, None, 2**53 + 1, {"amount": 12}])
@@ -386,10 +376,10 @@ async def test_unsupported_chart_cell_delivers_exact_reviewed_table_without_quer
     out = await run(loop)
     assert out.review["status"] == "approved"
     approved_sections = judge.briefs[0].answer_document["sections"]
-    assert approved_sections[0]["presentation"] == {"kind": "table", "result_id": "q"}
-    assert any("shown as a table" in c for c in approved_sections[0]["caveats"])
+    assert approved_sections[0]["presentation"]["kind"] == "bars"
+    assert not approved_sections[0]["caveats"]
     assert out.answer_document["sections"] == approved_sections
-    assert out.answer_document["sources"]["q"]["table_ref"] .startswith("tbl_")
+    assert out.answer_document["sources"]["q"]["sql"]
     assert len(mcp.calls) == 1
 
 
@@ -409,7 +399,7 @@ async def test_missing_primary_figure_can_be_repaired_without_querying_again():
     sections = out.answer_document["sections"]
     assert len(sections) == 1
     assert sections[0]["presentation"]["kind"] == "figure"
-    assert sections[0]["presentation"]["value"] == "120"
+    assert sections[0]["presentation"]["column"] == "n"
     assert out.review["status"] == "approved"
     assert len(mcp.calls) == 1
 
@@ -474,3 +464,88 @@ async def test_caveat_deduplication_preserves_distinct_long_qualifications():
     loop, _, _, _, _ = build([discovery(), query(), final(selected)], Judge())
     out = await run(loop)
     assert out.answer_document['sections'][0]['caveats'] == [caveat]
+
+
+@pytest.mark.parametrize("kind,selectors,rows", [
+    ("figure", {"column": "n", "label": "Employees"}, [["Sales", 120]]),
+    ("bars", {"category_column": "Department", "measure_column": "n", "label": "Employees"}, [["Sales", 120], ["Engineering", 40]]),
+    ("line", {"category_column": "Department", "measure_column": "n", "label": "Employees"}, [["2026-01-01", 10], ["2026-02-01", 20]]),
+])
+async def test_ui_can_access_visual_source_without_agent_opt_in(kind, selectors, rows):
+
+    loop, store, _, mcp, _ = build(
+        [discovery(), query(), final(section(kind, **selectors))], Judge(),
+        rows=[{"columns": ["Department", "n"], "rows": rows, "row_count": len(rows), "truncated": False}],
+    )
+    out = await run(loop)
+    assert out.review["status"] == "approved"
+    assert len(out.answer_document["sections"]) == 1
+    rendered = out.answer_document["sections"][0]
+    assert rendered["presentation"]["kind"] == kind
+    assert "supporting_table" not in rendered
+    assert out.answer_document["sources"]["q"]["sql"]
+    assert "table_ref" not in out.answer_document["sources"]["q"]
+    assert len(mcp.calls) == 1
+
+
+
+def test_supporting_data_is_not_an_agent_decision():
+    with pytest.raises(PresentationError, match="supporting_data|declared fields"):
+        proposal_to_internal({
+            "takeaway": "Employees by department.", "evidence": ["q"],
+            "sections": [{**section(), "supporting_data": True}],
+        })
+
+
+async def test_caveats_deduplicate_across_sections_without_erasing_distinct_scope():
+    one = section()
+    one['caveats'] = ['Only 2026 records are included.', 'Only active employees are included.']
+    two = {**section(), 'id':'notes', 'presentation':{'kind':'text','markdown':'Additional coverage.'},
+           'caveats':['ONLY  2026 records are included', 'Only 2025 records are included.', 'On Leave employees are not included.']}
+    loop, _, _, _, _ = build([discovery(), query(), final(one,two)], Judge())
+    out = await run(loop)
+    assert [c for s in out.answer_document['sections'] for c in s['caveats']] == [
+        'Only 2026 records are included.', 'Only active employees are included.',
+        'Only 2025 records are included.', 'On Leave employees are not included.']
+
+
+async def test_judge_corrects_document_without_agent_round_or_query():
+    corrected = section()
+    corrected['title'] = 'Active employees by department'
+    corrected['caveats'] = ['Only accessible employees are included.']
+    replacement = {'takeaway': 'Active employees grouped by department.', 'sections': [corrected], 'evidence': ['q'], 'assumptions': []}
+    judge = Judge([JudgeVerdict(True, reviewed=True, repair_type='presentation', corrected_document=replacement)])
+    draft = {**section(), 'title': 'Uncorrected draft heading'}
+    followup = batch(call('finalizeAnswer', 'followup', takeaway='The active employee breakdown.', sections=[]))
+    loop, store, model, mcp, _ = build([discovery(), query(), final(draft), followup], judge)
+    out = await run(loop)
+    assert out.review['status'] == 'approved'
+    assert out.assistant_text == replacement['takeaway']
+    assert out.answer_document['sections'][0]['title'] == corrected['title']
+    assert out.answer_document['sections'][0]['caveats'] == corrected['caveats']
+    assert len(judge.briefs) == 1
+    assert len(mcp.calls) == 1
+    saved = await store.get_or_create_session(CREDS.session_id)
+    assert saved.messages[-1].answer_document == out.answer_document
+
+    await run(loop, 'What did you just show?')
+    previous = [m['content'] for m in model.calls[3].messages if m.get('role') == 'assistant' and isinstance(m.get('content'), str)]
+    assert any(replacement['takeaway'] in text for text in previous)
+    assert any(corrected['title'] in text and corrected['caveats'][0] in text for text in previous)
+    assert not any('Uncorrected draft heading' in text for text in previous)
+
+
+async def test_judge_correction_cannot_introduce_unexecuted_source():
+    changed = section()
+    changed['presentation']['result_id'] = 'invented'
+    changed['evidence_refs'] = ['invented']
+    judge = Judge([
+        JudgeVerdict(True, reviewed=True, repair_type='presentation', corrected_document={
+            'takeaway': 'Employee counts.', 'sections': [changed], 'evidence': ['invented']}),
+        JudgeVerdict(True, reviewed=True),
+    ])
+    loop, _, _, mcp, _ = build([discovery(), query(), final(section()), final(section(), ident='repaired')], judge)
+    out = await run(loop)
+    assert 'invented' not in out.answer_document['sources']
+    assert len(mcp.calls) == 1
+    assert len(judge.briefs) == 2

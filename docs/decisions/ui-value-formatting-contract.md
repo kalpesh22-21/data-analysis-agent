@@ -17,10 +17,51 @@ through a simple alias. Unknown units do not establish currency or percentage sc
 unknown semantics default to text, never a guess based on an alias or numeric-looking
 string. Unsupported lineage is safe to display as raw text.
 
+## Ad-hoc formatting enrichment
+
+Before answer review, Lane5 batches unresolved columns from selected ad-hoc query
+results into one structured, non-reasoning model call. It receives the question,
+SQL, existing formats and at most three scoped sample rows per result. It cannot
+change data, select presentations, execute tools, or override authored blueprint
+formats or specific semantic formats (currency, identifiers, dates, percentages
+and unit-bearing numbers). Explicit count projections retain integer formatting.
+Bare integer metadata can describe a numeric identifier, so generic text/number/integer
+columns can receive semantic formats.
+Unknown meanings keep their existing formats. Returned entries for non-eligible columns or unrequested
+results are discarded before validating and applying the eligible entries; protected
+formats cannot be overwritten by those extras.
+
+The same call includes read-only currency metadata and source provenance from selected,
+successful results in the current turn, including blueprint results. This lets a derived
+money-per-employee value retain an established currency without reformatting the
+blueprint. Money divided by money remains a ratio; unknown or conflicting currencies
+must not be guessed. This adds no model call or UI field.
+
+The call has an eight-second timeout, no retries, and a request-local cache so
+presentation repairs reuse its result. Failure retains deterministic formats and
+continues delivery. Salvage uses the same enrichment and reviews the materialized
+recovery document before shipping. Formats persist in the approved document and
+stay with the saved answer; they are not sent to snapshot creation or paging. Raw
+evidence receipts remain unchanged.
+
+`ANSWER_FORMAT_ENABLED` defaults to true. `ANSWER_FORMAT_MODEL` optionally selects
+a separate model on the main endpoint; empty uses the agent model. The endpoint
+must support strict JSON-schema responses and non-reasoning execution. GPT-4.1/4o
+are already non-reasoning; other models receive `reasoning_effort: none`.
+`ANSWER_FORMAT_TIMEOUT_SECONDS` controls the bounded timeout. Unsupported endpoints
+fall back to existing formats; Phoenix `answer.format` records applied/fallback
+status and counts, and `loop_response_emitted` records the final UI response.
+
+This adds no UI fields or agent tool arguments. The UI chooses the component from
+`sections[].presentation.kind` and formats its values using
+`sources[result_id].column_formats`. For example,
+`kind: table` chooses the grid, while a `percent` column with `scale: ratio`
+displays raw `0.25` as `25.00%`. The raw value stays `0.25`.
+
 ## Transport
 
-Ordered `columns` remain strings. Query results and snapshot create/page responses
-add `column_formats`, keyed by those exact strings:
+Ordered `columns` remain strings. Execution receipts supply initial `column_formats`,
+keyed by those exact strings; Lane5 stores final formats in the answer source:
 
 ```json
 {
@@ -34,17 +75,25 @@ add `column_formats`, keyed by those exact strings:
 }
 ```
 
-In `answer_document`, the same map is on `sources[result_id].column_formats`.
-Figures and each facts item have an optional `format` and an already formatted
-`value` string. Bars/lines have a measure `format`; bars retain numeric `raw` and a
-formatted `value`, and lines retain numeric/null `value` and `formatted_value`.
-Never parse the formatted display string for chart geometry, sorting or export.
+In answer-document schema 2, the map lives on `sources[result_id].column_formats`,
+alongside exact executed `sql`. Presentations contain kind and column bindings,
+not values or rows. The UI fetches rows through `/query/page` and applies these
+formats consistently to cells, figures, facts, axes and tooltips. Raw rows remain
+unchanged. Optional date/datetime `grain` is year, quarter, month, day or timestamp.
 
-Ember continues to create snapshots with `{table_ref}` and refresh them with
-`{table_ref, refresh_of}`. Lane5 resolves approved SQL and formats server-side;
-Ember must not resubmit format choices. The API persists these formats with the
-snapshot. Paging, idempotent creation, refresh and automatic rebuild preserve them.
-Saved answer documents retain the source formats too.
+Ember posts only source SQL and paging bounds to Lane5 `/query/page`; the response
+contains the first saved page and snapshot ID. Later requests use that snapshot ID.
+Explicit refresh sends SQL and `refresh_of`, at offset zero. Lane5 orchestrates the
+existing clickhouse-api snapshot-create/page endpoints; no API changes are required.
+The UI keeps formats from the saved answer document across pages, reload and refresh.
+CSV part URLs come from the existing `/query/snapshots/{id}/download-urls` endpoint.
+S3 bytes download directly from presigned URLs; authenticated part streams pass
+through Lane5. Do not concatenate parts or expect a full-file download URL.
+
+The UI must show table and CSV options for every data result **except figure**.
+Facts, bars and lines offer View table/Download CSV parts; tables offer CSV alongside
+the grid. Text has no data controls. No agent flags gate these controls. See the
+[v2 UI contract](../ui-answer-document-spec.md).
 
 ## Rendering rules
 
@@ -67,8 +116,7 @@ Unknown or absent metadata uses raw text. Do not guess from names such as “Rat
 from numeric-looking strings, or from database storage types alone.
 
 Use decimal-safe formatting for large integers and decimal strings; do not first
-coerce them through JavaScript Number. Figures/facts and chart exact tooltips can
-use the supplied backend-formatted strings directly. Chart axes may use compact
+coerce them through JavaScript Number. Figures/facts and chart exact tooltips format fetched raw values using the same metadata. Chart axes may use compact
 labels with the same unit and scale; exact tooltips must remain available.
 
 Examples: ZIP `"75039"` → `75039`; ZIP `"02108"` → `02108`; employee count `75039`
@@ -206,8 +254,8 @@ This confirms the local implementation, not the remote branch or deployment.
 ## Exports and validation
 
 CSV cells remain raw, without currency symbols, grouping separators or display
-rounding. Headers include declared units/currency/percentage scale, e.g.
-`Gross Earnings (USD)` and `Denial Rate (ratio)`. Identifier strings retain leading
+rounding. Exports retain the existing snapshot-service headers. UI-only enrichment is not
+forwarded to storage, so do not assume those headers contain its inferred units. Identifier strings retain leading
 zeros in the file; spreadsheet import settings must treat those columns as text.
 
 Invalid authored formats fail blueprint loading. Runtime formatting never

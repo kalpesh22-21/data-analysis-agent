@@ -1,21 +1,21 @@
 """Build the one user-facing answer document from explicit, scope-filtered receipts.
 
-Adapted from the answer-block design: values are host-built, previews must be
-complete for visuals; unsupported presentations become explained tables for judge review.
+The backend selects scoped SQL and validates presentation selectors. The UI
+fetches saved rows and owns value formatting, chart geometry and display fallback.
 Units never authorize arithmetic. There is no implicit execution selection.
 """
 
 from __future__ import annotations
 
-import math
 import re
 from copy import deepcopy
-from hashlib import sha256
 from datetime import date, datetime
 from decimal import Decimal
 
-from data_agent.runtime.answer_scrub import scrub_answer_prose, strip_redundant_identifier_annotations
-from data_agent.runtime.provenance.formats import display_value
+from data_agent.runtime.answer_scrub import (
+    scrub_answer_prose,
+    strip_redundant_identifier_annotations,
+)
 
 
 class PresentationError(ValueError):
@@ -48,7 +48,7 @@ PRESENTATION_SCHEMA = _object(
             "maxItems": 16,
             "uniqueItems": True,
         },
-        "category_column": {**ID, "description": "Bars accept scalar labels, including numbers, booleans and dates. Lines accept ISO dates/timestamps or consistent YYYY, YYYY-Qn, YYYY-MM periods; the backend orders distinct periods chronologically. Not epoch numbers."},
+        "category_column": {**ID, "description": "Bars accept scalar labels, including numbers, booleans and dates. Lines accept ISO dates/timestamps or consistent YYYY, YYYY-Qn, YYYY-MM periods; the UI orders distinct periods chronologically. Not epoch numbers."},
         "category_columns": {"type": "array", "items": ID, "minItems": 2, "maxItems": 6, "uniqueItems": True,
                              "description": "Bars only: exact columns identifying a compound category, e.g. Department and Pay Type. Use instead of category_column; all dimensions are preserved in the label without grouping rows."},
         "measure_column": {**ID, "description": "Numeric column: finite numbers or unformatted decimal/scientific strings. Never currency text, booleans, or inferred percentages. Nulls are gaps in lines; bars require non-null measures."},
@@ -89,13 +89,11 @@ SECTION_SCHEMA = _object(
         "explanation": TEXT,
         "evidence_refs": REFS,
         "presentation": PRESENTATION_SCHEMA,
-        "supporting_data": {"type": "boolean"},
-        "fallback": {"type": "boolean"},
         "caveats": {
             "type": "array",
             "items": TEXT,
             "maxItems": 8,
-            "description": "Required; use [] when there are no caveats.",
+            "description": "Only distinct limitations; use [] when none. Recorded assumptions are added automatically: do not repeat or paraphrase them here.",
         },
         "actions": {
             "description": "Required; use [] when no prepared actions are selected.",
@@ -178,7 +176,7 @@ def proposal_to_internal(raw):
             if rid not in seen:
                 tables.append({"result_id": rid, "caption": section.get("title")})
                 seen.add(rid)
-        elif p.get("result_id") or section.get("supporting_data") or section.get("fallback"):
+        elif p.get("result_id"):
             raise PresentationError(
                 "Text sections cannot select data tables; use a data presentation."
             )
@@ -186,7 +184,7 @@ def proposal_to_internal(raw):
     visible = [s for s in sections if s["presentation"]["kind"] == "table"]
     if len(visible) > 1 and any(not s.get("table_reason", "").strip() for s in visible):
         raise PresentationError(
-            "Prefer zero or one visible table. Justify each visible table with table_reason when more are necessary; otherwise use supporting data."
+            "Prefer zero or one visible table. Justify each visible table with table_reason when more are necessary; otherwise keep only the primary presentation."
         )
     return {
         **raw,
@@ -221,30 +219,6 @@ def _text(value, business_values=frozenset()):
             "Presentation text contains internal identifiers. Use business wording."
         )
     return (clean or "").strip()
-
-
-def _chart_number(value):
-    """Normalize warehouse numeric cells to finite, precision-safe JSON numbers."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise PresentationError("Boolean measures are not numeric counts; select a numeric measure.")
-    if isinstance(value, str):
-        value = value.strip()
-        if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value):
-            raise PresentationError("Chart measures must be numeric; formatted currency or locale-dependent numbers require a numeric column.")
-        value = Decimal(value)
-    if not isinstance(value, (int, float, Decimal)):
-        raise PresentationError("Chart measures must be numeric scalars.")
-    # Apply the same check to native numbers and serialized Decimal/Int64 cells.
-    # UI geometry is a JavaScript number; display strings retain original precision.
-    try:
-        number = float(value)
-        if math.isfinite(number) and abs(number) <= 2**53 - 1 and Decimal(str(number)) == Decimal(str(value)):
-            return number
-    except (OverflowError, ValueError):
-        pass
-    raise PresentationError("The chart value is non-finite or loses precision; use its table.")
 
 
 def _chart_label(value):
@@ -284,28 +258,6 @@ def _chart_period(value):
     return parsed, parsed.isoformat() if grain == "timestamp" else anchor, grain
 
 
-def _format(value):
-    if value is None:
-        return "Not available"
-    if isinstance(value, bool):
-        return "Yes" if value else "No"
-    if isinstance(value, int):
-        return f"{value:,}"
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise PresentationError("A non-finite value cannot be displayed.")
-        return f"{int(value):,}" if value.is_integer() else f"{value:,}"
-    if isinstance(value, Decimal):
-        if not value.is_finite():
-            raise PresentationError("A non-finite value cannot be displayed.")
-        return str(value)
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    if isinstance(value, str):
-        return value
-    raise PresentationError("A structured cell requires a table presentation.")
-
-
 def _index(columns, name):
     if not name or columns.count(name) != 1:
         raise PresentationError(
@@ -323,6 +275,7 @@ def build_document(
     assumptions=(),
     sql_by_id=None,
     business_values=frozenset(),
+    format_overrides=None,
 ):
     """Materialize a candidate for judge review. trail MUST already be scope-filtered."""
     from data_agent.runtime.loop.proposal import evidence_kind
@@ -385,76 +338,63 @@ def build_document(
             )
         preview = entry.result_preview
         columns, rows = list(preview.columns), preview.preview_rows
+        formats = {**preview.column_formats, **(format_overrides or {}).get(rid, {})}
         complete = not preview.truncated and preview.row_count == len(rows)
         source = {
             "retrieved_at": entry.retrieved_at or entry.ts,
-            "column_formats": deepcopy(preview.column_formats),
+            "column_formats": deepcopy(formats),
             "row_count": preview.row_count,
             "completeness": "complete" if complete else "partial",
         }
-        # Opaque handle resolves only through a persisted approved answer + scoped trail.
-        if rid in sql_by_id or entry.tool_name == "runQuery" and entry.args.get("sql"):
-            source["table_ref"] = table_reference(turn_index, rid)
+        sql = sql_by_id.get(rid) or (entry.args.get("sql") if entry.tool_name == "runQuery" else None)
+        if not isinstance(sql, str) or not sql.strip():
+            raise PresentationError("A data presentation needs its exact executed SQL.")
+        source["sql"] = sql
         if entry.freshness is not None:
             source["freshness"] = deepcopy(entry.freshness)
         data_as_of = getattr(entry, "data_as_of", None)
         if data_as_of:
             source["data_as_of"] = data_as_of
         sources[rid] = source
-        for flag, field in (
-            ("supporting_data", "supporting_table"),
-            ("fallback", "fallback_table"),
-        ):
-            if proposed.get(flag):
-                if kind == "table" or "table_ref" not in source:
-                    raise PresentationError(
-                        "Supporting/fallback data needs a pageable source and a non-table primary presentation."
-                    )
-                section[field] = {"result_id": rid}
         if kind == "table":
-            if "table_ref" not in source:
-                raise PresentationError("The selected result has no pageable table.")
             rendered = {"kind": "table", "result_id": rid}
         else:
             try:
-                if not complete or len(rows) > 25:
-                    raise PresentationError(
-                        "A visual requires the complete result, at most 25 rows; select a table without rerunning the query."
-                    )
-                rendered = _visual(p, columns, rows, business_values=business_values, column_formats=preview.column_formats)
+                if kind in {"figure", "facts"} and preview.row_count != 1:
+                    raise PresentationError("Figures and facts require exactly one returned row.")
+                rendered = _visual(p, columns, rows, business_values=business_values, column_formats=formats)
             except PresentationError as exc:
-                if "table_ref" not in source:
-                    raise
                 section["caveats"].append(
                     f"The requested {kind} presentation is shown as a table: {exc}"
                 )
                 rendered = {"kind": "table", "result_id": rid}
-                section.pop("fallback_table", None)
-                section.pop("supporting_table", None)
-        if rendered["kind"] in {"bars", "line"}:
-            fmt = preview.column_formats.get(p.get("measure_column"))
-            if fmt:
-                rendered["format"] = deepcopy(fmt)
+        if rendered["kind"] == "line":
+            column = rendered["x_column"]
+            index = columns.index(column)
+            try:
+                grains = {_chart_period(row[index])[2] for row in rows if row[index] is not None}
+                declared = source["column_formats"].get(column, {})
+                if len(grains) == 1 and declared.get("kind") in {None, "text", "date", "datetime"} and "grain" not in declared:
+                    grain = grains.pop()
+                    source["column_formats"][column] = {
+                        "kind": "datetime" if grain == "timestamp" else "date", "grain": grain,
+                    }
+            except (ValueError, TypeError, PresentationError):
+                pass  # Unknown dates stay as declared; the UI owns parsing/fallback.
         section["presentation"] = rendered
         sections.append(section)
     # Keep one visible occurrence of each recorded interpretation. Only normalize
     # presentation differences; semantic paraphrases are consolidated by the model.
     from data_agent.runtime.composite.record_assumptions import assumption_key, clean_assumptions
     assumptions = clean_assumptions([text(a) for a in (assumptions or ())])
-    keys = {assumption_key(a) for a in assumptions}
     seen = set()
     for section in sections:
         caveats = []
-        local_keys = set()
         for caveat in section["caveats"]:
             key = assumption_key(caveat)
-            if not key or key in local_keys:
+            if not key or key in seen:
                 continue
-            local_keys.add(key)
-            if key in keys:
-                if key in seen:
-                    continue
-                seen.add(key)
+            seen.add(key)
             caveats.append(caveat)
         section["caveats"] = caveats
     remaining = [a for a in assumptions if assumption_key(a) not in seen]
@@ -475,134 +415,46 @@ def build_document(
 
 
 def _visual(p, columns, rows, *, business_values=frozenset(), column_formats=None):
+    """Validate selectors and emit instructions; the UI fetches and renders values."""
     formats = column_formats or {}
-
-    def formatted(value, column):
-        return display_value(value, formats[column]) if column in formats else _format(value)
-
-    kind, rid = p["kind"], p["result_id"]
+    kind = p["kind"]
+    result = {"kind": kind, "result_id": p["result_id"]}
     label = _text(p.get("label", ""), business_values)
-    if any(len(r) != len(columns) for r in rows):
-        raise PresentationError("The result has malformed row widths; use its table.")
-    if kind in {"figure", "facts"}:
-        if len(rows) != 1:
-            raise PresentationError("Figures and facts require exactly one returned row.")
-        if kind == "figure":
-            index = _index(columns, p.get("column"))
-            if not label:
-                raise PresentationError(
-                    "A figure needs a meaningful label including its unit where relevant."
-                )
-            return {
-                "kind": kind,
-                "result_id": rid,
-                "label": label,
-                "value": formatted(rows[0][index], columns[index]),
-                **({"format": formats[columns[index]]} if columns[index] in formats else {}),
-            }
+    if kind == "figure":
+        _index(columns, p.get("column"))
+        result["column"] = p["column"]
+    elif kind == "facts":
         names = p.get("columns", [])
         if not names:
             raise PresentationError("Facts must name the returned columns to display.")
-        return {
-            "kind": kind,
-            "result_id": rid,
-            "items": [
-                {"label": _text(c.replace("_", " "), business_values), "value": formatted(rows[0][_index(columns, c)] , c), **({"format": formats[c]} if c in formats else {})}
-                for c in names
-            ],
-        }
-    category_names = p.get("category_columns") or [p.get("category_column")]
-    xs = [_index(columns, name) for name in category_names]
-    y = _index(columns, p.get("measure_column"))
-    if formats.get(columns[y], {}).get("kind") in {"identifier", "text", "date", "datetime", "boolean"}:
-        raise PresentationError("The selected measure is not a quantitative value; show it in a table.")
-    if y in xs or not rows:
-        raise PresentationError(
-            "The visual needs distinct category and measure columns with rectangular rows."
-        )
-    if not label:
-        raise PresentationError(
-            "A chart needs a meaningful measure label including its unit where relevant."
-        )
-    labels = [" · ".join(_chart_label(r[x]) for x in xs) for r in rows]
-    original_values = [r[y] for r in rows]
-    values = [_chart_number(v) for v in original_values]
-    if len({label.strip() for label in labels}) != len(labels):
-        raise PresentationError(
-            "Chart categories must be distinct non-empty strings; use a table for ambiguous grouping."
-        )
-    if kind == "bars":
-        if any(v is None for v in values):
-            raise PresentationError("Bars require finite numeric values; missing is not zero.")
-        direction = p.get("direction")
-        if bool(direction) != bool(p.get("ties")):
-            raise PresentationError(
-                "For comparison bars, omit both direction and ties and preserve result order. A requested ranking requires both direction and tie policy."
-            )
-        if direction:
-            if values != sorted(values, reverse=direction == "descending"):
-                raise PresentationError(
-                    "Ranking direction contradicts result order. For comparison bars, remove direction and ties to preserve existing rows; do not rerun the query for presentation."
-                )
-        rendered = {
-            "kind": kind,
-            "result_id": rid,
-            "measure_label": label,
-            "mode": "ranking" if direction else "comparison",
-            "items": [],
-        }
-        rank, dense = 0, 0
-        for i, (category, value) in enumerate(zip(labels, values, strict=True)):
-            if i == 0 or value != values[i - 1]:
-                dense += 1
-                rank = dense if p.get("ties") == "dense" else i + 1
-            item = {"label": category, "raw": value, "value": formatted(original_values[i], columns[y])}
-            if direction:
-                item["rank"] = rank
-            rendered["items"].append(item)
-        if direction:
-            rendered["ranking"] = {"direction": direction, "ties": p["ties"]}
-        return rendered
-    if len(rows) < 2:
-        raise PresentationError(
-            "A line chart needs at least two periods and finite values or explicit null gaps."
-        )
-    try:
-        periods = [_chart_period(r[xs[0]]) for r in rows]
-        dates, times, grains = zip(*periods, strict=True)
-        if len(set(grains)) != 1:
-            raise ValueError
-        if len(set(dates)) != len(dates):
-            raise ValueError
-        order = sorted(range(len(dates)), key=dates.__getitem__)
-    except (ValueError, TypeError):
-        raise PresentationError(
-            "Line chart periods must be distinct chronological ISO dates/timestamps or YYYY, YYYY-Qn, YYYY-MM periods of consistent granularity; epoch and locale dates require an explicit date column."
-        ) from None
-    return {
-        "kind": "line",
-        "result_id": rid,
-        "measure_label": label,
-        "points": [
-            {
-                "time": time,
-                "label": t,
-                "value": v,
-                "formatted_value": formatted(raw, columns[y]) if v is not None else None,
-            }
-            for time, t, v, raw in ((times[i], labels[i], values[i], original_values[i]) for i in order)
-        ],
-    }
-
-
-def table_reference(turn_index, result_id):
-    """Stable opaque identity; authorization remains session- and scope-bound."""
-    return "tbl_" + sha256(f"{turn_index}:{result_id}".encode()).hexdigest()
+        for name in names:
+            _index(columns, name)
+        result["columns"] = list(names)
+    else:
+        xs = p.get("category_columns") or [p.get("category_column")]
+        for name in xs:
+            _index(columns, name)
+        measure = p.get("measure_column")
+        _index(columns, measure)
+        if measure in xs or formats.get(measure, {}).get("kind") in {"identifier", "text", "date", "datetime", "boolean"}:
+            raise PresentationError("Select distinct category columns and a quantitative measure, or use a table.")
+        result.update({"x_columns": list(xs)} if len(xs) > 1 else {"x_column": xs[0]})
+        result["y_column"] = measure
+        if kind == "bars":
+            if bool(p.get("direction")) != bool(p.get("ties")):
+                raise PresentationError("Ranking bars require both direction and tie policy.")
+            if p.get("direction"):
+                result["ranking"] = {"direction": p["direction"], "ties": p["ties"]}
+    if kind != "facts":
+        if not label:
+            raise PresentationError("A figure or chart needs a meaningful measure label.")
+        result["label"] = label
+    return result
 
 
 def seal_document(candidate, *, answer_id, generated_at, revision=1):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "answer_id": answer_id,
         "revision": revision,
         "generated_at": generated_at,
