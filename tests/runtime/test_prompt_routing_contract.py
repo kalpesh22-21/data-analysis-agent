@@ -150,8 +150,8 @@ def test_help_and_capability_prompts_agree_with_finalization():
 def test_prompt_is_bounded_and_byte_stable():
     from data_agent.runtime import prompts
 
-    # Includes shared Markdown answer guidance for agent and judge delivery.
-    assert len(AGENT_SYSTEM_PROMPT) < 16000
+    # Includes earnings-source/salvage, MCP deduplication and shared access guidance.
+    assert len(AGENT_SYSTEM_PROMPT) < 18000
     assert importlib.reload(prompts).AGENT_SYSTEM_PROMPT == AGENT_SYSTEM_PROMPT
 
 
@@ -169,5 +169,5 @@ def test_authorized_personal_fields_are_not_refused_for_sensitivity():
     from data_agent.runtime.loop.answer_judge import _system_prompt
 
     assert ACCESS_SCOPE_GUIDANCE in AGENT_SYSTEM_PROMPT
-    for site in ("ask_user", "exit_prose"):
+    for site in ("ask_user", "exit_prose", "exit_table", "exit_capability"):
         assert ACCESS_SCOPE_GUIDANCE in _system_prompt(site)

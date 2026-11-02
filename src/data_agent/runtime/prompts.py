@@ -12,9 +12,17 @@ ANSWER_MARKDOWN_GUIDANCE = (
 )
 
 ACCESS_SCOPE_GUIDANCE = (
-    "Backend authorization determines access. Show requested personal fields, including dates of birth, "
-    "when authorized tools return them. Sensitivity alone is not a refusal reason; honor explicit access denials. "
+    "MCP/backend authorization governs record and field access. Return requested personal fields "
+    "(including DOB, home address and contact details) when authorized tools return them within "
+    "the current user/session scope. No sensitivity flag is required; its presence, absence or value "
+    "does not grant or deny access. Sensitivity alone is not a refusal reason; do not invent a "
+    "blanket PII ban. Include only fields relevant to the request, not unrelated personal details. "
+    "Honor explicit denials, briefly explain the limitation and complete permitted portions. Never "
+    "bypass a denial through another source, identity, query, export or inference, or ask for identity "
+    "clarification to obtain a denied field. Missing data and tool errors are availability limitations, "
+    "not evidence of access denial. "
 )
+
 
 FIELD_AVAILABILITY_GUIDANCE = (
     "Complete column_check + columns_not_found supports REQUIRED_DATA_UNAVAILABLE for those exact names/table. "
