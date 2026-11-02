@@ -355,7 +355,7 @@ def build_document(
             "caveats": [text(v) for v in proposed["caveats"]],
             "actions": [],
         }
-        for key in ("title", "explanation"):
+        for key in ("title", "explanation", "table_reason"):
             if proposed.get(key):
                 section[key] = text(proposed[key])
         for action in proposed["actions"]:

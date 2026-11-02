@@ -774,7 +774,7 @@ def _tool_trail_entry_to_canonical(
             "content": entry["content"],
             "context_kind": "retrieval",
         }
-    elif entry.get("withheld_sentinel"):
+    elif entry.get("withheld_sentinel") or entry.get("historical_delivery"):
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call_id,

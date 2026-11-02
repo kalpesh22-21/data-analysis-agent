@@ -18,7 +18,6 @@ needs `column_scope`, never the JWT.
 
 from __future__ import annotations
 
-import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date
@@ -44,6 +43,7 @@ from data_agent.runtime.session.store import SessionStore
 
 from . import scope_filter
 from .budget import _render_entry
+from .delivered_answer import delivered_answer_entry
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -418,23 +418,14 @@ class ContextAssembler:
         # Dialogue stream (inserted in doc order so identical-key ties are stable).
         for message in in_scope_messages:
             rank = _STREAM_RANK_USER if message.role == "user" else _STREAM_RANK_ASSISTANT
+            historical = delivered_answer_entry(message)
+            if historical is not None:
+                items.append((message.turn_index, message.ts, rank, historical))
+            # Retain the delivered takeaway as dialogue and as the completed-turn
+            # boundary used by request budgeting. Never append document JSON here.
             items.append(
-                (
-                    message.turn_index,
-                    message.ts,
-                    rank,
-                    {
-                        "role": message.role,
-                        "content": (
-                            message.content + "\n\nHistorical delivered-result metadata (context only; submit new answers through finalizeAnswer):\n" + json.dumps(
-                                {k: v for k, v in message.answer_document.items() if k in {"sections", "sources"}},
-                                ensure_ascii=False,
-                            )
-                            if message.role == "assistant" and message.answer_document
-                            else message.content
-                        ),
-                    },
-                )
+                (message.turn_index, message.ts, rank,
+                 {"role": message.role, "content": message.content})
             )
 
         # Trail stream + folded D94 sentinels, walked in raw_trail order so
@@ -446,7 +437,18 @@ class ContextAssembler:
                 raw_trail, in_scope_ids, current_turn_index
             )
         }
+        documented_turns = {m.turn_index for m in in_scope_messages if m.answer_document}
         for entry in raw_trail:
+            # Prior proposals may have been rejected or corrected. The delivered
+            # message above is the sole historical finalizer authority, including
+            # legacy trail entries without model_response metadata.
+            if (
+                current_turn_index is not None
+                and entry.turn_index != current_turn_index
+                and entry.turn_index in documented_turns
+                and entry.tool_name in {"answerWithText", "answerWithTable", "finalizeAnswer"}
+            ):
+                continue
             if _is_stale_model_text_entry(entry, current_turn_index):
                 continue
             if entry.tool_name in {"answerWithText", "answerWithTable", "finalizeAnswer"}:

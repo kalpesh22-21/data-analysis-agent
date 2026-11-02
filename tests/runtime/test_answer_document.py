@@ -1,5 +1,7 @@
 """Approved presentation, source selection and repair integration regressions."""
 
+import json
+
 import pytest
 
 from data_agent.runtime.composer import PresentationError, proposal_to_internal
@@ -240,14 +242,14 @@ async def test_selected_prepared_action_survives_persistence_and_cannot_be_swapp
         resolve_action(doc, answer_id, "unselected", CREDS)
 
 
-async def test_additional_table_reasons_reach_judge_but_not_ui():
+async def test_additional_table_reasons_survive_for_delivered_history():
     first = {**section(), "table_reason": "Requested detailed departments."}
     second = {**section(), "id": "second", "table_reason": "Explicitly requested a separate view."}
     judge = Judge()
     loop, _, _, _, _ = build([discovery(), query(), final(first, second)], judge)
     out = await run(loop)
     assert len(judge.briefs[0].presentation_reasons) == 2
-    assert all("table_reason" not in s for s in out.answer_document["sections"])
+    assert [s["table_reason"] for s in out.answer_document["sections"]] == [first["table_reason"], second["table_reason"]]
 
 
 async def test_multiple_requested_results_keep_order_scope_and_snapshot_bindings():
@@ -531,7 +533,12 @@ async def test_judge_corrects_document_without_agent_round_or_query():
     await run(loop, 'What did you just show?')
     previous = [m['content'] for m in model.calls[3].messages if m.get('role') == 'assistant' and isinstance(m.get('content'), str)]
     assert any(replacement['takeaway'] in text for text in previous)
-    assert any(corrected['title'] in text and corrected['caveats'][0] in text for text in previous)
+    assert not any(corrected['title'] in text for text in previous)
+    historical = [json.loads(c['function']['arguments'])
+                  for m in model.calls[3].messages for c in m.get('tool_calls', [])
+                  if c['function']['name'] == 'finalizeAnswer']
+    assert historical[0]['sections'][0]['title'] == corrected['title']
+    assert historical[0]['sections'][0]['caveats'] == corrected['caveats']
     assert not any('Uncorrected draft heading' in text for text in previous)
 
 
