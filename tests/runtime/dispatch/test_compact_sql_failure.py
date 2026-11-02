@@ -76,3 +76,38 @@ def test_failure_policy_is_hoisted_once_for_structured_and_other_denials():
         content = json.loads(_tool_trail_entry_to_canonical(entry)[-1]['content'])
         assert 'evidence_usage' not in content
         assert content['error_code'] == code
+
+
+async def test_trino_access_denial_survives_dispatch_replay_and_licenses_no_access():
+    from dataclasses import replace
+    from data_agent.runtime.composite.analysis_state import classify_block_evidence
+    from data_agent.runtime.context.budget import render_entry
+    from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+    from data_agent.runtime.mcp.client import MCPToolError
+    from data_agent.runtime.mcp.fake_client import FakeMCPClient
+    from tests.runtime.loop.test_repository_regressions import entry
+    from tests.runtime.test_harness_improvements import CATALOG, CREDS
+
+    packet = dict(version=1, code='EXECUTION_ACCESS_DENIED', input_dialect='clickhouse',
+                  cause='PERMISSION_DENIED', guidance='Do not bypass the denial.', retry='after_access_change')
+    dispatcher = ToolDispatcher(FakeMCPClient(scripted={'runQuery': [MCPToolError(packet['code'], json.dumps(packet))]}), CATALOG)
+    result = await dispatcher.dispatch('runQuery', {'sql': 'SELECT Salary FROM hr.employee'}, CREDS)
+    assert result.status == 'denied' and result.retryable is False
+    receipt = replace(entry('denied', 'runQuery', status='denied'),
+                      error_code=result.error_code, denial_detail=result.denial_detail)
+    content = json.loads(_tool_trail_entry_to_canonical(render_entry(receipt, 5))[-1]['content'])
+    assert content['sql_diagnostic']['cause'] == 'PERMISSION_DENIED'
+    assert content['retryable'] is False
+    assert classify_block_evidence('denied', [receipt], 0) == 'NO_ACCESS'
+
+
+def test_all_allowlisted_trino_causes_survive_compaction_without_numeric_invention():
+    from data_agent.runtime.dispatch.sql_diagnostics import TRINO_CAUSES, compact_model_diagnostic
+    for cause in TRINO_CAUSES:
+        packet = dict(version=1, code='SQL_EXECUTION_ERROR', input_dialect='clickhouse',
+                      cause=cause, hint='unused', guidance='Safe advice.', retry='after_query_change')
+        diagnostic = compact_model_diagnostic(sql_diagnostic(json.dumps(packet), 'SELECT 1'))
+        assert diagnostic['cause'] == cause and 'code_num' not in diagnostic
+    for code in ('EXECUTION_ACCESS_DENIED', 'EXECUTION_CONFIGURATION_ERROR', 'EXECUTION_SERVICE_UNAVAILABLE', 'EXECUTION_CANCELLED'):
+        packet.update(code=code, retry='after_operator_action')
+        assert sql_diagnostic(json.dumps(packet), '')['retryable'] is False

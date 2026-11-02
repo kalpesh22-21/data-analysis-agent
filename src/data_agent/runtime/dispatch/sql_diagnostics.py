@@ -42,6 +42,20 @@ MESSAGES = {
 }
 
 
+# Public coordinator causes; counterpart registry is clickhouse-api app/trino_errors.py.
+TRINO_CAUSES = frozenset("""
+ABANDONED_QUERY ACCESS_DENIED ADMINISTRATIVELY_KILLED AMBIGUOUS_COLUMN AMBIGUOUS_COLUMN_NAME
+AMBIGUOUS_NAME CATALOG_NOT_FOUND CATALOG_UNAVAILABLE CLUSTER_OUT_OF_MEMORY COLUMN_NOT_FOUND
+DIVISION_BY_ZERO EXCEEDED_CPU_LIMIT EXCEEDED_FUNCTION_MEMORY_LIMIT EXCEEDED_GLOBAL_MEMORY_LIMIT EXCEEDED_LOCAL_MEMORY_LIMIT
+EXCEEDED_SCAN_LIMIT EXCEEDED_SPILL_LIMIT EXCEEDED_TIME_LIMIT EXPRESSION_NOT_AGGREGATE EXPRESSION_NOT_IN_GROUP_BY
+FUNCTION_NOT_FOUND GENERIC_INSUFFICIENT_RESOURCES INVALID_CAST_ARGUMENT INVALID_COLUMN_MASK INVALID_FUNCTION_ARGUMENT
+INVALID_LITERAL INVALID_ROW_FILTER INVALID_VIEW NOT_AN_AGGREGATE NOT_SUPPORTED
+NUMERIC_VALUE_OUT_OF_RANGE OPERATOR_NOT_FOUND PERMISSION_DENIED QUERY_QUEUE_FULL QUERY_TIMEOUT
+SCHEMA_NOT_FOUND SUBQUERY_MULTIPLE_ROWS SYNTAX_ERROR TABLE_NOT_FOUND TYPE_MISMATCH
+USER_CANCELED VIEW_IS_STALE
+""".split())
+
+
 def sql_diagnostic(message: str, sql: str) -> dict:
     try:
         payload = json.loads(message)
@@ -54,7 +68,7 @@ def sql_diagnostic(message: str, sql: str) -> dict:
         result = {key: payload[key][:3000] for key in
                   ("code", "message", "input_dialect", "guidance", "retry", "candidate_expression")
                   if isinstance(payload.get(key), str)}
-        causes = set(MESSAGES) | {"UNSUPPORTED_METHOD"}
+        causes = set(MESSAGES) | {"UNSUPPORTED_METHOD"} | TRINO_CAUSES
         if payload.get("cause") in causes:
             result["cause"] = payload["cause"]
             codes = {"UNSUPPORTED_METHOD": 1, "SYNTAX_ERROR": 62, "UNKNOWN_IDENTIFIER": 47,

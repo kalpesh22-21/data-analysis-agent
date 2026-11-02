@@ -126,7 +126,7 @@ BLUEPRINT_NOT_SEARCHED_MESSAGE = (
 )
 
 # Authoritative permission receipts shared by direct queries, blueprint probes and intents.
-ACCESS_DENIAL_CODES = frozenset({"COLUMN_SCOPE_VIOLATION", "SCRATCH_SESSION_VIOLATION"})
+ACCESS_DENIAL_CODES = frozenset({"COLUMN_SCOPE_VIOLATION", "SCRATCH_SESSION_VIOLATION", "EXECUTION_ACCESS_DENIED"})
 
 OUT_OF_SCOPE_REQUEST_CODE = "OUT_OF_SCOPE_REQUEST"
 
@@ -636,7 +636,7 @@ MODEL_QUERY_ERROR_CODES = frozenset({
 })
 MODEL_SERVICE_ERROR_CODES = frozenset({
     "EXECUTION_SERVICE_UNAVAILABLE", "EXECUTION_CONFIGURATION_ERROR", "EXECUTION_IDENTITY_REQUIRED",
-    "SOURCE_UNAVAILABLE",
+    "SOURCE_UNAVAILABLE", "EXECUTION_ACCESS_DENIED", "EXECUTION_CANCELLED",
 })
 for _code in MODEL_QUERY_ERROR_CODES:
     _DENIAL_TABLE[_code] = DenialInfo(
@@ -648,6 +648,13 @@ for _code in MODEL_SERVICE_ERROR_CODES:
         code=_code, retryable=False, kind=DenialKind.INFRA_FAILED,
         user_message="Execution requires service recovery, operator action, or a valid session. Changing SQL will not resolve this.",
     )
+
+_DENIAL_TABLE["EXECUTION_ACCESS_DENIED"] = DenialInfo(
+    code="EXECUTION_ACCESS_DENIED", retryable=False, kind=DenialKind.INFRA_FAILED,
+    user_message="The effective execution identity was denied access. Do not bypass the denial; ask the operator to resolve access and complete permitted work.")
+_DENIAL_TABLE["EXECUTION_CANCELLED"] = DenialInfo(
+    code="EXECUTION_CANCELLED", retryable=False, kind=DenialKind.INFRA_FAILED,
+    user_message="Execution was canceled or stopped. Follow the diagnostic before retrying; changing SQL is not a remedy.")
 
 AGGREGATION_QUERY_CODES = frozenset({"AGGREGATION_UNVERIFIED", "AGGREGATION_DUPLICATE_KEYS", "AGGREGATION_CHECK_FAILED"})
 for _code in AGGREGATION_QUERY_CODES:

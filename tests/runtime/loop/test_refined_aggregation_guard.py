@@ -211,6 +211,7 @@ async def test_live_loop_blocks_cosmetic_retry_without_third_probe():
     ("COLUMN_SCOPE_VIOLATION", "This query needs access to columns outside your permitted scope: hr.employee.salary. Use accessible fields."),
     ("COLUMN_SCOPE_VIOLATION", "Payroll records are unavailable to this session."),
     ("SCRATCH_SESSION_VIOLATION", "That dataset belongs to another session."),
+    ("EXECUTION_ACCESS_DENIED", "The effective execution identity lacks access."),
 ])
 async def test_access_denial_survives_probe_blueprint_and_model_context(code, detail):
     from data_agent.runtime.blueprint.executor import ExecFailed
@@ -235,13 +236,17 @@ async def test_access_denial_survives_probe_blueprint_and_model_context(code, de
     model = _render_entry(receipt, 20)
     assert model["error_code"] == code
     diagnostic = model["sql_diagnostic"]
-    assert detail in diagnostic["message"]
     assert diagnostic["cause"] == {"code": code, "message": detail}
-    assert diagnostic["retry"] == "after_access_change"
-    assert diagnostic["retryable"] is False
-    assert "NO_ACCESS" in diagnostic["guidance"]
-    assert "Continue independent accessible parts" in diagnostic["guidance"]
-    assert "EXECUTION_FAILED" not in diagnostic["guidance"]
+    assert model["retryable"] is False
+    assert "NO_ACCESS" in diagnostic["hint"]
+    assert "Continue independent accessible parts" in diagnostic["hint"]
+    # Full recovery/audit state remains in storage, not repeated in model context.
+    from data_agent.runtime.dispatch.sql_diagnostics import decode_diagnostic
+    stored = decode_diagnostic(receipt.denial_detail)
+    assert detail in stored["message"]
+    assert stored["retry"] == "after_access_change"
+    assert stored["retryable"] is False
+    assert "EXECUTION_FAILED" not in diagnostic["hint"]
     dispatcher.dispatch.assert_awaited_once()
 
 
