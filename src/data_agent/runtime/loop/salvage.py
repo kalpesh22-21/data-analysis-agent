@@ -7,13 +7,13 @@ from copy import deepcopy
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from data_agent.runtime.composer import RECOVERY_SCHEMA
+from data_agent.runtime.composer import RECOVERY_SCHEMA, PresentationError, proposal_to_internal
 
 from .answer_judge import _estimate_tokens, begin_turn_client
 
 
 async def _call(judge, messages, name, schema):
-    if _estimate_tokens(messages[1]["content"]) > judge.token_budget:
+    if sum(_estimate_tokens(m["content"]) for m in messages if m.get("role") != "system") > judge.token_budget:
         raise ValueError("recovery_evidence_budget")
     factory = getattr(judge.model_client, "without_thinking", None)
     if not callable(factory):
@@ -55,6 +55,9 @@ async def _call(judge, messages, name, schema):
                     if span is not None:
                         span.set_attribute("recovery_fields_omitted", len(unknown))
             Draft202012Validator(schema).validate(args)
+            if name == "salvageAnswer":
+                stage = "presentation_validation"
+                proposal_to_internal({key: args[key] for key in ("takeaway", "sections", "evidence")})
             if span is not None:
                 span.set_attribute("outcome", args.get("outcome", args.get("impact", "")))
             return args
@@ -105,6 +108,23 @@ async def salvage(judge, brief):
     messages[0]["content"] += (
         "\nSALVAGE MODE overrides the verdict format. Return salvageAnswer: an independently "
         "approved answer document using takeaway, sections, evidence, unfinished and outcome. "
+        "Analysis has stopped: a requested repair may have been prevented or interrupted by "
+        "a time, execution or service limit. A repair request, queued correction or revised SQL "
+        "is not a successful execution receipt. Determine what actually completed from the "
+        "supplied results; never assume a requested rerun happened or reuse a rejected measure "
+        "as if its missing filter/calculation had been corrected. You cannot resume analysis. "
+        "If some requested findings have valid evidence, preserve them as partial and name the "
+        "specific remaining outcome in unfinished. If no requested finding is supportable, use "
+        "none with empty sections/evidence and a concise limitation. If existing valid evidence "
+        "already answers everything, full with unfinished=[] remains correct despite a timeout. "
+        "For example, an uncorrected leave ranking must be omitted; an independently verified "
+        "headcount may still be delivered. Explain that the ranking could not be verified, not "
+        "that no leave exists. Do not invent a timeout, denial or missing source as the cause; "
+        "state a specific cause only when supplied evidence establishes it. Keep internal "
+        "review, retry and budget bookkeeping out of user-facing text. Describe unfinished "
+        "work in business terms, such as: The approved leave total could not be verified. "
+        "Do not expose SQL, predicates or physical column names from rejection feedback. A schema-correction "
+        "retry can repair this recovery response, but cannot create missing execution evidence. "
         "Use only supplied evidence and selected_components; no new queries. Use the same "
         "presentation selectors as finalizeAnswer, including figures, bars and line charts. "
         "The UI fetches rows from the selected SQL; do not invent or aggregate cells. "
@@ -127,7 +147,23 @@ async def salvage(judge, brief):
         "measure_column and label; line uses the same fields with chronological ISO dates/timestamps or consistent year, quarter, month periods. "
         "The UI owns table and CSV options for every data result except figures; do not add a visible table of the same result."
     )
-    return await _call(judge, messages, "salvageAnswer", schema)
+    # Reuse the same call and validators for one correction, within one deadline.
+    async def attempts():
+        for attempt in range(2):
+            try:
+                return await _call(judge, messages, "salvageAnswer", schema)
+            except (ValidationError, PresentationError) as exc:
+                if attempt:
+                    raise
+                judge._emit("loop_recovery_repair_requested", {"attempts": 1, "exception_type": type(exc).__name__})
+                # _call sanitizes schema failures; proposal errors contain only
+                # validator guidance. Never echo raw provider exceptions.
+                messages.append({"role": "user", "content":
+                    "Your recovery proposal was invalid: " + str(exc) +
+                    " Return a corrected salvageAnswer using the same evidence. "
+                    "Do not invent unfinished work to satisfy the schema; full requires "
+                    "all requested outcomes supported, partial requires a real unfinished outcome."})
+    return await asyncio.wait_for(attempts(), timeout=judge.timeout_seconds)
 
 
 async def approve_presentation_fallback(judge, brief):

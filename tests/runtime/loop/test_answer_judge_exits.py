@@ -129,6 +129,7 @@ def _build(
     mcp: FakeMCPClient | None = None,
     max_wall_clock_seconds: float = 60,
     min_headroom_seconds: float = 25.0,
+    clock=None,
 ) -> tuple[AgentLoop, _CountingStore, list[tuple[str, dict[str, Any]]], ScriptedModelClient]:
     store = _CountingStore()
     events: list[tuple[str, dict[str, Any]]] = []
@@ -151,6 +152,7 @@ def _build(
             STATE: UpdateAnalysisStateTool(session_store=store, observer=_observe),
             ANSWER: AnswerWithTableTool(),
         },
+        **({"clock": clock} if clock else {}),
         answer_judge=judge,  # type: ignore[arg-type]
         answer_judge_min_headroom_seconds=min_headroom_seconds,
     )
@@ -844,3 +846,74 @@ async def test_the_two_exits_share_one_allowance() -> None:
         "exit_table",
     ]
     assert _events(events, ANSWER_JUDGE_SKIPPED_EVENT) == []
+
+
+@pytest.mark.parametrize("makes_progress", [True, False])
+async def test_granted_analysis_repair_survives_stagnation_boundary(makes_progress):
+    judge = _ScriptedJudge([JudgeVerdict(
+        approved=False, reviewed=True, violation="measurement_mismatch",
+        repair_type="analysis", feedback="Restrict the ranking to the requested department.",
+    )])
+    corrected = ToolCallRequest(id="corrected", name="runQuery", arguments={
+        "sql": RAN_SQL.replace("GROUP BY", "WHERE Department = 'D0' GROUP BY")
+    }) if makes_progress else _query("repeat")
+    loop, store, events, model = _build([
+        *[ModelTurnResult(tool_calls=[_query(f"q{i}")]) for i in range(4)],
+        ModelTurnResult(tool_calls=[_answer_table("initial", "Department totals.")]),
+        ModelTurnResult(tool_calls=[corrected]),
+        final_answer(assistant_text="Requested department totals.", evidence=["corrected"],
+                     tables=[{"result_id": "corrected", "caption": "Requested department"}]),
+    ], judge, mcp=_rows_mcp(1, 1, 1, 1, 1))
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Department totals?")
+    authorized = _events(events, "loop_answer_judge_repair_authorized")
+    assert len(authorized) == 1 and authorized[0]["remaining_ms"] > 0
+    assert _carrying(model, "Repair target")
+    assert len(_events(events, "loop_answer_judge_repair_attempted")) == 1
+    stops = _events(events, "loop_no_new_evidence_stop")
+    if makes_progress:
+        assert outcome.status == "done"
+        assert not stops
+        assert judge.calls_made == 2
+        assert outcome.answer_tables
+    else:
+        assert outcome.status == "stopped_no_progress"
+        assert stops[0]["iteration"] == 6  # The repair round ran, then stopped.
+        assert judge.calls_made == 1
+
+
+async def test_review_exhausting_wall_clock_cannot_authorize_repair():
+    now = [0.0]
+
+    class SlowJudge(_ScriptedJudge):
+        async def review(self, brief):
+            now[0] = 61.0
+            return await super().review(brief)
+
+    judge = SlowJudge([JudgeVerdict(approved=False, reviewed=True,
+        violation="measurement_mismatch", repair_type="analysis", feedback="Correct the measure.")])
+    loop, _, events, model = _build([
+        ModelTurnResult(tool_calls=[_query("q1")]),
+        ModelTurnResult(tool_calls=[_answer_table("initial", "Department totals.")]),
+    ], judge, mcp=_rows_mcp(1), clock=lambda: now[0])
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Department totals?")
+    assert not _events(events, "loop_answer_judge_repair_authorized")
+    assert not _events(events, "loop_answer_judge_repair_attempted")
+    refused = _events(events, "loop_answer_judge_repair_refused")
+    assert refused[0]["reason"] == "budget_exhausted"
+    assert refused[0]["remaining_ms"] == 0
+    assert not _carrying(model, "Repair target")
+
+
+async def test_invalid_finalizer_keeps_original_tool_identity_and_type_feedback():
+    loop, store, events, model = _build([
+        ModelTurnResult(tool_calls=[ToolCallRequest(id="bad-final", name="finalizeAnswer",
+            arguments={"takeaway": "Hello", "sections": "[]", "evidence": []})]),
+        final_answer(assistant_text="Hello"),
+    ], _ScriptedJudge())
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Hello")
+    trail = await store.load_trail(SESSION_ID)
+    failed = next(e for e in trail if e.tool_call_id == "bad-final")
+    assert failed.tool_name == "finalizeAnswer"
+    assert failed.error_code == "INVALID_TOOL_ARGUMENTS"
+    assert "expected type: array, got: string" in failed.denial_detail
+    assert _carrying(model, "expected type: array, got: string")

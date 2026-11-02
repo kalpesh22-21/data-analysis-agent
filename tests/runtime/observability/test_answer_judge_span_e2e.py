@@ -278,7 +278,7 @@ async def test_salvage_schema_failure_records_diagnostics_without_response_value
     tracer, exporter = _tracer_with_memory_exporter()
     response = {**PART, 'outcome': 'full', 'unfinished': [],
                 'takeaway': ['PRIVATE_RESPONSE_PAYLOAD']}
-    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))]),
+    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))] * 2),
                         token_budget=100000, tracer=tracer,
                         observer=tracing.guardrail_observer(tracer))
     with pytest.raises(ValidationError):
@@ -303,3 +303,18 @@ def test_recovery_schema_coordinates_survive_guardrail_allowlist():
     assert span.attributes['schema_keyword'] == 'required'
     assert span.attributes['schema_path'] == '/required'
     assert SECRET_DRAFT not in _all_attribute_text(exporter)
+
+
+def test_repair_decisions_survive_existing_trace_allowlist_without_feedback():
+    tracer, exporter = _tracer_with_memory_exporter()
+    observer = tracing.guardrail_observer(tracer)
+    for decision in ("authorized", "refused"):
+        payload = {"reason": "authorized" if decision == "authorized" else "budget_exhausted",
+                   "repair_type": "analysis", "calls": 1, "repaired": False,
+                   "remaining_ms": 1000 if decision == "authorized" else 0,
+                   "review_seconds": 20.0, "repair_reserve_seconds": 10.0}
+        observer("loop_answer_judge_repair_" + decision, {**payload, "feedback": SECRET_FEEDBACK})
+        span = exporter.get_finished_spans()[-1]
+        for key, value in payload.items():
+            assert span.attributes[key] == value
+    assert SECRET_FEEDBACK not in _all_attribute_text(exporter)

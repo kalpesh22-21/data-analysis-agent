@@ -23,7 +23,10 @@ class ReviewState:
     prose_correction: dict[str, str] = field(default_factory=dict)
     approved_partial: dict[str, Any] = field(default_factory=dict)
     calls: int = 0
+    # repaired reserves the single allowance; it does not prove execution.
     repaired: bool = False
+    repair_pending: bool = False
+    repair_attempted: bool = False
     answer_version: str = ""
     scope_hash: str = ""
     violation: str = ""
@@ -63,6 +66,7 @@ class ReviewState:
             state.delivery_reason = ""
             state.prose_correction = {}
             state.approved_partial = {}
+            state.repair_pending = False
             state.feedback = ""
             state.measured_population = ""
             state.required_population = ""

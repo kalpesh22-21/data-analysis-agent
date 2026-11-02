@@ -155,7 +155,9 @@ def proposal_to_internal(raw):
             missing = [key for key in error.validator_value if key not in error.instance]
             detail = "missing required field(s): " + ", ".join(missing)
         elif error.validator == "type":
-            detail = "expected type: " + str(error.validator_value)
+            received = {str: "string", list: "array", dict: "object", bool: "boolean",
+                        int: "number", float: "number", type(None): "null"}.get(type(error.instance), "unknown")
+            detail = "expected type: " + str(error.validator_value) + ", got: " + received
         elif error.validator == "additionalProperties":
             detail = "use only declared fields: " + ", ".join(error.schema.get("properties", {}))
         raise PresentationError(f"Invalid answer proposal at {location}: {detail}.")

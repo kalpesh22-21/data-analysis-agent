@@ -3250,7 +3250,9 @@ class AgentLoop:
             blueprint_search_gate.observe_context(canonical_messages)
             if request.prefetched_blueprints:
                 blueprint_search_gate.observe_prefetch()
+            repair_request_pending = bool(finalization_nudge and review_state.repair_pending)
             finalization_nudge = None
+            repair_authorized_this_round = False
             # K2, same one-round-trip rule: the note has now been rendered into the
             # request the model is about to see. A REBIND, not `.clear()`, because
             # the set was just handed to the builder.
@@ -3299,6 +3301,17 @@ class AgentLoop:
             call_started = self._clock()
             try:
                 async with asyncio.timeout(limit):
+                    if repair_request_pending:
+                        review_state.repair_pending = False
+                        review_state.repair_attempted = True
+                        await self._session_store.write_review_state(
+                            session_id, turn_index, review_state.to_doc()
+                        )
+                        self._observer("loop_answer_judge_repair_attempted", {
+                            "repair_type": review_state.repair_type,
+                            "calls": review_state.calls,
+                            "repair_attempted": True,
+                        })
                     result = await model_client.send_turn(canonical_messages, tools)
             except TimeoutError:
                 mark_current_span_error("model_call_timeout")
@@ -3431,7 +3444,8 @@ class AgentLoop:
                         else ""
                     )
                     + "Your assistant message has not completed this turn. If you can answer now, "
-                    "call finalizeAnswer with your complete text in takeaway. For a simple "
+                    "call finalizeAnswer with your complete text in takeaway and sections as a JSON array, "
+                    "not a JSON-encoded string. Historical answer metadata is not an output format. For a simple "
                     "conversational reply, use empty sections and evidence lists; "
                     "no lookup is needed. If the request still needs work, continue with the "
                     "appropriate capability or data tools, then call finalizeAnswer. "
@@ -3564,12 +3578,12 @@ class AgentLoop:
                         tool_call = replace(tool_call, argument_error=str(exc))
                     else:
                         tool_call = replace(tool_call, arguments=arguments)
-                    tool_call = replace(
-                        tool_call,
-                        name=ANSWER_TABLE_TOOL_NAME
-                        if tool_call.arguments.get("tables")
-                        else ANSWER_TEXT_TOOL_NAME,
-                    )
+                        tool_call = replace(
+                            tool_call,
+                            name=ANSWER_TABLE_TOOL_NAME
+                            if tool_call.arguments.get("tables")
+                            else ANSWER_TEXT_TOOL_NAME,
+                        )
                 raw_tags = tool_call.arguments.get("serves_intents", [])
                 valid_tags = (
                     {i.intent_id for i in analysis_state.intents} if analysis_state else set()
@@ -5072,9 +5086,30 @@ class AgentLoop:
                             measured_population=review_state.measured_population,
                             required_population=review_state.required_population,
                         )
-                        if (not review_state.repaired and review_state.calls < 2 and remaining > 0
-                            and verdict.repair_type != "prose"):
+                        # Review may consume the remaining turn budget. Decide with
+                        # fresh time, and expose why a repair was granted or refused.
+                        usage = guard.usage()
+                        remaining = max(0.0, usage.max_wall_clock_seconds - usage.elapsed_seconds)
+                        reason = (
+                            "repair_already_used" if review_state.repaired else
+                            "review_limit" if review_state.calls >= 2 else
+                            "budget_exhausted" if guard.exceeded or remaining <= 0 else
+                            "prose_only" if verdict.repair_type == "prose" else
+                            "authorized"
+                        )
+                        repair_authorized_this_round = reason == "authorized"
+                        context = CURRENT_DELIVERY.get()
+                        self._observer(
+                            "loop_answer_judge_repair_" + ("authorized" if repair_authorized_this_round else "refused"),
+                            {"reason": reason, "repair_type": verdict.repair_type,
+                             "calls": review_state.calls, "repaired": review_state.repaired,
+                             "remaining_ms": int(remaining * 1000),
+                             "review_seconds": context.review_seconds if context else 0.0,
+                             "repair_reserve_seconds": context.repair_reserve_seconds if context else 0.0},
+                        )
+                        if repair_authorized_this_round:
                             review_state.repaired = True
+                            review_state.repair_pending = True
                             feedback = verdict.feedback
                             finalization_nudge = answer_judge_nudge_text(final_text, feedback)
                             finalization_nudge += "\nRepair target: " + json.dumps(
@@ -5162,7 +5197,9 @@ class AgentLoop:
             # full weight on purpose (loop/budget_guard.py module docstring).
             guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
 
-            if loop_safety.end_round():
+            # Keep stagnation accounting, but give the one granted repair its
+            # next round. Repeated/failed work still stops; hard budgets still apply.
+            if loop_safety.end_round() and not repair_authorized_this_round:
                 await self._force_block_pending_intents(
                     session_id=session_id,
                     turn_index=turn_index,

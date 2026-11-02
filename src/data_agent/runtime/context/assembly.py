@@ -426,7 +426,7 @@ class ContextAssembler:
                     {
                         "role": message.role,
                         "content": (
-                            message.content + "\n\nDelivered answer document:\n" + json.dumps(
+                            message.content + "\n\nHistorical delivered-result metadata (context only; submit new answers through finalizeAnswer):\n" + json.dumps(
                                 {k: v for k, v in message.answer_document.items() if k in {"sections", "sources"}},
                                 ensure_ascii=False,
                             )

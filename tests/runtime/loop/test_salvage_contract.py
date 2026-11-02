@@ -33,7 +33,7 @@ async def test_salvage_has_explicit_outcome_and_non_reasoning_transport(outcome)
 
 async def test_invalid_salvage_response_is_not_approval():
     events = []
-    judge = AnswerJudge(RecoveryClient([batch(call("salvageAnswer", "s", outcome="full"))]), 10000,
+    judge = AnswerJudge(RecoveryClient([batch(call("salvageAnswer", "s", outcome="full"))] * 2), 10000,
                         observer=lambda name, payload: events.append((name, payload)))
     with pytest.raises(ValidationError):
         await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
@@ -247,7 +247,7 @@ async def test_salvage_accepts_schema_valid_json_content_without_tool_wrapper():
 
 async def test_json_content_still_requires_complete_salvage_schema():
     from data_agent.runtime.model.client import ModelTurnResult
-    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text='{"outcome":"full"}')]), 10000)
+    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text='{"outcome":"full"}')] * 2), 10000)
     with pytest.raises(ValidationError):
         await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
 
@@ -293,7 +293,7 @@ async def test_extra_key_tolerance_does_not_relax_known_or_nested_fields(patch, 
     from data_agent.runtime.model.client import ModelTurnResult
     events = []
     response = {**PART, 'outcome': 'partial', 'outcome_notes': 'extra', **patch}
-    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))]), 10000,
+    judge = AnswerJudge(RecoveryClient([ModelTurnResult(assistant_text=json.dumps(response))] * 2), 10000,
                         observer=lambda name, payload: events.append((name, payload)))
     with pytest.raises(ValidationError):
         await judge.salvage(JudgeBrief('exit_prose', 'Headcount?'))
@@ -375,7 +375,7 @@ async def test_salvage_materializes_selected_visual_and_persists_it(kind, select
 ])
 async def test_salvage_schema_rejects_contradictory_completion(patch):
     response = {**PART, 'outcome': 'partial', **patch}
-    judge = AnswerJudge(RecoveryClient([batch(call('salvageAnswer', 's', **response))]), 10000)
+    judge = AnswerJudge(RecoveryClient([batch(call('salvageAnswer', 's', **response))] * 2), 10000)
     with pytest.raises(ValidationError):
         await judge.salvage(JudgeBrief('exit_table', 'Show a chart'))
 
@@ -453,3 +453,94 @@ async def test_missing_source_keeps_verified_partial_answer_and_blocks_repeat():
     assert out.answer_document is not None
     assert "120" in out.assistant_text and "Expense data is unavailable" in out.assistant_text
     assert len(mcp.calls) == 2
+
+
+@pytest.mark.parametrize("failure", ["partial", "tables"])
+async def test_salvage_repairs_contract_once_using_validation_feedback(failure):
+    response = {**PART, "outcome": "partial"}
+    if failure == "partial":
+        response["unfinished"] = []
+    else:
+        response["sections"] = recovery_sections(["q", "q2"])
+        for section in response["sections"]:
+            section.pop("table_reason", None)
+    valid = {**PART, "outcome": "partial"}
+    events = []
+    client = RecoveryClient([batch(call("salvageAnswer", "bad", **response)),
+                             batch(call("salvageAnswer", "fixed", **valid))])
+    judge = AnswerJudge(client, 10000, observer=lambda n, p: events.append((n, p)))
+    assert await judge.salvage(JudgeBrief("exit_prose", "Headcount?")) == valid
+    assert client.calls_made == 2
+    feedback = client.calls[1].messages[-1]["content"]
+    assert ("minItems" if failure == "partial" else "table_reason") in feedback
+    assert sum(n == "loop_recovery_repair_requested" for n, _ in events) == 1
+
+
+async def test_salvage_repair_is_bounded_and_preserves_presentation_gate():
+    from data_agent.runtime.composer import PresentationError
+    response = {**PART, "outcome": "partial", "sections": recovery_sections(["q", "q2"])}
+    for section in response["sections"]:
+        section.pop("table_reason", None)
+    client = RecoveryClient([batch(call("salvageAnswer", "bad", **response))] * 3)
+    with pytest.raises(PresentationError, match="table_reason"):
+        await AnswerJudge(client, 10000).salvage(JudgeBrief("exit_prose", "Headcount?"))
+    assert client.calls_made == 2
+
+
+async def test_salvage_transport_failure_does_not_trigger_contract_repair():
+    events = []
+
+    class UnavailableClient(RecoveryClient):
+        async def send_turn(self, messages, tools):
+            raise TimeoutError("provider unavailable")
+
+    judge = AnswerJudge(UnavailableClient([]), 10000,
+                        observer=lambda n, p: events.append((n, p)))
+    with pytest.raises(TimeoutError):
+        await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
+    assert not any(n == "loop_recovery_repair_requested" for n, _ in events)
+
+
+async def test_salvage_correction_cannot_extend_the_original_deadline():
+    import asyncio
+
+    class SlowCorrection(RecoveryClient):
+        async def send_turn(self, messages, tools):
+            if self.calls_made:
+                await asyncio.Event().wait()
+            return await super().send_turn(messages, tools)
+
+    client = SlowCorrection([batch(call("salvageAnswer", "bad", **{
+        **PART, "outcome": "partial", "unfinished": [],
+    }))])
+    events = []
+    judge = AnswerJudge(client, 10000, timeout_seconds=0.02,
+                        observer=lambda n, p: events.append((n, p)))
+    with pytest.raises(TimeoutError):
+        await judge.salvage(JudgeBrief("exit_prose", "Headcount?"))
+    assert sum(n == "loop_recovery_repair_requested" for n, _ in events) == 1
+
+
+async def test_salvage_retry_feedback_counts_against_evidence_budget():
+    from data_agent.runtime.loop.answer_judge import _estimate_tokens
+    brief = JudgeBrief('exit_prose', 'Headcount?')
+    client = RecoveryClient([
+        batch(call('salvageAnswer', 'bad', **{**PART, 'outcome': 'partial', 'unfinished': []})),
+        batch(call('salvageAnswer', 'fixed', **{**PART, 'outcome': 'partial'})),
+    ])
+    judge = AnswerJudge(client, 10000)
+    judge.token_budget = _estimate_tokens(judge.messages_for(brief)[1]['content']) + 1
+    with pytest.raises(ValueError, match='recovery_evidence_budget'):
+        await judge.salvage(brief)
+    assert client.calls_made == 1
+
+
+def test_repair_reservation_survives_restore_without_claiming_attempt():
+    from data_agent.runtime.loop.proposal import ReviewState
+    state = ReviewState(repaired=True, repair_pending=True, scope_hash='same')
+    restored = ReviewState.restore(state.to_doc(), 'same')
+    assert restored.repaired and restored.repair_pending
+    assert not restored.repair_attempted
+    assert not ReviewState.restore(state.to_doc(), 'changed').repair_pending
+    legacy = ReviewState.restore({'repaired': True, 'scope_hash': 'same'}, 'same')
+    assert legacy.repaired and not legacy.repair_attempted
