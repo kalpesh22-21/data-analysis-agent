@@ -54,6 +54,14 @@ def sql_diagnostic(message: str, sql: str) -> dict:
         result = {key: payload[key][:3000] for key in
                   ("code", "message", "input_dialect", "guidance", "retry", "candidate_expression")
                   if isinstance(payload.get(key), str)}
+        causes = set(MESSAGES) | {"UNSUPPORTED_METHOD"}
+        if payload.get("cause") in causes:
+            result["cause"] = payload["cause"]
+            codes = {"UNSUPPORTED_METHOD": 1, "SYNTAX_ERROR": 62, "UNKNOWN_IDENTIFIER": 47,
+                     "UNKNOWN_FUNCTION": 46, "NOT_AN_AGGREGATE": 215, "ILLEGAL_AGGREGATION": 184,
+                     "TYPE_MISMATCH": 53, "NO_COMMON_TYPE": 386, "ILLEGAL_TYPE_OF_ARGUMENT": 43}
+            if type(payload.get("code_num")) is int and codes.get(payload["cause"]) == payload["code_num"]:
+                result["code_num"] = payload["code_num"]
         if payload.get("code") == "SOURCE_UNAVAILABLE":
             from .source_availability import source_receipt
             source = source_receipt(message)
@@ -208,3 +216,13 @@ def repeated_sql_failure(
         }
     ]
     return any(errors.count(signature) >= 2 for signature in set(errors))
+
+
+def compact_model_diagnostic(diagnostic: dict) -> dict:
+    """Project structured diagnostics for the model; retain full receipts internally."""
+    hint = diagnostic.get("guidance") or diagnostic.get("message", "")
+    generic = "Write ClickHouse SQL using logical catalog tables. Inspect getTableSchema and correct the submitted query before retrying; explainQuery applies the same validation."
+    if hint.startswith(generic) and hint[len(generic):].strip():
+        hint = hint[len(generic):].strip()
+    return {**{k: diagnostic[k] for k in ("input_dialect", "cause", "code_num", "source") if k in diagnostic},
+            "hint": hint}

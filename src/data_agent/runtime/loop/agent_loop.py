@@ -819,6 +819,15 @@ def _tool_trail_entry_to_canonical(
         # runQuerys (see prompts.py). Present ONLY for a verified blueprint result;
         # a runQuery, a denied/errored blueprint, or a blueprint that failed verify
         # never carries the flag, so those tool messages are byte-identical to before.
+        diagnostic = entry.get("sql_diagnostic") or {}
+        if entry.get("status") != "ok" and diagnostic.get("input_dialect") == "clickhouse" and diagnostic.get("code"):
+            from data_agent.runtime.dispatch.sql_diagnostics import compact_model_diagnostic
+            content = {
+                "tool_name": entry["tool_name"], "status": entry["status"],
+                "error_code": entry.get("error_code"),
+                "retryable": diagnostic.get("retryable", False),
+                "sql_diagnostic": compact_model_diagnostic(diagnostic),
+            }
         if entry.get("authoritative"):
             content["authoritative"] = True
             # J6: an EMPTY blueprint result is still the authoritative answer for
