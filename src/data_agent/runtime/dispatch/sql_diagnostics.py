@@ -220,7 +220,7 @@ def repeated_sql_failure(
 
 def compact_model_diagnostic(diagnostic: dict) -> dict:
     """Project structured diagnostics for the model; retain full receipts internally."""
-    hint = diagnostic.get("guidance") or diagnostic.get("message", "")
+    hint = diagnostic.get("hint") or diagnostic.get("guidance") or diagnostic.get("message", "")
     generic = "Write ClickHouse SQL using logical catalog tables. Inspect getTableSchema and correct the submitted query before retrying; explainQuery applies the same validation."
     if hint.startswith(generic) and hint[len(generic):].strip():
         hint = hint[len(generic):].strip()

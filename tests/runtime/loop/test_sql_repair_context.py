@@ -337,7 +337,7 @@ def test_structured_diagnostic_survives_saved_trail_and_context():
                       error_code="SQL_TYPE_MISMATCH", denial_detail=encode_diagnostic(json.dumps(payload), "SELECT 1"))
     receipt = type(receipt).from_doc(receipt.to_doc())
     rendered = render_entry(receipt, 5)
-    assert rendered["sql_diagnostic"]["guidance"] == payload["guidance"]
+    assert rendered["sql_diagnostic"]["hint"] == payload["guidance"]
     canonical = json.dumps(_tool_trail_entry_to_canonical(rendered))
     assert 'SQL_TYPE_MISMATCH' in canonical and 'clickhouse' in canonical
     assert 'engine_code' not in canonical and 'TRINO' not in canonical

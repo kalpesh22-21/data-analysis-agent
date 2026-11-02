@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from data_agent.runtime.dispatch.denial_mapping import classify_denial
-from data_agent.runtime.dispatch.sql_diagnostics import decode_diagnostic
+from data_agent.runtime.dispatch.sql_diagnostics import compact_model_diagnostic, decode_diagnostic
 from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
 from data_agent.runtime.session.models import TrailEntry
 
@@ -102,7 +102,13 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         **({"freshness": entry.freshness, "retrieved_at": entry.retrieved_at, "data_as_of": entry.data_as_of} if entry.freshness is not None else {}),
     }
     if diagnostic:
-        rendered["sql_diagnostic"] = diagnostic
+        # Project before context/judge consumers see the receipt. Final request fitting
+        # already happens after canonicalization; persisted denial_detail stays intact.
+        if diagnostic.get("input_dialect") == "clickhouse" and diagnostic.get("code"):
+            rendered["sql_diagnostic"] = compact_model_diagnostic(diagnostic)
+            rendered["retryable"] = diagnostic.get("retryable", False)
+        else:
+            rendered["sql_diagnostic"] = diagnostic
     # Carry the verified-blueprint "authoritative" marker through so the canonical
     # tool message (loop/agent_loop.py::_tool_trail_entry_to_canonical) can flag it
     # to the model. Emitted only when set (a plain runQuery/denial entry is

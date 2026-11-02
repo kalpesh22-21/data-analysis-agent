@@ -809,11 +809,9 @@ def _tool_trail_entry_to_canonical(
                 "Apply the following user answer or decline to the original request "
                 "and continue; do not repeat an answered clarification."
             )
-        elif entry.get("status") != "ok":
-            content["evidence_usage"] = (
-                "Failure reference only; never supports completion or data claims. Permissions denials can support NO_ACCESS; SQL_REPAIR_EXHAUSTED can support EXECUTION_FAILED. Other SQL failures require a corrected approach and do not prove data is absent."
-            )
-        elif entry.get("tool_name") in SUPPORTING_LOOKUP_TOOLS:
+        # Failure outcome licensing lives once in the shared system prompt, for
+        # structured SQL failures and other denials alike.
+        elif entry.get("status") == "ok" and entry.get("tool_name") in SUPPORTING_LOOKUP_TOOLS:
             content["evidence_usage"] = (
                 "Discovery context only. Do not cite this result in finalizeAnswer.evidence "
                 "or a completed deliverable's result_ids. Use successful answer-producing "
@@ -827,12 +825,12 @@ def _tool_trail_entry_to_canonical(
         # a runQuery, a denied/errored blueprint, or a blueprint that failed verify
         # never carries the flag, so those tool messages are byte-identical to before.
         diagnostic = entry.get("sql_diagnostic") or {}
-        if entry.get("status") != "ok" and diagnostic.get("input_dialect") == "clickhouse" and diagnostic.get("code"):
+        if entry.get("status") != "ok" and diagnostic.get("input_dialect") == "clickhouse" and (diagnostic.get("code") or "hint" in diagnostic):
             from data_agent.runtime.dispatch.sql_diagnostics import compact_model_diagnostic
             content = {
                 "tool_name": entry["tool_name"], "status": entry["status"],
                 "error_code": entry.get("error_code"),
-                "retryable": diagnostic.get("retryable", False),
+                "retryable": entry.get("retryable", diagnostic.get("retryable", False)),
                 "sql_diagnostic": compact_model_diagnostic(diagnostic),
             }
         if entry.get("authoritative"):
