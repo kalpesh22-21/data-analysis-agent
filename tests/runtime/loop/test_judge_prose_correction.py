@@ -1,5 +1,7 @@
 """Exact prose corrections ship without another agent round or evidence mutation."""
 
+import json
+
 import pytest
 
 from data_agent.runtime.loop.answer_judge import APPROVED, AnswerJudge, JudgeBrief, JudgeVerdict
@@ -267,7 +269,8 @@ async def test_narration_rejection_does_not_block_or_apply_unapproved_replacemen
     assert any(p.get("outcome") == "approved" and p.get("reviewed") for _, p in events)
 
 
-async def test_judge_correction_repairs_caveat_without_query_or_agent_round():
+@pytest.mark.parametrize("encoded", [False, True])
+async def test_judge_correction_repairs_caveat_without_query_or_agent_round(encoded):
     from tests.runtime.test_answer_document import final as document_final
     from tests.runtime.test_answer_document import section
 
@@ -275,7 +278,8 @@ async def test_judge_correction_repairs_caveat_without_query_or_agent_round():
     judge_client = ScriptedModelClient([_raw_turn({
         "approved": True, "violation": "", "feedback": "", "repair_type": "presentation",
         "corrected_document": {"takeaway": "There are 120 employees in the accessible records.",
-                               "sections": [section()], "evidence": ["q"]},
+                               "sections": json.dumps([section()]) if encoded else [section()],
+                               "evidence": json.dumps(["q"]) if encoded else ["q"]},
     })])
     judge = AnswerJudge(judge_client, token_budget=100000)
     loop, store, model, mcp, events = build([

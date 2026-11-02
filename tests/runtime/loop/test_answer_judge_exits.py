@@ -915,5 +915,5 @@ async def test_invalid_finalizer_keeps_original_tool_identity_and_json_feedback(
     failed = next(e for e in trail if e.tool_call_id == "bad-final")
     assert failed.tool_name == "finalizeAnswer"
     assert failed.error_code == "INVALID_TOOL_ARGUMENTS"
-    assert "supply a JSON array or a valid JSON-encoded array" in failed.denial_detail
-    assert _carrying(model, "supply a JSON array or a valid JSON-encoded array")
+    assert "expected type: array, got: string" in failed.denial_detail
+    assert _carrying(model, "expected type: array, got: string")

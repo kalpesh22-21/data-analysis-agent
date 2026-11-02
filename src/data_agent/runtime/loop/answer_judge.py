@@ -1104,7 +1104,9 @@ def _valid_correction(arguments, site):
         from jsonschema import Draft202012Validator
 
         key = "corrected_document" if document is not None else "corrected_question"
-        value = arguments[key]
+        from data_agent.runtime.composer import normalize_answer_arguments
+
+        value = normalize_answer_arguments(arguments[key]) if document is not None else arguments[key]
         schema = build_judge_tool(site)["parameters"]["properties"][key]
         return (
             sum(arguments.get(k) is not None for k in ("corrected_document", "corrected_question", "corrected_answer", "partial_answer")) == 1
@@ -1210,7 +1212,11 @@ def parse_verdict(
         return APPROVED
     if approved:
         if arguments.get("corrected_document") is not None or arguments.get("corrected_question") is not None:
-            return JudgeVerdict(True, repair_type=arguments["repair_type"], corrected_document=arguments.get("corrected_document"), corrected_question=arguments.get("corrected_question"))
+            from data_agent.runtime.composer import normalize_answer_arguments
+
+            return JudgeVerdict(True, repair_type=arguments["repair_type"],
+                                corrected_document=normalize_answer_arguments(arguments.get("corrected_document")),
+                                corrected_question=arguments.get("corrected_question"))
         if arguments.get("corrected_answer") is not None:
             return JudgeVerdict(
                 True, repair_type="prose", corrected_answer=arguments["corrected_answer"]

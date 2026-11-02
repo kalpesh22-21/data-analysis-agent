@@ -140,20 +140,31 @@ RECOVERY_SCHEMA = _object(
 )
 
 
-def normalize_sections(raw):
-    """Decode one JSON-encoded sections array without repairing its contents."""
-    if not isinstance(raw, dict) or not isinstance(raw.get("sections"), str):
+def normalize_answer_arguments(raw):
+    """Decode only allowlisted, top-level JSON-encoded arrays, without mutation.
+
+    Invalid JSON and non-arrays remain untouched so the schema owns path/type
+    feedback. Prose and nested fields are never interpreted as JSON.
+    """
+    if not isinstance(raw, dict):
         return raw
 
     def invalid_constant(value):
         raise ValueError("Non-JSON constant")
 
-    try:
-        sections = json.loads(raw["sections"], parse_constant=invalid_constant)
-    except (ValueError, RecursionError):
-        raise PresentationError("Invalid answer proposal at sections: supply a JSON array or a valid JSON-encoded array.") from None
-    # The ordinary schema still rejects objects, scalars and invalid section items.
-    return {**raw, "sections": sections}
+    normalized = raw
+    for field in ("sections", "evidence"):
+        if not isinstance(raw.get(field), str):
+            continue
+        try:
+            value = json.loads(raw[field], parse_constant=invalid_constant)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, list):
+            if normalized is raw:
+                normalized = dict(raw)
+            normalized[field] = value
+    return normalized
 
 
 def proposal_to_internal(raw):
@@ -164,7 +175,7 @@ def proposal_to_internal(raw):
     """
     from jsonschema import Draft202012Validator
 
-    raw = normalize_sections(raw)
+    raw = normalize_answer_arguments(raw)
     error = next(Draft202012Validator(PROPOSAL_SCHEMA).iter_errors(raw), None)
     if error:
         location = ".".join(map(str, error.absolute_path)) or "root"

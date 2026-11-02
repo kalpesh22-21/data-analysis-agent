@@ -1,5 +1,7 @@
 """Supported subsets survive failed full answers without shipping rejected content."""
 
+import json
+
 import pytest
 
 from data_agent.runtime.loop.answer_judge import APPROVED, AnswerJudge, JudgeBrief, JudgeVerdict
@@ -48,8 +50,10 @@ def final():
     return final_answer(assistant_text="There are 120 employees. The leave ranking is shown.", tables=[{"result_id": "q", "caption": "Headcount"}], evidence=["q"])
 
 
-async def test_terminal_review_delivers_partial_and_history_omits_unapproved_table():
-    judge = Judge([reject(), reject(), reject(PART)])
+@pytest.mark.parametrize("encoded", [False, True])
+async def test_terminal_review_delivers_partial_and_history_omits_unapproved_table(encoded):
+    part = {**PART, "sections": json.dumps(PART["sections"]), "evidence": json.dumps(PART["evidence"])} if encoded else PART
+    judge = Judge([reject(), reject(), reject(part)])
     loop, store, model, mcp, _ = build([discovery(), query(), final(), final()], judge)
     out = await run(loop, "Give me headcount and leave ranking.")
     assert out.assistant_text == TEXT
