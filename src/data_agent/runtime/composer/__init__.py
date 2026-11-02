@@ -7,6 +7,7 @@ Units never authorize arithmetic. There is no implicit execution selection.
 
 from __future__ import annotations
 
+import json
 import re
 from copy import deepcopy
 from datetime import date, datetime
@@ -139,6 +140,22 @@ RECOVERY_SCHEMA = _object(
 )
 
 
+def normalize_sections(raw):
+    """Decode one JSON-encoded sections array without repairing its contents."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("sections"), str):
+        return raw
+
+    def invalid_constant(value):
+        raise ValueError("Non-JSON constant")
+
+    try:
+        sections = json.loads(raw["sections"], parse_constant=invalid_constant)
+    except (ValueError, RecursionError):
+        raise PresentationError("Invalid answer proposal at sections: supply a JSON array or a valid JSON-encoded array.") from None
+    # The ordinary schema still rejects objects, scalars and invalid section items.
+    return {**raw, "sections": sections}
+
+
 def proposal_to_internal(raw):
     """Project the new proposal into internal evidence/selection bookkeeping only.
 
@@ -147,6 +164,7 @@ def proposal_to_internal(raw):
     """
     from jsonschema import Draft202012Validator
 
+    raw = normalize_sections(raw)
     error = next(Draft202012Validator(PROPOSAL_SCHEMA).iter_errors(raw), None)
     if error:
         location = ".".join(map(str, error.absolute_path)) or "root"

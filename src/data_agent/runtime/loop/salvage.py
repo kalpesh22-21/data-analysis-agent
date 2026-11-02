@@ -7,7 +7,7 @@ from copy import deepcopy
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from data_agent.runtime.composer import RECOVERY_SCHEMA, PresentationError, proposal_to_internal
+from data_agent.runtime.composer import RECOVERY_SCHEMA, PresentationError, normalize_sections, proposal_to_internal
 
 from .answer_judge import _estimate_tokens, begin_turn_client
 
@@ -54,6 +54,8 @@ async def _call(judge, messages, name, schema):
                     judge._emit("loop_recovery_fields_omitted", {"removed_count": len(unknown)})
                     if span is not None:
                         span.set_attribute("recovery_fields_omitted", len(unknown))
+            if name == "salvageAnswer":
+                args = normalize_sections(args)
             Draft202012Validator(schema).validate(args)
             if name == "salvageAnswer":
                 stage = "presentation_validation"

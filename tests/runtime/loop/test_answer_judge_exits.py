@@ -904,10 +904,10 @@ async def test_review_exhausting_wall_clock_cannot_authorize_repair():
     assert not _carrying(model, "Repair target")
 
 
-async def test_invalid_finalizer_keeps_original_tool_identity_and_type_feedback():
+async def test_invalid_finalizer_keeps_original_tool_identity_and_json_feedback():
     loop, store, events, model = _build([
         ModelTurnResult(tool_calls=[ToolCallRequest(id="bad-final", name="finalizeAnswer",
-            arguments={"takeaway": "Hello", "sections": "[]", "evidence": []})]),
+            arguments={"takeaway": "Hello", "sections": "not JSON", "evidence": []})]),
         final_answer(assistant_text="Hello"),
     ], _ScriptedJudge())
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Hello")
@@ -915,5 +915,5 @@ async def test_invalid_finalizer_keeps_original_tool_identity_and_type_feedback(
     failed = next(e for e in trail if e.tool_call_id == "bad-final")
     assert failed.tool_name == "finalizeAnswer"
     assert failed.error_code == "INVALID_TOOL_ARGUMENTS"
-    assert "expected type: array, got: string" in failed.denial_detail
-    assert _carrying(model, "expected type: array, got: string")
+    assert "supply a JSON array or a valid JSON-encoded array" in failed.denial_detail
+    assert _carrying(model, "supply a JSON array or a valid JSON-encoded array")
