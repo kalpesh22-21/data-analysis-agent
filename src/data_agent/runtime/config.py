@@ -469,6 +469,17 @@ class RuntimeSettings(BaseSettings):
         gt=0,
         description="Result evidence budget for the answer judge; subject fields remain pinned.",
     )
+    allowed_ui_components: tuple[str, ...] = Field(
+        ("text", "table", "figure", "facts", "bars", "line"),
+        description="Enabled answer presentations. JSON array in ALLOWED_UI_COMPONENTS; text/table are mandatory safe fallbacks.",
+    )
+
+    @field_validator("allowed_ui_components")
+    @classmethod
+    def validate_ui_components(cls, value):
+        from .composer.components import validate_components
+        return validate_components(value)
+
     answer_judge_enabled: bool = Field(
         True,
         description="Review terminal answers and clarification questions. No-verdict exhaustion may deliver; explicit rejections remain binding.",

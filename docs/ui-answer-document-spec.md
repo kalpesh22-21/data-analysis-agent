@@ -67,6 +67,13 @@ execution token. SQL and all column names belong in the data contract, not prose
 | `bars` | `result_id`, `x_column` **or** `x_columns`, `y_column`, `label`; optional `ranking` | Build comparisons from rows. Compound categories retain separate column bindings. |
 | `line` | `result_id`, `x_column`, `y_column`, `label` | Parse periods using column metadata, order complete row pairs chronologically, preserve null gaps. |
 
+New opt-in selectors are `multi_series_line`, `grouped_bars`, `stacked_bars`,
+`heatmap`, and `donut`. They are disabled by default. See the
+[chart component contract and allowlist](decisions/2026-11-02-chart-components.md)
+for exact model/wire shapes, validation, rendering limits and Ember adoption requirements.
+`ALLOWED_UI_COMPONENTS` controls the agent, judge and salvage schemas consistently;
+existing saved documents are not rewritten by this setting.
+
 `ranking`, when supplied, contains `direction: ascending|descending` and
 `ties: dense|competition`. Preserve query order and requested top-N semantics;
 do not invent grouping, totals, shares, aggregation, or omitted records.

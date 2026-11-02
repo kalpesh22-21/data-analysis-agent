@@ -15,6 +15,11 @@ def validate_document(document, executed_sql):
         'bars': {'result_id', 'y_column', 'label'},
         'line': {'result_id', 'x_column', 'y_column', 'label'},
         'text': {'markdown'},
+        'multi_series_line': {'result_id', 'x_column', 'series', 'label'},
+        'grouped_bars': {'result_id', 'x_column', 'series', 'label'},
+        'stacked_bars': {'result_id', 'x_column', 'series', 'label', 'additive'},
+        'heatmap': {'result_id', 'x_column', 'y_column', 'value_column', 'label'},
+        'donut': {'result_id', 'x_column', 'y_column', 'label', 'composition'},
     }
     for source in sources.values():
         assert source['sql'] in executed_sql
@@ -29,6 +34,9 @@ def validate_document(document, executed_sql):
         assert not {'rows', 'value', 'formatted_value', 'format', 'points', 'items'} & presentation.keys()
         if kind != 'text':
             assert presentation['result_id'] in sources
+        if 'series' in presentation:
+            assert 2 <= len(presentation['series']) <= 4
+            assert all(set(item) == {'y_column', 'label'} for item in presentation['series'])
         if kind == 'bars':
             assert ('x_column' in presentation) != ('x_columns' in presentation)
 

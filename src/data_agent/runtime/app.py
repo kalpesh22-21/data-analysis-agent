@@ -910,6 +910,7 @@ def create_app(
                 disable_redaction=settings.otlp_disable_redaction,
             )
         return AgentLoop(
+            allowed_ui_components=settings.allowed_ui_components,
             model_client=model_client,
             tool_dispatcher=dispatcher,
             context_assembler=_context_assembler(session_store),

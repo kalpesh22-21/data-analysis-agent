@@ -39,6 +39,85 @@ function answerPeriod(value) {
   return text;
 }
 
+// Reference renderer for the new selector contracts. Ember uses its kit chart wrapper.
+function renderExtendedAnswerChart(view, p, columns, rows, formats) {
+  const kinds = ['multi_series_line','grouped_bars','stacked_bars','heatmap','donut'];
+  if (!kinds.includes(p.kind)) throw new Error('Unsupported chart');
+  if (!rows.length || rows.length > 120) throw new Error('Chart row limit');
+  const index = name => { const matches=columns.filter(c=>c===name); if(matches.length!==1) throw new Error('Ambiguous column'); return columns.indexOf(name); };
+  const number = value => {
+    if(value===null) return null;
+    if(typeof value==='boolean' || !['string','number'].includes(typeof value) || !String(value).trim()) throw new Error('Invalid measure');
+    const n=Number(value);
+    if(!Number.isFinite(n) || Math.abs(n)>Number.MAX_SAFE_INTEGER || String(value).replace(/[^0-9]/g,'').length>15) throw new Error('Unsafe numeric value');
+    return n;
+  };
+  const category = value => { if(value===null || typeof value==='object') throw new Error('Missing category'); return String(value); };
+  const x=index(p.x_column), labels=rows.map(row=>category(row[x]));
+  const palette=['#2563eb','#0f766e','#9333ea','#c2410c','#64748b'];
+  const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('viewBox','0 0 640 280'); svg.setAttribute('role','img');
+  svg.setAttribute('aria-label',p.label); svg.dataset.chartKind=p.kind; svg.style.width='100%'; svg.style.maxWidth='720px';
+  const shape=(tag,attrs,title) => { const node=document.createElementNS(svg.namespaceURI,tag); for(const [k,v] of Object.entries(attrs)) node.setAttribute(k,v); if(title){const t=document.createElementNS(svg.namespaceURI,'title');t.textContent=title;node.appendChild(t);}svg.appendChild(node);return node; };
+  const tick=(x,y,label,anchor='middle')=>{const node=shape('text',{x,y,'text-anchor':anchor,'font-size':11,fill:'currentColor'});node.textContent=label;};
+  const legend=document.createElement('ul');
+  const item=(label,value,column) => {const li=document.createElement('li');li.textContent=label+': '+window.formatAnswerCell(value,formats[column]);legend.appendChild(li);};
+  if(p.kind==='heatmap') {
+    const y=index(p.y_column), v=index(p.value_column), ys=rows.map(r=>category(r[y]));
+    if(new Set([x,y,v]).size!==3) throw new Error('Invalid dimensions');
+    const xs=[...new Set(labels)], yKeys=[...new Set(ys)], pairs=new Set();
+    const values=rows.map(r=>number(r[v])), finite=values.filter(v=>v!==null);
+    if(!finite.length || xs.length>24 || yKeys.length>20) throw new Error('Heatmap limit');
+    const lo=Math.min(...finite), hi=Math.max(...finite), span=hi-lo || 1;
+    xs.forEach((name,i)=>{if(i%Math.ceil(xs.length/12)===0)tick(40+(i+0.5)*560/xs.length,255,name);});
+    yKeys.forEach((name,i)=>tick(35,25+(i+0.5)*220/yKeys.length,name,'end'));
+    rows.forEach((row,i)=>{const key=JSON.stringify([labels[i],ys[i]]);if(pairs.has(key))throw new Error('Duplicate heatmap cell');pairs.add(key);
+      item(labels[i]+' / '+ys[i],row[v],p.value_column);
+      if(values[i]!==null) shape('rect',{x:40+xs.indexOf(labels[i])*560/xs.length,y:20+yKeys.indexOf(ys[i])*220/yKeys.length,width:550/xs.length,height:210/yKeys.length,fill:palette[0],opacity:0.2+0.8*(values[i]-lo)/span},legend.lastChild.textContent);
+    });
+  } else if(p.kind==='donut') {
+    if(p.composition!==true || rows.length<2 || rows.length>5 || new Set(labels).size!==labels.length || formats[p.y_column]?.kind==='percent') throw new Error('Invalid composition');
+    const y=index(p.y_column), values=rows.map(r=>number(r[y]));
+    if(values.some(v=>v===null || v<0) || !values.some(v=>v>0)) throw new Error('Invalid composition amounts');
+    const total=values.reduce((a,b)=>a+b,0);if(!Number.isFinite(total))throw new Error('Invalid total');
+    let angle=-Math.PI/2;
+    rows.forEach((row,i)=>{item(labels[i],row[y],p.y_column);legend.lastChild.style.borderLeft='4px solid '+palette[i];legend.lastChild.style.paddingLeft='8px';const step=values[i]/total*2*Math.PI;
+      if(step>0){
+        // Two arcs handle a full circle when every other category is zero.
+        const mid=angle+step/2,end=angle+step,r=90,cx=220,cy=135;
+        const at=a=>[cx+r*Math.cos(a),cy+r*Math.sin(a)];const a=at(angle),b=at(mid),c=at(end);
+        shape('path',{d:`M ${a} A ${r} ${r} 0 0 1 ${b} A ${r} ${r} 0 0 1 ${c}`,fill:'none',stroke:palette[i],'stroke-width':45},legend.lastChild.textContent);
+      }angle+=step;
+    });
+  } else {
+    const series=p.series;
+    if(!Array.isArray(series) || series.length<2 || series.length>4 || new Set(series.map(s=>s.y_column)).size!==series.length || new Set(series.map(s=>s.label)).size!==series.length || new Set(labels).size!==labels.length)throw new Error('Invalid series');
+    const signatures=series.map(s=>JSON.stringify(['kind','currency','scale','unit'].map(k=>formats[s.y_column]?.[k]??null)));
+    if(new Set(signatures).size!==1)throw new Error('Conflicting axis formats');
+    const values=series.map(s=>{const i=index(s.y_column);if(i===x)throw new Error('Invalid series column');return rows.map(r=>number(r[i]));});
+    if(values.some(v=>v.every(n=>n===null)))throw new Error('Empty series');
+    const stacked=p.kind==='stacked_bars', line=p.kind==='multi_series_line';
+    if(stacked && (p.additive!==true || values.some(v=>v.some(n=>n===null || n<0)) || series.some(s=>formats[s.y_column]?.kind==='percent')))throw new Error('Invalid stacked values');
+    let order=rows.map((_,i)=>i),times=[];
+    if(line){times=rows.map(r=>Date.parse(answerPeriod(r[x])));if(rows.length<2 || times.some(t=>!Number.isFinite(t)) || new Set(times).size!==times.length)throw new Error('Invalid periods');order.sort((a,b)=>times[a]-times[b]);}
+    const finite=values.flat().filter(v=>v!==null),totals=rows.map((_,i)=>values.reduce((a,v)=>a+(v[i]??0),0));
+    const lo=Math.min(0,...finite),hi=Math.max(0,...(stacked?totals:finite)),span=hi-lo||1;
+    if(!Number.isFinite(span))throw new Error('Unsafe axis range');
+    shape('line',{x1:40,y1:240,x2:600,y2:240,stroke:'currentColor'});
+    order.forEach((i,k)=>{if(k%Math.ceil(order.length/12)===0)tick(line?40+560*(times[i]-times[order[0]])/(times[order.at(-1)]-times[order[0]]):40+(k+0.5)*560/rows.length,260,labels[i]);});
+    series.forEach((s,j)=>{let previous=null;const y=index(s.y_column);
+      order.forEach((i,k)=>{item(s.label+' / '+labels[i],rows[i][y],s.y_column);legend.lastChild.style.borderLeft='4px solid '+palette[j];legend.lastChild.style.paddingLeft='8px';const v=values[j][i];if(v===null){previous=null;return;}
+        const xx=line?40+560*(times[i]-times[order[0]])/(times[order.at(-1)]-times[order[0]]):40+k*560/rows.length;
+        const base=stacked?values.slice(0,j).reduce((a,row)=>a+row[i],0):0;
+        const yy=240-210*(v+base-lo)/span,zero=240-210*(base-lo)/span;
+        if(line){if(previous)shape('line',{x1:previous.x,y1:previous.y,x2:xx,y2:yy,stroke:palette[j],'stroke-width':2});shape('circle',{cx:xx,cy:yy,r:3,fill:palette[j]},legend.lastChild.textContent);previous={x:xx,y:yy};}
+        else {const width=500/rows.length/(stacked?1:series.length);shape('rect',{x:xx+(stacked?0:j*width),y:Math.min(yy,zero),width:width-1,height:Math.abs(yy-zero),fill:palette[j]},legend.lastChild.textContent);}
+      });
+    });
+  }
+  view.appendChild(svg);view.appendChild(legend);
+}
+
 window.renderAnswerDocument = async function (root, doc, table, fetchResult) {
   root.replaceChildren();
   function text(parent, tag, value) {
@@ -180,6 +259,8 @@ window.renderAnswerDocument = async function (root, doc, table, fetchResult) {
           text(legend, "li", (point.rank == null ? "" : point.rank + ". ") + point.label + ": " +
             (isBars ? point.value : point.formatted_value == null ? "Missing" : point.formatted_value));
         });
+      } else if (['multi_series_line','grouped_bars','stacked_bars','heatmap','donut'].includes(p.kind)) {
+        renderExtendedAnswerChart(view,p,cols,rows,formats);
       } else throw new Error("Unsupported presentation");
     } catch (error) {
       view.replaceChildren();
@@ -190,7 +271,7 @@ window.renderAnswerDocument = async function (root, doc, table, fetchResult) {
         tableShown = true;
       } catch (_) { text(view, "p", "This view is unavailable."); }
     }
-    if (!tableShown && ["facts","bars","line"].includes(p.kind)) {
+    if (!tableShown && ["facts","bars","line","multi_series_line","grouped_bars","stacked_bars","heatmap","donut"].includes(p.kind)) {
       var details = text(card, "details", "");
       text(details, "summary", "View data / CSV");
       try { grid(details, p); } catch (_) { text(details, "p", "This data is unavailable."); }

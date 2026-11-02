@@ -507,7 +507,12 @@ def _fit_payload(payload: dict[str, Any], token_budget: int) -> dict[str, Any]:
 JUDGE_TOOL_NAME = "record_judgement"
 
 
-def build_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> dict[str, Any]:
+def build_judge_tool(site, *, capabilities_enabled=True):
+    from data_agent.runtime.composer.components import restrict_schema
+    return restrict_schema(_unfiltered_judge_tool(site, capabilities_enabled=capabilities_enabled))
+
+
+def _unfiltered_judge_tool(site: JudgeSite, *, capabilities_enabled: bool = True) -> dict[str, Any]:
     """The single forced tool for *site*, in the runtime's canonical flat shape.
 
     The `violation` enum is DERIVED from `violations_for_site`, never re-spelled: a model
@@ -1394,11 +1399,7 @@ class AnswerJudge:
     )
 
     def _tools_for(self, site: JudgeSite) -> list[dict[str, Any]]:
-        if site not in self._tools:
-            self._tools[site] = [
-                build_judge_tool(site, capabilities_enabled=self.capabilities_enabled)
-            ]
-        return self._tools[site]
+        return [build_judge_tool(site, capabilities_enabled=self.capabilities_enabled)]
 
     def _emit(self, event: str, payload: Mapping[str, Any]) -> None:
         if self.observer is None:
@@ -1411,6 +1412,7 @@ class AnswerJudge:
     def messages_for(self, brief: JudgeBrief) -> list[dict[str, Any]]:
         """The canonical request for *brief* — exposed so a test can assert what the judge
         was shown without reaching into `review`."""
+        from data_agent.runtime.composer.components import component_guidance
         fitted = _fit_payload(brief.payload(), self.token_budget)
         return [
             {
@@ -1418,6 +1420,7 @@ class AnswerJudge:
                 "content": _system_prompt(
                     brief.site, capabilities_enabled=self.capabilities_enabled
                 )
+                + "\n" + component_guidance()
                 + (
                     "\nFINAL REVIEW AFTER COMPONENT OMISSION: Judge only this revised draft and its selected UI "
                     "components against the remaining results. Excluded components are deliberately not delivered. "

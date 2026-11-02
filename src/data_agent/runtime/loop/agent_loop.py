@@ -42,6 +42,13 @@ from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from data_agent.runtime.composer.components import (
+    DEFAULT_COMPONENTS,
+    component_guidance,
+    presentation_boundary,
+    restrict_schema,
+    validate_components,
+)
 from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_answer_prose
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.capabilities.preparation import PreparationCache
@@ -1003,7 +1010,9 @@ class AgentLoop:
         # loop test that wires neither still agrees with a deployment that wires both;
         # `app.py` passes `settings.preview_row_count` to this AND to the assembler.
         preview_row_count: int = 20,
+        allowed_ui_components: tuple[str, ...] = DEFAULT_COMPONENTS,
     ) -> None:
+        self._allowed_ui_components = validate_components(allowed_ui_components)
         self._use_reasoning_metadata = bool(getattr(model_client, "_use_reasoning_metadata", False))
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
@@ -1068,6 +1077,7 @@ class AgentLoop:
         self._progress_summarizer = progress_summarizer
         self._answer_table_hooks = answer_table_hooks or AnswerTableHooks()
 
+    @presentation_boundary
     @source_availability_boundary
     @observe_turn_abort
     @progress_summary_boundary
@@ -1100,6 +1110,7 @@ class AgentLoop:
             question=user_message,
         )
 
+    @presentation_boundary
     @source_availability_boundary
     @observe_turn_abort
     @progress_summary_boundary
@@ -2980,7 +2991,16 @@ class AgentLoop:
         # catalogue is scope-independent; this is not a live MCP round-trip
         # on every call in practice, just a credentialed one the first time.
         try:
-            tools = await self._tools_provider(credentials)
+            tools = restrict_schema(await self._tools_provider(credentials))
+            for tool in tools:
+                if tool.get('name') == 'finalizeAnswer':
+                    tool['description'] = (
+                        'Propose one coherent answer with takeaway and ordered sections, exact execution result IDs and column names. '
+                        'The UI fetches the selected result; never invent values. Every section requires id, evidence_refs, presentation, caveats and actions. '
+                        'Use [] for optional caveats/actions. Evidence-only results stay hidden. Prefer one visible table; extras require table_reason. '
+                        'Prepared actions need capability_ref. A presentation repair reuses existing correct results. '
+                        + component_guidance()
+                    )
         except Exception as exc:
             failure = dependency_failure(exc, "tool_schema")
             if failure:

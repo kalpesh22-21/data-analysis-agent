@@ -13,6 +13,8 @@ from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal
 
+from .components import ALL_COMPONENTS, CURRENT_COMPONENTS, restrict_schema
+
 from data_agent.runtime.answer_scrub import (
     scrub_answer_prose,
     strip_redundant_identifier_annotations,
@@ -37,7 +39,7 @@ ID = {"type": "string", "minLength": 1, "maxLength": 128}
 REFS = {"type": "array", "items": ID, "uniqueItems": True, "maxItems": 32}
 PRESENTATION_SCHEMA = _object(
     {
-        "kind": {"enum": ["text", "figure", "facts", "table", "bars", "line"]},
+        "kind": {"enum": list(ALL_COMPONENTS)},
         "result_id": ID,
         "markdown": TEXT,
         "label": {"type": "string", "minLength": 1, "description": "Required for figure, bars and line. State the measure and its unit, not just a section title."},
@@ -81,6 +83,23 @@ PRESENTATION_SCHEMA["allOf"].append({
     "then": {"oneOf": [{"required": ["category_column"]}, {"required": ["category_columns"]}]},
     "else": {"not": {"required": ["category_columns"]}},
 })
+
+
+PRESENTATION_SCHEMA['properties'].update({
+    'series': {'type': 'array', 'minItems': 2, 'maxItems': 4,
+               'items': _object({'measure_column': ID, 'label': {**TEXT, 'minLength': 1}}, ['measure_column', 'label'])},
+    'series_column': ID,
+    'composition': {'const': True, 'description': 'Exhaustive mutually exclusive additive parts of the stated whole; not top-N or rates.'},
+    'additive': {'const': True, 'description': 'Disjoint additive measures, not a total plus its components or rates.'},
+})
+for kind in ('multi_series_line', 'grouped_bars', 'stacked_bars', 'heatmap', 'donut'):
+    fields = ['result_id', 'category_column', 'label']
+    fields += ['series'] if kind in ('multi_series_line', 'grouped_bars', 'stacked_bars') else ['measure_column']
+    fields += ['series_column'] if kind == 'heatmap' else ['composition'] if kind == 'donut' else ['additive'] if kind == 'stacked_bars' else []
+    PRESENTATION_SCHEMA['allOf'].append({
+        'if': {'properties': {'kind': {'const': kind}}},
+        'then': {'required': fields, 'not': {'anyOf': [{'required': [key]} for key in
+            (('measure_column', 'category_columns', 'direction', 'ties') if 'series' in fields else ('series', 'category_columns', 'direction', 'ties'))]}}})
 
 
 SECTION_SCHEMA = _object(
@@ -176,7 +195,7 @@ def proposal_to_internal(raw):
     from jsonschema import Draft202012Validator
 
     raw = normalize_answer_arguments(raw)
-    error = next(Draft202012Validator(PROPOSAL_SCHEMA).iter_errors(raw), None)
+    error = next(Draft202012Validator(restrict_schema(PROPOSAL_SCHEMA)).iter_errors(raw), None)
     if error:
         location = ".".join(map(str, error.absolute_path)) or "root"
         detail = "check the declared field schema"
@@ -351,6 +370,8 @@ def build_document(
             section["actions"].append({"capability_ref": ref, "label": text(action["label"])})
         p = proposed["presentation"]
         kind = p["kind"]
+        if kind not in CURRENT_COMPONENTS.get():
+            raise PresentationError("This presentation is disabled; select an enabled component.")
         if kind == "text":
             section["presentation"] = {"kind": "text", "markdown": text(p.get("markdown", ""))}
             if (
@@ -400,7 +421,7 @@ def build_document(
                     value for value in (section.get("explanation"), fallback) if value
                 )
                 rendered = {"kind": "table", "result_id": rid}
-        if rendered["kind"] == "line":
+        if rendered["kind"] in {"line", "multi_series_line"}:
             column = rendered["x_column"]
             index = columns.index(column)
             try:
@@ -446,6 +467,11 @@ def _visual(p, columns, rows, *, business_values=frozenset(), column_formats=Non
     kind = p["kind"]
     result = {"kind": kind, "result_id": p["result_id"]}
     label = _text(p.get("label", ""), business_values)
+    if kind not in CURRENT_COMPONENTS.get():
+        raise PresentationError("This presentation is disabled.")
+    if kind in {'multi_series_line', 'grouped_bars', 'stacked_bars', 'heatmap', 'donut'}:
+        from .charts import chart_selection
+        return chart_selection(p, columns, formats, label)
     if kind == "figure":
         _index(columns, p.get("column"))
         result["column"] = p["column"]

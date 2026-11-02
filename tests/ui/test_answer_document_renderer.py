@@ -147,3 +147,68 @@ def test_mixed_freshness_does_not_assign_payroll_date_to_live_employee(page):
 def test_source_formatting_preserves_values(page,value,fmt,expected):
     page.add_script_tag(path=str(ROOT / "ui/static/answer-document.js"))
     assert page.evaluate("([value,fmt]) => formatAnswerCell(value,fmt)",[value,fmt]) == expected
+
+
+@pytest.mark.parametrize('kind', ['multi_series_line','grouped_bars','stacked_bars','heatmap','donut'])
+def test_opt_in_chart_rendering_with_shared_table_data(page, kind):
+    page.set_content('<main></main>')
+    page.add_script_tag(path=str(ROOT / 'ui/static/answer-document.js'))
+    page.evaluate('''async kind => {
+      const p={kind,result_id:'r',x_column:'Month',label:'Earnings',series:[{y_column:'Regular',label:'Regular'},{y_column:'Overtime',label:'Overtime'}]};
+      if(kind==='stacked_bars')p.additive=true;
+      if(kind==='donut'){delete p.series;p.y_column='Regular';p.composition=true;}
+      if(kind==='heatmap'){delete p.series;p.y_column='Department';p.value_column='Regular';}
+      window.grids=[];
+      await window.renderAnswerDocument(document.querySelector('main'),{schema_version:2,takeaway:'Results',sections:[{id:'s',title:'Earnings',presentation:p}],sources:{r:{sql:'approved',column_formats:{Regular:{kind:'currency',currency:'USD'},Overtime:{kind:'currency',currency:'USD'}}}}},
+        (el,sql)=>{window.grids.push(sql);const t=document.createElement('div');t.textContent='Approved table';el.appendChild(t);},
+        async()=>({columns:['Month','Department','Regular','Overtime'],rows:[['2026-01','Sales',10,2],['2026-02','Engineering',20,3]],has_more:false}));
+    }''', kind)
+    assert page.locator('svg').count() == 1
+    assert page.locator('svg').get_attribute('data-chart-kind') == kind
+    assert page.get_by_text('View data / CSV').count() == 1
+    assert page.evaluate('window.grids') == ['approved']
+    assert page.get_by_text('This visualization is unavailable; showing its approved table.').count() == 0
+
+
+@pytest.mark.parametrize('failure', ['partial','negative','too_many','duplicate','null'])
+def test_donut_fails_to_same_table_without_dropping_rows(page, failure):
+    page.set_content('<main></main>')
+    page.add_script_tag(path=str(ROOT / 'ui/static/answer-document.js'))
+    page.evaluate('''async failure => {
+      let rows=[['Sales',10],['Engineering',20]];
+      if(failure==='negative')rows[1][1]=-1;
+      if(failure==='null')rows[1][1]=null;
+      if(failure==='duplicate')rows[1][0]='Sales';
+      if(failure==='too_many')rows=Array.from({length:6},(_,i)=>['D'+i,i+1]);
+      await window.renderAnswerDocument(document.querySelector('main'),{schema_version:2,takeaway:'Results',sections:[{id:'s',presentation:{kind:'donut',result_id:'r',x_column:'Department',y_column:'Count',label:'Headcount',composition:true}}],sources:{r:{sql:'approved'}}},
+        (el,sql)=>{const t=document.createElement('div');t.textContent=sql;el.appendChild(t);},async()=>({columns:['Department','Count'],rows,has_more:failure==='partial'}));
+    }''', failure)
+    assert page.locator('svg').count() == 0
+    assert page.get_by_text('This visualization is unavailable; showing its approved table.').count() == 1
+    assert page.get_by_text('approved', exact=True).count() == 1
+
+
+@pytest.mark.parametrize('failure', ['null_gap', 'duplicate_period', 'format_conflict', 'negative_stack', 'too_many_series'])
+def test_multi_series_guards_and_null_gaps(page, failure):
+    page.set_content('<main></main>')
+    page.add_script_tag(path=str(ROOT / 'ui/static/answer-document.js'))
+    page.evaluate('''async failure => {
+      const rows=[['2026-01',10,2],['2026-02',null,3],['2026-03',20,4]];
+      const formats={A:{kind:'currency',currency:'USD'},B:{kind:'currency',currency:'USD'}};
+      const p={kind:'multi_series_line',result_id:'r',x_column:'Month',label:'Earnings',series:[{y_column:'A',label:'Regular'},{y_column:'B',label:'Overtime'}]};
+      if(failure==='duplicate_period')rows[1][0]='2026-01';
+      if(failure==='format_conflict')formats.B.currency='EUR';
+      if(failure==='negative_stack'){p.kind='stacked_bars';p.additive=true;rows[1][1]=-1;}
+      if(failure==='too_many_series')p.series=Array.from({length:5},()=>p.series[0]);
+      await window.renderAnswerDocument(document.querySelector('main'),{schema_version:2,takeaway:'Results',sections:[{id:'s',presentation:p}],sources:{r:{sql:'approved',column_formats:formats}}},
+        (el,sql)=>{const t=document.createElement('div');t.textContent=sql;el.appendChild(t);},
+        async()=>({columns:['Month','A','B'],rows,has_more:false}));
+    }''', failure)
+    if failure == 'null_gap':
+        assert page.locator('svg circle').count() == 5
+        # Axis plus two segments for B; no segment bridges A's null.
+        assert page.locator('svg line').count() == 3
+        assert page.get_by_text('Regular / 2026-02: Not available', exact=True).count() == 1
+    else:
+        assert page.locator('svg').count() == 0
+        assert page.get_by_text('This visualization is unavailable; showing its approved table.').count() == 1

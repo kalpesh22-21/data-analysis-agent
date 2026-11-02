@@ -94,7 +94,8 @@ async def _call(judge, messages, name, schema):
 
 
 async def salvage(judge, brief):
-    schema = deepcopy(RECOVERY_SCHEMA)
+    from data_agent.runtime.composer.components import restrict_schema, component_guidance
+    schema = restrict_schema(RECOVERY_SCHEMA)
     schema["properties"]["unfinished"].pop("minItems", None)
     schema["properties"]["outcome"] = {"type": "string", "enum": ["full", "partial", "none"]}
     schema["required"].append("outcome")
@@ -107,6 +108,7 @@ async def salvage(judge, brief):
          "then": {"properties": {"sections": {"maxItems": 0}, "evidence": {"maxItems": 0}}}},
     ]
     messages = judge.messages_for(brief)
+    messages[0]["content"] += "\n" + component_guidance()
     messages[0]["content"] += (
         "\nSALVAGE MODE overrides the verdict format. Return salvageAnswer: an independently "
         "approved answer document using takeaway, sections, evidence, unfinished and outcome. "
