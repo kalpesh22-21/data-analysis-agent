@@ -67,6 +67,7 @@ _RUN_BLUEPRINT_CODES = {
 }
 
 _TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR"}
+_SCOPE_RECOVERY_CODES = {"SESSION_SCOPE_STALE", "SESSION_SCOPE_CHANGED"}
 _RECEIVE_LIMIT_CODES = {"API_PROVENANCE_INVALID", "RESULT_TOO_LARGE", "MCP_RESPONSE_UNSUPPORTED_ENCODING"}
 
 _EXPECTED_RETRYABLE = {
@@ -116,6 +117,8 @@ _EXPECTED_RETRYABLE = {
     "RUN_BLUEPRINT_ABORTED": True,
     # B4 raw transport blowup: the dispatcher itself sets retryable=False.
     "INTERNAL_TRANSPORT_ERROR": False,
+    "SESSION_SCOPE_STALE": False,
+    "SESSION_SCOPE_CHANGED": False,
     # analysisState (Release 1, 03 §C.3). The split is load-bearing: a rejected
     # UPDATE is fixable inside the same turn, but a LATE INIT is not — the
     # substantive work has already started, so the boundary has passed and no
@@ -206,6 +209,7 @@ _ALL_KNOWN_CODES = (
     | _BLUEPRINT_DEFINITION_CODES
     | _RUN_BLUEPRINT_CODES
     | _TRANSPORT_CODES
+    | _SCOPE_RECOVERY_CODES
     | _RECEIVE_LIMIT_CODES
 )
 
@@ -356,6 +360,8 @@ _EXPECTED_KIND = {
     "RUN_BLUEPRINT_VERIFY_FAILED": DenialKind.WORK_JUDGED,
     # B4: a connection refusal / timeout / malformed response. The wire broke.
     "INTERNAL_TRANSPORT_ERROR": DenialKind.INFRA_FAILED,
+    "SESSION_SCOPE_STALE": DenialKind.INFRA_FAILED,
+    "SESSION_SCOPE_CHANGED": DenialKind.INFRA_FAILED,
 }
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 
@@ -58,6 +59,31 @@ class ResponseGuard:
             await response.aclose()
             self.fail("RESULT_TOO_LARGE")
         response.stream = _BoundedStream(response.stream, self)
+        # Auth middleware rejects before dispatch. Inspect only a bounded JSON
+        # error, never coordinator text or an arbitrary 403/404.
+        if response.status_code == 403 and response.request.method == "POST":
+            # Notifications have no reply and may finish after a successful tool.
+            # A rejected notification must never replay that completed tool.
+            try:
+                request = json.loads(response.request.content)
+            except (ValueError, UnicodeDecodeError, httpx.RequestNotRead):
+                return
+            if not isinstance(request, dict) or request.get("id") is None:
+                return
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > 8192:
+                    await response.aclose()
+                    return
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeDecodeError):
+                return
+            if isinstance(payload, dict) and payload.get("code") == "SESSION_SCOPE_STALE":
+                self.error_code = "SESSION_SCOPE_STALE"
+                self.failed.set()
+                self.raise_if_failed()
 
 
 class _BoundedStream(httpx.AsyncByteStream):

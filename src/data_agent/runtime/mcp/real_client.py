@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from contextlib import asynccontextmanager
 from typing import Any
@@ -92,6 +93,7 @@ class RealMCPClient:
         self._mcp_url = mcp_url
         self._max_response_bytes = max_response_bytes
         self.scope_token_provider = None
+        self.scope_token_refresher = None
 
     @asynccontextmanager
     async def _session(self, headers: dict[str, str]):
@@ -127,6 +129,18 @@ class RealMCPClient:
             headers["X-Catalog-Scope"] = await self.scope_token_provider(jwt=jwt, session_id=session_id)
         return headers
 
+    async def _recover_stale_scope(self, exc, headers, *, jwt, session_id):
+        if (not isinstance(exc, MCPToolError) or exc.code != "SESSION_SCOPE_STALE"
+                or self.scope_token_refresher is None):
+            return False
+        headers["X-Catalog-Scope"] = await self.scope_token_refresher(
+            jwt=jwt, session_id=session_id, rejected_token=headers.get("X-Catalog-Scope")
+        )
+        logging.getLogger(__name__).info("MCP scope recovery code=SESSION_SCOPE_STALE retry=1")
+        from opentelemetry import trace
+        trace.get_current_span().add_event("mcp.scope_recovered", {"code": "SESSION_SCOPE_STALE", "retry": 1})
+        return True
+
     async def call_tool(
         self,
         tool_name: str,
@@ -139,9 +153,15 @@ class RealMCPClient:
         for attempt in range(2):
             try:
                 async with self._session(headers) as session:
+                    # The SDK otherwise discovers output schemas AFTER execution.
+                    # Preload them so a stale discovery response cannot replay a
+                    # tool whose execution already succeeded.
+                    await session.list_tools()
                     result = await session.call_tool(tool_name, args)
                 break
             except Exception as exc:
+                if not attempt and await self._recover_stale_scope(exc, headers, jwt=jwt, session_id=session_id):
+                    continue
                 if attempt or tool_name not in _READ_TOOLS or not transient_transport_error(exc):
                     raise
                 await asyncio.sleep(0.2)
@@ -161,8 +181,14 @@ class RealMCPClient:
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
         headers = await self._scoped_headers(jwt, session_id)
-        async with self._session(headers) as session:
-            result = await session.list_tools()
+        for attempt in range(2):
+            try:
+                async with self._session(headers) as session:
+                    result = await session.list_tools()
+                break
+            except Exception as exc:
+                if attempt or not await self._recover_stale_scope(exc, headers, jwt=jwt, session_id=session_id):
+                    raise
 
         return [
             MCPToolSpec(

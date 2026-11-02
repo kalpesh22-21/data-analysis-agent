@@ -153,3 +153,32 @@ async def test_old_cached_snapshot_is_refreshed_to_discover_namespace(rig):
     snapshot = await manager.ensure(jwt='alice', session_id='s')
     assert snapshot['scratch_database'] == 'tenant_uploads'
     assert len(calls) == 2
+
+
+async def test_concurrent_stale_recovery_uses_rejected_token_baseline(rig):
+    store, settings, calls, transport = rig
+    manager = SessionCatalog(settings, store, transport=transport)
+    original = await manager.ensure(jwt='alice', session_id='s')
+    tokens = await asyncio.gather(*(manager.refresh_scope_token(jwt='alice', session_id='s',
+        rejected_token=original['scope_token']) for _ in range(8)))
+    assert len(calls) == 2
+    assert len(set(tokens)) == 1
+    assert tokens[0] != original['scope_token']
+    # A delayed failed request also reuses the completed refresh.
+    assert await manager.refresh_scope_token(jwt='alice', session_id='s', rejected_token=original['scope_token']) == tokens[0]
+    assert len(calls) == 2
+
+
+async def test_changed_grants_stop_retry(rig):
+    from data_agent.runtime.mcp.client import MCPToolError
+    store, settings, calls, transport = rig
+    manager = SessionCatalog(settings, store, transport=transport)
+    original = await manager.ensure(jwt='alice', session_id='s')
+    async def changed(request):
+        snapshot = {**original, 'scope_token': 'new', 'columns': []}
+        return httpx.Response(200, json=snapshot)
+    manager.transport = httpx.MockTransport(changed)
+    with pytest.raises(MCPToolError) as exc:
+        await manager.refresh_scope_token(jwt='alice', session_id='s', rejected_token=original['scope_token'])
+    assert exc.value.code == 'SESSION_SCOPE_CHANGED'
+    assert (await store.get_or_create_session('s')).catalog_session['columns'] == []

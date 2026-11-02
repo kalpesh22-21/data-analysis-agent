@@ -36,12 +36,12 @@ class SessionCatalog:
                                    issuer=self.settings.jwt_issuer, audience=self.settings.jwt_audience)
         return identity_hash(claims)
 
-    async def ensure(self, *, jwt: str, session_id: str, force=False):
+    async def ensure(self, *, jwt: str, session_id: str, force=False, rejected_token=None):
         owner = self.owner(jwt)
         lease = uuid.uuid4().hex
         deadline = time.monotonic() + 65
         baseline = (await self.store.get_or_create_session(session_id)).catalog_session
-        baseline_token = baseline.get('scope_token') if baseline else None
+        baseline_token = rejected_token or (baseline.get('scope_token') if baseline else None)
         if baseline and baseline.get('owner') != owner:
             raise HTTPException(403, detail='Session belongs to a different identity.')
         if baseline and not force and 'scratch_database' in baseline and baseline.get('scope_token') and baseline.get('expires_at', 0) > time.time() + 30:
@@ -105,6 +105,17 @@ class SessionCatalog:
 
     async def scope_token(self, *, jwt, session_id):
         return (await self.ensure(jwt=jwt, session_id=session_id))['scope_token']
+
+    async def refresh_scope_token(self, *, jwt, session_id, rejected_token=None):
+        # The rejected token is the CAS baseline: concurrent stale calls reuse
+        # another worker's refresh rather than each minting a new token.
+        before = await self.ensure(jwt=jwt, session_id=session_id)
+        after = await self.ensure(jwt=jwt, session_id=session_id, force=True,
+                                  rejected_token=rejected_token)
+        if set(before['columns']) != set(after['columns']):
+            from data_agent.runtime.mcp.client import MCPToolError
+            raise MCPToolError("SESSION_SCOPE_CHANGED", "Access scope changed; start a new turn.")
+        return after['scope_token']
 
     async def catalog_handle(self, credentials):
         snapshot = await self.ensure(jwt=credentials.jwt, session_id=credentials.session_id)

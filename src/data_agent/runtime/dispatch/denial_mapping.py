@@ -662,6 +662,12 @@ _DENIAL_TABLE["SOURCE_UNAVAILABLE"] = DenialInfo(
     code="SOURCE_UNAVAILABLE", retryable=False, kind=DenialKind.INFRA_FAILED,
     user_message="A required data source is unavailable. Use independent sources or deliver verified portions with a limitation; do not retry this source during this turn.")
 
+for _code in ("SESSION_SCOPE_STALE", "SESSION_SCOPE_CHANGED"):
+    _DENIAL_TABLE[_code] = DenialInfo(
+        code=_code, retryable=False, kind=DenialKind.INFRA_FAILED,
+        user_message="The session access context changed. Please submit the question again.",
+    )
+
 KNOWN_DENIAL_CODES = frozenset(_DENIAL_TABLE)
 
 # The enforcement half of the table, DERIVED. The offline learning loop's

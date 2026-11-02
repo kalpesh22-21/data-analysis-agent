@@ -199,6 +199,7 @@ async def _stream_turn(
     emitter: ProgressEmitter,
     *,
     delivery_observer=None,
+    delivery_scope_check=None,
 ) -> AsyncIterator[str]:
     """Drive one `AgentLoop.run`/`resume` call as a background task while
     streaming its `ProgressEmitter` output as SSE `progress` events, then a
@@ -231,6 +232,12 @@ async def _stream_turn(
 
         try:
             outcome = await task
+            if delivery_scope_check is not None and not await delivery_scope_check():
+                yield _format_sse("error", {
+                    "code": "SESSION_SCOPE_CHANGED",
+                    "message": "Your access scope changed. Please submit the question again.",
+                })
+                return
         except (AlreadyConsumedError, CASMismatchError, RefreshRejectedError) as exc:
             yield _format_sse("error", {"code": type(exc).__name__, "message": str(exc)})
             return
@@ -583,11 +590,16 @@ def create_app(
         catalog_provider = session_catalog.catalog_handle
         if isinstance(mcp_client, RealMCPClient):
             mcp_client.scope_token_provider = session_catalog.scope_token
+            mcp_client.scope_token_refresher = session_catalog.refresh_scope_token
         if isinstance(scratch_client, ScratchClient):
             scratch_client.scope_token_provider = session_catalog.scope_token
 
     async def _session_credentials(credentials):
         return await session_catalog.credentials(credentials) if session_catalog else credentials
+
+    async def _delivery_scope_matches(credentials):
+        current = await _session_credentials(credentials)
+        return current.column_scope == credentials.column_scope
 
     help_center_schemas = (
         (SEARCH_HELP_CENTER_TOOL_SCHEMA, GET_HELP_CENTER_DOCUMENT_TOOL_SCHEMA)
@@ -1112,7 +1124,8 @@ def create_app(
                 return replace(outcome, delivery_traceparent=tracing.inject_current_traceparent())
 
         return _TurnStreamingResponse(
-            _stream_turn(_call, emitter, delivery_observer=_tracing_observer),
+            _stream_turn(_call, emitter, delivery_observer=_tracing_observer,
+                         delivery_scope_check=lambda: _delivery_scope_matches(credentials)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1159,7 +1172,8 @@ def create_app(
                 return replace(outcome, delivery_traceparent=tracing.inject_current_traceparent())
 
         return _TurnStreamingResponse(
-            _stream_turn(_call, emitter, delivery_observer=_tracing_observer),
+            _stream_turn(_call, emitter, delivery_observer=_tracing_observer,
+                         delivery_scope_check=lambda: _delivery_scope_matches(credentials)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1290,7 +1304,8 @@ def create_app(
                 tracing.record_turn_output(turn_span, outcome)
                 return replace(outcome, delivery_traceparent=tracing.inject_current_traceparent())
 
-        return _TurnStreamingResponse(_stream_turn(_call, emitter, delivery_observer=_tracing_observer),
+        return _TurnStreamingResponse(_stream_turn(_call, emitter, delivery_observer=_tracing_observer,
+                         delivery_scope_check=lambda: _delivery_scope_matches(credentials)),
             media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/answer/action")
