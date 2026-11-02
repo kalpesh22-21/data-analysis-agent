@@ -78,6 +78,28 @@ def restrict_schema(schema):
 def component_guidance():
     available = CURRENT_COMPONENTS.get()
     notes = ["Enabled presentations: " + ", ".join(available) + ". Select only these kinds."]
+    notes.append(
+        "Honor an explicit presentation request when it is enabled and appropriate for the data. "
+        "Otherwise choose an enabled alternative that preserves all requested information; "
+        "use table when no enabled chart fits. Never drop measures, categories or requested detail, "
+        "restrict the population, or change the metric just to fit a chart. "
+        "Do not ask the user to choose a display format. Choose by analytical intent and result shape, "
+        "not row count alone. Rendering limits are not SQL population limits."
+    )
+    selection_rules = {
+        "text": "Use text for explanations, refusals or limitations without a verified data result.",
+        "table": "Use table for detailed records, requested detail, incompatible units, or results unsuitable for enabled charts.",
+        "figure": "Use figure for one summary number.",
+        "facts": "Use facts for several summary numbers from one row.",
+        "bars": "Use bars for one measure compared or ranked across categories; prefer it when precise category comparison is the goal.",
+        "line": "Use line for one measure trending over time.",
+        "multi_series_line": "Use multi_series_line for two to four comparable measures trending over the same time periods.",
+        "grouped_bars": "Use grouped_bars to compare two to four measures side by side within each category; additivity is not required.",
+        "stacked_bars": "Use stacked_bars when the question concerns a total and its disjoint additive components within each category.",
+        "heatmap": "Use heatmap to reveal patterns in one measure across two categorical dimensions, with one row per dimension pair.",
+        "donut": "Use donut for a part-to-whole question with two to five complete, mutually exclusive categories; a small ranking alone is not composition.",
+    }
+    notes.extend(selection_rules[kind] for kind in available)
     if "bars" in available:
         notes.append(
             "Bars select category_column (or compound category_columns), measure_column and label. Ranking alone adds direction and ties; ordinary comparisons omit both."

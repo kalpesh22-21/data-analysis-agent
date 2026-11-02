@@ -17,6 +17,7 @@ from data_agent.runtime.composer.components import (
     ALL_COMPONENTS,
     CURRENT_COMPONENTS,
     DEFAULT_COMPONENTS,
+    component_guidance,
     restrict_schema,
 )
 from data_agent.runtime.config import RuntimeSettings
@@ -188,6 +189,9 @@ async def test_real_tool_schema_is_filtered_per_loop_and_not_mutated():
         loop._tools_provider = tools
         await run(loop)
         tool = next(t for t in model.calls[0].tools if t["name"] == "finalizeAnswer")
+        assert "preserves all requested information" in tool["description"]
+        for kind in ALL_COMPONENTS:
+            assert (f"Use {kind} " in tool["description"]) == (kind in components)
         return tool["parameters"]["properties"]["sections"]["items"]["properties"]["presentation"][
             "properties"
         ]["kind"]["enum"]
@@ -229,3 +233,24 @@ async def test_disabled_chart_cannot_ship_even_if_model_ignores_allowlist():
     assert any(
         t.tool_call_id == "disabled" and t.error_code == "INVALID_TOOL_ARGUMENTS" for t in trail
     )
+
+
+@pytest.mark.parametrize(
+    "allowed", [DEFAULT_COMPONENTS, ("text", "table", "donut"), ALL_COMPONENTS]
+)
+def test_selection_guidance_matches_configuration_and_preserves_information(allowed):
+    with enabled(allowed):
+        guidance = component_guidance()
+    for kind in ALL_COMPONENTS:
+        assert (f"Use {kind} " in guidance) == (kind in allowed)
+    assert "Honor an explicit presentation request" in guidance
+    assert "preserves all requested information" in guidance
+    assert "Never drop measures" in guidance
+    assert "not row count alone" in guidance
+    assert "Do not ask the user to choose a display format" in guidance
+    if "donut" in allowed:
+        assert "a small ranking alone is not composition" in guidance
+    if "grouped_bars" in allowed:
+        assert "additivity is not required" in guidance
+    if "stacked_bars" in allowed:
+        assert "disjoint additive components" in guidance
