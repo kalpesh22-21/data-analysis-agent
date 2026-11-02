@@ -1,5 +1,17 @@
 # UI assumptions in answer-document v2
 
+Caveats default to `[]`. Include only material qualifications needed to interpret
+the answer: population, calculation/exclusion rules, reporting basis, or missing
+data. A qualification already clear in a title, explanation or takeaway does not
+need a second caveat. Do not manufacture boilerplate to populate the field. The
+field remains present in the v2 contract; an empty list is valid.
+
+The model and judge assess whether disclosure is sufficient. The backend also
+removes normalized whole-statement duplicates found in displayed text, before
+review and at sealing. It does not delete substring matches inside negated or
+more qualified statements, or infer equivalence from a short title. Essential
+qualifications remain even if other caveats are removed. No SQL rerun is needed.
+
 `recordAssumptions` replaces the current-turn list; `[]` clears it. Resume and
 history use the last successful list. Normalized duplicates are removed. The composer cleans the combined caveats and
 recorded assumptions across sections before review, and repeats caveat cleanup

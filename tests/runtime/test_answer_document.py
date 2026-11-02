@@ -549,3 +549,21 @@ async def test_judge_correction_cannot_introduce_unexecuted_source():
     assert 'invented' not in out.answer_document['sources']
     assert len(mcp.calls) == 1
     assert len(judge.briefs) == 2
+
+
+async def test_disclosed_population_does_not_force_a_second_caveat_in_live_or_history():
+    from data_agent.runtime.session_history import project_history
+    population = "Headcount counts distinct employees with status Active or On Leave."
+    selected = section()
+    selected["title"] = population
+    loop, store, _, mcp, _ = build([
+        discovery(), query(),
+        batch(call("recordAssumptions", "a", assumptions=[population])),
+        final(selected),
+    ], Judge())
+    out = await run(loop)
+    assert out.answer_document["sections"][0]["caveats"] == []
+    saved = await store.get_or_create_session(CREDS.session_id)
+    assert saved.messages[-1].answer_document == out.answer_document
+    assert project_history(saved.messages, saved.tool_trail, CREDS.column_scope, None)["turns"][-1]["answer_document"] == out.answer_document
+    assert len(mcp.calls) == 1

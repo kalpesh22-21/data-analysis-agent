@@ -93,7 +93,7 @@ SECTION_SCHEMA = _object(
             "type": "array",
             "items": TEXT,
             "maxItems": 8,
-            "description": "Only distinct business/data limitations; no chart limits, paging, CSV, or UI instructions. Use [] when none. Recorded assumptions are added automatically: do not repeat or paraphrase them here.",
+            "description": "Default to []. Include only material business/data qualifications not already clear in the title or answer. No boilerplate, chart limits, paging, CSV, or UI instructions. Recorded assumptions are added automatically: do not repeat or paraphrase them here.",
         },
         "actions": {
             "description": "Required; use [] when no prepared actions are selected.",
@@ -384,10 +384,11 @@ def build_document(
                 pass  # Unknown dates stay as declared; the UI owns parsing/fallback.
         section["presentation"] = rendered
         sections.append(section)
-    from data_agent.runtime.composite.assumption_text import clean_caveats, clean_document_caveats
+    from data_agent.runtime.composite.assumption_text import clean_caveats, clean_document_caveats, displayed_qualification_keys
     from data_agent.runtime.composite.record_assumptions import clean_assumptions
     assumptions = clean_assumptions([text(a) for a in (assumptions or ())])
-    seen = set()
+    takeaway = text(args.get("answer", args.get("takeaway", "")))
+    seen = displayed_qualification_keys({"takeaway": takeaway, "sections": sections})
     for section in sections:
         section["caveats"] = clean_caveats(section["caveats"], seen=seen)
     remaining = clean_caveats(assumptions, seen=seen)
@@ -400,9 +401,9 @@ def build_document(
                 "presentation": {"kind": "text", "markdown": "\n\n".join(remaining)},
                 "caveats": [], "actions": [],
             })
-    clean_document_caveats({"sections": sections})
+    clean_document_caveats({"takeaway": takeaway, "sections": sections})
     return {
-        "takeaway": text(args.get("answer", args.get("takeaway", ""))),
+        "takeaway": takeaway,
         "sections": sections,
         "sources": sources,
     }

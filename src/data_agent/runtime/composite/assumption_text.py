@@ -63,9 +63,27 @@ def clean_caveats(raw, *, seen: set[str] | None = None) -> list[str]:
     return result
 
 
+def displayed_qualification_keys(document) -> set[str]:
+    """Whole statements only; a substring inside a negation is not disclosure."""
+    texts = [document.get("takeaway", "")]
+    for section in document.get("sections", []):
+        texts.extend(section.get(field, "") for field in ("title", "explanation"))
+        if section.get("id") != "scope":
+            texts.append(section.get("presentation", {}).get("markdown", ""))
+    keys = set()
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        for statement in [text, *re.split(r"(?<=[.!?;])\s+|\n+", text)]:
+            key = assumption_key(statement)
+            if key:
+                keys.add(key)
+    return keys
+
+
 def clean_document_caveats(document):
     """Mutate a candidate/copy at both composition and final sealing boundaries."""
-    seen: set[str] = set()
+    seen = displayed_qualification_keys(document)
     sections = document.get("sections", [])
     for section in sections:
         section["caveats"] = clean_caveats(section.get("caveats", []), seen=seen)

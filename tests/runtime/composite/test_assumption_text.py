@@ -116,3 +116,36 @@ def test_population_definition_is_preserved_without_an_equivalent_full_definitio
     doc = {"sections": [{"caveats": list(caveats)}]}
     clean_document_caveats(doc)
     assert doc["sections"][0]["caveats"] == caveats
+
+
+@pytest.mark.parametrize("field", ["takeaway", "title", "explanation", "markdown"])
+def test_qualification_already_displayed_does_not_need_a_caveat(field):
+    from data_agent.runtime.composite.assumption_text import clean_document_caveats
+
+    text = "Median excludes zero salaries."
+    section = {
+        "caveats": [text, "Employees without hire dates are excluded."],
+        "presentation": {"kind": "text"},
+    }
+    doc = {"sections": [section]}
+    if field == "takeaway":
+        doc[field] = "The median is $100,000. " + text
+    elif field == "markdown":
+        section["presentation"][field] = text
+    else:
+        section[field] = text
+    clean_document_caveats(doc)
+    assert section["caveats"] == ["Employees without hire dates are excluded."]
+
+
+def test_a_negated_or_differently_scoped_statement_does_not_suppress_a_caveat():
+    from data_agent.runtime.composite.assumption_text import clean_document_caveats
+
+    doc = {
+        "takeaway": "It is not true that median excludes zero salaries. Only 2026 records are included.",
+        "sections": [
+            {"caveats": ["Median excludes zero salaries.", "Only 2025 records are included."]}
+        ],
+    }
+    clean_document_caveats(doc)
+    assert len(doc["sections"][0]["caveats"]) == 2

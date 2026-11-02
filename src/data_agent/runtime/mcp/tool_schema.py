@@ -322,7 +322,7 @@ RECORD_ASSUMPTIONS_TOOL_SCHEMA: dict[str, Any] = {
         "Record the plain-English assumptions behind your answer so the user can see "
         "them. Use this when you interpreted an ambiguous term a particular way, applied "
         "a default filter or time period, or resolved a fuzzy concept to specific values. "
-        "Each call replaces the entire current-turn list; send [] to clear it. During repair, "
+        "Record only material interpretations not already clear in the title or answer. No boilerplate is required. Each call replaces the entire current-turn list; send [] to clear it. During repair, "
         "resubmit only assumptions that still apply. Consolidate paraphrases into one short "
         "business sentence per interpretation. Do not repeat them in answer prose or caveats; "
         "the backend displays this list. Section caveats add only distinct data limitations, not "

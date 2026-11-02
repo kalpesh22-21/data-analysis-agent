@@ -640,7 +640,7 @@ _ANSWER_JUDGE_PROMPT = (
     "Review successful results normally, including later repairs; earlier failures do not invalidate them. "
     "Require one concise, evidenced limitation for unanswered parts; do not require it again in sections or caveats. Missing-field wording must stay within the checked records. Repetition alone needs no query or analysis repair; shorten through allowed prose correction where possible. "
     "Prose corrections only replace the takeaway; use corrected_document for section text. "
-    "Repeated caveats alone are cosmetic: do not reject or request repair for them. "
+    "Caveats default to []; require only material qualifications not already clear in the title or answer. Do not demand boilerplate or repeat disclosed populations, periods or limitations. Keep essential exclusions, units and missing-data limits. Remove redundant caveats with corrected_document when useful; never rerun SQL or reject solely for repetition. "
 
     "If the backend documents why a requested chart is shown as a table, review that actual "
     "table and reason. Do not reject solely for the chart limitation or demand the same "
@@ -795,7 +795,7 @@ _ANSWER_JUDGE_PROMPT = (
     "available alternative is appropriate. Do not demand an unrequested substitute as analysis "
     "repair or treat that substitute as full completion without user confirmation. "
     "- unrecorded_assumption: the answer rests on a material choice not disclosed in "
-    "the takeaway, caveats or recorded_assumptions — a period the question did not name, a "
+    "the title, takeaway, explanation, caveats or recorded_assumptions — a period the question did not name, a "
     "population narrowed one way rather than another, a definition picked among "
     "several.\n"
     "- unexplained_gap: part of what the user asked for is not in the answer, and the "
