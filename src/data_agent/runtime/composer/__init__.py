@@ -93,7 +93,7 @@ SECTION_SCHEMA = _object(
             "type": "array",
             "items": TEXT,
             "maxItems": 8,
-            "description": "Only distinct limitations; use [] when none. Recorded assumptions are added automatically: do not repeat or paraphrase them here.",
+            "description": "Only distinct business/data limitations; no chart limits, paging, CSV, or UI instructions. Use [] when none. Recorded assumptions are added automatically: do not repeat or paraphrase them here.",
         },
         "actions": {
             "description": "Required; use [] when no prepared actions are selected.",
@@ -364,8 +364,9 @@ def build_document(
                     raise PresentationError("Figures and facts require exactly one returned row.")
                 rendered = _visual(p, columns, rows, business_values=business_values, column_formats=formats)
             except PresentationError as exc:
-                section["caveats"].append(
-                    f"The requested {kind} presentation is shown as a table: {exc}"
+                fallback = f"The requested {kind} presentation is shown as a table: {exc}"
+                section["explanation"] = " ".join(
+                    value for value in (section.get("explanation"), fallback) if value
                 )
                 rendered = {"kind": "table", "result_id": rid}
         if rendered["kind"] == "line":
@@ -383,21 +384,13 @@ def build_document(
                 pass  # Unknown dates stay as declared; the UI owns parsing/fallback.
         section["presentation"] = rendered
         sections.append(section)
-    # Keep one visible occurrence of each recorded interpretation. Only normalize
-    # presentation differences; semantic paraphrases are consolidated by the model.
-    from data_agent.runtime.composite.record_assumptions import assumption_key, clean_assumptions
+    from data_agent.runtime.composite.assumption_text import clean_caveats
+    from data_agent.runtime.composite.record_assumptions import clean_assumptions
     assumptions = clean_assumptions([text(a) for a in (assumptions or ())])
     seen = set()
     for section in sections:
-        caveats = []
-        for caveat in section["caveats"]:
-            key = assumption_key(caveat)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            caveats.append(caveat)
-        section["caveats"] = caveats
-    remaining = [a for a in assumptions if assumption_key(a) not in seen]
+        section["caveats"] = clean_caveats(section["caveats"], seen=seen)
+    remaining = clean_caveats(assumptions, seen=seen)
     if remaining:
         if sections:
             sections[0]["caveats"].extend(remaining)
@@ -453,12 +446,16 @@ def _visual(p, columns, rows, *, business_values=frozenset(), column_formats=Non
 
 
 def seal_document(candidate, *, answer_id, generated_at, revision=1):
+    from data_agent.runtime.composite.assumption_text import clean_document_caveats
+
+    candidate = deepcopy(candidate)
+    clean_document_caveats(candidate)
     return {
         "schema_version": 2,
         "answer_id": answer_id,
         "revision": revision,
         "generated_at": generated_at,
-        **deepcopy(candidate),
+        **candidate,
     }
 
 

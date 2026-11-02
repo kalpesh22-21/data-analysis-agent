@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.composite.assumption_text import assumption_key, business_caveat
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
 from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
 from data_agent.runtime.session.models import ResultPreview
@@ -25,11 +26,6 @@ TOOL_NAME = "recordAssumptions"
 # verbatim into the turn result / history.
 _MAX_ASSUMPTIONS = 50
 _MAX_ASSUMPTION_LEN = 2000
-
-
-def assumption_key(text: str) -> str:
-    """Ignore case, whitespace and a terminal period, never semantic differences."""
-    return " ".join(text.split()).casefold().rstrip(".")
 
 
 def clean_assumptions(raw: Any) -> list[str]:
@@ -52,7 +48,7 @@ def clean_assumptions(raw: Any) -> list[str]:
     for item in raw:
         if not isinstance(item, str):
             continue
-        text = item.strip()
+        text = business_caveat(item)
         if not text:
             continue
         if len(text) > _MAX_ASSUMPTION_LEN:

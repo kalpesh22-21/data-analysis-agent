@@ -1,10 +1,25 @@
 # UI assumptions in answer-document v2
 
 `recordAssumptions` replaces the current-turn list; `[]` clears it. Resume and
-history use the last successful list. Normalized duplicates are removed; the
-composer removes normalized duplicate caveats across sections before review.
+history use the last successful list. Normalized duplicates are removed. The composer cleans the combined caveats and
+recorded assumptions across sections before review, and repeats caveat cleanup
+when sealing a corrected or partial document. The first wording is retained.
+
+A deterministic canonical key also consolidates recognized whole-statement
+headcount definitions with explicit Active + On Leave populations (including
+“Active or On Leave” and “current employees (Active plus On Leave)”). This is
+bounded semantic normalization, not general similarity matching. Unknown wording,
+Active-only populations, record counts, dates, department restrictions and
+exclusions remain distinct. “Current employees” alone does not establish an
+explicit population and is not silently merged.
+
+The server removes recognized chart/preview row-limit and paging/CSV instructions
+from assumptions and caveats. Business sentences adjacent to a removed UI
+sentence remain. Source limitations (for example, a CSV source excluding a
+population) are not UI instructions. A generated chart-to-table fallback reason
+belongs in the section explanation and remains visible to the judge and user.
 Section authors should not restate recorded assumptions, which the composer
-includes automatically. Semantic paraphrases are cosmetic and must not trigger
+includes automatically. Unrecognized semantic paraphrases must not trigger
 judge rejection or a repair cycle. Distinct populations, periods and limitations
 must remain intact.
 

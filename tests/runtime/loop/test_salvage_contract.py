@@ -400,7 +400,9 @@ async def test_salvage_falls_back_to_table_and_reviews_exact_document(approved):
     out = await run(loop)
     candidate = judge.briefs[-1].answer_document
     assert candidate['sections'][0]['presentation']['kind'] == 'table'
-    assert any('shown as a table' in c and 'distinct category' in c for c in candidate['sections'][0]['caveats'])
+    assert 'shown as a table' in candidate['sections'][0]['explanation']
+    assert 'distinct category' in candidate['sections'][0]['explanation']
+    assert not candidate['sections'][0]['caveats']
     assert len(mcp.calls) == 1
     assert ('loop_recovery_fallback_reviewed', {'status': 'approved' if approved else 'rejected'}) in events
     if approved:

@@ -327,7 +327,7 @@ RECORD_ASSUMPTIONS_TOOL_SCHEMA: dict[str, Any] = {
         "business sentence per interpretation. Do not repeat them in answer prose or caveats; "
         "the backend displays this list. Section caveats add only distinct data limitations, not "
         "another wording of the recorded interpretation. Short metric/population labels are fine. "
-        "Never include freshness claims, SQL or internal identifiers. "
+        "Never include freshness claims, SQL, internal identifiers, chart/display limits, paging or CSV instructions. "
         "Example: Salary means recorded annual salary. Skip the call if none were recorded or needed."
     ),
     "parameters": {
