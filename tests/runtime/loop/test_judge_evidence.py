@@ -631,3 +631,21 @@ async def test_missing_source_receipts_are_scoped_and_not_data_evidence():
             {"result_id": "missing", "source": SOURCE, "status": "unavailable"}]
         assert not brief.results
         assert "private SQL" not in json.dumps(brief.payload())
+
+
+def test_timecard_execution_preserves_cross_source_measurement_rule_for_review():
+    """Review must see the default even when SQL chose the alternative relation."""
+    handle = load_catalog_handle_from_catalog({
+        'warehouse.total_earning': {
+            'columns': {'earn_amount': {'type': 'Float64'}, 'punch_date': {'type': 'Date'}},
+            'rules': [{
+                'id': 'earnings_source_selection',
+                'predicate': "payroll.amount WHERE register_type = 'EARN'; date basis pay_date",
+                'applies_when': 'unqualified gross earnings for a year',
+                'description': 'Use payroll by pay_date. Explicit timecard earnings use earn_amount by punch_date.',
+            }],
+        },
+    })
+    context = catalog_context(handle, ['SELECT sum(earn_amount) FROM warehouse.total_earning'], frozenset())
+    assert context['tables'][0]['rules'][0]['id'] == 'earnings_source_selection'
+    assert context['tables'][0]['rules'][0]['applies_when'] == 'unqualified gross earnings for a year'

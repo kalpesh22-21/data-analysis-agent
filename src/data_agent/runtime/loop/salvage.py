@@ -118,7 +118,7 @@ async def salvage(judge, brief):
         "None requires empty evidence and sections and an honest limitation. Never manufacture "
         "a gap for a scope caveat or wording repair. Respect previous_rejection: do not approve "
         "a rejected population/metric just by adding a caveat. If the correct result is already "
-        "available, select it. Put genuinely unfinished portions in unfinished only; the runtime "
+        "available, select it. A direct sum of payroll and timecard earnings without verified lifecycle overlap handling is not a supported combined measure: omit that value and its column from the takeaway and presentation, even if SQL returned it. Preserve only separate supported subtotals and mark the combined outcome unfinished. A caveat cannot repair an invalid measurement. Put genuinely unfinished portions in unfinished only; the runtime "
         "appends them to the takeaway, so do not repeat them in takeaway, sections or caveats. Use one short business-language reason per missing outcome, scoped to checked records. Prefer one "
         "coherent answer and at most one visible table; extra tables need table_reason. "
         "State each qualification once; consolidate paraphrases without dropping distinct scope or limitations. "
