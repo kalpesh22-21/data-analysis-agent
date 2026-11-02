@@ -66,3 +66,10 @@ Limits: these are single live model runs over small synthetic fixtures, not prod
 numeric reconciliation or proof of universal model reliability. The combined case
 still took 97 seconds. Some duplicated caveat wording and technical source labels
 remain; this change addresses measurement selection, not prose quality.
+
+Correction after owner review: explicit FINAL was redundant; MCP already applies
+ClickHouse final=1. Removed the added clause from the timecard summary, corrected
+its catalog/knowledge guidance, and instructed agent and judge to leave storage
+deduplication to MCP. Kept the searched CASE fix. Focused checks: 24 corpus tests,
+21 API source tests, 70 agent judge tests pass. The live runs above predate this
+redundant-clause removal; no new live-model run is claimed for this correction.
