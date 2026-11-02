@@ -3250,8 +3250,11 @@ class AgentLoop:
         # is why this is a separate call and not folded into that walk.
 
         discovery_rounds = 0
+        stagnation_finalization_pending = False
         while True:
             loop_safety.begin_round()
+            stagnation_finalization_round = stagnation_finalization_pending
+            stagnation_finalization_pending = False
             await cancellation_checkpoint("context", guard.usage().iterations + 1)
             request = await self._build_canonical_messages(
                 session_id,
@@ -4544,6 +4547,7 @@ class AgentLoop:
                     # the user's screen, and the two complaints are made at
                     # different moments about different text.
                     if await finalization_gate.may_refuse("ask_user_judge"):
+                        loop_safety.reset_for_repair()
                         self._observer(
                             ASK_USER_JUDGE_REFUSED_EVENT,
                             {"violation": ask_verdict.violation},
@@ -5224,9 +5228,36 @@ class AgentLoop:
             # full weight on purpose (loop/budget_guard.py module docstring).
             guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
 
-            # Keep stagnation accounting, but give the one granted repair its
-            # next round. Repeated/failed work still stops; hard budgets still apply.
-            if loop_safety.end_round() and not repair_authorized_this_round:
+            stagnant = loop_safety.end_round()
+            repair_granted = repair_authorized_this_round or finalization_gate.refused_this_round
+            if repair_granted:
+                # Only durable, bounded repair grants reset stagnation. Preserve
+                # seen evidence, read limits, review allowances and hard budgets.
+                loop_safety.reset_for_repair()
+            elif (stagnant or stagnation_finalization_round) and not guard.exceeded:
+                if not stagnation_finalization_round:
+                    stagnation_finalization_pending = True
+                    finalization_nudge = (
+                        "The no-progress limit has been reached. This is your final answer opportunity. "
+                        "Call finalizeAnswer in this response using existing verified results. If you "
+                        "need to update intent status or assumptions, include those tool calls together "
+                        "with finalizeAnswer in the same response; a state update alone does not finish "
+                        "the turn. Do not run further "
+                        "discovery or queries. Answer supported parts and disclose unfinished work; "
+                        "if nothing is supported, explain that limitation. Failed queries do not prove "
+                        "data is absent. Normal answer validation and review still apply."
+                    )
+                    self._observer(
+                        "loop_stagnation_finalization_requested",
+                        {
+                            "iteration": guard.usage().iterations,
+                            "stagnant_rounds": loop_safety.stagnant_rounds,
+                            "window": window_count,
+                        },
+                    )
+            if (stagnant or stagnation_finalization_round) and not (
+                repair_granted or stagnation_finalization_pending or guard.exceeded
+            ):
                 await self._force_block_pending_intents(
                     session_id=session_id,
                     turn_index=turn_index,
@@ -5263,7 +5294,7 @@ class AgentLoop:
             if loop_safety.stagnant_rounds == self._max_no_progress_rounds - 1:
                 finalization_nudge = (finalization_nudge or "") + "\n" + NO_PROGRESS_COACH
             progress_coach = loop_safety.progress_checkpoint(guard.usage().elapsed_seconds)
-            if progress_coach:
+            if progress_coach and not stagnation_finalization_pending:
                 finalization_nudge = (finalization_nudge or "") + "\n" + progress_coach
 
             if guard.exceeded:

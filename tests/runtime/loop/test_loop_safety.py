@@ -74,7 +74,7 @@ async def test_rc3_identical_reads_stop_early_and_persist_honest_notice():
     assert out.pending_question is None
     assert "no longer adding information" in out.assistant_text
     stops = [p for e, p in events if e == "loop_no_new_evidence_stop"]
-    assert stops == [{"iteration": 5, "window": 1, "stagnant_rounds": 4, "exit": "no_progress"}]
+    assert stops == [{"iteration": 6, "window": 1, "stagnant_rounds": 5, "exit": "no_progress"}]
     assert not any(e in {"loop_paused_budget_cap", "loop_hard_ceiling_stop"} for e, _ in events)
     doc = await store.get_or_create_session(CREDS.session_id)
     assert doc.messages[-1].content == out.assistant_text
@@ -288,3 +288,51 @@ def test_progress_checkpoint_counts_queries_and_time_without_blocking_work():
     assert safety.progress_checkpoint(30) == ''
     assert safety.progress_checkpoint(90)
     assert len(events)==2
+
+
+async def test_stagnation_requests_normal_finalization_before_recovery():
+    loop, _, model, _, events = build([
+        *[batch(call("searchBlueprints", f"search{i}", query="headcount")) for i in range(5)],
+        final(),
+    ])
+    outcome = await run(loop)
+    assert outcome.status == "done"
+    assert "final answer opportunity" in json.dumps(model.calls[-1].messages)
+    assert len([e for e, _ in events if e == "loop_stagnation_finalization_requested"]) == 1
+    assert not any(e == "loop_no_new_evidence_stop" for e, _ in events)
+
+
+async def test_hard_budget_does_not_grant_stagnation_finalization_round():
+    loop, _, model, _, events = build([
+        *[batch(call("searchBlueprints", f"search{i}", query="headcount")) for i in range(5)],
+    ])
+    loop._max_loop_iterations = 5
+    loop._max_budget_windows = 1
+    outcome = await run(loop)
+    assert outcome.status == "stopped_hard_ceiling"
+    assert len(model.calls) == 5
+    assert not any(e == "loop_stagnation_finalization_requested" for e, _ in events)
+
+
+def test_repair_reset_preserves_seen_evidence_and_read_allowance():
+    from data_agent.runtime.dispatch.tool_dispatcher import _build_preview
+    from data_agent.runtime.loop.loop_safety import LoopSafety
+
+    safety = LoopSafety(read_limit=3, no_progress_limit=4, help_failure_limit=3,
+                        observer=lambda *_: None)
+    result = ToolResult("ok", "runQuery", None, None, None, frozenset(),
+                        _build_preview({"columns": ["n"], "rows": [[1]], "row_count": 1}, 20), None)
+    safety.begin_round()
+    safety.observe_result("runQuery", {"sql": "SELECT 1"}, result)
+    safety.end_round()
+    for _ in range(4):
+        safety.begin_round()
+        safety.end_round()
+    safety.read_attempts["getTableSchema"] = 3
+    safety.reset_for_repair()
+    assert safety.stagnant_rounds == 0
+    safety.begin_round()
+    safety.observe_result("runQuery", {"sql": "SELECT 1"}, result)
+    assert not safety.end_round()
+    assert safety.stagnant_rounds == 1  # A repeated result is still not new evidence.
+    assert safety.check("getTableSchema").error_code == "READ_REFETCH_LIMIT"

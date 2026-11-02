@@ -861,8 +861,8 @@ async def test_granted_analysis_repair_survives_stagnation_boundary(makes_progre
         *[ModelTurnResult(tool_calls=[_query(f"q{i}")]) for i in range(4)],
         ModelTurnResult(tool_calls=[_answer_table("initial", "Department totals.")]),
         ModelTurnResult(tool_calls=[corrected]),
-        final_answer(assistant_text="Requested department totals.", evidence=["corrected"],
-                     tables=[{"result_id": "corrected", "caption": "Requested department"}]),
+        final_answer(assistant_text="Requested department totals.", evidence=[corrected.id],
+                     tables=[{"result_id": corrected.id, "caption": "Requested department"}]),
     ], judge, mcp=_rows_mcp(1, 1, 1, 1, 1))
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Department totals?")
     authorized = _events(events, "loop_answer_judge_repair_authorized")
@@ -870,15 +870,11 @@ async def test_granted_analysis_repair_survives_stagnation_boundary(makes_progre
     assert _carrying(model, "Repair target")
     assert len(_events(events, "loop_answer_judge_repair_attempted")) == 1
     stops = _events(events, "loop_no_new_evidence_stop")
-    if makes_progress:
-        assert outcome.status == "done"
-        assert not stops
-        assert judge.calls_made == 2
-        assert outcome.answer_tables
-    else:
-        assert outcome.status == "stopped_no_progress"
-        assert stops[0]["iteration"] == 6  # The repair round ran, then stopped.
-        assert judge.calls_made == 1
+    assert outcome.status == "done"
+    assert not stops
+    assert judge.calls_made == 2
+    assert outcome.answer_tables
+    assert _events(events, "loop_stagnation_reset")[0]["stagnant_rounds"] == 4
 
 
 async def test_review_exhausting_wall_clock_cannot_authorize_repair():

@@ -869,3 +869,18 @@ async def test_closing_the_last_intent_and_answering_in_one_response_finalizes()
     assert store.claims == 0
     doc = await store.get_or_create_session(SESSION_ID)
     assert [i.status for i in live_analysis_state(doc, 0).intents] == ["completed"]
+
+
+async def test_finalization_refusal_resets_stagnation_at_boundary():
+    loop, _, events, model = _build([
+        ModelTurnResult(tool_calls=[_init_call("s1", HEADCOUNT)]),
+        final_answer(assistant_text="THE DRAFT ANSWER"),
+        final_answer(assistant_text="the real answer"),
+    ])
+    # The first non-evidence finalization reaches the configured boundary.
+    loop._max_no_progress_rounds = 1
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="one thing")
+    assert outcome.status == "done"
+    assert "THE DRAFT ANSWER" in str(model.calls[2].messages)
+    assert _events(events, "loop_stagnation_reset")
+    assert not _events(events, "loop_no_new_evidence_stop")

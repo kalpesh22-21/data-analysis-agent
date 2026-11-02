@@ -64,6 +64,15 @@ class LoopSafety:
     def begin_round(self):
         self._round_progress = False
 
+    def reset_for_repair(self) -> None:
+        """Give an authorized repair fresh stagnation allowance, not fresh evidence."""
+        previous = self.stagnant_rounds
+        self.stagnant_rounds = 0
+        self.observer(
+            "loop_stagnation_reset",
+            {"stagnant_rounds": previous, "reason": "repair_authorized"},
+        )
+
     def check(self, name: str) -> ToolResult | None:
         if self.help_open and name in HELP_TOOLS:
             return safety_refusal(name, "HELP_CENTER_CIRCUIT_OPEN", HELP_BREAKER_TEXT)
