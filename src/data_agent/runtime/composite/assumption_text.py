@@ -40,6 +40,10 @@ def assumption_key(text: str) -> str:
     )
     if any(re.fullmatch(pattern, statement) for pattern in patterns):
         return "semantic:headcount:employees:active+on-leave"
+    if re.fullmatch(
+        rf"current(?: employees)? (?:means|includes|is|are) {statuses}(?: employees)?", statement
+    ):
+        return "semantic:population:current:active+on-leave"
     return key
 
 
@@ -62,5 +66,16 @@ def clean_caveats(raw, *, seen: set[str] | None = None) -> list[str]:
 def clean_document_caveats(document):
     """Mutate a candidate/copy at both composition and final sealing boundaries."""
     seen: set[str] = set()
-    for section in document.get("sections", []):
+    sections = document.get("sections", [])
+    for section in sections:
         section["caveats"] = clean_caveats(section.get("caveats", []), seen=seen)
+    # The full headcount definition already states this exact population and
+    # additionally preserves distinct counting. Prefer it over the standalone
+    # definition regardless of section/order; never drop qualified definitions.
+    if "semantic:headcount:employees:active+on-leave" in seen:
+        for section in sections:
+            section["caveats"] = [
+                caveat
+                for caveat in section["caveats"]
+                if assumption_key(caveat) != "semantic:population:current:active+on-leave"
+            ]

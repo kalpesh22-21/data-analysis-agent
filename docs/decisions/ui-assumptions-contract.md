@@ -8,7 +8,10 @@ when sealing a corrected or partial document. The first wording is retained.
 A deterministic canonical key also consolidates recognized whole-statement
 headcount definitions with explicit Active + On Leave populations (including
 “Active or On Leave” and “current employees (Active plus On Leave)”). This is
-bounded semantic normalization, not general similarity matching. Unknown wording,
+bounded semantic normalization, not general similarity matching. When a full
+headcount definition already specifies Active + On Leave, a standalone “Current
+means Active plus On Leave” definition is redundant; keep the full definition
+regardless of section order. Unknown wording,
 Active-only populations, record counts, dates, department restrictions and
 exclusions remain distinct. “Current employees” alone does not establish an
 explicit population and is not silently merged.

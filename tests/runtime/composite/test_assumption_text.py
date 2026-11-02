@@ -91,3 +91,28 @@ def test_sealing_cleans_corrections_without_mutating_reviewed_input():
     assert sealed["sections"][1]["caveats"] == ["Only 2025 records are counted."]
     assert len(candidate["sections"][1]["caveats"]) == 3
     assert seal_document(sealed, answer_id="a", generated_at="now") == sealed
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_deepseek_population_definition_is_subsumed_by_full_headcount(reverse):
+    from data_agent.runtime.composite.assumption_text import clean_document_caveats
+
+    full = "Headcount counts distinct employees with status Active or On Leave."
+    sections = [{"caveats": ["Current means Active plus On Leave."]}, {"caveats": [full]}]
+    if reverse:
+        sections.reverse()
+    doc = {"sections": sections}
+    clean_document_caveats(doc)
+    assert [c for section in sections for c in section["caveats"]] == [full]
+
+
+def test_population_definition_is_preserved_without_an_equivalent_full_definition():
+    from data_agent.runtime.composite.assumption_text import clean_document_caveats
+
+    caveats = [
+        "Current means Active plus On Leave.",
+        "Headcount counts distinct employees with status Active or On Leave in Sales.",
+    ]
+    doc = {"sections": [{"caveats": list(caveats)}]}
+    clean_document_caveats(doc)
+    assert doc["sections"][0]["caveats"] == caveats

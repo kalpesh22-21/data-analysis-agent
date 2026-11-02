@@ -384,7 +384,7 @@ def build_document(
                 pass  # Unknown dates stay as declared; the UI owns parsing/fallback.
         section["presentation"] = rendered
         sections.append(section)
-    from data_agent.runtime.composite.assumption_text import clean_caveats
+    from data_agent.runtime.composite.assumption_text import clean_caveats, clean_document_caveats
     from data_agent.runtime.composite.record_assumptions import clean_assumptions
     assumptions = clean_assumptions([text(a) for a in (assumptions or ())])
     seen = set()
@@ -400,6 +400,7 @@ def build_document(
                 "presentation": {"kind": "text", "markdown": "\n\n".join(remaining)},
                 "caveats": [], "actions": [],
             })
+    clean_document_caveats({"sections": sections})
     return {
         "takeaway": text(args.get("answer", args.get("takeaway", ""))),
         "sections": sections,
