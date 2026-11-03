@@ -100,16 +100,16 @@ def test_salary_template_can_filter_status(db):
 
 def test_payroll_period_register_filters_and_unmatched_employee(db):
     row = execute(db, 'bp-payroll-summary', group_by='company', register_type='EARN', period=PERIOD)[0]
-    assert row == ('Company',675,5,4)
+    assert row == ('Company',675,4)
     row = execute(db, 'bp-payroll-summary', group_by='company', register_type='EETAX', period=PERIOD)[0]
-    assert row == ('Company',40,1,1)
+    assert row == ('Company',40,1)
     row = execute(db, 'bp-payroll-summary', group_by='company', register_type='EARN', period=PERIOD, employee_status='Active', type_code='REG')[0]
-    assert row == ('Company',300,2,2)
+    assert row == ('Company',300,2)
 
 
 def test_taken_amounts_are_balance_values_not_approved_event_hours(db):
     row = execute(db, 'bp-accrual-balance-summary', group_by='company', accrual_code='PTO', employee_status='Active')[0]
-    assert row == ('Company',70,7,0,12,3,2)
+    assert row == ('Company',70,7,0,12,2)
 
 
 def test_events_default_includes_payouts_and_all_statuses(db):
