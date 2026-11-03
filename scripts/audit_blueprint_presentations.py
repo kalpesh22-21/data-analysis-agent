@@ -2,7 +2,9 @@
 
 This is a shape/contract battery using explicitly synthetic cells, NOT SQL execution
 or a conversational LLM battery. SQL projection names and grouping variants come from
-actual blueprints; the reviewed candidate selections live beside the corpus snapshot.
+actual blueprints, and so do the reviewed selections: each canon blueprint's
+`presentation` (kind, category_columns, measure_columns, optional by_group_by), the same
+advice getBlueprint suggests to the model.
 """
 from __future__ import annotations
 
@@ -17,11 +19,11 @@ import sqlglot
 import yaml
 
 from data_agent.runtime.composer import PresentationError, build_document, proposal_to_internal
+from data_agent.runtime.composer.components import ALL_COMPONENTS, CURRENT_COMPONENTS
 from data_agent.runtime.session.models import ResultPreview
 
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / 'tests/fixtures/corpus_snapshot/blueprints.yaml'
-PROFILES = ROOT / 'tests/fixtures/corpus_snapshot/presentation_cases.yaml'
 
 
 def load_cases(corpus=SNAPSHOT):
@@ -29,30 +31,32 @@ def load_cases(corpus=SNAPSHOT):
     docs = raw['blueprints'] if isinstance(raw, dict) else raw
     if isinstance(docs, dict):
         docs = list(docs.values())
-    profiles = yaml.safe_load(PROFILES.read_text())
-    assert {d['id'] for d in docs} == set(profiles), 'Every blueprint requires a reviewed profile'
+    missing = sorted(d['id'] for d in docs if not d.get('presentation'))
+    assert not missing, f'Every blueprint requires a reviewed presentation: {missing}'
     for doc in docs:
-        profile = profiles[doc['id']]
+        presentation = doc['presentation']
         sql = (doc.get('composes') or [doc])[-1]['sql_template']
         tree = sqlglot.parse_one(re.sub(r'\{(\w+)\}', r':\1', sql), read='clickhouse')
         columns = [e.alias_or_name for e in tree.selects]
         assert len(set(columns)) == len(columns), (doc['id'], 'ambiguous projection')
-        assert set(profile.get('categories', []) + profile.get('measures', [])) <= set(columns), doc['id']
+        measures = presentation.get('measure_columns', [])
+        assert set(presentation.get('category_columns', []) + measures) <= set(columns), doc['id']
         groups = next((s['enum_values'] for s in doc['slots'] if s['name'] == 'group_by'), [None])
         for group in groups:
-            categories = profile.get('categories', [])
-            kind = profile['kind']
-            if kind == 'grouped':
-                kind = 'line' if group in {'month', 'day'} else 'scalar' if group == 'company' and not {'Pay Type'} & set(categories) else 'bars'
-                if kind == 'line':
-                    categories = ['Group']
-            measures = profile.get('measures', [])
-            if kind == 'scalar':
-                yield dict(blueprint=doc['id'], group=group, columns=columns, kind='facts' if len(measures) > 1 else 'figure', measures=measures, categories=[], sql=sql)
+            categories = presentation.get('category_columns', [])
+            kind = presentation.get('by_group_by', {}).get(group, presentation['kind'])
+            if kind == 'line' and group in presentation.get('by_group_by', {}):
+                categories = ['Group']  # a group_by line override plots the Group column
+            if kind in {'figure', 'facts'}:
+                yield dict(blueprint=doc['id'], group=group, columns=columns, kind=kind, measures=measures, categories=[], sql=sql)
             elif kind == 'table':
                 yield dict(blueprint=doc['id'], group=group, columns=columns, kind='table', measures=[], categories=[], sql=sql)
+            elif kind == 'donut':
+                # Audited where donut is enabled, and as the bars a default deployment gets.
+                for audited in ('donut', 'bars'):
+                    yield dict(blueprint=doc['id'], group=group, columns=columns, kind=audited, measures=measures, categories=categories, sql=sql)
             else:
-                for measure in measures:
+                for measure in measures:  # alternatives, one chart each
                     yield dict(blueprint=doc['id'], group=group, columns=columns, kind=kind, measures=[measure], categories=categories, sql=sql)
 
 
@@ -88,6 +92,9 @@ def materialize(case, *, count=4, numeric_strings=False, reverse=False, null_mea
             presentation['category_column'] = categories[0]
         else:
             presentation['category_columns'] = categories
+    elif kind == 'donut':
+        presentation.update(category_column=categories[0], measure_column=case['measures'][0],
+                            label=case['measures'][0].replace('_', ' '), composition=True)
     elif kind == 'figure':
         presentation.update(column=case['measures'][0], label=case['measures'][0].replace('_', ' '))
     elif kind == 'facts':
@@ -95,6 +102,8 @@ def materialize(case, *, count=4, numeric_strings=False, reverse=False, null_mea
     proposal = {'takeaway': 'Synthetic presentation compatibility check.', 'evidence': ['audit'], 'sections': [
         {'id': 'audit', 'evidence_refs': ['audit'], 'presentation': presentation, 'caveats': [], 'actions': []},
     ]}
+    # Donut is off by default; audit it under a deployment that enables it.
+    token = CURRENT_COMPONENTS.set(ALL_COMPONENTS) if kind == 'donut' else None
     try:
         normalized = proposal_to_internal(proposal)
         receipt = SimpleNamespace(tool_call_id='audit', turn_index=0, tool_name='runQuery', status='ok', error_code=None,
@@ -106,6 +115,9 @@ def materialize(case, *, count=4, numeric_strings=False, reverse=False, null_mea
         return {'rendered': section['presentation']['kind'], 'reasons': section['caveats'], 'document': document}
     except PresentationError as exc:
         return {'rendered': 'rejected', 'reasons': [str(exc)]}
+    finally:
+        if token is not None:
+            CURRENT_COMPONENTS.reset(token)
 
 
 def audit():
@@ -128,7 +140,7 @@ def audit():
 
 
 def write_markdown(path, results):
-    profiles = yaml.safe_load(PROFILES.read_text())
+    profiles = {doc['id']: doc['presentation'] for doc in yaml.safe_load(SNAPSHOT.read_text())}
     counts = Counter(profile['kind'] for profile in profiles.values())
     lines = [
         '# Blueprint presentation compatibility audit', '',
@@ -160,8 +172,8 @@ def write_markdown(path, results):
     for blueprint, profile in sorted(profiles.items()):
         checks = [r for r in results if r['blueprint'] == blueprint]
         kinds = ', '.join(sorted({r['kind'] for r in checks}))
-        categories = ', '.join(profile.get('categories', [])) or '—'
-        measures = ', '.join(profile.get('measures', [])) or 'Record columns'
+        categories = ', '.join(profile.get('category_columns', [])) or '—'
+        measures = ', '.join(profile.get('measure_columns', [])) or 'Record columns'
         lines.append(f'| {blueprint} | {kinds} | {categories} | {measures} | {sum(r["passed"] for r in checks)}/{len(checks)} |')
     lines += ['', 'Reproduce with:', '', '```sh',
               'PYTHONPATH=src .venv/bin/python scripts/audit_blueprint_presentations.py --output /tmp/blueprint-presentations.json --markdown docs/verification/blueprint-presentations.md',

@@ -19,9 +19,9 @@ Locating the MCP repo (first match wins):
     1. ``$CLICKHOUSE_API_REPO`` env var (absolute path to the clickhouse-api repo)
     2. sibling of this agent repo: ``../clickhouse-api``
 
-Commit the result. ``tests/fixtures/corpus_snapshot/presentation_cases.yaml`` needs a
-reviewed profile for any NEW blueprint id; ``scripts/audit_blueprint_presentations.py``
-fails until one is added.
+Commit the result. Every canon blueprint carries a reviewed ``presentation``;
+``scripts/audit_blueprint_presentations.py`` checks each against the document
+materializer and fails for a blueprint that has none.
 """
 
 from __future__ import annotations

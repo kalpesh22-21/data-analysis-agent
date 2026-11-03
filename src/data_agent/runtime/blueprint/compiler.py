@@ -1004,6 +1004,7 @@ def dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
         "composes_json": json.dumps(bp.composes) if bp.composes else None,
         "result_grain_json": (json.dumps(bp.result_grain) if bp.result_grain is not None else None),
         "column_formats_json": json.dumps(bp.column_formats) if bp.column_formats else None,
+        "presentation_json": json.dumps(bp.presentation) if bp.presentation else None,
         # J7: `or None` so an undeclared anchor writes `null` — neo4j REMOVES a
         # null-valued SET, which is what makes a re-seed that DROPS the declaration
         # actually clear the stale property instead of leaving the old claim behind. The

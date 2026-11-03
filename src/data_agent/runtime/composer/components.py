@@ -75,6 +75,50 @@ def restrict_schema(schema):
     return value
 
 
+# The nearest enabled presentation when a blueprint suggests a disabled one. Text and
+# table are always enabled (`validate_components`), so every chain ends somewhere usable.
+_SUGGESTION_FALLBACK = {
+    "figure": ("facts", "table"), "facts": ("table",), "line": ("bars", "table"), "bars": ("table",),
+    # Donut is off by default; its parts compare just as well as bars on one axis.
+    "donut": ("bars", "table"),
+}
+
+
+def _enabled_kind(kind, available):
+    for candidate in (kind, *_SUGGESTION_FALLBACK.get(kind, ())):
+        if candidate in available:
+            return candidate
+    return "table"
+
+
+def suggested_presentation(hint):
+    """A blueprint's reviewed presentation, restricted to this turn's enabled kinds.
+
+    A disabled kind would steer the model into the composer's "presentation is disabled"
+    refusal and cost a repair round, so it is replaced by the nearest enabled kind.
+    Columns travel only with a chart they still describe; a table needs none.
+    """
+    if not isinstance(hint, dict) or not isinstance(hint.get("kind"), str):
+        return None
+    available = CURRENT_COMPONENTS.get()
+    kind = _enabled_kind(hint["kind"], available)
+    suggestion = {"kind": kind}
+    if kind != "table":
+        for key in ("category_columns", "measure_columns"):
+            if hint.get(key):
+                # Bars stay one category and one measure, including a line or donut
+                # that fell back to bars; other kinds keep their alternatives.
+                suggestion[key] = list(hint[key])[:1] if kind == "bars" else list(hint[key])
+    overrides = {
+        group: resolved
+        for group, group_kind in (hint.get("by_group_by") or {}).items()
+        if (resolved := _enabled_kind(group_kind, available)) != kind
+    }
+    if overrides:
+        suggestion["by_group_by"] = overrides
+    return suggestion
+
+
 def component_guidance():
     available = CURRENT_COMPONENTS.get()
     notes = ["Enabled presentations: " + ", ".join(available) + ". Select only these kinds."]
@@ -85,6 +129,12 @@ def component_guidance():
         "restrict the population, or change the metric just to fit a chart. "
         "Do not ask the user to choose a display format. Choose by analytical intent and result shape, "
         "not row count alone. Rendering limits are not SQL population limits."
+    )
+    notes.append(
+        "A blueprint's suggested_presentation (from getBlueprint) is the reviewed view of its result: "
+        "follow it, with any by_group_by entry for the group_by you bound, unless the user asks for "
+        "another view or the actual result does not fit. Its measure_columns are alternatives; the "
+        "first is the default."
     )
     selection_rules = {
         "text": "Use text for explanations, refusals or limitations without a verified data result.",

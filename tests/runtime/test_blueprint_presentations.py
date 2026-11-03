@@ -8,7 +8,7 @@ CASES = list(load_cases())
 
 
 def case_id(case):
-    return ':'.join([case['blueprint'], str(case['group']), *case['measures']])
+    return ':'.join([case['blueprint'], str(case['group']), *case['measures'], *(['donut'] if case['kind'] == 'donut' else [])])
 
 
 @pytest.mark.parametrize('case', CASES, ids=case_id)

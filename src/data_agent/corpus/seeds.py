@@ -66,6 +66,11 @@ class BlueprintSeed:
     composes: list[dict[str, Any]] = field(default_factory=list)
     result_grain: list[str] | dict[str, Any] | None = None
     column_formats: dict[str, dict[str, Any]] | None = None
+    # The reviewed presentation for this blueprint's result (`kind`, `category_columns`,
+    # `measure_columns`, optional `by_group_by`). Advice for the model, surfaced by
+    # getBlueprint filtered to the deployment's enabled presentations
+    # (`composer.components.suggested_presentation`); never a forced layout.
+    presentation: dict[str, Any] | None = None
     # J7 — the OPTIONAL window-anchor declaration (`blueprint.models.WINDOW_ANCHORS`:
     # `"data"` | `"calendar"`). Meaningful only for a WINDOWED blueprint; `None` (the
     # default) means the blueprint makes no claim, nothing is stored, and the read path

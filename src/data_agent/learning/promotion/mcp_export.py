@@ -148,6 +148,10 @@ def _blueprint_doc(env: CandidateEnvelope, node_id: str) -> dict[str, Any]:
         doc["column_formats"] = seed.column_formats
     if seed.window_anchor:
         doc["window_anchor"] = seed.window_anchor
+    # The reviewed presentation, when the candidate carries one. Omitted when absent: a
+    # learned blueprint without a review makes no presentation claim.
+    if seed.presentation:
+        doc["presentation"] = seed.presentation
     if seed.sql_template:
         doc["sql_template"] = seed.sql_template
     if seed.resolves:

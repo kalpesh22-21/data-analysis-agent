@@ -37,6 +37,7 @@ from itertools import zip_longest
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.blueprint.models import slot_type_gloss, window_anchor_declaration
+from data_agent.runtime.composer.components import suggested_presentation
 from data_agent.runtime.dispatch.tool_dispatcher import (
     _DEFAULT_MAX_TOOL_RESULT_TOKENS,
     ToolObserver,
@@ -790,6 +791,11 @@ class GetBlueprintTool(_ReadTool):
         # FOUND shape is byte-identical to before for the other eight.
         _put_if_present(
             result_full, "window_anchor", window_anchor_declaration(detail.window_anchor)
+        )
+        # The canon's reviewed view of this result, restricted to the turn's enabled
+        # presentations so the model is never steered to a kind the composer refuses.
+        _put_if_present(
+            result_full, "suggested_presentation", suggested_presentation(detail.presentation)
         )
         # S1: provenance is the blueprint's SCOPED uses footprint (NOT the
         # safe-empty frozenset()) — this is the same class of info getTableSchema

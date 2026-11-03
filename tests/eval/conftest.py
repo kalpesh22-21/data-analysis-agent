@@ -290,6 +290,8 @@ def blueprint_detail(seed: BlueprintSeed) -> BlueprintDetail:
         # the whole eval while every other assertion keeps passing.
         window_anchor=seed.window_anchor,
         column_formats=seed.column_formats,
+        # getBlueprint renders it as `suggested_presentation`, read off THIS object.
+        presentation=seed.presentation,
     )
 
 
