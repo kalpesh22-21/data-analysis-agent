@@ -547,3 +547,29 @@ def test_a_legacy_document_without_the_field_loads_unchanged() -> None:
     assert _render_entry(restored, 20)["user_message"] == (
         classify_denial("COLUMN_SCOPE_VIOLATION").user_message
     )
+
+
+# ---------------------------------------------------------------------------
+# A finalizeAnswer entry is labelled with the tool the model called.
+# ---------------------------------------------------------------------------
+
+
+def _refused_answer(model_response: dict | None) -> TrailEntry:
+    return TrailEntry(
+        turn_index=0, tool_call_id="c1", tool_name="answerWithTable", args={"answer": "x"},
+        status="error", error_code="ANSWER_TABLE_BLUEPRINT_NOT_RUN", provenance=frozenset(),
+        result_preview=None, result_full_ref=None, ts="t", model_response=model_response,
+    )
+
+
+def test_a_refused_finalize_answer_is_labelled_finalize_answer() -> None:
+    """The loop persists `finalizeAnswer` under the internal `answerWithTable`. The model
+    is offered only `finalizeAnswer`, so the refusal it reads back must use that name."""
+    call = {"id": "c1", "type": "function", "function": {"name": "finalizeAnswer", "arguments": "{}"}}
+    rendered = _render_entry(_refused_answer({"id": "r1", "tool_calls": [call]}), 20)
+    assert rendered["tool_name"] == "finalizeAnswer"
+    assert "call finalizeAnswer again" in rendered["user_message"]
+
+
+def test_a_legacy_answer_entry_keeps_the_name_its_model_called() -> None:
+    assert _render_entry(_refused_answer(None), 20)["tool_name"] == "answerWithTable"

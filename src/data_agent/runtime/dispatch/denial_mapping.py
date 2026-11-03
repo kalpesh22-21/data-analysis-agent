@@ -234,7 +234,7 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         user_message=(
             "You referenced a blueprint you have not run in this turn, so there is no "
             "table to show. Call runBlueprint with that blueprint first, then call "
-            "answerWithTable again."
+            "finalizeAnswer again."
         ),
     ),
     # ANSWER_TABLE_NO_TABLE_DESIGNATED (Release 1, 08 §O): the model called
@@ -259,11 +259,10 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         # table at all. Nothing was computed and nothing computed was wrong.
         kind=DenialKind.GATE,
         user_message=(
-            "Your answerWithTable named no table, so there is nothing for the user "
-            "to look at. Every table goes in `tables`, one entry per part of your "
-            'answer: `tables: [{sql: "SELECT …"}]` for a query you wrote, or '
-            '`tables: [{blueprint_id: "bp-…"}]` for a blueprint you ran this turn. '
-            "Send your answer again with the table in it."
+            "Your finalizeAnswer selected no table, so there is nothing for the user "
+            "to look at. Give each result the user needs to see its own section, with "
+            "a non-text presentation (a table, chart or figure) whose result_id is also "
+            "in that section's evidence_refs. Send your answer again with the table in it."
         ),
     ),
     # BLUEPRINT_DEFINITION_NOT_READ (Release 1): the model called `runBlueprint` for

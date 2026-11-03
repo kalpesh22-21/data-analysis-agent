@@ -472,3 +472,30 @@ def test_late_registered_codes_render_their_live_message_on_replay() -> None:
     for code, message in live.items():
         assert classify_denial(code).user_message == message
         assert classify_denial(code).user_message != "Something went wrong processing that request."
+
+
+def test_no_refusal_names_an_internal_answer_tool() -> None:
+    """The model is offered only `finalizeAnswer`; `answerWithTable` / `answerWithText`
+    are internal routing names. A refusal telling the model to call one of them names a
+    tool it does not have."""
+    from data_agent.runtime.dispatch.denial_mapping import _DENIAL_TABLE
+    from data_agent.runtime.loop.agent_loop import (
+        _answer_table_blueprint_not_run,
+        _answer_table_result_invalid,
+    )
+    from data_agent.runtime.loop.finalization import (
+        answer_judge_rejected,
+        answer_table_no_table_designated,
+        finalization_blocked,
+    )
+
+    texts = {code: info.user_message for code, info in _DENIAL_TABLE.items()}
+    for result in (
+        _answer_table_blueprint_not_run("bp-x"),
+        _answer_table_result_invalid("r1", ["r2"]),
+        answer_table_no_table_designated(),
+        answer_judge_rejected("Fix the total."),
+        finalization_blocked(()),
+    ):
+        texts[result.error_code] = f"{result.user_message} {result.denial_detail}"
+    assert {code: text for code, text in texts.items() if "answerWith" in text} == {}

@@ -263,11 +263,10 @@ def answer_table_no_table_designated() -> ToolResult:
     otherwise degrades to a generic message.
     """
     detail = (
-        "Your finalizeAnswer named no table, so there is nothing for the user to "
-        "look at. Every table goes in `tables`, one entry per part of your answer: "
-        '`tables: [{sql: "SELECT …"}]` for a query you wrote, or '
-        '`tables: [{blueprint_id: "bp-…"}]` for a blueprint you ran this turn. '
-        "Send your answer again with the table in it."
+        "Your finalizeAnswer selected no table, so there is nothing for the user "
+        "to look at. Give each result the user needs to see its own section, with "
+        "a non-text presentation (a table, chart or figure) whose result_id is also "
+        "in that section's evidence_refs. Send your answer again with the table in it."
     )
     return ToolResult(
         status="error",

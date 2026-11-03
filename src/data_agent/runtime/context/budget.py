@@ -26,6 +26,24 @@ from data_agent.runtime.dispatch.sql_diagnostics import compact_model_diagnostic
 from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
 from data_agent.runtime.session.models import TrailEntry
 
+# The loop routes every `finalizeAnswer` call through the internal `answerWithTable` /
+# `answerWithText` tools and persists it under that internal name. The model is offered
+# only `finalizeAnswer`, so a result labelled with an internal name names a tool it
+# cannot call, and every refusal of its answer reads as a refusal of some other tool.
+# The entry's own `model_response` records the name the model actually called; a legacy
+# entry without one keeps its stored name, which is what that model called.
+_FINALIZER_ALIASES = frozenset({"answerWithTable", "answerWithText"})
+
+
+def _model_facing_tool_name(entry: TrailEntry) -> str:
+    if entry.tool_name in _FINALIZER_ALIASES:
+        for call in (entry.model_response or {}).get("tool_calls") or ():
+            if isinstance(call, dict) and call.get("id") == entry.tool_call_id:
+                name = (call.get("function") or {}).get("name")
+                if isinstance(name, str) and name:
+                    return name
+    return entry.tool_name
+
 
 def _estimate_tokens(text: str) -> int:
     """Crude token estimate (chars/4) — a budget heuristic, not a tokenizer."""
@@ -69,7 +87,7 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         }
     # The model-facing reason for a non-`ok` entry. `denial_detail` — set only where
     # the runtime already decided the specific text is safe (the dispatcher's
-    # COLUMN_SCOPE_VIOLATION carve-out, the answerWithTable nudge) — wins, because it
+    # COLUMN_SCOPE_VIOLATION carve-out, the finalizeAnswer nudges) — wins, because it
     # names the thing the model must change: WHICH column is out of scope, WHICH
     # blueprint was not run. Everything else falls back to the canned
     # `denial_mapping.py` string, so an ordinary denial is byte-identical to before.
@@ -93,7 +111,7 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         "measurement_review": entry.measurement_review,
         "turn_index": entry.turn_index,
         "serves_intents": list(entry.serves_intents),
-        "tool_name": entry.tool_name,
+        "tool_name": _model_facing_tool_name(entry),
         "args": dict(entry.args),
         "status": entry.status,
         "error_code": entry.error_code,

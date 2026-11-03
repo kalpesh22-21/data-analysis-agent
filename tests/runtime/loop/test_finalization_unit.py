@@ -560,10 +560,12 @@ def test_the_empty_designation_nudge_is_a_retryable_answer_table_error() -> None
     assert nudge.provenance == frozenset()
     assert nudge.denial_detail == nudge.user_message
     assert nudge.denial_detail is not None
-    # It has to say what to send instead — both designation forms, by name.
-    assert "sql" in nudge.denial_detail
-    assert "blueprint_id" in nudge.denial_detail
-    assert classify_denial(ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE).user_message
+    # It has to say what to send instead, in finalizeAnswer's own fields — the
+    # sql/blueprint_id designation belongs to the internal answerWithTable shape.
+    assert "finalizeAnswer" in nudge.denial_detail
+    assert "result_id" in nudge.denial_detail
+    assert "evidence_refs" in nudge.denial_detail
+    assert classify_denial(ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE).user_message == nudge.denial_detail
 
 
 # --- the nudges --------------------------------------------------------------
