@@ -65,7 +65,6 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-employee-day-clock-span",
         "bp-timecard-earnings-summary",
         "bp-salary-exact-median",
-        "bp-salary-distribution",
         "bp-salary-threshold-count",
         "bp-salary-threshold-directory",
         "bp-employee-date-summary",

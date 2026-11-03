@@ -160,12 +160,6 @@ def test_salary_median_never_uses_approximation():
     assert 'approx' not in sql.lower()
 
 
-@pytest.mark.parametrize('width', [0,-1,10000001])
-def test_invalid_salary_band_width_rejected(width):
-    with pytest.raises(AssertionError):
-        bound_sql('bp-salary-distribution',band_width=width,salary_population='recorded')
-
-
 @pytest.mark.parametrize('bid', ['bp-punch-pair-summary','bp-employee-day-clock-span','bp-timecard-earnings-summary'])
 def test_timecard_templates_require_source_and_final(bid):
     kwargs = {'period':PERIOD,'source':'synthetic'}

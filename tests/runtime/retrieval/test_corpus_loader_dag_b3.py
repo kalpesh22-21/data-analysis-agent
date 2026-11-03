@@ -208,7 +208,6 @@ def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
         "bp-employee-day-clock-span",
         "bp-timecard-earnings-summary",
         "bp-salary-exact-median",
-        "bp-salary-distribution",
         "bp-salary-threshold-count",
         "bp-salary-threshold-directory",
         "bp-employee-date-summary",

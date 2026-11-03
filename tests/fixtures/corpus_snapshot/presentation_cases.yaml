@@ -67,9 +67,10 @@ bp-expense-approval-backlog: {kind: bars, categories: [Employee Code], measures:
 bp-expense-approval-trim: {kind: bars, categories: [Expense Rule], measures: [Approved Total, Submitted Total, Trimmed Total, Line Count]}
 bp-expense-by-account-category: {kind: bars, categories: [Account Code, Account Description], measures: [Approved Spend]}
 bp-expense-by-policy: {kind: bars, categories: [Policy], measures: [Approved Spend, Line Count]}
+bp-expense-category-distribution: {kind: bars, categories: [Account Code, Account Description], measures: [Approved Spend, Share Of Approved Spend Pct, Line Count]}
 bp-expense-concept-spend: {kind: bars, categories: [Matched Description], measures: [Approved Spend, Line Count]}
 bp-expense-cycle-time: {kind: line, categories: [Month], measures: [Line Count, Median Submission To Approval, Median Approval To Payment]}
-bp-expense-line-size-distribution: {kind: bars, categories: [Account Description, Band Start], measures: [Line Count]}
+bp-expense-line-size-distribution: {kind: bars, categories: [Amount Band], measures: [Line Count]}
 bp-expense-monthly-trend: {kind: line, categories: [Month], measures: [Total Approved Spend]}
 bp-expense-payroll-recon: {kind: table}
 bp-expense-per-capita: {kind: bars, categories: [Department], measures: [Approved Spend, Active Headcount, Per Capita Spend]}
@@ -149,9 +150,7 @@ bp-register-type-breakdown: {kind: bars, categories: [Register Type], measures: 
 bp-regular-vs-premium-hours-ratio: {kind: line, categories: [Month], measures: [Regular Hours, Premium Hours, Regular Pct]}
 bp-rehired-employees: {kind: table}
 bp-retroactive-change-share: {kind: bars, categories: [Changed Field], measures: [Retroactive Changes, Share Pct]}
-bp-salary-distribution: {kind: bars, categories: [Pay Type, Compensation Basis, Lower Bound, Upper Bound Exclusive], measures: [Employee Count, Percent Within Pay Type]}
 bp-salary-exact-median: {kind: grouped, categories: [Group, Pay Type, Compensation Basis], measures: [Known Compensation Count, Exact Median Annual Compensation, Average Annual Compensation, Minimum Annual Compensation, Maximum Annual Compensation, Average Hourly Rate]}
-bp-salary-histogram: {kind: bars, categories: [Salary Band], measures: [Headcount]}
 bp-salary-threshold-count: {kind: bars, categories: [Pay Type, Compensation Basis], measures: [Employee Count]}
 bp-salary-threshold-directory: {kind: table}
 bp-shift-differential-spend: {kind: scalar, measures: [Shift Differential Dollars, Shift Differential Hours]}
