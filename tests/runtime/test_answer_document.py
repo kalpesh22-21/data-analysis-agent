@@ -93,7 +93,7 @@ async def test_presentation_repair_reuses_result():
 
 def test_rejects_multiple_unjustified_visible_tables_and_old_proposals():
     second = {**section(), "id": "second"}
-    with pytest.raises(PresentationError, match="zero or one"):
+    with pytest.raises(PresentationError, match="table_reason"):
         proposal_to_internal({"takeaway": "Counts", "sections": [section(), second]})
     with pytest.raises(PresentationError):
         proposal_to_internal({"answer": "Counts", "tables": []})

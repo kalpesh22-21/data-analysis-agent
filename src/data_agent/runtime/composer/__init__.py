@@ -121,7 +121,7 @@ SECTION_SCHEMA = _object(
             "maxItems": 8,
             "items": _object({"capability_ref": ID, "label": TEXT}, ["capability_ref", "label"]),
         },
-        "table_reason": TEXT,
+        "table_reason": {**TEXT, "description": "When the answer has two or more table presentations, every table requires a non-blank reason explaining its distinct requested purpose."},
     },
     ["id", "evidence_refs", "presentation", "caveats", "actions"],
 )
@@ -146,6 +146,26 @@ PROPOSAL_SCHEMA = _object(
     },
     ["takeaway", "sections"],
 )
+
+
+# Count only explicit table presentations; charts and their data access do not
+# create additional visible tables. Keep this on sections so recovery and judge
+# correction schemas inherit it even when they add their own top-level allOf.
+_TABLE_SECTION = {
+    "type": "object", "required": ["presentation"],
+    "properties": {"presentation": {
+        "type": "object", "required": ["kind"],
+        "properties": {"kind": {"const": "table"}},
+    }},
+}
+PROPOSAL_SCHEMA["properties"]["sections"]["allOf"] = [{
+    "if": {"contains": _TABLE_SECTION, "minContains": 2},
+    "then": {"items": {
+        "if": _TABLE_SECTION,
+        "then": {"required": ["table_reason"],
+                 "properties": {"table_reason": {"type": "string", "pattern": r"\S"}}},
+    }},
+}]
 
 
 # Recovery uses the same selectors and materializer as ordinary finalization.

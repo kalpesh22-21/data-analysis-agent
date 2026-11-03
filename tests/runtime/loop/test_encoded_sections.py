@@ -24,6 +24,7 @@ def test_encoded_sections_still_require_unique_ids_and_table_reasons():
         s.pop('table_reason', None)
     with pytest.raises(PresentationError, match='table_reason'):
         proposal_to_internal({'takeaway': 'Totals', 'sections': json.dumps(sections)})
+    sections = recovery_sections(['q', 'q2'])
     sections[1]['id'] = sections[0]['id']
     with pytest.raises(PresentationError, match='unique'):
         proposal_to_internal({'takeaway': 'Totals', 'sections': json.dumps(sections)})

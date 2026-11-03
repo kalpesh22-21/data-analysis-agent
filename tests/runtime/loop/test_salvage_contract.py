@@ -471,18 +471,20 @@ async def test_salvage_repairs_contract_once_using_validation_feedback(failure):
     judge = AnswerJudge(client, 10000, observer=lambda n, p: events.append((n, p)))
     assert await judge.salvage(JudgeBrief("exit_prose", "Headcount?")) == valid
     assert client.calls_made == 2
+    from data_agent.runtime.composer import PROPOSAL_SCHEMA
+    advertised = client.calls[0].tools[0]["parameters"]
+    assert advertised["properties"]["sections"]["allOf"] == PROPOSAL_SCHEMA["properties"]["sections"]["allOf"]
     feedback = client.calls[1].messages[-1]["content"]
     assert ("minItems" if failure == "partial" else "table_reason") in feedback
     assert sum(n == "loop_recovery_repair_requested" for n, _ in events) == 1
 
 
 async def test_salvage_repair_is_bounded_and_preserves_presentation_gate():
-    from data_agent.runtime.composer import PresentationError
     response = {**PART, "outcome": "partial", "sections": recovery_sections(["q", "q2"])}
     for section in response["sections"]:
         section.pop("table_reason", None)
     client = RecoveryClient([batch(call("salvageAnswer", "bad", **response))] * 3)
-    with pytest.raises(PresentationError, match="table_reason"):
+    with pytest.raises(ValidationError, match="table_reason"):
         await AnswerJudge(client, 10000).salvage(JudgeBrief("exit_prose", "Headcount?"))
     assert client.calls_made == 2
 

@@ -68,7 +68,7 @@ def test_extra_visible_tables_require_explicit_reasons():
     proposal = answer_arguments(takeaway="Two requested breakdowns.", tables=[{"result_id": "a"}, {"result_id": "b"}])
     assert len(proposal_to_internal(proposal)["tables"]) == 2
     proposal["sections"][1].pop("table_reason")
-    with pytest.raises(PresentationError, match="zero or one"):
+    with pytest.raises(PresentationError, match="table_reason"):
         proposal_to_internal(proposal)
 
 

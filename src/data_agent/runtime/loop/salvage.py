@@ -83,7 +83,9 @@ async def _call(judge, messages, name, schema):
                 # The surrounding tracing context records escaping exceptions.
                 # Preserve the error class, but not jsonschema's embedded payload.
                 raise ValidationError(
-                    f"Recovery response failed {diagnostic['schema_keyword']} at {diagnostic['schema_path']}",
+                    f"Recovery response failed {diagnostic['schema_keyword']} at {diagnostic['schema_path']}"
+                    + (f"; missing required field(s): {diagnostic['missing_fields']}"
+                       if diagnostic.get("missing_fields") else ""),
                     validator=exc.validator,
                     schema_path=exc.absolute_schema_path,
                 ) from None
