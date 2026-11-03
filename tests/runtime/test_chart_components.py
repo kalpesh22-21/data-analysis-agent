@@ -248,6 +248,9 @@ def test_selection_guidance_matches_configuration_and_preserves_information(allo
     assert "Never drop measures" in guidance
     assert "not row count alone" in guidance
     assert "Do not ask the user to choose a display format" in guidance
+    if "bars" in allowed:
+        assert "a distribution on one category axis" in guidance
+        assert "Unrequested extra measures stay in the UI table/CSV and do not prevent bars" in guidance
     if "donut" in allowed:
         assert "a small ranking alone is not composition" in guidance
     if "grouped_bars" in allowed:

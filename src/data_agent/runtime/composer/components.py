@@ -88,10 +88,15 @@ def component_guidance():
     )
     selection_rules = {
         "text": "Use text for explanations, refusals or limitations without a verified data result.",
-        "table": "Use table for detailed records, requested detail, incompatible units, or results unsuitable for enabled charts.",
+        "table": "Use table for detailed records, requested detail, requested measures in incompatible units, or results unsuitable for enabled charts.",
         "figure": "Use figure for one summary number.",
         "facts": "Use facts for several summary numbers from one row.",
-        "bars": "Use bars for one measure compared or ranked across categories; prefer it when precise category comparison is the goal.",
+        "bars": (
+            "Use bars for one measure compared or ranked across categories, including a distribution on one "
+            "category axis (categories, or ordered amount bands); prefer it when precise category comparison is "
+            "the goal. Unrequested extra measures stay in the UI table/CSV and do not prevent bars. A distribution "
+            "crossing two category dimensions or over about 25 categories reads better as a table."
+        ),
         "line": "Use line for one measure trending over time.",
         "multi_series_line": "Use multi_series_line for two to four comparable measures trending over the same time periods.",
         "grouped_bars": "Use grouped_bars to compare two to four measures side by side within each category; additivity is not required.",

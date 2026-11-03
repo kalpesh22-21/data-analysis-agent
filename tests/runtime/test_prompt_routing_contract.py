@@ -69,6 +69,8 @@ def test_procedure_has_each_stage(step):
         "exact execution result_id",
         "Choose rendering without asking",
         "never limit scope for display",
+        "bars for comparisons/ranks/distributions",
+        "A distribution by category groups by it; band amounts only for asked amount sizes",
         "Preserve top-N semantics",
         "Scalars require a query-backed one-row result",
         "never in prose",
@@ -81,6 +83,12 @@ def test_procedure_has_each_stage(step):
 )
 def test_procedure_preserves_required_safeguard(rule):
     assert rule in AGENT_SYSTEM_PROMPT
+
+
+def test_large_results_are_not_routed_to_tables_by_size():
+    # "Large results use tables" sent a 223-row distribution to a paged table; the
+    # result's shape, not its size, picks the presentation (composer component guidance).
+    assert "Large results use tables" not in AGENT_SYSTEM_PROMPT
 
 
 def test_unified_finalizer_is_the_only_advertised_answer_tool():
