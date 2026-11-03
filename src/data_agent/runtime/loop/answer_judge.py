@@ -1102,23 +1102,33 @@ def _system_prompt(site: JudgeSite, *, capabilities_enabled: bool = True) -> str
 # --- the guard on what comes back -------------------------------------------
 
 
+_CORRECTION_FIELDS = ("corrected_answer", "corrected_document", "corrected_question")
+
+
 def _repair_rejected_correction(arguments, site):
     """A replacement attached to a rejection is not approved text.
 
     Preserve the rejection and repair the document from existing receipts rather
     than treating the whole review as unavailable. Do not infer approval or edit
     section text on the judge's behalf. The ordinary verdict guards still apply.
+
+    Every correction field is dropped, not only prose: `_valid_correction` admits a
+    correction only on an approval, so a stray document or question left in place would
+    turn a valid rejection into `APPROVED` and ship the answer the judge just rejected.
     """
+    if arguments.get("approved") is not False or all(
+        arguments.get(key) is None for key in _CORRECTION_FIELDS
+    ):
+        return arguments
+    repaired = {**arguments, **dict.fromkeys(_CORRECTION_FIELDS)}
+    # A prose rejection without its replacement would be refused as `prose_only`.
     if (
         site != "ask_user"
-        and arguments.get("approved") is False
         and arguments.get("repair_type") == "prose"
-        and isinstance(arguments.get("corrected_answer"), str)
-        and arguments["corrected_answer"].strip()
         and arguments.get("partial_answer") is None
     ):
-        return {**arguments, "corrected_answer": None, "repair_type": "presentation"}
-    return arguments
+        repaired["repair_type"] = "presentation"
+    return repaired
 
 
 def _valid_correction(arguments, site):
@@ -1230,9 +1240,13 @@ def parse_verdict(
     if not isinstance(approved, bool):
         _logger.warning("answer judge: approved was %r, not a boolean — approving", approved)
         return APPROVED
-    if (
-        arguments.get("approved") is True and arguments.get("partial_answer") is not None
-    ) or not _valid_correction(arguments, site):
+    if arguments.get("approved") is True and arguments.get("partial_answer") is not None:
+        _logger.warning("answer judge: approval carried a partial_answer at %s — approving", site)
+        return APPROVED
+    if not _valid_correction(arguments, site):
+        # Only an approval reaches here (rejections were stripped above), so the
+        # original answer was approved; only the unusable correction is dropped.
+        _logger.warning("answer judge: correction failed validation at %s — approving", site)
         return APPROVED
     if approved:
         if arguments.get("corrected_document") is not None or arguments.get("corrected_question") is not None:

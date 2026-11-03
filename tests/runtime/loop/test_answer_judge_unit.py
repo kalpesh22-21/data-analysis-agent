@@ -562,6 +562,45 @@ def test_document_correction_is_approved_and_cannot_contain_sql():
     assert parse_verdict(_raw_turn(arguments), 'exit_table') is APPROVED
 
 
+@pytest.mark.parametrize(
+    ("site", "stray"),
+    [
+        ("exit_table", {"corrected_document": {"takeaway": "x"}}),
+        ("exit_table", {"corrected_answer": "Some replacement text."}),
+        ("exit_table", {"corrected_answer": ""}),
+        ("ask_user", {"corrected_question": {"question": "Which department?"}}),
+    ],
+)
+def test_rejection_with_a_stray_correction_stays_a_rejection(site, stray):
+    """A replacement on a rejection is not approved text; dropping it must not also drop
+    the rejection and ship the answer the judge just rejected."""
+    violation = "measurement_mismatch" if site != "ask_user" else ASK_USER_VIOLATIONS[0]
+    arguments = {"approved": False, "violation": violation, "feedback": "Filter event_type.",
+                 "repair_type": "presentation", **stray}
+    verdict = parse_verdict(_raw_turn(arguments), site)
+    assert verdict.approved is False
+    assert verdict.violation == violation
+    assert verdict.corrected_document is None
+    assert verdict.corrected_answer is None
+    assert verdict.corrected_question is None
+
+
+@pytest.mark.asyncio
+async def test_review_marks_a_discarded_rejected_replacement_without_failing():
+    events = []
+    client = ScriptedModelClient([_raw_turn({
+        "approved": False, "violation": "measurement_mismatch", "feedback": "Filter event_type.",
+        "repair_type": "presentation", "corrected_document": {"takeaway": "x"},
+    })])
+    judge = AnswerJudge(model_client=client, token_budget=_ROOMY,
+                        observer=lambda e, p: events.append((e, p)))
+    verdict = await judge.review(_brief(site="exit_table"))
+    assert verdict.reviewed and not verdict.approved
+    assert verdict.violation == "measurement_mismatch"
+    assert not any(e == "loop_answer_judge_failed" for e, _ in events)
+    assert any(p.get("outcome") == "rejected" for _, p in events)
+
+
 def test_question_correction_is_only_valid_on_clarification():
     question = {'question': 'Which department?', 'options': ['Sales', 'Engineering']}
     arguments = {'approved': True, 'violation': '', 'feedback': '', 'repair_type': 'prose', 'corrected_question': question}
