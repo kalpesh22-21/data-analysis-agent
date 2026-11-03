@@ -3607,6 +3607,13 @@ class AgentLoop:
                     except PresentationError as exc:
                         tool_call = replace(tool_call, argument_error=str(exc))
                     else:
+                        from .historical_evidence import bind_historical_evidence
+
+                        arguments, reused_sql = await bind_historical_evidence(
+                            self._session_store, session_id, turn_index,
+                            credentials.column_scope, arguments,
+                        )
+                        accum.result_sql_by_call_id.update(reused_sql)
                         tool_call = replace(tool_call, arguments=arguments)
                         tool_call = replace(
                             tool_call,

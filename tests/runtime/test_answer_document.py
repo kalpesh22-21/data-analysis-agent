@@ -574,3 +574,63 @@ async def test_disclosed_population_does_not_force_a_second_caveat_in_live_or_hi
     assert saved.messages[-1].answer_document == out.answer_document
     assert project_history(saved.messages, saved.tool_trail, CREDS.column_scope, None)["turns"][-1]["answer_document"] == out.answer_document
     assert len(mcp.calls) == 1
+
+
+async def test_followup_can_finalize_delivered_rows_without_new_query():
+    judge = Judge()
+    loop, store, model, mcp, events = build(
+        [discovery(), query(), final(section()), final(section(), ident="followup")], judge
+    )
+    first = await run(loop)
+    second = await run(loop, "Show that same breakdown again using the previous results.")
+    assert second.review["status"] == "approved"
+    assert second.review["attempts"] == 1
+    assert len(mcp.calls) == 1
+    rid = second.answer_document["sections"][0]["presentation"]["result_id"]
+    assert rid.startswith("reused_")
+    assert second.answer_document["sources"][rid]["retrieved_at"] == first.answer_document["sources"]["q"]["retrieved_at"]
+    assert any(r["tool_call_id"] == rid for r in judge.briefs[-1].results)
+    doc = await store.get_or_create_session(CREDS.session_id)
+    original = next(e for e in doc.tool_trail if e.tool_call_id == "q")
+    reused = next(e for e in doc.tool_trail if e.tool_call_id == rid)
+    assert reused.provenance == original.provenance
+    assert reused.model_response["reused_from_result_id"] == "q"
+    assert "not freshly executed" in reused.window_note
+    assert not any(name == "loop_recovery_requested" for name, _ in events)
+
+
+async def test_blueprint_followup_preserves_saved_sql_and_uses_normal_judge():
+    from dataclasses import replace
+
+    from tests.runtime.test_harness_improvements import SQL, Tool
+
+    class Blueprint(Tool):
+        calls = 0
+
+        async def run(self, *args, **kwargs):
+            self.calls += 1
+            value = {
+                "status": "verified", "blueprint_id": "bp", "terminal_sql": SQL,
+                "verify": {"grain_ok": True, "signature_ok": True, "grain_checked": True},
+                "columns": ["Department", "n"], "rows": [["Sales", 120]],
+                "row_count": 1, "truncated": False,
+            }
+            return replace(await Tool("runBlueprint", value).run(), authoritative=True)
+
+    blueprint = Blueprint("runBlueprint")
+    judge = Judge()
+    loop, _, _, _, _ = build([
+        batch(call("getBlueprint", "g", id="bp")),
+        batch(call("runBlueprint", "q", id="bp", slot_bindings={})),
+        final(section()),
+        final(section("bars", category_column="Department", measure_column="n", label="Employees"), ident="followup"),
+    ], judge, extra={"getBlueprint": Tool("getBlueprint", {"found": True}), "runBlueprint": blueprint})
+    first = await run(loop)
+    second = await run(loop, "Show that same breakdown as bars.")
+    assert first.review["status"] == second.review["status"] == "approved"
+    assert second.review["attempts"] == 1
+    assert second.answer_document["sections"][0]["presentation"]["kind"] == "bars"
+    assert blueprint.calls == 1
+    source = next(iter(second.answer_document["sources"].values()))
+    assert source["sql"] == SQL
+    assert source["retrieved_at"] == first.answer_document["sources"]["q"]["retrieved_at"]

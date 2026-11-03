@@ -835,6 +835,29 @@ def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return validated
 
 
+def previous_result_reference(source, turn_index, scope_hash):
+    """Shared fail-closed authorization and lineage for historical result bindings."""
+    if (source is None or source.turn_index >= turn_index or source.status != "ok"
+            or source.error_code or source.tool_name not in {"runQuery", "runBlueprint"}
+            or source.provenance is None or not source.ts
+            or source.result_preview is None
+            or source.tool_name == "runBlueprint" and not source.authoritative
+            or not scope_hash or (source.model_response or {}).get("scope_hash") != scope_hash
+            or (source.model_response or {}).get("reused_from_result_id")
+            or any(table.split(".", 1)[0] in scratch_databases() for table, _ in source.provenance)):
+        raise _reject("unresolved_evidence", "That prior result is not an eligible successful snapshot under the current scope. Use a fresh authorized query; failed, unknown-scope, scratch and unverified blueprint results cannot be reused.")
+    source_id = source.tool_call_id
+    reference_id = "reused_" + hashlib.sha256(f"{turn_index}:{source_id}".encode()).hexdigest()[:24]
+    return replace(
+        source, turn_index=turn_index, tool_call_id=reference_id,
+        serves_intent=None, serves_intents=(),
+        model_response={"scope_hash": scope_hash, "reused_from_result_id": source_id,
+                        "reused_from_turn": source.turn_index, "source_timestamp": source.ts},
+        window_note="Reused earlier result snapshot; not freshly executed. Original result: "
+                    + source_id + "; retrieved at " + source.ts + ". " + (source.window_note or ""),
+    )
+
+
 def _prepare_previous_result_reuse(updates, trail, turn_index, live, scope_hash):
     """Create explicit current-turn references, never fabricated new executions.
 
@@ -854,28 +877,10 @@ def _prepare_previous_result_reuse(updates, trail, turn_index, live, scope_hash)
             raise _reject("unresolved_evidence", "Prior snapshots may explicitly complete a declared intent; they cannot establish a current blocked condition.")
         source_id = update.get("evidence_tool_call_id")
         source = next((entry for entry in trail if entry.tool_call_id == source_id), None)
-        if (source is None or source.turn_index >= turn_index or source.status != "ok"
-                or source.error_code or source.tool_name not in {"runQuery", "runBlueprint"}
-                or source.provenance is None or not source.ts
-                or source.result_preview is None
-                or source.tool_name == "runBlueprint" and not source.authoritative
-                or not scope_hash or (source.model_response or {}).get("scope_hash") != scope_hash
-                or (source.model_response or {}).get("reused_from_result_id")
-                or any(table.split(".", 1)[0] in scratch_databases() for table, _ in source.provenance)):
-            raise _reject("unresolved_evidence", "That prior result is not an eligible successful snapshot under the current scope. Use a fresh authorized query; failed, unknown-scope, scratch and unverified blueprint results cannot be reused.")
-        # Stable within this turn so repeating an explicit binding does not
-        # manufacture extra receipts or trigger another query.
-        reference_id = "reused_" + hashlib.sha256(f"{turn_index}:{source_id}".encode()).hexdigest()[:24]
-        existing = next((e for e in trail if e.tool_call_id == reference_id), None)
-        if existing is None and not any(e.tool_call_id == reference_id for e in receipts):
-            receipts.append(replace(
-                source, turn_index=turn_index, tool_call_id=reference_id,
-                serves_intent=None, serves_intents=(),
-                model_response={"scope_hash": scope_hash, "reused_from_result_id": source_id,
-                                "reused_from_turn": source.turn_index, "source_timestamp": source.ts},
-                window_note="Reused earlier result snapshot; not freshly executed. Original result: "
-                            + source_id + "; captured at " + source.ts + ". " + (source.window_note or ""),
-            ))
+        reference = previous_result_reference(source, turn_index, scope_hash)
+        reference_id = reference.tool_call_id
+        if not any(e.tool_call_id == reference_id for e in (*trail, *receipts)):
+            receipts.append(reference)
         update["evidence_tool_call_id"] = reference_id
     return receipts
 

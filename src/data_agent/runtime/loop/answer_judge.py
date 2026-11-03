@@ -628,7 +628,7 @@ _ANSWER_JUDGE_PROMPT = (
     "otherwise use corrected_document when available; do not start an agent round for wording alone. Do not query merely to add freshness prose. "
     "Preserve requested reporting/event dates and population definitions such as current employees; those are not freshness claims. "
     "Review the whole answer_document for factual correctness, source/column binding and requested coverage. "
-    "Layout, titles, repeated caveats, extra tables and process wording are cosmetic: correct them "
+    "Layout, repeated caveats, extra tables and process wording are cosmetic: correct them "
     "directly if useful, otherwise approve unchanged; never reject or request an agent repair solely for them. "
     "Prefer one primary presentation. The UI provides table/CSV controls for every data result except figures. "
     "Do not ask the user about rendering or restrict the population to fit a chart. "
@@ -734,6 +734,18 @@ _ANSWER_JUDGE_PROMPT = (
     "date ranges only when relevant to the request. MAX(event date), observed months or missing later rows do not establish a paid-through/finalized boundary or an incomplete reporting period. Require explicit coverage evidence for those claims; otherwise report the requested aggregate without volunteering a completeness interpretation. "
     "Do not require boilerplate for a zero already limited to an explicitly evidenced scope. "
     "For period-over-period comparisons, check that the first displayed period can access its predecessor before output filtering; NULL after filtering is not evidence that prior data is missing. Reject wrong window boundaries as analysis repair, not prose repair. "
+    "Before approving, check EVERY section title, caption and takeaway against its bound result. "
+    "A title asserting a different population, status, period or measure is a substantive contradiction, "
+    "not optional cosmetic polish. For example, Terminated employees cannot label Active plus On Leave counts. "
+    "Correct that section through corrected_document when the result is right; otherwise reject. "
+    "Check each derived numeric claim against the visible operands and stated rounding precision. "
+    "For example 2/3 is 66.666...%, which rounds to 67% or 66.67%, not 60%. "
+    "Never approve a wrong percentage because the underlying chart values are correct. "
+    "If an erroneous derived claim was not requested, remove it through corrected_answer; "
+    "if the requested calculation needs new evidence, request analysis repair. "
+    "Receipts labeled Reused earlier result snapshot are actual historical results, not new executions. They can support "
+    "summaries or re-presentations of a prior answer. Preserve their retrieval time; require fresh "
+    "execution when the user requests updated data or a changed population/period. "
     "Compare the requested metric, executed expressions/filters, source grain, result column labels, "
     "captions and prose. COUNT(*) over request rows means requests, not days; request frequency "
     "across statuses is not approved usage. Approved event hours are not recorded taken "
@@ -895,6 +907,13 @@ _ANSWER_JUDGE_PROMPT += (
     "\nFor corrected_answer, partial_answer.takeaway and salvage takeaway text: "
     + ANSWER_MARKDOWN_GUIDANCE
     + " Missing Markdown styling alone is not grounds for rejection or new analysis."
+    + " Final numeric-claim check: comparing two returned series does not itself return a ratio, "
+    "share or growth rate. If the user did not request that derived percentage and it is not "
+    "a returned query measure, remove the extra numeric claim through corrected_answer "
+    "(or corrected_document for section text), retaining the requested evidenced comparison. "
+    "Do not approve it as an informal approximation. If a requested percentage is unsupported "
+    "or incorrect, request analysis repair to calculate it in the query."
+
 )
 
 _ASK_USER_JUDGE_PROMPT = (
