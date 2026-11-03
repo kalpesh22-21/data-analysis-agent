@@ -44,7 +44,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -62,9 +61,9 @@ from data_agent.runtime.retrieval.corpus_loader import (
 )
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
 from tests._catalog_fixture import load_catalog_export
+from tests.mcp_repo import canon_blueprints_dir, require
 
 _MODEL = "all-mpnet-base-v2"
-_CANON_DIR = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/corpus/data/blueprints")
 _COMPOSITE = "bp-compare-employee-check-detail-two-periods"
 _CHILD = "bp-employee-check-detail-for-period"
 
@@ -128,10 +127,8 @@ _PRE_2B_NODE_SQL: dict[int, str] = {
 
 def _canon_docs() -> dict[str, Any]:
     yaml = pytest.importorskip("yaml")
-    if not _CANON_DIR.is_dir():
-        pytest.skip(f"real MCP canon not checked out at {_CANON_DIR}")
     docs: dict[str, Any] = {}
-    for path in sorted(_CANON_DIR.glob("bp-*.yaml")):
+    for path in sorted(require(canon_blueprints_dir()).glob("bp-*.yaml")):
         doc = yaml.safe_load(path.read_text())
         docs[doc["id"]] = doc
     return docs

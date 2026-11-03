@@ -59,7 +59,6 @@ what golden replay does with these types, which is the next thing that keys off 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -75,10 +74,10 @@ from data_agent.learning.extractor.schema import SLOT_TYPE_ENUM, build_extractor
 from data_agent.learning.extractor.validation import REASON_BAD_ROLE, to_candidate
 from data_agent.runtime.blueprint.models import SLOT_TYPES as RUNTIME_SLOT_TYPES
 from data_agent.runtime.blueprint.models import BlueprintParseError, SlotSpec
+from tests.mcp_repo import canon_blueprints_dir, require
 
 from .helpers import blueprint_raw, make_summary, make_tool_call, param_slot
 
-_REAL_CANON_DIR = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/corpus/data/blueprints")
 _WINDOWED = ("relative_window", "period_range")
 # The subset of `_WINDOWED` the pipeline can actually CARRY. `period_range` is withheld
 # (`UNSUPPORTED_SLOT_TYPES`) because S4's rewriter emits one bind token and the type
@@ -270,11 +269,9 @@ def test_a_windowed_slot_round_trips_into_the_runtime_slot_spec(slot_type: str) 
 
 def _canon_docs() -> dict[str, Any]:
     yaml = pytest.importorskip("yaml")
-    if not _REAL_CANON_DIR.is_dir():
-        pytest.skip(f"real MCP canon not checked out at {_REAL_CANON_DIR}")
     return {
         (doc := yaml.safe_load(path.read_text()))["id"]: doc
-        for path in sorted(_REAL_CANON_DIR.glob("bp-*.yaml"))
+        for path in sorted(require(canon_blueprints_dir()).glob("bp-*.yaml"))
     }
 
 

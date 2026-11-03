@@ -41,8 +41,8 @@ from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
 )
+from tests.mcp_repo import canon_blueprints_dir, require
 
-_REAL_CANON_DIR = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/corpus/data/blueprints")
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "corpus"
 
 _USES = [
@@ -432,8 +432,7 @@ def test_the_table_consume_grammar_still_classifies_every_ref_the_same_way(ref: 
 
 def _canon_docs(directory: Path) -> dict[str, Any]:
     yaml = pytest.importorskip("yaml")
-    if not directory.is_dir():
-        pytest.skip(f"real MCP canon not checked out at {directory}")
+    require(directory)
     return {
         (doc := yaml.safe_load(path.read_text()))["id"]: doc
         for path in sorted(directory.glob("bp-*.yaml"))
@@ -446,7 +445,7 @@ def test_check_dag_accepts_every_composite_in_the_real_mcp_canon() -> None:
     A canon-only composite the loop cannot express is caught even before the
     committed snapshot is refreshed.
     """
-    canon = _canon_docs(_REAL_CANON_DIR)
+    canon = _canon_docs(canon_blueprints_dir())
     composites = {
         bid: doc["composes"] for bid, doc in canon.items() if doc.get("composes")
     }
@@ -456,7 +455,7 @@ def test_check_dag_accepts_every_composite_in_the_real_mcp_canon() -> None:
 
 
 def test_the_canon_composite_the_parity_claim_rests_on_still_uses_a_table_intermediate() -> None:
-    canon = _canon_docs(_REAL_CANON_DIR)
+    canon = _canon_docs(canon_blueprints_dir())
     composes = canon["bp-earnings-by-department-via-scratch-join"]["composes"]
     assert any("table" in (n.get("output") or {}).values() for n in composes)
     assert any(str(v).lstrip("$").isdigit() and "." not in str(v)
@@ -466,7 +465,7 @@ def test_the_canon_composite_the_parity_claim_rests_on_still_uses_a_table_interm
 def test_the_hermetic_mirror_still_matches_the_real_canon_on_composes() -> None:
     """Keep the full snapshot's DAG definitions synchronized with the real corpus."""
     yaml = pytest.importorskip("yaml")
-    canon = _canon_docs(_REAL_CANON_DIR)
+    canon = _canon_docs(canon_blueprints_dir())
     mirror = {d["id"]: d for d in yaml.safe_load((_FIXTURE_DIR.parent / "corpus_snapshot" / "blueprints.yaml").read_text())}
     assert set(canon) == set(mirror)
     drift = [bid for bid in sorted(canon) if canon[bid].get("composes") != mirror[bid].get("composes")]

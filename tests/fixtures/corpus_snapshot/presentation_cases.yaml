@@ -3,13 +3,13 @@
 bp-accrual-balance-summary: {kind: grouped, categories: [Group], measures: [Beginning Balance, Accrued Amount, Awarded Amount, Taken Amount, Source Balance Rows, Employee Count]}
 bp-accrual-code-dictionary: {kind: bars, categories: [Accrual Code], measures: [Holder Count]}
 bp-accrual-event-summary: {kind: grouped, categories: [Group, Event Status], measures: [Event Day Rows, Event Hours, Employee Count]}
-bp-active-headcount-by-department: {kind: bars, categories: [department_code, department], measures: [headcount]}
+bp-active-headcount-by-department: {kind: bars, categories: [Department Code, Department], measures: [Headcount]}
 bp-adjustment-line-volume: {kind: line, categories: [Month], measures: [Adjustment Lines, Adjustment Amount]}
 bp-age-band-distribution: {kind: bars, categories: [Age Band], measures: [Headcount, Avg Age In Band, Median Age In Band]}
 bp-approved-timeoff-hours: {kind: bars, categories: [Department], measures: [Approved Hours]}
 bp-approved-timeoff-ranking: {kind: bars, categories: [Employee Code, Employee Name], measures: [Approved Time-Off Hours, Requested Days]}
 bp-average-annual-salary-by-status: {kind: bars, categories: [Pay Type, Compensation Basis], measures: [Average Annual Compensation, Average Hourly Rate]}
-bp-average-salary-by-department: {kind: bars, categories: [department, Pay Type, Compensation Basis], measures: [average_annual_compensation, headcount, Average Hourly Rate]}
+bp-average-salary-by-department: {kind: bars, categories: [Department, Pay Type, Compensation Basis], measures: [Average Annual Compensation, Headcount, Average Hourly Rate]}
 bp-avg-request-size: {kind: bars, categories: [Earn Code, Leave Type], measures: [Average Hours, Request Rows]}
 bp-avg-shift-length: {kind: bars, categories: [Department], measures: [Avg Shift Hours, Pair Count]}
 bp-break-gap-median: {kind: bars, categories: [Employee Code, Punch Date], measures: [Median Break Gap Hours, Gap Count]}
@@ -24,7 +24,7 @@ bp-change-velocity-spikes: {kind: bars, categories: [Day], measures: [Change Eve
 bp-clock-time-profile: {kind: bars, categories: [Department], measures: [Median Clock-In Min, Median Clock-Out Min, Pair Count]}
 bp-commission-by-employee: {kind: bars, categories: [Employee Code, Employee Name], measures: [Total Commission]}
 bp-comp-range-exceptions: {kind: bars, categories: [Employee Code], measures: [Annual Salary, Range Min, Range Mid, Range Max, Compa Ratio]}
-bp-compare-employee-check-detail-two-periods: {kind: bars, categories: [register_type, type_code, type_code_description], measures: [amount_a, amount_b, amount_delta, hours_a, hours_b]}
+bp-compare-employee-check-detail-two-periods: {kind: bars, categories: [Register Type, Type Code, Type Code Description], measures: [Amount Period A, Amount Period B, Amount Change, Hours Period A, Hours Period B]}
 bp-compare-employee-paychecks-two-periods: {kind: bars, categories: [Pay Category, Pay Code, Description], measures: [Recent Amount, Recent Hours, Prior Amount, Prior Hours, Amount Change, Hours Change]}
 bp-compensation-ranking: {kind: bars, categories: [Pay Type, Employee Code, Employee Name], measures: [Annual Compensation, Hourly Rate]}
 bp-consecutive-day-streaks: {kind: bars, categories: [Employee Code, Streak Start, Streak End], measures: [Streak Length]}
@@ -40,7 +40,7 @@ bp-dol-status-per-work-location: {kind: bars, categories: [Work Location], measu
 bp-duplicate-expense-flag-list: {kind: bars, categories: [Employee Code], measures: [Flagged Amount, Flagged Lines]}
 bp-earning-category-dictionary: {kind: table}
 bp-earnings-by-category: {kind: scalar, measures: [Total Earnings, Total Hours]}
-bp-earnings-by-department-via-scratch-join: {kind: bars, categories: [department], measures: [total_earnings]}
+bp-earnings-by-department-via-scratch-join: {kind: bars, categories: [Department], measures: [Total Earnings]}
 bp-earnings-by-dol-status: {kind: bars, categories: [DOL Status], measures: [Gross Earnings]}
 bp-earnings-by-pay-basis: {kind: bars, categories: [Pay Basis], measures: [Gross Earnings]}
 bp-earnings-by-work-state: {kind: bars, categories: [Work State], measures: [Gross Earnings]}
@@ -52,7 +52,7 @@ bp-effective-mileage-rate: {kind: bars, categories: [Expense Rule], measures: [T
 bp-employee-benefits-summary: {kind: bars, categories: [Benefit Code], measures: [Total Benefit Contributions]}
 bp-employee-change-timeline: {kind: table}
 bp-employee-change-volume: {kind: bars, categories: [Month, Changed Field], measures: [Change Events]}
-bp-employee-check-detail-for-period: {kind: bars, categories: [register_type, type_code, type_code_description], measures: [amount, hours]}
+bp-employee-check-detail-for-period: {kind: bars, categories: [Register Type, Type Code, Type Code Description], measures: [Amount, Hours]}
 bp-employee-coverage-matrix: {kind: table}
 bp-employee-date-summary: {kind: grouped, categories: [Group], measures: [Employee Count]}
 bp-employee-day-clock-span: {kind: table}
@@ -79,6 +79,7 @@ bp-fica-medicare-totals: {kind: bars, categories: [Tax Side, Tax Code], measures
 bp-future-dated-position-changes: {kind: table}
 bp-future-hire-roster: {kind: table}
 bp-future-termination-roster: {kind: table}
+bp-gross-earnings-for-pay-period: {kind: scalar, measures: [Total Gross Earnings]}
 bp-gross-earnings-period-compare: {kind: line, categories: [Period], measures: [Gross Earnings]}
 bp-gross-earnings-summary: {kind: scalar, measures: [Total Gross Earnings]}
 bp-gross-wages-date-window: {kind: scalar, measures: [Total Gross Wages]}
@@ -90,9 +91,9 @@ bp-headcount-by-work-city-country: {kind: bars, categories: [Country, State, Cit
 bp-headcount-by-works-in-state: {kind: bars, categories: [Works In State], measures: [Headcount, Lives Elsewhere]}
 bp-headcount-growth-rate: {kind: line, categories: [Month], measures: [Hires, Terms, Net Delta]}
 bp-headcount-monthly-trend: {kind: line, categories: [Month], measures: [Active Headcount, Terms In Month]}
-bp-hires-in-range: {kind: line, categories: [month], measures: [hires]}
-bp-hires-per-month: {kind: line, categories: [month], measures: [hires]}
-bp-hires-projection: {kind: scalar, measures: [hires_in_window, avg_monthly_hires, projected_next_n_hires]}
+bp-hires-in-range: {kind: line, categories: [Month], measures: [Hires]}
+bp-hires-per-month: {kind: line, categories: [Month], measures: [Hires]}
+bp-hires-projection: {kind: scalar, measures: [Hires In Window, Average Monthly Hires, Projected Hires]}
 bp-holiday-work-audit: {kind: line, categories: [Punch Date], measures: [Employees, Total Hours, Line Count]}
 bp-inactive-supervisor-audit: {kind: table}
 bp-inactive-without-leave-start: {kind: table}
@@ -119,7 +120,7 @@ bp-new-hire-90d-attrition: {kind: scalar, measures: [Hires In Window, Terms With
 bp-night-shift-share: {kind: bars, categories: [Department], measures: [Total Hours, Night Hours, Night Share Pct]}
 bp-orphan-register-codes: {kind: bars, categories: [Employee Code], measures: [Register Lines]}
 bp-ot-two-basis-tieout: {kind: table}
-bp-overtime-by-department: {kind: bars, categories: [department], measures: [earnings]}
+bp-overtime-by-department: {kind: bars, categories: [Department], measures: [Earnings]}
 bp-overtime-hours-dollars: {kind: bars, categories: [Department], measures: [Overtime Dollars, Overtime Hours]}
 bp-paid-hours-summary: {kind: scalar, measures: [Total Paid Hours]}
 bp-pairs-per-day-distribution: {kind: bars, categories: [Pairs Per Day], measures: [Employee-Days]}
@@ -174,7 +175,7 @@ bp-top-expense-spenders: {kind: bars, categories: [Employee Code, Employee Name]
 bp-top-home-zip-city: {kind: bars, categories: [Zip Code, City, State], measures: [Headcount]}
 bp-top-payroll-codes: {kind: bars, categories: [Type Code], measures: [Total Amount]}
 bp-top-timeoff-users: {kind: bars, categories: [Employee Code, Employee Name], measures: [Approved Hours, Current Balance Hours]}
-bp-total-earnings-by-department: {kind: bars, categories: [department], measures: [total_earnings]}
+bp-total-earnings-by-department: {kind: bars, categories: [Department], measures: [Total Earnings]}
 bp-unpaid-active-employees: {kind: table}
 bp-unused-leave-roster: {kind: bars, categories: [Employee Code, Employee Name], measures: [Balance Hours]}
 bp-upcoming-anniversaries: {kind: table}

@@ -18,6 +18,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The canon-parity guards compare tests/fixtures/corpus_snapshot against the MCP's
+      # blueprint canon. Under CI they FAIL (not skip) without this checkout. The ref is
+      # the canon the snapshot must match; a private repo needs CLICKHOUSE_API_REPO_TOKEN
+      # (read-only contents). Refresh the snapshot with scripts/regen_corpus_snapshot.py.
+      - name: Check out the MCP canon (clickhouse-api)
+        uses: actions/checkout@v4
+        with:
+          repository: kalpesh22-21/click-house-openapi
+          ref: ${{ vars.CLICKHOUSE_API_REF || 'main' }}
+          token: ${{ secrets.CLICKHOUSE_API_REPO_TOKEN || github.token }}
+          path: .ci/clickhouse-api
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -30,4 +42,6 @@ jobs:
         run: uv run ruff check src/ tests/
 
       - name: Test (pytest — Layer 1 unit suite)
+        env:
+          CLICKHOUSE_API_REPO: ${{ github.workspace }}/.ci/clickhouse-api
         run: uv run pytest --tb=short

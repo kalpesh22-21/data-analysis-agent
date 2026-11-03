@@ -39,7 +39,6 @@ entry and every `payroll.<col>` reference is then dropped as "a scratch column".
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -61,6 +60,7 @@ from data_agent.sqlparse import (
     ScratchSessionError,
     extract_column_provenance,
 )
+from tests.mcp_repo import mcp_repo, require
 
 from .helpers import (
     CATALOG as FIXTURE_CATALOG,
@@ -298,23 +298,14 @@ def test_guard_the_runtime_provenance_capture_never_passes_declared_scratch() ->
     assert signature.parameters["declared_scratch"].default == frozenset()
 
 
-_MCP_PROVENANCE = Path(
-    "/Users/kalpeshmulye/Development/clickhouse-api/app/sqlparse/provenance.py"
-)
-_MCP_SERVICE = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/service.py")
-
-
-@pytest.mark.skipif(
-    not _MCP_PROVENANCE.exists(), reason="the MCP repo is not checked out beside this one"
-)
 def test_guard_the_learning_plane_cannot_influence_the_mcp_recheck() -> None:
     """The enforcement point is the MCP's OWN copy of the extractor, in a separate repo.
     It has no `declared_scratch` parameter at all, so no learning-plane artifact can
     widen it — the emitted SQL is ownership-checked against the caller's session or the
     call raises SCRATCH_SESSION_VIOLATION. This is the reason the S4 relaxation is not a
     cross-session read; if the MCP ever grows the parameter, that reason evaporates."""
-    assert "declared_scratch" not in _MCP_PROVENANCE.read_text()
-    service = _MCP_SERVICE.read_text()
+    assert "declared_scratch" not in require(mcp_repo() / "app/sqlparse/provenance.py").read_text()
+    service = require(mcp_repo() / "app/service.py").read_text()
     assert "extract_column_provenance(clean_sql, catalog, session_id=session_id)" in service
     assert "SCRATCH_SESSION_VIOLATION" in service
 

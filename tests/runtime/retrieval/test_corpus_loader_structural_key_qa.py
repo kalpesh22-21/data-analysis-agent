@@ -38,9 +38,9 @@ from data_agent.runtime.retrieval.corpus_loader import (
     load_corpus,
     resolve_blueprint_references,
 )
+from tests.mcp_repo import canon_blueprints_dir, require
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "corpus_snapshot"
-_REAL_CANON_DIR = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/corpus/data/blueprints")
 
 # The fields that feed the structural key. Drift in ANY of these changes the digest and
 # invalidates the hermetic canon-coverage claim; drift elsewhere (intent, slots, uses) is
@@ -286,10 +286,8 @@ def _load_yaml(path: Path) -> Any:
 
 
 def _real_canon_docs() -> dict[str, Any]:
-    if not _REAL_CANON_DIR.is_dir():
-        pytest.skip(f"real MCP canon not checked out at {_REAL_CANON_DIR}")
     docs = {}
-    for path in sorted(_REAL_CANON_DIR.glob("bp-*.yaml")):
+    for path in sorted(require(canon_blueprints_dir()).glob("bp-*.yaml")):
         doc = _load_yaml(path)
         docs[doc["id"]] = doc
     return docs
@@ -304,6 +302,14 @@ def test_the_hermetic_fixture_covers_the_same_blueprint_ids_as_the_real_canon() 
     canon, fixture = _real_canon_docs(), _fixture_docs()
     assert set(canon) - set(fixture) == set(), "canon has blueprints the fixture mirror lacks"
     assert set(fixture) - set(canon) == set(), "fixture has blueprints the real canon lacks"
+
+
+def test_the_snapshot_header_names_the_canon_fingerprint() -> None:
+    """The snapshot records the sealed canon it was generated from. A mismatch means the
+    canon moved: run `scripts/regen_corpus_snapshot.py` and commit the result."""
+    canon = require(canon_blueprints_dir())
+    header = (_FIXTURE_DIR / "blueprints.yaml").read_text().splitlines()[1]
+    assert header == "# BLUEPRINTS_SHA: " + (canon / "BLUEPRINTS_SHA").read_text().strip()
 
 
 def test_the_hermetic_fixture_has_not_drifted_from_the_real_canon() -> None:
@@ -355,7 +361,9 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
     `bp-compare-employee-check-detail-two-periods`. 11 became 12 on 2026-08-28 when
     `bp-average-annual-salary-by-status` was registered in the canon (`clickhouse-api`
     commit 3e1bfb9); the count is a DELIBERATE checkpoint, so a canon addition is meant to
-    stop here once and be acknowledged rather than pass silently. The seeds are built through the
+    stop here once and be acknowledged rather than pass silently. Since 2026-11-02 the
+    acknowledged count is the committed snapshot's size, so acknowledging means re-running
+    `scripts/regen_corpus_snapshot.py`, not editing a literal. The seeds are built through the
     PRODUCTION projection + resolver (`corpus_seeds_from_export` →
     `resolve_blueprint_references`) rather than a local `node_pairs` reader, and that
     swap is the point of the edit, not incidental: a `composes` node may now name
@@ -364,7 +372,9 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
     class of silent mirror drift this file exists to catch. Measured: the composite's
     key is byte-identical before and after the extraction."""
     canon = _real_canon_docs()
-    assert len(canon) == 188  # Canonical blueprint inventory, synchronized 2026-10-29.
+    # The acknowledged inventory is the committed snapshot: a canon addition stops here
+    # until `scripts/regen_corpus_snapshot.py` is re-run and its output reviewed.
+    assert len(canon) == len(_fixture_docs())
 
     seeds, _ = corpus_seeds_from_export({"blueprints": canon})
     assert len(seeds) == len(canon), "the export projection dropped a canon blueprint"
