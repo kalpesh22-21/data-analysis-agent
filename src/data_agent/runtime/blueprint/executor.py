@@ -1058,7 +1058,12 @@ class BlueprintExecutor:
                     True,
                 ),
             )
-        values = [str(row[0]) for row in rows if row and row[0] is not None]
+        # A FixedString column returns each value NUL-padded to its declared width
+        # ('Travel\x00\x00…'), which no supplied value can match exactly. The padding is
+        # storage, not data: match and bind the unpadded value, which the template's
+        # own equality still selects (ClickHouse pads a String constant compared with
+        # a FixedString). Only NULs are stripped; a trailing space can be real data.
+        values = [str(row[0]).rstrip("\x00") for row in rows if row and row[0] is not None]
         if values and slot_type == "period" and isinstance(raw, str):
             # The equality probe can return a DateTime serialized with a midnight
             # suffix. A valid ISO date already verified by SQL keeps its typed input.

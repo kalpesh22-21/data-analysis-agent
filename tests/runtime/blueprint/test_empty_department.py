@@ -44,3 +44,14 @@ async def test_abbreviation_miss_returns_to_agent_without_guessing_or_running_no
     assert result.error_code=='BLUEPRINT_ENTITY_NOT_FOUND'
     assert result.retryable
     assert len(mcp.calls)==1
+
+
+async def test_fixed_string_padding_does_not_hide_an_exact_match():
+    # A FixedString(255) column comes back NUL-padded; the padding is not part of the value.
+    padded='Information Technology'+'\x00'*233
+    executor,mcp=setup([rows(['department_name'],[[padded]]),rows(['employee_code'],[['E1']]),rows(['__bp_n','__bp_d'],[[1,1]])])
+    result=await executor.execute(blueprint_id='bp-directory',slot_bindings={'department':'information technology'},credentials=RuntimeCredentials(session_id='s',jwt='test',column_scope=frozenset()))
+    assert isinstance(result,ExecCompleted)
+    node_sql=mcp.calls[1].args['sql']
+    assert "department_name = 'Information Technology'" in node_sql
+    assert '\x00' not in node_sql
