@@ -66,7 +66,7 @@ _RUN_BLUEPRINT_CODES = {
     "RUN_BLUEPRINT_ABORTED",
 }
 
-_TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR"}
+_TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR", "TOOL_CALL_TIMEOUT"}
 _SCOPE_RECOVERY_CODES = {"SESSION_SCOPE_STALE", "SESSION_SCOPE_CHANGED"}
 _RECEIVE_LIMIT_CODES = {"API_PROVENANCE_INVALID", "RESULT_TOO_LARGE", "MCP_RESPONSE_UNSUPPORTED_ENCODING"}
 
@@ -117,6 +117,8 @@ _EXPECTED_RETRYABLE = {
     "RUN_BLUEPRINT_ABORTED": True,
     # B4 raw transport blowup: the dispatcher itself sets retryable=False.
     "INTERNAL_TRANSPORT_ERROR": False,
+    # Cancelled at its time limit: a narrower request can finish where this did not.
+    "TOOL_CALL_TIMEOUT": True,
     "SESSION_SCOPE_STALE": False,
     "SESSION_SCOPE_CHANGED": False,
     # analysisState (Release 1, 03 §C.3). The split is load-bearing: a rejected
@@ -362,6 +364,8 @@ _EXPECTED_KIND = {
     "RUN_BLUEPRINT_VERIFY_FAILED": DenialKind.WORK_JUDGED,
     # B4: a connection refusal / timeout / malformed response. The wire broke.
     "INTERNAL_TRANSPORT_ERROR": DenialKind.INFRA_FAILED,
+    # Nothing returned before the time limit, so nothing judged the work.
+    "TOOL_CALL_TIMEOUT": DenialKind.INFRA_FAILED,
     "SESSION_SCOPE_STALE": DenialKind.INFRA_FAILED,
     "SESSION_SCOPE_CHANGED": DenialKind.INFRA_FAILED,
 }
@@ -450,7 +454,7 @@ def test_an_unknown_code_is_work_judged() -> None:
 
 
 def test_late_registered_codes_render_their_live_message_on_replay() -> None:
-    """H8 patch 2. These six codes are SPELLED in `denial_mapping.py`, not imported:
+    """H8 patch 2. These codes are SPELLED in `denial_mapping.py`, not imported:
     `blueprint/executor.py` imports `dispatch/tool_dispatcher.py`, which imports the
     denial table, so importing the constants back would close a cycle.
 
@@ -468,6 +472,7 @@ def test_late_registered_codes_render_their_live_message_on_replay() -> None:
         _ex.VERIFY_FAILED_CODE: _ex._VERIFY_FAILED_MESSAGE,
         _ex.ABORTED_CODE: _ex._ABORTED_MESSAGE,
         _td.INTERNAL_TRANSPORT_ERROR_CODE: _td._INTERNAL_TRANSPORT_ERROR_MESSAGE,
+        _td.TOOL_CALL_TIMEOUT_CODE: _td._TOOL_CALL_TIMEOUT_MESSAGE,
     }
     assert frozenset(live) == _RUN_BLUEPRINT_CODES | _TRANSPORT_CODES
     for code, message in live.items():

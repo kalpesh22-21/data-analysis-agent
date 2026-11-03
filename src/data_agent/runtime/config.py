@@ -782,6 +782,18 @@ class RuntimeSettings(BaseSettings):
         allow_inf_nan=False,
         description="Per-call model timeout, capped by the remaining turn-window time.",
     )
+    # Above the API's own 30s query limit (clickhouse-api `max_execution_time`, Trino
+    # `query_max_run_time`) so its typed QUERY_RESOURCE_LIMIT arrives first; this is
+    # the backstop for a call the API never answers.
+    tool_call_timeout_seconds: float = Field(
+        60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "Per-call timeout for one MCP tool call, including blueprint nodes and probes. "
+            "Every model-requested tool call is also capped by the remaining turn-window time."
+        ),
+    )
     max_read_calls_per_tool: int = Field(
         3,
         ge=1,

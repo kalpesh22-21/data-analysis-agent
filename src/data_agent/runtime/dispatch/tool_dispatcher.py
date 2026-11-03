@@ -18,6 +18,7 @@ D5 (load-bearing): `ToolResult` NEVER carries the JWT or session_id in any field
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -85,6 +86,17 @@ INTERNAL_TRANSPORT_ERROR_CODE = "INTERNAL_TRANSPORT_ERROR"
 _INTERNAL_TRANSPORT_ERROR_MESSAGE = (
     "Something went wrong reaching the data warehouse. Please try again."
 )
+
+# A call that did not return within its limit is cancelled. The API stops a slow
+# query itself with a typed QUERY_RESOURCE_LIMIT, so this is the backstop for a call it
+# never answered — what that call would have returned is unknown, never empty.
+TOOL_CALL_TIMEOUT_CODE = "TOOL_CALL_TIMEOUT"
+_TOOL_CALL_TIMEOUT_MESSAGE = (
+    "The tool call did not finish within its time limit and was stopped; its result is "
+    "unknown, not empty. Retry at most once with a narrower request, or deliver verified "
+    "results with this limitation."
+)
+_DEFAULT_TOOL_CALL_TIMEOUT_SECONDS = 60.0
 
 
 def _default_observer(event: str, payload: dict[str, Any]) -> None:
@@ -164,6 +176,20 @@ class ToolResult:
     freshness: dict | None = None
     retrieved_at: str | None = None
     terminal: bool = False
+
+
+def tool_call_timed_out(tool_name: str) -> ToolResult:
+    """The result of a tool call cancelled at its time limit — there is no partial result."""
+    return ToolResult(
+        status="error",
+        tool_name=tool_name,
+        error_code=TOOL_CALL_TIMEOUT_CODE,
+        retryable=True,
+        user_message=_TOOL_CALL_TIMEOUT_MESSAGE,
+        provenance=None,
+        result_preview=None,
+        result_full=None,
+    )
 
 
 # Default per-result token cap for the stored preview (RuntimeSettings.
@@ -497,11 +523,17 @@ class ToolDispatcher:
         preview_row_count: int = 20,
         max_tool_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
         schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
+        tool_call_timeout_seconds: float = _DEFAULT_TOOL_CALL_TIMEOUT_SECONDS,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
         disable_redaction: bool = False,
     ) -> None:
+        if not tool_call_timeout_seconds > 0:
+            raise ValueError("tool_call_timeout_seconds must be positive")
         self._mcp_client = mcp_client
+        # Bounds every MCP round trip made through this choke point, whoever the caller:
+        # the loop, each blueprint node, entity probes and measurement checks alike.
+        self._tool_call_timeout_seconds = tool_call_timeout_seconds
         self._data_as_of_enabled = data_as_of_enabled
         # Retained for the agent's pre-execution aggregation/measurement checks.
         # Execution provenance comes exclusively from the API response.
@@ -598,6 +630,7 @@ class ToolDispatcher:
         tool_call_id: str | None = None,
         emit_progress: bool = True,
         question: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ToolResult:
         """Dispatch one tool call. `emit_progress=False` silences the
         `tool_dispatch_start`/`ok`/`denied`/`error` OBSERVER events for THIS call and
@@ -619,6 +652,10 @@ class ToolDispatcher:
         dispatch site. Its ONE use is to order which columns of an over-cap schema keep
         their documentation; it is never persisted, never spanned, never echoed into a
         result (D25).
+
+        The MCP call is cancelled after the per-call limit, or after `timeout_seconds`
+        when that is shorter (the loop passes the time left in its turn window), and
+        returns `TOOL_CALL_TIMEOUT`.
         """
         # One local, resolved once: the four progress events below route through it,
         # so a future event added to this method cannot silently escape the gate by
@@ -634,14 +671,19 @@ class ToolDispatcher:
 
         from .source_availability import check_sources, remember_source
 
+        limit = self._tool_call_timeout_seconds
+        if timeout_seconds is not None:
+            limit = max(0.001, min(limit, timeout_seconds))
+        timer = asyncio.timeout(limit)
         try:
             check_sources(tool_name, model_args)
-            raw_result = await self._mcp_client.call_tool(
-                tool_name,
-                model_args,
-                jwt=credentials.jwt,
-                session_id=credentials.session_id,
-            )
+            async with timer:
+                raw_result = await self._mcp_client.call_tool(
+                    tool_name,
+                    model_args,
+                    jwt=credentials.jwt,
+                    session_id=credentials.session_id,
+                )
             provenance = capture_provenance(tool_name, raw_result)
             data_as_of = None
             freshness = None
@@ -731,6 +773,28 @@ class ToolDispatcher:
                 denial_detail=denial_detail,
             )
         except Exception:
+            if timer.expired():
+                # Checked on the timer, not the exception type: a socket's own
+                # TimeoutError is a transport failure and takes the path below.
+                _logger.warning(
+                    "Tool %r cancelled at its %gs time limit (session=%s)",
+                    tool_name,
+                    limit,
+                    credentials.session_id,
+                )
+                emit(
+                    "tool_dispatch_error",
+                    {
+                        "tool_name": tool_name,
+                        "error_code": TOOL_CALL_TIMEOUT_CODE,
+                        "tool_call_id": tool_call_id,
+                    },
+                )
+                self._emit_tool_span(
+                    tool_name, model_args, started_at_ns=started_at_ns, status="error",
+                    error_code=TOOL_CALL_TIMEOUT_CODE,
+                )
+                return tool_call_timed_out(tool_name)
             # B4: a RAW (non-MCPToolError) transport exception — connection
             # refusal, timeout, malformed response — must never crash the
             # turn or leak str(exc) to the client. Log the real exception

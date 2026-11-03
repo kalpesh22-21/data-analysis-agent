@@ -427,10 +427,12 @@ def validate_block_evidence(
             entry.status != "ok"
             and (entry.tool_name == "runQuery" and entry.error_code == "SQL_REPAIR_EXHAUSTED"
                  or entry.tool_name in {"runQuery", "runBlueprint"}
-                 and entry.error_code in {"AGGREGATION_CHECK_UNAVAILABLE", "SOURCE_UNAVAILABLE"})
+                 and entry.error_code in {
+                     "AGGREGATION_CHECK_UNAVAILABLE", "SOURCE_UNAVAILABLE", "TOOL_CALL_TIMEOUT",
+                 })
         ):
             return None
-        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED or AGGREGATION_CHECK_UNAVAILABLE/SOURCE_UNAVAILABLE receipt; other SQL errors do not establish exhaustion."
+        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED or AGGREGATION_CHECK_UNAVAILABLE/SOURCE_UNAVAILABLE/TOOL_CALL_TIMEOUT receipt; other SQL errors do not establish exhaustion."
 
     # A targeted, complete schema check can establish unavailable fields
     # without executing speculative SQL. It says nothing about other datasets.
@@ -952,7 +954,7 @@ def _bind_evidence_against_trail(
                 if reason_code is None:
                     raise _reject(
                         "unresolved_evidence",
-                        "This result does not establish a blocked intent. Scope refusal receipts support OUT_OF_SCOPE_REQUEST; permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED or SOURCE_UNAVAILABLE supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
+                        "This result does not establish a blocked intent. Scope refusal receipts support OUT_OF_SCOPE_REQUEST; permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED, SOURCE_UNAVAILABLE or TOOL_CALL_TIMEOUT supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
                     )
             tool_call_id, binding = explicit, EVIDENCE_BINDING_TAGGED
         else:

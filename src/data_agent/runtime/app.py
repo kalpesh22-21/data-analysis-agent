@@ -666,6 +666,7 @@ def create_app(
             # the cap above: a schema's table-level sections ride complete, and its
             # column list gets a larger allowance than a generic tool result.
             schema_columns_token_budget=settings.schema_columns_token_budget,
+            tool_call_timeout_seconds=settings.tool_call_timeout_seconds,
             observer=observer,
             tracer=tracer,
             # Access-controlled TELEMETRY DEBUG switch: when set, the TOOL span

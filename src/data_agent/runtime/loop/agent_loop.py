@@ -94,6 +94,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolPause,
     ToolResult,
     _default_observer,
+    tool_call_timed_out,
 )
 from data_agent.runtime.dispatch.tool_envelope import in_tool_span
 from data_agent.runtime.hooks.answer_table import (
@@ -472,6 +473,12 @@ def _runtime_tool_internal_error(tool_name: str) -> ToolResult:
         result_preview=None,
         result_full=None,
     )
+
+
+def _remaining_window(guard: BudgetGuard) -> float:
+    """Seconds left in this turn window; a tool call never runs past it."""
+    usage = guard.usage()
+    return max(0.001, usage.max_wall_clock_seconds - usage.elapsed_seconds)
 
 
 def _sanitize_runtime_provenance(
@@ -1759,28 +1766,46 @@ class AgentLoop:
         credentials: RuntimeCredentials,
         turn: TurnContext,
         tool_call_id: str,
+        *,
+        timeout_seconds: float,
     ) -> ToolResult:
-        """Run one registry handler with a crash guard and a returned-provenance-type
-        validation, so a misbehaving runtime tool cannot abort the turn or persist a
-        replay-poisoning provenance.
+        """Run one registry handler with a crash guard, a time limit and a
+        returned-provenance-type validation, so a misbehaving runtime tool cannot abort
+        the turn, outlive its window or persist a replay-poisoning provenance.
 
         *turn* is the loop's OWN `turn_index`, threaded explicitly — the only correct
         source. Passed to every runtime tool, ignored by the ones that do not need it.
+
+        *timeout_seconds* is the time left in the turn window. A runtime tool may make
+        several MCP calls (a composed blueprint runs one per node), each already bounded
+        by the dispatcher's per-call limit, so only the window bounds the whole tool.
         """
         managed = getattr(handler, "emits_dispatch_events", False)
         if not managed:
             self._observer(
                 "tool_dispatch_start", {"tool_name": tool_name, "tool_call_id": tool_call_id}
             )
+        timer = asyncio.timeout(timeout_seconds)
         try:
-            result = await handler.run(arguments, credentials, turn=turn, tool_call_id=tool_call_id)
+            async with timer:
+                result = await handler.run(
+                    arguments, credentials, turn=turn, tool_call_id=tool_call_id
+                )
         except Exception:
-            # Never propagate the raw exception (would abort the turn) or leak
-            # `str(exc)` — log server-side only, return a clean canned error.
-            _logger.exception(
-                "runtime tool %s raised (session=%s)", tool_name, credentials.session_id
-            )
-            result = _runtime_tool_internal_error(tool_name)
+            if timer.expired():
+                _logger.warning(
+                    "runtime tool %s cancelled at the end of the turn window (session=%s)",
+                    tool_name,
+                    credentials.session_id,
+                )
+                result = tool_call_timed_out(tool_name)
+            else:
+                # Never propagate the raw exception (would abort the turn) or leak
+                # `str(exc)` — log server-side only, return a clean canned error.
+                _logger.exception(
+                    "runtime tool %s raised (session=%s)", tool_name, credentials.session_id
+                )
+                result = _runtime_tool_internal_error(tool_name)
             managed = False
         if not managed:
             self._observer(
@@ -4066,6 +4091,7 @@ class AgentLoop:
                             credentials,
                             turn_context,
                             tool_call.id,
+                            timeout_seconds=_remaining_window(guard),
                         )
                     else:  # pragma: no cover - always wired by app.py
                         tool_result = _runtime_tool_internal_error(tool_call.name)
@@ -4086,6 +4112,7 @@ class AgentLoop:
                             credentials,
                             turn_context,
                             tool_call.id,
+                            timeout_seconds=_remaining_window(guard),
                         )
                     )
                 elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
@@ -4106,6 +4133,7 @@ class AgentLoop:
                         credentials,
                         tool_call_id=tool_call.id,
                         question=question,
+                        timeout_seconds=_remaining_window(guard),
                     )
 
                 if local_dispatch:

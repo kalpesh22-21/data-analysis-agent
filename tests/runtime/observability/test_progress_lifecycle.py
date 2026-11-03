@@ -66,6 +66,7 @@ async def test_dispatch_lifecycle_survives_sse_for_remote_and_runtime_tools(path
                 _credentials(),
                 TurnContext(turn_index=0, question="Check the information"),
                 "step-1",
+                timeout_seconds=60,
             )
         assert result.status == status
         # A late text update must not reopen or mark a denied/error row successful.

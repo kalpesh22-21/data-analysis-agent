@@ -625,6 +625,22 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         kind=DenialKind.INFRA_FAILED,
         user_message="Something went wrong reaching the data warehouse. Please try again.",
     ),
+    # `TOOL_CALL_TIMEOUT` (`dispatch/tool_dispatcher.py::TOOL_CALL_TIMEOUT_CODE`): the
+    # call was cancelled at its time limit — the dispatcher's per-MCP-call limit or the
+    # end of the turn window. Spelled, not imported, for the cycle noted above.
+    "TOOL_CALL_TIMEOUT": DenialInfo(
+        code="TOOL_CALL_TIMEOUT",
+        # Retryable: a narrower request can finish where the first did not.
+        retryable=True,
+        # INFRA_FAILED: nothing returned, so nothing formed a verdict on the work. A
+        # query too slow for the API's own limit arrives as QUERY_RESOURCE_LIMIT instead.
+        kind=DenialKind.INFRA_FAILED,
+        user_message=(
+            "The tool call did not finish within its time limit and was stopped; its result is "
+            "unknown, not empty. Retry at most once with a narrower request, or deliver verified "
+            "results with this limitation."
+        ),
+    ),
 }
 
 # Model-facing execution API contract: SQL authoring remains ClickHouse.

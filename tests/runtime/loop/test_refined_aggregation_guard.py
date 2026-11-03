@@ -56,6 +56,17 @@ async def test_failed_probes_preserve_recovery_policy(code, retryable, expected)
     assert decode_diagnostic(issue.denial_detail)["cause"]["code"] == code
 
 
+async def test_a_timed_out_probe_leaves_the_check_unavailable_not_correctable():
+    dispatcher = AsyncMock()
+    dispatcher.dispatch.return_value = SimpleNamespace(
+        status="error", result_full=None, error_code="TOOL_CALL_TIMEOUT", retryable=True,
+        denial_detail=None, user_message="timed out",
+    )
+    issue = await validate_join_cardinality(SQL, dispatcher, None)
+    assert (issue.code, issue.retryable) == ("AGGREGATION_CHECK_UNAVAILABLE", False)
+    assert decode_diagnostic(issue.denial_detail)["cause"]["code"] == "TOOL_CALL_TIMEOUT"
+
+
 async def test_duplicate_keys_and_success_have_distinct_outcomes():
     dispatcher = AsyncMock()
     dispatcher.dispatch.return_value = SimpleNamespace(status="ok", result_full={"rows": [[10, 3]]})

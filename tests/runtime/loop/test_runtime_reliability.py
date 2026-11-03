@@ -250,7 +250,8 @@ async def test_cancelled_span_closes_with_safe_error_reason():
     provider.shutdown()
 
 
+@pytest.mark.parametrize("field", ["model_call_timeout_seconds", "tool_call_timeout_seconds"])
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
-def test_timeout_config_rejects_invalid_limits(value):
+def test_timeout_config_rejects_invalid_limits(field, value):
     with pytest.raises(ValidationError):
-        RuntimeSettings(_env_file=None, model_call_timeout_seconds=value)
+        RuntimeSettings(_env_file=None, **{field: value})

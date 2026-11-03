@@ -569,7 +569,10 @@ async def validate_join_cardinality(
         )
     try:
         schema = None
-        from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+        from data_agent.runtime.dispatch.tool_dispatcher import (
+            TOOL_CALL_TIMEOUT_CODE,
+            ToolDispatcher,
+        )
 
         if isinstance(dispatcher, ToolDispatcher):
             catalog = await dispatcher._resolve_catalog(credentials)
@@ -597,14 +600,17 @@ async def validate_join_cardinality(
                         retryable=False,
                         cause={"code": result.error_code, "message": message},
                     )
+                # The runtime wrote the probe, so a probe that timed out leaves the
+                # check unavailable; there is no SQL for the model to correct.
+                correctable = bool(result.retryable) and result.error_code != TOOL_CALL_TIMEOUT_CODE
                 return AggregationIssue(
                     "The join cardinality probe failed; this is not proof of duplicate rows. "
                     "The main query was not executed. Follow the probe diagnostic in ClickHouse SQL "
                     "or use other successful results and disclose the limitation.",
                     code="AGGREGATION_CHECK_FAILED"
-                    if result.retryable
+                    if correctable
                     else "AGGREGATION_CHECK_UNAVAILABLE",
-                    retryable=bool(result.retryable),
+                    retryable=correctable,
                     cause=(
                         {
                             k: diagnostic[k]
