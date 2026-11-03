@@ -239,6 +239,10 @@ class RuntimeSettings(BaseSettings):
         True,
         description="Enable optional ingestion freshness metadata. Set DATA_AS_OF_ENABLED=false to disable.",
     )
+    build_sha: str = Field(
+        "unknown",
+        description="Commit SHA stamped into the image at build (Docker ARG GIT_SHA -> BUILD_SHA); served by GET /version.",
+    )
 
     # --- Adopted MCP (clickhouse-api, D75) ---
     mcp_max_response_bytes: int = Field(

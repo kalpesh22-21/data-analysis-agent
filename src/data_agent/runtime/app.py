@@ -1016,6 +1016,13 @@ def create_app(
         ok = await vector_index.graph_ready()
         return JSONResponse(status_code=200 if ok else 503, content={"ready": ok})
 
+    # The serving commit, so a deploy is verified rather than inferred from image tags
+    # (`appVersion`/`image.tag` do not track commits). Unauthenticated like `/ready`;
+    # it returns only the build-time SHA, never configuration.
+    @app.get("/version")
+    async def version() -> JSONResponse:
+        return JSONResponse(status_code=200, content={"commit": settings.build_sha})
+
     # Test-only span-dump endpoint (D-L3-5), registered ONLY when a
     # `span_exporter` is injected (the Layer-3 demo launcher's in-memory
     # exporter). Production passes `span_exporter=None`, so this route never

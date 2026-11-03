@@ -70,6 +70,12 @@ COPY scripts ./scripts
 # CORPUS_SOURCE=fixture. Both are resolved relative to /app by config.py.
 COPY tests/fixtures ./tests/fixtures
 
+# The serving commit for GET /version and the OCI revision label. Last, so a new SHA
+# invalidates only this layer: `docker build --build-arg GIT_SHA=$(git rev-parse HEAD)`.
+ARG GIT_SHA=unknown
+ENV BUILD_SHA=${GIT_SHA}
+LABEL org.opencontainers.image.revision=${GIT_SHA}
+
 # runtime API / UI BFF / inbox service (inbox is opt-in).
 EXPOSE 8000 3000 8100
 

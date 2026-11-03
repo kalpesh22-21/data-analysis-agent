@@ -109,3 +109,17 @@ def test_ready_never_calls_extract_credentials(monkeypatch, ready: bool) -> None
     with _app(monkeypatch, neo4j_url=_NEO4J_URL, ready=ready) as client:
         resp = client.get("/ready")
     assert resp.status_code in (200, 503)
+
+
+def test_version_reports_the_build_sha_without_auth(monkeypatch) -> None:
+    monkeypatch.setenv("BUILD_SHA", "08ea0ee9c3e973f690f4e178a7c7c29eaea90e25")
+    with _app(monkeypatch, neo4j_url="", ready=True) as client:
+        resp = client.get("/version")
+    assert resp.status_code == 200
+    assert resp.json() == {"commit": "08ea0ee9c3e973f690f4e178a7c7c29eaea90e25"}
+
+
+def test_version_defaults_to_unknown_when_unstamped(monkeypatch) -> None:
+    monkeypatch.delenv("BUILD_SHA", raising=False)
+    with _app(monkeypatch, neo4j_url="", ready=True) as client:
+        assert client.get("/version").json() == {"commit": "unknown"}
