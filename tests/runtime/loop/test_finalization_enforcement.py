@@ -884,3 +884,7 @@ async def test_finalization_refusal_resets_stagnation_at_boundary():
     assert "THE DRAFT ANSWER" in str(model.calls[2].messages)
     assert _events(events, "loop_stagnation_reset")
     assert not _events(events, "loop_no_new_evidence_stop")
+    skips = _events(events, "loop_answer_judge_skipped")
+    assert [s["reason"] for s in skips] == ["finalization_block_granted", "finalization_refused"]
+    assert all(s["finalization_kind"] == "intents" for s in skips)
+    assert all(s["review_state_calls"] == 0 and s["remaining_ms"] > 0 for s in skips)

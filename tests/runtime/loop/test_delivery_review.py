@@ -255,3 +255,59 @@ def test_partial_delivery_distinguishes_table_from_unselected_card():
     text = partial_delivery_text(doc, 0, accum)
     assert "Department headcount: The result is shown." in text
     assert "Compensation history: This part was not completed for display." in text
+
+
+@pytest.mark.parametrize("calls,violation,budget,reason", [
+    (0, "", 12.5, "normal_review_not_run"),
+    (1, "", 12.5, "review_unavailable"),
+    (2, "", 12.5, "review_limit_reached"),
+    (1, "measurement_mismatch", 12.5, "judge_rejected"),
+    (1, "", 0.0, "review_budget_exhausted"),
+])
+async def test_delivery_receipt_telemetry_reports_actual_state(calls, violation, budget, reason):
+    from data_agent.runtime.context.scope_filter import compute_scope_hash
+    from data_agent.runtime.loop.delivery import CURRENT_DELIVERY, DeliveryContext, review_delivery
+    from data_agent.runtime.loop.proposal import ReviewState
+    from data_agent.runtime.loop.turn_accumulators import TurnAccumulators
+
+    judge = Judge()
+    loop, store, _, _, events = build([], judge)
+    state = ReviewState(calls=calls, violation=violation,
+                        scope_hash=compute_scope_hash(CREDS.column_scope))
+    await store.get_or_create_session(CREDS.session_id)
+    await store.write_review_state(CREDS.session_id, 1, state.to_doc())
+    token = CURRENT_DELIVERY.set(DeliveryContext(CREDS, review_seconds=budget))
+    try:
+        envelope, _ = await review_delivery(loop, CREDS.session_id, 1, "Draft", TurnAccumulators(), None)
+    finally:
+        CURRENT_DELIVERY.reset(token)
+    payload = next(p for e, p in events if e == "loop_delivery_review")
+    assert payload["calls"] == payload["review_state_calls"] == envelope["attempts"] == calls
+    assert payload["delivery_review_calls"] == 0
+    assert payload["reason"] == reason
+    assert payload["review_budget_remaining_ms"] == int(budget * 1000)
+    assert not judge.briefs  # Telemetry must not cause a new review.
+    assert (await store.get_or_create_session(CREDS.session_id)).review_states["1"] == state.to_doc()
+
+
+async def test_approved_delivery_receipt_reports_review_without_rejudging():
+    judge = Judge()
+    loop, _, _, _, events = build([hello()], judge)
+    out = await run(loop, "Hello")
+    payload = next(p for e, p in events if e == "loop_delivery_review")
+    assert payload["status"] == "approved"
+    assert payload["reason"] == "approval_receipt_valid"
+    assert payload["review_state_calls"] == out.review["attempts"] == 1
+    assert payload["delivery_review_calls"] == 0
+    assert len(judge.briefs) == 1
+
+
+def test_delivery_telemetry_fields_survive_export_without_content():
+    from tests.runtime.observability.test_tracing import _observed_attributes
+
+    payload = {"review_state_calls": 2, "delivery_review_calls": 0,
+               "review_budget_remaining_ms": 12500, "terminal_reserve_seconds": 3.0,
+               "finalization_kind": "intents", "reason": "finalization_block_granted"}
+    attrs = _observed_attributes("loop_delivery_review", {**payload, "feedback": "PRIVATE"})
+    assert all(attrs[k] == v for k, v in payload.items())
+    assert "PRIVATE" not in json.dumps(attrs)

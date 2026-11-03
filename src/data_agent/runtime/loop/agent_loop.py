@@ -4825,7 +4825,17 @@ class AgentLoop:
                 if evidence_error and feedback != evidence_error:
                     feedback = evidence_error + "\n\n" + feedback
                 if feedback:
-                    if await finalization_gate.may_refuse(kind):
+                    finalization_repair_granted = await finalization_gate.may_refuse(kind)
+                    self._observer(ANSWER_JUDGE_SKIPPED_EVENT, {
+                        "site": site,
+                        "reason": "finalization_block_granted" if finalization_repair_granted
+                                  else "finalization_refused",
+                        "finalization_kind": kind,
+                        "review_state_calls": review_state.calls,
+                        "remaining_ms": int(max(0.0, guard.usage().max_wall_clock_seconds
+                                                - guard.usage().elapsed_seconds) * 1000),
+                    })
+                    if finalization_repair_granted:
                         if kind == "empty_answer":
                             self._observer(
                                 EMPTY_ANSWER_REFUSED_EVENT,

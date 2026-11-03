@@ -625,6 +625,11 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "dependency",
     "retryable",
     "calls",
+    "review_state_calls",
+    "delivery_review_calls",
+    "review_budget_remaining_ms",
+    "terminal_reserve_seconds",
+    "finalization_kind",
     "repair_type",  # Validated review enum; no model feedback or result values.
     "repaired",
     "repair_attempted",

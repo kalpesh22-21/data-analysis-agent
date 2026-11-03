@@ -238,6 +238,23 @@ def partial_delivery_text(doc, turn_index, accum):
     return "\n".join(lines)
 
 
+def _observe_delivery_review(loop, context, state, *, site, status, reason, delivery_calls=0):
+    """Keep durable answer-review counts distinct from this delivery check's calls.
+
+    The budget is the request-local judge budget, not the agent's wall-clock
+    deadline. Receipt checks and salvage must never increment the answer counter.
+    """
+    loop._observer("loop_delivery_review", {
+        "site": site, "status": status, "reason": reason,
+        "calls": delivery_calls if site == "ask_user" else state.calls,
+        "review_state_calls": state.calls,
+        "delivery_review_calls": delivery_calls,
+        "review_budget_remaining_ms": int(max(0.0, context.review_seconds) * 1000),
+        "repair_reserve_seconds": context.repair_reserve_seconds,
+        "terminal_reserve_seconds": context.terminal_reserve_seconds,
+    })
+
+
 async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint):
     """Verify an answer receipt without re-judging; review unreviewed clarifications only."""
     pending = checkpoint.pending_question if checkpoint else None
@@ -281,18 +298,33 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
     ):
         # The question already passed the askUser repair gate. Re-reviewing it at
         # finish time cannot re-round and used to turn a pause into a generic decline.
+        _observe_delivery_review(loop, context, state, site=site, status=state.delivery_status,
+                                 reason="clarification_receipt_reused")
         return envelope(state.delivery_status, violation=state.violation), False
     if (
         state.delivery_version == version
         and state.delivery_status == "approved"
         and (not state.violation or pending and state.site != "ask_user")
     ):
+        _observe_delivery_review(loop, context, state, site=site, status="approved",
+                                 reason="approval_receipt_valid")
         return envelope("approved", state.calls), False
     if not pending:
-        if doc.review_states.get(str(turn_index), {}).get("delivery_status") == "approved":
+        mismatch = doc.review_states.get(str(turn_index), {}).get("delivery_status") == "approved"
+        if mismatch:
             loop._observer("loop_delivery_receipt_invalid", {"reason": "approval_mismatch"})
         status = "rejected" if state.violation else "exhausted"
-        loop._observer("loop_delivery_review", {"site": site, "status": status, "calls": 0})
+        reason = (
+            "approval_mismatch" if mismatch else
+            "judge_rejected" if state.violation else
+            "review_timeout" if context.review_failure_reason == "timeout" else
+            "review_failed" if context.review_failure_reason == "review_failed" else
+            "review_budget_exhausted" if context.review_seconds <= 0 else
+            "review_limit_reached" if state.calls >= 2 else
+            "normal_review_not_run" if state.calls == 0 else
+            "review_unavailable"
+        )
+        _observe_delivery_review(loop, context, state, site=site, status=status, reason=reason)
         return envelope(status, state.calls, state.violation), status == "rejected"
     questions = [m.content for m in doc.messages if m.role == "user" and m.turn_index == turn_index]
     calls = 0
@@ -348,5 +380,10 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
         (context.review_failure_reason or "review_unavailable") if status == "exhausted" else ""
     )
     await loop._session_store.write_review_state(session_id, turn_index, state.to_doc())
-    loop._observer("loop_delivery_review", {"site": site, "status": status, "calls": calls})
+    _observe_delivery_review(
+        loop, context, state, site=site, status=status, delivery_calls=calls,
+        reason=("judge_approved" if status == "approved" else "judge_rejected"
+                if status == "rejected" else "review_budget_exhausted"
+                if context.review_seconds <= 0 else "review_unavailable"),
+    )
     return envelope(status, calls, state.violation), status == "rejected"
