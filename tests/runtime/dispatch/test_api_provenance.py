@@ -157,3 +157,40 @@ async def test_structured_error_survives_dispatch_without_backend_rediagnosis(co
     assert diagnostic['retry'] == retry
     assert 'engine_code' not in diagnostic and 'api_message' not in diagnostic
     assert 'backend_private' not in diagnostic
+
+
+async def test_employee_access_cause_reaches_the_model():
+    import json
+
+    from data_agent.runtime.dispatch.sql_diagnostics import compact_model_diagnostic
+    guidance = ("The user's employee-access list could not be loaded, so warehouse data cannot be "
+                "read for this user right now. This is not an empty result or a permission denial.")
+    payload = dict(version=1, code='EXECUTION_SERVICE_UNAVAILABLE',
+                   message='The execution service is temporarily unavailable. Cause: EMPLOYEE_ACCESS_UNAVAILABLE.',
+                   input_dialect='clickhouse', guidance=guidance, retry='after_service_recovery',
+                   cause='EMPLOYEE_ACCESS_UNAVAILABLE')
+    result = await ToolDispatcher(
+        RawAPI([MCPToolError('EXECUTION_SERVICE_UNAVAILABLE', json.dumps(payload))]), unavailable_catalog,
+    ).dispatch('runQuery', {'sql': 'SELECT 1'}, _credentials())
+    assert result.error_code == 'EXECUTION_SERVICE_UNAVAILABLE' and result.retryable is False
+    model_view = compact_model_diagnostic(decode_diagnostic(result.denial_detail))
+    assert model_view['cause'] == 'EMPLOYEE_ACCESS_UNAVAILABLE'
+    assert 'not an empty result' in model_view['hint']
+
+
+async def test_column_context_failure_keeps_its_guidance():
+    """getTableSchema's column-context lookup failure. Before it was registered, the
+    agent discarded the payload and the model read only a generic failure."""
+    import json
+
+    from data_agent.runtime.dispatch.sql_diagnostics import compact_model_diagnostic
+    guidance = ('Ask the operator to check the column context query, result shape, limits and '
+                'source permissions. Do not rewrite business SQL to bypass this failure.')
+    payload = dict(version=1, code='CATALOG_CONTEXT_UNAVAILABLE', message='Column context could not be loaded.',
+                   input_dialect='clickhouse', guidance=guidance, retry='after_operator_action')
+    result = await ToolDispatcher(
+        RawAPI([MCPToolError('CATALOG_CONTEXT_UNAVAILABLE', json.dumps(payload))]), unavailable_catalog,
+    ).dispatch('getTableSchema', {'database': 'hr', 'table': 'payroll'}, _credentials())
+    assert result.error_code == 'CATALOG_CONTEXT_UNAVAILABLE' and result.retryable is False
+    assert result.user_message != 'Something went wrong processing that request.'
+    assert compact_model_diagnostic(decode_diagnostic(result.denial_detail))['hint'] == guidance

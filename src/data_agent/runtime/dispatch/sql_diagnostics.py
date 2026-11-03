@@ -56,6 +56,15 @@ USER_CANCELED VIEW_IS_STALE
 """.split())
 
 
+# Employee-access failures; counterpart registry is clickhouse-api app/model_errors.py
+# `_EMPLOYEE_ACCESS_POLICIES`. The public code classifies the failure; the cause tells
+# the model its employee-access list, not the data, is what is missing.
+EMPLOYEE_ACCESS_CAUSES = frozenset({
+    "EMPLOYEE_ACCESS_UNAVAILABLE", "EMPLOYEE_ACCESS_NOT_PROVISIONED", "EMPLOYEE_ACCESS_MISCONFIGURED",
+    "EMPLOYEE_ACCESS_NO_TOKEN", "EMPLOYEE_ACCESS_NO_JTI",
+})
+
+
 def sql_diagnostic(message: str, sql: str) -> dict:
     try:
         payload = json.loads(message)
@@ -68,7 +77,7 @@ def sql_diagnostic(message: str, sql: str) -> dict:
         result = {key: payload[key][:3000] for key in
                   ("code", "message", "input_dialect", "guidance", "retry", "candidate_expression")
                   if isinstance(payload.get(key), str)}
-        causes = set(MESSAGES) | {"UNSUPPORTED_METHOD"} | TRINO_CAUSES
+        causes = set(MESSAGES) | {"UNSUPPORTED_METHOD"} | TRINO_CAUSES | EMPLOYEE_ACCESS_CAUSES
         if payload.get("cause") in causes:
             result["cause"] = payload["cause"]
             codes = {"UNSUPPORTED_METHOD": 1, "SYNTAX_ERROR": 62, "UNKNOWN_IDENTIFIER": 47,

@@ -188,6 +188,7 @@ _MODEL_SERVICE_CODES = {
     "EXECUTION_SERVICE_UNAVAILABLE", "EXECUTION_CONFIGURATION_ERROR", "EXECUTION_IDENTITY_REQUIRED",
     "EXECUTION_ACCESS_DENIED", "EXECUTION_CANCELLED",
     "SOURCE_UNAVAILABLE",  # Confirmed missing source is infrastructure, not bad blueprint work.
+    "CATALOG_CONTEXT_UNAVAILABLE",  # getTableSchema's column-context lookup; operator action.
 }
 _EXPECTED_RETRYABLE.update({c: True for c in _MODEL_QUERY_CODES})
 _EXPECTED_RETRYABLE.update({c: False for c in _MODEL_SERVICE_CODES})
