@@ -1,5 +1,6 @@
 """Exact judge-approved subsets, retained independently of rejected full answers."""
 
+import json
 from copy import deepcopy
 from dataclasses import replace
 
@@ -33,6 +34,30 @@ def capture_partial(verdict, brief, accum, trail, turn_index, *, observer=None):
     )
 
 
+def _table_counts(sections, components):
+    """Shape-only counts for recovery telemetry (D25): never section text or ids."""
+    if isinstance(sections, str):
+        try:
+            sections = json.loads(sections)
+        except ValueError:
+            sections = None
+    tables = [
+        s for s in sections
+        if isinstance(s, dict) and isinstance(s.get("presentation"), dict)
+        and s["presentation"].get("kind") == "table"
+    ] if isinstance(sections, list) else []
+    return {
+        "visible_table_count": sum(
+            1 for c in components if isinstance(c, dict) and c.get("kind") == "table"
+        ),
+        "table_section_count": len(tables),
+        "missing_table_reason_count": sum(
+            1 for s in tables
+            if not (isinstance(s.get("table_reason"), str) and s["table_reason"].strip())
+        ),
+    }
+
+
 def _validate_response(
     part,
     brief,
@@ -45,10 +70,12 @@ def _validate_response(
     observer=None,
 ):
     """Validate structure/provenance; the judge is responsible for factual support."""
+    counts = _table_counts(part.get("sections") if isinstance(part, dict) else None,
+                           brief.selected_components)
 
     def invalid(reason, **details):
         if observer:
-            observer("loop_recovery_validation_failed", {"reason": reason, **details})
+            observer("loop_recovery_validation_failed", {"reason": reason, **counts, **details})
         return {}
 
     from data_agent.runtime.composer import PresentationError, build_document, proposal_to_internal

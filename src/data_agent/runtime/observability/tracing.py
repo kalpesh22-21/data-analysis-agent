@@ -315,7 +315,17 @@ def mark_current_span_error(reason: str) -> None:
     """Record a runtime-authored failure reason without exception or request text."""
     current = trace.get_current_span()
     current.set_attribute("reason", reason)
-    current.set_status(Status(StatusCode.ERROR, reason))
+    mark_span_error(current, reason)
+
+
+def mark_span_error(span: Any, reason: str) -> None:
+    """ERROR status on a held span, so status-only dashboards count it.
+
+    *reason* must be a runtime-authored closed-vocabulary code (an error code or outcome
+    slug), never request, SQL or provider text.
+    """
+    if hasattr(span, "set_status"):
+        span.set_status(Status(StatusCode.ERROR, reason))
 
 
 # --- W3C trace-context propagation (cross-process span chaining) --------------
@@ -494,6 +504,10 @@ def tool_span(
         start_time=wall_start,
         record_exception=record_exception,
     ) as current_span:
+        # Post-hoc callers know the outcome at open; the envelope opens `ok` and
+        # stamps the real status (and this ERROR) itself.
+        if status in {"denied", "error"}:
+            mark_span_error(current_span, error_code or status)
         try:
             yield current_span
         finally:
@@ -794,6 +808,21 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "redaction_count",
     "disposition",  # Closed runtime ship disposition; never model-authored text.
     "count",
+    # --- SQL denial -> corrective-call linkage ---
+    # `loop_sql_correction_linked` and both repair-exhaustion events: the failed call a
+    # SQL call follows and its attempt number. Tool-call ids (same class as
+    # `tool_call_id`) and closed error codes only; `prior_tool_call_ids` is a JSON id
+    # list. Never SQL or denial prose.
+    "corrects_tool_call_id",
+    "corrects_error_code",
+    "attempt",
+    "prior_tool_call_ids",
+    # --- recovery validation shape ---
+    # `loop_recovery_validation_failed`: table counts from the salvage proposal and the
+    # judge-visible components. Counts only; never captions, reasons or ids.
+    "visible_table_count",
+    "table_section_count",
+    "missing_table_reason_count",
 )
 
 

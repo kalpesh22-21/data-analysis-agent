@@ -262,7 +262,8 @@ async def test_salvage_rejects_sql_in_section_title():
     out = await run(loop)
     assert out.review["status"] != "approved"
     assert "SELECT" not in str(out.answer_document)
-    assert ("loop_recovery_validation_failed", {"reason": "sql_in_prose"}) in events
+    failed = [p for e, p in events if e == "loop_recovery_validation_failed"]
+    assert any(p["reason"] == "sql_in_prose" and p.keys() == {"reason", "visible_table_count", "table_section_count", "missing_table_reason_count"} for p in failed)
 
 
 @pytest.mark.parametrize('as_text', [True, False])

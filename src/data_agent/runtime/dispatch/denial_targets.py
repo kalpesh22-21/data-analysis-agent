@@ -1,5 +1,6 @@
 """Conservative column-denial targets for telemetry and retry bounding, not provenance."""
 
+import json
 import re
 from collections import Counter
 
@@ -91,6 +92,31 @@ def repeated_target_denial(tool_name, args, trail, turn_index, scope_hash):
         if count >= 2 and ((table, column) in requested or (table, "*") in requested):
             return code
     return None
+
+
+def correction_link(tool_name, trail, turn_index, scope_hash):
+    """Name the failed attempts a call follows, so a correction pairs with its denial.
+
+    The chain is the run of non-`ok` same-tool calls since that tool's last success in
+    this turn and scope. Ids and closed-vocabulary codes only; `{}` when nothing failed.
+    """
+    chain = []
+    for entry in trail:
+        if (
+            entry.turn_index != turn_index
+            or entry.tool_name != tool_name
+            or (entry.model_response or {}).get("scope_hash") != scope_hash
+        ):
+            continue
+        chain = [] if entry.status == "ok" else [*chain, entry]
+    if not chain:
+        return {}
+    return {
+        "corrects_tool_call_id": chain[-1].tool_call_id,
+        "corrects_error_code": chain[-1].error_code,
+        "attempt": len(chain) + 1,
+        "prior_tool_call_ids": json.dumps([entry.tool_call_id for entry in chain[-8:]]),
+    }
 
 
 def record_column_denial(span, *, code, detail, args, tool_name, tool_call_id):

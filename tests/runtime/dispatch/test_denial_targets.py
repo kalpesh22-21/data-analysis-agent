@@ -154,3 +154,53 @@ async def test_loop_blocks_third_reworded_denial_and_allows_corrected_read():
     assert blocked.error_code == "SQL_REPAIR_EXHAUSTED"
     assert len(mcp.calls) == 3  # Two denied calls and the corrected read.
     assert any(event == "loop_semantic_denial_exhausted" for event, _ in events)
+
+
+async def test_each_corrective_call_names_the_denials_it_follows():
+    queries = [
+        SQL,
+        f"SELECT field_id AS renamed FROM {TABLE}",
+        f"SELECT field_id FROM {TABLE} LIMIT 1",
+    ]
+    steps = [
+        discovery(),
+        *[batch(call("runQuery", f"bad{i}", sql=sql)) for i, sql in enumerate(queries)],
+        query(),
+        batch(finish()),
+    ]
+    loop, _, _, _, events = build(
+        steps,
+        rows=[
+            MCPToolError("INVALID_COLUMN_REFERENCE", MESSAGE),
+            MCPToolError("INVALID_COLUMN_REFERENCE", MESSAGE),
+            {"columns": ["Department", "n"], "rows": [["Sales", 120]], "row_count": 1},
+        ],
+    )
+    await run(loop)
+    linked = [p for e, p in events if e == "loop_sql_correction_linked"]
+    assert [(p["tool_call_id"], p["corrects_tool_call_id"], p["attempt"]) for p in linked[:2]] == [
+        ("bad1", "bad0", 2), ("bad2", "bad1", 3),
+    ]
+    assert json.loads(linked[1]["prior_tool_call_ids"]) == ["bad0", "bad1"]
+    assert linked[1]["corrects_error_code"] == "INVALID_COLUMN_REFERENCE"
+    # The corrected read pairs with the refusal it follows, closing the chain.
+    assert linked[-1]["corrects_tool_call_id"] == "bad2" and linked[-1]["attempt"] == 4
+    exhausted = next(p for e, p in events if e == "loop_semantic_denial_exhausted")
+    assert exhausted["tool_call_id"] == "bad2"
+    assert exhausted["corrects_tool_call_id"] == "bad1" and exhausted["attempt"] == 3
+
+
+def test_correction_link_resets_on_success_and_respects_turn_and_scope():
+    from data_agent.runtime.dispatch.denial_targets import correction_link
+
+    first, second = denied(), replace(denied(), tool_call_id="d2")
+    ok = replace(denied(), tool_call_id="ok", status="ok", error_code=None)
+    assert correction_link("runQuery", [], 0, "scope") == {}
+    assert correction_link("runQuery", [first, ok], 0, "scope") == {}
+    assert correction_link("runQuery", [first, ok, second], 0, "scope") == {
+        "corrects_tool_call_id": "d2", "corrects_error_code": "INVALID_COLUMN_REFERENCE",
+        "attempt": 2, "prior_tool_call_ids": '["d2"]',
+    }
+    assert correction_link("runQuery", [first], 1, "scope") == {}
+    assert correction_link("runQuery", [first], 0, "other-scope") == {}
+    assert correction_link("explainQuery", [first], 0, "scope") == {}

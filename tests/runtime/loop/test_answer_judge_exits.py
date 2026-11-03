@@ -913,3 +913,30 @@ async def test_invalid_finalizer_keeps_original_tool_identity_and_json_feedback(
     assert failed.error_code == "INVALID_TOOL_ARGUMENTS"
     assert "expected type: array, got: string" in failed.denial_detail
     assert _carrying(model, "expected type: array, got: string")
+
+
+@pytest.mark.parametrize(("windows", "preempted"), [(1, True), (3, False)])
+async def test_authorized_repair_cut_off_by_the_budget_is_reported_preempted(windows, preempted):
+    """A terminal stop before the repair round preempts the grant; a budget pause keeps
+    the persisted grant for the resumed window, so it is not a preemption."""
+    judge = _ScriptedJudge([JudgeVerdict(
+        approved=False, reviewed=True, violation="measurement_mismatch",
+        repair_type="analysis", feedback="Restrict the ranking to the requested department.",
+    )])
+    loop, _, events, _ = _build([
+        ModelTurnResult(tool_calls=[_query("q1")]),
+        ModelTurnResult(tool_calls=[_answer_table("initial", "Department totals.")]),
+    ], judge, mcp=_rows_mcp(1))
+    loop._max_loop_iterations = 2
+    loop._max_budget_windows = windows
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Department totals?")
+    assert len(_events(events, "loop_answer_judge_repair_authorized")) == 1
+    assert not _events(events, "loop_answer_judge_repair_attempted")
+    found = _events(events, "loop_answer_judge_repair_preempted")
+    if preempted:
+        assert outcome.status == "stopped_hard_ceiling"
+        assert found == [{"status": "stopped_hard_ceiling", "exit": "pause",
+                          "repair_type": "analysis", "calls": 1}]
+    else:
+        assert outcome.status == "paused_budget_cap"
+        assert not found

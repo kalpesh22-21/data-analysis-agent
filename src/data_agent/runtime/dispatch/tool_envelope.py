@@ -89,6 +89,8 @@ def _stamp[OutcomeT: SpanOutcome](
     span.set_attribute("tool.status", outcome.status)
     if outcome.error_code is not None:
         span.set_attribute("tool.error_code", outcome.error_code)
+    if outcome.status != "ok":
+        tracing.mark_span_error(span, outcome.error_code or outcome.status)
     if not include_result:
         return outcome
     pause = getattr(outcome, "pause", None)

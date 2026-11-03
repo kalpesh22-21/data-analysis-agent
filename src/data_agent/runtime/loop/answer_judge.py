@@ -1535,14 +1535,21 @@ class AnswerJudge:
                 if isinstance(value, str | int | float | bool):
                     judge_span.set_attribute(key, value)
 
+        def _failed(reason: str) -> None:
+            # Fail-open returns an approval, so the span status is the only
+            # status-level signal that the review never happened.
+            self._emit(ANSWER_JUDGE_FAILED_EVENT, {"reason": reason})
+            _mark(outcome=reason)
+            if judge_span is not None:
+                tracing.mark_span_error(judge_span, reason)
+
         _mark(reviewed=False)
         try:
             # INSIDE the try, so `review`'s "never raises" is true by construction rather
             # than by `json.dumps(default=str)` happening to tolerate every brief.
             messages = self.messages_for(brief)
             if _estimate_tokens(messages[1]["content"]) > self.token_budget:
-                self._emit(ANSWER_JUDGE_FAILED_EVENT, {"reason": "evidence_budget"})
-                _mark(outcome="evidence_budget")
+                _failed("evidence_budget")
                 return APPROVED
             tools = self._tools_for(brief.site)
             client = begin_turn_client(self.model_client)
@@ -1555,8 +1562,7 @@ class AnswerJudge:
                 self.timeout_seconds,
                 brief.site,
             )
-            self._emit(ANSWER_JUDGE_FAILED_EVENT, {"reason": "timeout"})
-            _mark(outcome="timeout")
+            _failed("timeout")
             return replace(APPROVED, failure_reason="timeout")
         except asyncio.CancelledError:
             _mark(outcome="cancelled")
@@ -1566,8 +1572,7 @@ class AnswerJudge:
             raise
         except Exception:
             _logger.exception("answer judge: provider error at %s — approving", brief.site)
-            self._emit(ANSWER_JUDGE_FAILED_EVENT, {"reason": "provider_error"})
-            _mark(outcome="provider_error")
+            _failed("provider_error")
             return APPROVED
 
         usage = result.usage if isinstance(result.usage, Mapping) else {}
@@ -1616,6 +1621,8 @@ class AnswerJudge:
         # "the judge could not be read", which the returned value deliberately cannot.
         if malformed:
             self._emit(ANSWER_JUDGE_FAILED_EVENT, {"reason": "malformed"})
+            if judge_span is not None:
+                tracing.mark_span_error(judge_span, "malformed")
         return verdict if malformed else replace(verdict, reviewed=True)
 
 

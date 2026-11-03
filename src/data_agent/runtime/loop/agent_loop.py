@@ -2139,6 +2139,7 @@ class AgentLoop:
         judge_site: str = "exit_prose",
         completion_notice: str | None = None,
         failure: dict[str, Any] | None = None,
+        review_state: ReviewState | None = None,
     ) -> TurnOutcome:
         """THE ORDER every in-body `TurnOutcome` return performs its effects in, in one place:
         checkpoint write, assistant-message append, envelope read, observer event, return.
@@ -2411,6 +2412,18 @@ class AgentLoop:
             self._observer(
                 ANSWER_PROSE_REDACTED_EVENT,
                 {"redaction_count": redaction_count, "exit": exit_label},
+            )
+        if (
+            review_state is not None
+            and review_state.repair_pending
+            and status not in {"paused_ask_user", "paused_budget_cap"}
+        ):
+            # The authorized repair round never ran. A pause keeps the persisted
+            # grant for the resumed window, so only a terminal exit preempts it.
+            self._observer(
+                "loop_answer_judge_repair_preempted",
+                {"status": status, "exit": exit_label,
+                 "repair_type": review_state.repair_type, "calls": review_state.calls},
             )
         if event is not None:
             # LAST, after every store write above: an observer that reads the
@@ -3362,6 +3375,7 @@ class AgentLoop:
                 return await self._finish(
                     session_id=session_id,
                     turn_index=turn_index,
+                    review_state=review_state,
                     status="done",
                     exit_label="runtime_fallback",
                     assistant_text=None,
@@ -3456,6 +3470,7 @@ class AgentLoop:
                 return await self._finish(
                     session_id=session_id,
                     turn_index=turn_index,
+                    review_state=review_state,
                     status="done",
                     ship_guard=ship_guard,
                     exit_label="runtime_fallback",
@@ -3888,12 +3903,24 @@ class AgentLoop:
                     "explainQuery",
                     "sampleRows",
                 }:
-                    from data_agent.runtime.dispatch.denial_targets import repeated_target_denial
+                    from data_agent.runtime.dispatch.denial_targets import (
+                        correction_link,
+                        repeated_target_denial,
+                    )
 
                     current_doc = await self._session_store.get_or_create_session(session_id)
+                    scope_hash = scope_filter.compute_scope_hash(credentials.column_scope)
+                    link = correction_link(
+                        tool_call.name, current_doc.tool_trail, turn_index, scope_hash
+                    )
+                    if link:
+                        self._observer(
+                            "loop_sql_correction_linked",
+                            {"tool_name": tool_call.name, "tool_call_id": tool_call.id, **link},
+                        )
                     repeated_code = repeated_target_denial(
                         tool_call.name, call_args, current_doc.tool_trail, turn_index,
-                        scope_filter.compute_scope_hash(credentials.column_scope),
+                        scope_hash,
                     )
                     if repeated_code:
                         code = (
@@ -3915,6 +3942,7 @@ class AgentLoop:
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
                                 "error_code": repeated_code,
+                                **link,
                             },
                         )
 
@@ -3932,7 +3960,9 @@ class AgentLoop:
                             retryable=False,
                             provenance=None,
                         )
-                        self._observer("loop_sql_repair_exhausted", {"tool_call_id": tool_call.id})
+                        self._observer(
+                            "loop_sql_repair_exhausted", {"tool_call_id": tool_call.id, **link}
+                        )
 
                 if gate_refusal is None and tool_call.name in {
                     ANSWER_TABLE_TOOL_NAME,
@@ -4448,6 +4478,7 @@ class AgentLoop:
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
+                        review_state=review_state,
                         status="done",
                         exit_label="declined_clarification",
                         assistant_text=honest,
@@ -4641,6 +4672,7 @@ class AgentLoop:
                 return await self._finish(
                     session_id=session_id,
                     turn_index=turn_index,
+                    review_state=review_state,
                     status="paused_ask_user",
                     exit_label="pause",
                     assistant_text=result.assistant_text,
@@ -5192,6 +5224,7 @@ class AgentLoop:
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
+                        review_state=review_state,
                         status="done",
                         exit_label="answer_with_table"
                         if accum.has_answer_tables
@@ -5284,6 +5317,7 @@ class AgentLoop:
                 return await self._finish(
                     session_id=session_id,
                     turn_index=turn_index,
+                    review_state=review_state,
                     status="stopped_no_progress",
                     exit_label="no_progress",
                     assistant_text=None,
@@ -5332,6 +5366,7 @@ class AgentLoop:
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
+                        review_state=review_state,
                         status="stopped_hard_ceiling",
                         exit_label="pause",
                         assistant_text=last_assistant_text,
@@ -5395,6 +5430,7 @@ class AgentLoop:
                 return await self._finish(
                     session_id=session_id,
                     turn_index=turn_index,
+                    review_state=review_state,
                     status="paused_budget_cap",
                     exit_label="pause",
                     assistant_text=last_assistant_text,

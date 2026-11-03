@@ -135,7 +135,8 @@ async def test_finish_rejects_invalid_partial_and_attempts_salvage():
     assert result["review"]["status"] == "exhausted"
     assert result["answer_document"]["takeaway"] != TEXT
     assert len(judge.briefs) == 2 and model.calls_made == 3
-    assert ("loop_recovery_validation_failed", {"reason": "unknown_evidence_id"}) in events
+    failed = [p for e, p in events if e == "loop_recovery_validation_failed"]
+    assert any(p["reason"] == "unknown_evidence_id" and p.keys() == {"reason", "visible_table_count", "table_section_count", "missing_table_reason_count"} for p in failed)
     await assert_history(store, result)
 
 
