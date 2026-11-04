@@ -206,6 +206,64 @@ def normalize_answer_arguments(raw):
     return normalized
 
 
+# Fields a rendered answer document carries that a proposal never sets: the renderer
+# materializes `sources` from the selected results and `seal_document` adds the rest.
+RUNTIME_OWNED_DOCUMENT_FIELDS = frozenset(
+    {"sources", "schema_version", "answer_id", "revision", "generated_at"}
+)
+
+
+def _proposal_presentation(rendered):
+    """Undo `_visual`/`charts.chart_selection` field names; never overwrite a proposal name."""
+    if not isinstance(rendered, dict):
+        return rendered
+    p = dict(rendered)
+    heatmap = p.get("kind") == "heatmap"
+    renames = {"x_column": "category_column", "x_columns": "category_columns",
+               "y_column": "series_column" if heatmap else "measure_column"}
+    if heatmap:
+        renames["value_column"] = "measure_column"
+    for old, new in renames.items():
+        if old in p and new not in p:
+            p[new] = p.pop(old)
+    ranking = p.get("ranking")
+    if isinstance(ranking, dict) and "direction" not in p and "ties" not in p:
+        p.pop("ranking")
+        p.update({k: ranking[k] for k in ("direction", "ties") if k in ranking})
+    if isinstance(p.get("series"), list):
+        p["series"] = [
+            {("measure_column" if k == "y_column" else k): v for k, v in item.items()}
+            if isinstance(item, dict) and "measure_column" not in item else item
+            for item in p["series"]
+        ]
+    return p
+
+
+def proposal_from_rendered(document):
+    """Return a document a model copied from a rendered answer to proposal form.
+
+    A reviewer or recovery model is shown the rendered document but must answer in
+    proposal form. Runtime-owned fields are dropped and rendered presentation names
+    mapped back, by inverting the renderer; nothing else is repaired. Returns the
+    document and how many fields changed, without mutating the input.
+    """
+    if not isinstance(document, dict):
+        return document, 0
+    kept = {k: v for k, v in document.items() if k not in RUNTIME_OWNED_DOCUMENT_FIELDS}
+    changed = len(document) - len(kept)
+    if isinstance(kept.get("sections"), list):
+        sections = []
+        for section in kept["sections"]:
+            if isinstance(section, dict) and "presentation" in section:
+                presentation = _proposal_presentation(section["presentation"])
+                if presentation != section["presentation"]:
+                    changed += 1
+                    section = {**section, "presentation": presentation}
+            sections.append(section)
+        kept["sections"] = sections
+    return (kept, changed) if changed else (document, 0)
+
+
 def proposal_to_internal(raw):
     """Project the new proposal into internal evidence/selection bookkeeping only.
 

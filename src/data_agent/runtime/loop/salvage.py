@@ -7,7 +7,13 @@ from copy import deepcopy
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from data_agent.runtime.composer import RECOVERY_SCHEMA, PresentationError, normalize_answer_arguments, proposal_to_internal
+from data_agent.runtime.composer import (
+    RECOVERY_SCHEMA,
+    PresentationError,
+    normalize_answer_arguments,
+    proposal_from_rendered,
+    proposal_to_internal,
+)
 
 from .answer_judge import _estimate_tokens, begin_turn_client
 
@@ -55,7 +61,11 @@ async def _call(judge, messages, name, schema):
                     if span is not None:
                         span.set_attribute("recovery_fields_omitted", len(unknown))
             if name == "salvageAnswer":
-                args = normalize_answer_arguments(args)
+                # The recovery model is shown the rendered document; a chart section
+                # copied from it is returned to proposal form before validation.
+                args, mapped = proposal_from_rendered(normalize_answer_arguments(args))
+                if mapped and span is not None:
+                    span.set_attribute("recovery_fields_mapped", mapped)
             Draft202012Validator(schema).validate(args)
             if name == "salvageAnswer":
                 stage = "presentation_validation"
@@ -95,6 +105,38 @@ async def _call(judge, messages, name, schema):
                 span.set_attribute("duration_ms", (time.monotonic() - started) * 1000)
 
 
+# One row per salvage outcome: the list sizes it requires, and the same rule in words.
+# The schema's `allOf` is built from this table, so a failed branch index names its rule.
+_OUTCOME_LISTS = (
+    ("partial", {"unfinished": {"minItems": 1}, "evidence": {"minItems": 1}},
+     "outcome=partial needs at least one unfinished item and at least one evidence reference"),
+    ("full", {"unfinished": {"maxItems": 0}, "evidence": {"minItems": 1}},
+     "outcome=full needs unfinished=[] and at least one evidence reference"),
+    ("none", {"sections": {"maxItems": 0}, "evidence": {"maxItems": 0}},
+     "outcome=none needs empty sections and empty evidence"),
+)
+
+
+def _retry_reason(exc):
+    """The correction to ask for: an outcome/list mismatch in words, else the sanitized error.
+
+    A raw `/allOf/1/then/...` path tells the model nothing it can act on.
+    """
+    path = list(getattr(exc, "absolute_schema_path", ()) or ())
+    if (
+        isinstance(exc, ValidationError)
+        and len(path) > 1
+        and path[0] == "allOf"
+        and isinstance(path[1], int)
+        and path[1] < len(_OUTCOME_LISTS)
+    ):
+        return (
+            "the outcome does not match the lists: " + _OUTCOME_LISTS[path[1]][2] + ". "
+            "Choose the outcome the evidence supports, then make the lists match it."
+        )
+    return str(exc)
+
+
 async def salvage(judge, brief):
     from data_agent.runtime.composer.components import restrict_schema, component_guidance
     schema = restrict_schema(RECOVERY_SCHEMA)
@@ -102,12 +144,8 @@ async def salvage(judge, brief):
     schema["properties"]["outcome"] = {"type": "string", "enum": ["full", "partial", "none"]}
     schema["required"].append("outcome")
     schema["allOf"] = [
-        {"if": {"properties": {"outcome": {"const": "partial"}}},
-         "then": {"properties": {"unfinished": {"minItems": 1}, "evidence": {"minItems": 1}}}},
-        {"if": {"properties": {"outcome": {"const": "full"}}},
-         "then": {"properties": {"unfinished": {"maxItems": 0}, "evidence": {"minItems": 1}}}},
-        {"if": {"properties": {"outcome": {"const": "none"}}},
-         "then": {"properties": {"sections": {"maxItems": 0}, "evidence": {"maxItems": 0}}}},
+        {"if": {"properties": {"outcome": {"const": outcome}}}, "then": {"properties": lists}}
+        for outcome, lists, _ in _OUTCOME_LISTS
     ]
     messages = judge.messages_for(brief)
     messages[0]["content"] += "\n" + component_guidance()
@@ -165,7 +203,7 @@ async def salvage(judge, brief):
                 # _call sanitizes schema failures; proposal errors contain only
                 # validator guidance. Never echo raw provider exceptions.
                 messages.append({"role": "user", "content":
-                    "Your recovery proposal was invalid: " + str(exc) +
+                    "Your recovery proposal was invalid: " + _retry_reason(exc) +
                     " Return a corrected salvageAnswer using the same evidence. "
                     "Do not invent unfinished work to satisfy the schema; full requires "
                     "all requested outcomes supported, partial requires a real unfinished outcome."})

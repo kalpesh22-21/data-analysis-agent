@@ -512,7 +512,9 @@ async def test_malformed_response_approves_and_is_distinguishable_in_telemetry_o
         observer=lambda e, p: events.append((e, p)),
     )
     assert await judge.review(_brief()) is APPROVED
-    assert ("loop_answer_judge_failed", {"reason": "malformed"}) in events
+    assert (
+        "loop_answer_judge_failed", {"reason": "malformed", "malformed_reason": "unknown_violation"}
+    ) in events
 
 
 @pytest.mark.asyncio

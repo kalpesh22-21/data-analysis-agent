@@ -476,7 +476,11 @@ async def test_salvage_repairs_contract_once_using_validation_feedback(failure):
     advertised = client.calls[0].tools[0]["parameters"]
     assert advertised["properties"]["sections"]["allOf"] == PROPOSAL_SCHEMA["properties"]["sections"]["allOf"]
     feedback = client.calls[1].messages[-1]["content"]
-    assert ("minItems" if failure == "partial" else "table_reason") in feedback
+    # An outcome/list mismatch is named as the rule, not as a raw /allOf schema path.
+    assert ("outcome=partial needs at least one unfinished item" if failure == "partial"
+            else "table_reason") in feedback
+    if failure == "partial":
+        assert "/allOf" not in feedback
     assert sum(n == "loop_recovery_repair_requested" for n, _ in events) == 1
 
 

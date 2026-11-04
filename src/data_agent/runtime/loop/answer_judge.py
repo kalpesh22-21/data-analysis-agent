@@ -1112,7 +1112,7 @@ def _repair_rejected_correction(arguments, site):
     than treating the whole review as unavailable. Do not infer approval or edit
     section text on the judge's behalf. The ordinary verdict guards still apply.
 
-    Every correction field is dropped, not only prose: `_valid_correction` admits a
+    Every correction field is dropped, not only prose: `_correction_problem` admits a
     correction only on an approval, so a stray document or question left in place would
     turn a valid rejection into `APPROVED` and ship the answer the judge just rejected.
     """
@@ -1131,55 +1131,257 @@ def _repair_rejected_correction(arguments, site):
     return repaired
 
 
-def _valid_correction(arguments, site):
-    document = arguments.get("corrected_document")
-    question = arguments.get("corrected_question")
-    if document is not None or question is not None:
-        from jsonschema import Draft202012Validator
+def _drop_runtime_owned_fields(arguments: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Return a corrected document or partial answer to proposal form; count the changes.
 
-        key = "corrected_document" if document is not None else "corrected_question"
-        from data_agent.runtime.composer import normalize_answer_arguments
+    The judge reviews the rendered document but writes corrections in proposal form, so
+    what it copies from the draft is mapped back (`composer.proposal_from_rendered`).
+    Anything else unexpected still voids the correction (a correction that brings its
+    own `sql` or `tables` depends on something the runtime will not apply), and is
+    reported by reason instead of as an opaque failure.
+    """
+    from data_agent.runtime.composer import proposal_from_rendered
 
-        value = normalize_answer_arguments(arguments[key]) if document is not None else arguments[key]
-        schema = build_judge_tool(site)["parameters"]["properties"][key]
-        return (
-            sum(arguments.get(k) is not None for k in ("corrected_document", "corrected_question", "corrected_answer", "partial_answer")) == 1
-            and arguments.get("approved") is True
-            and not arguments.get("violation") and not arguments.get("feedback")
-            and arguments.get("repair_type") == ("presentation" if document is not None else "prose")
-            and (site != "ask_user" if document is not None else site == "ask_user")
-            and not list(Draft202012Validator(schema).iter_errors(value))
+    changed = 0
+    for key in ("corrected_document", "partial_answer"):
+        if isinstance(arguments.get(key), dict):
+            document, count = proposal_from_rendered(arguments[key])
+            if count:
+                arguments, changed = {**arguments, key: document}, changed + count
+    return arguments, changed
+
+
+def _infer_repair_type(arguments: dict[str, Any]) -> dict[str, Any]:
+    """An approval's repair type is fixed by the one correction it carries."""
+    if arguments.get("approved") is not True or arguments.get("repair_type"):
+        return arguments
+    present = [key for key in _CORRECTION_FIELDS if arguments.get(key) is not None]
+    if len(present) != 1:
+        return arguments
+    repair_type = "presentation" if present == ["corrected_document"] else "prose"
+    return {**arguments, "repair_type": repair_type}
+
+
+# Complaints the prompt declares cosmetic ("never reject or request an agent repair
+# solely for them"). The model still files some, under the declared slug or under one it
+# invents (`repeated_caveat`); either way the answer stands and was reviewed. The runtime
+# already removes repeated caveats (`assumption_text.clean_document_caveats`).
+_COSMETIC_COMPLAINTS = frozenset({"internal_process_narration", "repeated_caveat"})
+
+
+_CORRECTED_ANSWER_FIELDS = frozenset({
+    "approved", "violation", "feedback", "repair_type", "corrected_answer",
+    "corrected_document", "corrected_question", "measured_population",
+    "required_population", "partial_answer", "intent_id", "result_ids",
+})
+
+
+def _correction_problem(arguments: dict[str, Any], site: JudgeSite) -> tuple[str, str] | None:
+    """Why an approval's correction cannot be applied, as `(reason, schema_path)`.
+
+    `None` when there is no correction or it is usable. Only an approval reaches here
+    carrying one: `_repair_rejected_correction` removes the replacement from a rejection.
+    The schema path names trusted schema coordinates, never a value from the response.
+    """
+    present = [
+        key for key in (*_CORRECTION_FIELDS, "partial_answer") if arguments.get(key) is not None
+    ]
+    corrections = [key for key in present if key != "partial_answer"]
+    if not corrections:
+        return None
+    if len(present) != 1:
+        return "correction_count", ""
+    if (
+        arguments.get("approved") is not True
+        or arguments.get("violation")
+        or arguments.get("feedback")
+    ):
+        return "correction_with_feedback", ""
+    kind = corrections[0]
+    if arguments.get("repair_type") != ("presentation" if kind == "corrected_document" else "prose"):
+        return "correction_repair_type", ""
+    if (site == "ask_user") != (kind == "corrected_question"):
+        return "correction_site", ""
+    if kind == "corrected_answer":
+        unknown = arguments.keys() - _CORRECTED_ANSWER_FIELDS
+        if unknown:
+            _logger.warning("answer judge: corrected_answer arrived with unknown fields %s", sorted(unknown)[:10])
+            return "correction_unknown_fields", ""
+        text = arguments[kind]
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or any(ord(c) < 32 and c not in "\n\t\r" for c in text)
+        ):
+            return "correction_text", ""
+        return None
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import best_match
+
+    from data_agent.runtime.composer import normalize_answer_arguments
+
+    value = arguments[kind]
+    if kind == "corrected_document":
+        value = normalize_answer_arguments(value)
+    schema = build_judge_tool(site)["parameters"]["properties"][kind]
+    error = best_match(Draft202012Validator(schema).iter_errors(value))
+    if error is not None:
+        return "correction_schema", "/" + "/".join(map(str, error.absolute_schema_path))
+    return None
+
+
+@dataclass(frozen=True)
+class _Reading:
+    """One judgement, read once: the verdict, and why it could not be used if it could not.
+
+    `parse_verdict` returns only the verdict, so no caller can branch on the difference
+    (09 §E); the reason exists for telemetry alone.
+    """
+
+    verdict: JudgeVerdict
+    malformed_reason: str | None = None
+    schema_path: str = ""
+    fields_omitted: int = 0
+
+
+def _unusable(reason: str, message: str, *args: Any, schema_path: str = "", fields_omitted: int = 0) -> _Reading:
+    _logger.warning("answer judge: " + message + " — approving", *args)
+    return _Reading(APPROVED, reason, schema_path, fields_omitted)
+
+
+def _read_verdict(
+    result: ModelTurnResult, site: JudgeSite, *, capabilities_enabled: bool = True
+) -> _Reading:
+    """`parse_verdict`'s body, also naming why an unusable response approved.
+
+    Each unusable shape has one reason from a closed vocabulary, so the parser and the
+    telemetry cannot disagree about which responses were read.
+    """
+    calls = result.tool_calls
+    if not isinstance(calls, list | tuple):
+        return _unusable(
+            "not_a_sequence", "tool_calls was %s, not a sequence", type(calls).__name__
         )
-    corrected = arguments.get("corrected_answer")
-    if corrected is None:
-        return True
-    return (
-        site != "ask_user"
-        and not (
-            arguments.keys()
-            - {
-                "approved",
-                "violation",
-                "feedback",
-                "repair_type",
-                "corrected_answer",
-                "corrected_document",
-                "corrected_question",
-                "measured_population",
-                "required_population",
-                "partial_answer",
-                "intent_id",
-                "result_ids",
-            }
+    call = next(
+        (
+            c
+            for c in calls
+            if getattr(c, "name", None) == JUDGE_TOOL_NAME and hasattr(c, "arguments")
+        ),
+        None,
+    )
+    if call is None:
+        return _unusable(
+            "no_judgement_call",
+            "model did not call %s (got %r)",
+            JUDGE_TOOL_NAME,
+            [getattr(c, "name", type(c).__name__) for c in calls],
         )
-        and arguments.get("partial_answer") is None
-        and arguments.get("approved") is True
-        and arguments.get("repair_type") == "prose"
-        and arguments.get("violation") == ""
-        and arguments.get("feedback") == ""
-        and isinstance(corrected, str)
-        and bool(corrected.strip())
-        and not any(ord(c) < 32 and c not in "\n\t\r" for c in corrected)
+    arguments = call.arguments
+    if not isinstance(arguments, dict):
+        return _unusable(
+            "arguments_not_object",
+            "%s arguments were %s, not an object",
+            JUDGE_TOOL_NAME,
+            type(arguments).__name__,
+        )
+
+    arguments, omitted = _drop_runtime_owned_fields(_repair_rejected_correction(arguments, site))
+    arguments = _infer_repair_type(arguments)
+    approved = arguments.get("approved")
+    if not isinstance(approved, bool):
+        return _unusable(
+            "approved_not_boolean", "approved was %r, not a boolean", approved,
+            fields_omitted=omitted,
+        )
+    if approved and arguments.get("partial_answer") is not None:
+        return _unusable(
+            "approval_with_partial_answer", "approval carried a partial_answer at %s", site,
+            fields_omitted=omitted,
+        )
+    problem = _correction_problem(arguments, site)
+    if problem is not None:
+        # Only an approval reaches here (rejections were stripped above), so the
+        # original answer was approved; only the unusable correction is dropped.
+        reason, schema_path = problem
+        return _unusable(
+            reason, "correction failed validation (%s %s) at %s", reason, schema_path, site,
+            schema_path=schema_path, fields_omitted=omitted,
+        )
+    if approved:
+        if arguments.get("corrected_document") is not None or arguments.get("corrected_question") is not None:
+            from data_agent.runtime.composer import normalize_answer_arguments
+
+            return _Reading(
+                JudgeVerdict(True, repair_type=arguments["repair_type"],
+                             corrected_document=normalize_answer_arguments(arguments.get("corrected_document")),
+                             corrected_question=arguments.get("corrected_question")),
+                fields_omitted=omitted,
+            )
+        if arguments.get("corrected_answer") is not None:
+            return _Reading(
+                JudgeVerdict(True, repair_type="prose", corrected_answer=arguments["corrected_answer"]),
+                fields_omitted=omitted,
+            )
+        return _Reading(APPROVED, fields_omitted=omitted)
+
+    violation = arguments.get("violation")
+    if site != "ask_user" and violation in _COSMETIC_COMPLAINTS:
+        # Cosmetic complaints cannot spend a repair round or withhold valid results.
+        # A replacement paired with rejection is still not approved replacement text.
+        return _Reading(APPROVED, fields_omitted=omitted)
+    if violation not in violations_for_site(site, capabilities_enabled=capabilities_enabled):
+        return _unusable(
+            "unknown_violation",
+            "rejected with violation %r, not one of %s",
+            violation,
+            list(violations_for_site(site, capabilities_enabled=capabilities_enabled)),
+            fields_omitted=omitted,
+        )
+
+    raw_feedback = arguments.get("feedback")
+    feedback = (
+        sanitize_text(raw_feedback, MAX_FEEDBACK_CHARS) if isinstance(raw_feedback, str) else ""
+    )
+    if not feedback:
+        return _unusable(
+            "unusable_feedback", "rejected as %s with no usable feedback", violation,
+            fields_omitted=omitted,
+        )
+    refs = arguments.get("result_ids", [])
+    repair = arguments.get("repair_type", "")
+    if repair not in {
+        "",
+        "analysis",
+        "prose",
+        "presentation",
+        "obtain_evidence_or_disclose_gap",
+        "omit_component",
+    }:
+        return _unusable(
+            "unknown_repair_type", "rejected with repair_type %r", repair,
+            fields_omitted=omitted,
+        )
+    if not isinstance(refs, list) or any(not isinstance(r, str) for r in refs):
+        return _unusable(
+            "result_ids_invalid", "rejected with result_ids that are not a list of IDs",
+            fields_omitted=omitted,
+        )
+    return _Reading(
+        JudgeVerdict(
+            approved=False,
+            violation=str(violation),
+            feedback=feedback,
+            intent_id=sanitize_text(str(arguments.get("intent_id", "")), 100),
+            result_ids=tuple(refs[:20]),
+            repair_type=repair,
+            partial_answer=arguments.get("partial_answer") if site != "ask_user" else None,
+            measured_population=(arguments.get("measured_population", "")
+                                 if arguments.get("measured_population") in POPULATION_LABELS else ""),
+            required_population=(arguments.get("required_population", "")
+                                 if arguments.get("required_population") in POPULATION_LABELS else ""),
+        ),
+        fields_omitted=omitted,
     )
 
 
@@ -1201,114 +1403,13 @@ def parse_verdict(
       |             capped. EMPTY feedback on a rejection also degrades to approval: a
       |             refusal with nothing to say costs a round-trip and teaches nothing.
 
+    A runtime-owned field echoed into a corrected document is discarded first
+    (`_drop_runtime_owned_fields`), so a copied `sources` cannot void a usable correction.
+
     `tool_calls` is checked as a CONTAINER and as MEMBERS — `ModelClient` is a Protocol,
     and a bare string char-explodes into an `AttributeError` on `.name`.
     """
-    calls = result.tool_calls
-    if not isinstance(calls, list | tuple):
-        _logger.warning(
-            "answer judge: tool_calls was %s, not a sequence — approving",
-            type(calls).__name__,
-        )
-        return APPROVED
-    call = next(
-        (
-            c
-            for c in calls
-            if getattr(c, "name", None) == JUDGE_TOOL_NAME and hasattr(c, "arguments")
-        ),
-        None,
-    )
-    if call is None:
-        _logger.warning(
-            "answer judge: model did not call %s (got %r) — approving",
-            JUDGE_TOOL_NAME,
-            [getattr(c, "name", type(c).__name__) for c in calls],
-        )
-        return APPROVED
-    arguments = call.arguments
-    if not isinstance(arguments, dict):
-        _logger.warning(
-            "answer judge: %s arguments were %s, not an object — approving",
-            JUDGE_TOOL_NAME,
-            type(arguments).__name__,
-        )
-        return APPROVED
-
-    arguments = _repair_rejected_correction(arguments, site)
-    approved = arguments.get("approved")
-    if not isinstance(approved, bool):
-        _logger.warning("answer judge: approved was %r, not a boolean — approving", approved)
-        return APPROVED
-    if arguments.get("approved") is True and arguments.get("partial_answer") is not None:
-        _logger.warning("answer judge: approval carried a partial_answer at %s — approving", site)
-        return APPROVED
-    if not _valid_correction(arguments, site):
-        # Only an approval reaches here (rejections were stripped above), so the
-        # original answer was approved; only the unusable correction is dropped.
-        _logger.warning("answer judge: correction failed validation at %s — approving", site)
-        return APPROVED
-    if approved:
-        if arguments.get("corrected_document") is not None or arguments.get("corrected_question") is not None:
-            from data_agent.runtime.composer import normalize_answer_arguments
-
-            return JudgeVerdict(True, repair_type=arguments["repair_type"],
-                                corrected_document=normalize_answer_arguments(arguments.get("corrected_document")),
-                                corrected_question=arguments.get("corrected_question"))
-        if arguments.get("corrected_answer") is not None:
-            return JudgeVerdict(
-                True, repair_type="prose", corrected_answer=arguments["corrected_answer"]
-            )
-        return APPROVED
-
-    violation = arguments.get("violation")
-    if site != "ask_user" and violation == "internal_process_narration":
-        # Cosmetic narration cannot spend a repair round or withhold valid results.
-        # A replacement paired with rejection is still not approved replacement text.
-        return APPROVED
-    if violation not in violations_for_site(site, capabilities_enabled=capabilities_enabled):
-        _logger.warning(
-            "answer judge: rejected with violation %r, not one of %s — approving",
-            violation,
-            list(violations_for_site(site, capabilities_enabled=capabilities_enabled)),
-        )
-        return APPROVED
-
-    raw_feedback = arguments.get("feedback")
-    feedback = (
-        sanitize_text(raw_feedback, MAX_FEEDBACK_CHARS) if isinstance(raw_feedback, str) else ""
-    )
-    if not feedback:
-        _logger.warning(
-            "answer judge: rejected as %s with no usable feedback — approving", violation
-        )
-        return APPROVED
-    refs = arguments.get("result_ids", [])
-    repair = arguments.get("repair_type", "")
-    if repair not in {
-        "",
-        "analysis",
-        "prose",
-        "presentation",
-        "obtain_evidence_or_disclose_gap",
-        "omit_component",
-    }:
-        return APPROVED
-    if not isinstance(refs, list) or any(not isinstance(r, str) for r in refs):
-        return APPROVED
-    return JudgeVerdict(
-        approved=False,
-        violation=str(violation),
-        feedback=feedback,
-        intent_id=sanitize_text(str(arguments.get("intent_id", "")), 100),
-        result_ids=tuple(refs[:20]),
-        repair_type=repair,
-        partial_answer=arguments.get("partial_answer") if site != "ask_user" else None,
-        measured_population=(arguments.get("measured_population", "")
-                             if arguments.get("measured_population") in POPULATION_LABELS else ""),
-        required_population=(arguments.get("required_population", "")
-                             if arguments.get("required_population") in POPULATION_LABELS else ""),
-    )
+    return _read_verdict(result, site, capabilities_enabled=capabilities_enabled).verdict
 
 
 # --- the nudges -------------------------------------------------------------
@@ -1576,13 +1677,11 @@ class AnswerJudge:
             return APPROVED
 
         usage = result.usage if isinstance(result.usage, Mapping) else {}
-        malformed = _looks_malformed(
-            result, brief.site, capabilities_enabled=self.capabilities_enabled
-        )
-        verdict = parse_verdict(result, brief.site, capabilities_enabled=self.capabilities_enabled)
+        reading = _read_verdict(result, brief.site, capabilities_enabled=self.capabilities_enabled)
+        verdict, malformed_reason = reading.verdict, reading.malformed_reason
         if (verdict.corrected_answer is not None or verdict.corrected_document is not None) and not brief.allow_prose_correction:
-            malformed = True
-            verdict = APPROVED
+            malformed_reason, verdict = "correction_not_allowed", APPROVED
+        malformed = malformed_reason is not None
         if verdict.partial_answer is not None and not brief.allow_partial_answer:
             verdict = replace(verdict, partial_answer=None)
         total = usage.get("total_tokens")
@@ -1605,6 +1704,9 @@ class AnswerJudge:
             input_tokens=usage.get("prompt_tokens", usage.get("input_tokens", 0)),
             output_tokens=usage.get("completion_tokens", usage.get("output_tokens", 0)),
             tokens=total if isinstance(total, int) else 0,
+            malformed_reason=malformed_reason,
+            schema_path=reading.schema_path or None,
+            fields_omitted=reading.fields_omitted or None,
         )
         if not verdict.approved:
             if any(
@@ -1620,7 +1722,10 @@ class AnswerJudge:
         # event is emitted here so the loop's telemetry can tell "the judge approved" from
         # "the judge could not be read", which the returned value deliberately cannot.
         if malformed:
-            self._emit(ANSWER_JUDGE_FAILED_EVENT, {"reason": "malformed"})
+            failure = {"reason": "malformed", "malformed_reason": malformed_reason}
+            if reading.schema_path:
+                failure["schema_path"] = reading.schema_path
+            self._emit(ANSWER_JUDGE_FAILED_EVENT, failure)
             if judge_span is not None:
                 tracing.mark_span_error(judge_span, "malformed")
         return verdict if malformed else replace(verdict, reviewed=True)
@@ -1630,30 +1735,6 @@ def _looks_malformed(
     result: ModelTurnResult, site: JudgeSite, *, capabilities_enabled: bool = True
 ) -> bool:
     """Whether this response approved because it could not be READ, rather than because the
-    judge approved. Kept separate from `parse_verdict` so that function has ONE return
-    shape and the caller cannot branch on the difference (09 §E) — this is for the event
-    only, and is deliberately cheap and approximate."""
-    calls = result.tool_calls
-    if not isinstance(calls, list | tuple):
-        return True
-    call = next((c for c in calls if getattr(c, "name", None) == JUDGE_TOOL_NAME), None)
-    if call is None or not isinstance(getattr(call, "arguments", None), dict):
-        return True
-    arguments = _repair_rejected_correction(call.arguments, site)
-    approved = arguments.get("approved")
-    if not isinstance(approved, bool):
-        return True
-    if (approved and arguments.get("partial_answer") is not None) or not _valid_correction(
-        arguments, site
-    ):
-        return True
-    if approved:
-        return False
-    # Rejected, yet `parse_verdict` returned an approval: the slug or the feedback was
-    # unusable.
-    return (
-        arguments.get("violation")
-        not in violations_for_site(site, capabilities_enabled=capabilities_enabled)
-        or not isinstance(arguments.get("feedback"), str)
-        or not sanitize_text(arguments["feedback"], MAX_FEEDBACK_CHARS)
-    )
+    judge approved. For telemetry only; `_read_verdict` names the reason."""
+    reading = _read_verdict(result, site, capabilities_enabled=capabilities_enabled)
+    return reading.malformed_reason is not None

@@ -705,6 +705,10 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "proposed_count",
     "blocking_tool_name",
     "reason",
+    # `loop_answer_judge_failed`: why a judgement could not be read. A closed runtime
+    # vocabulary and trusted judge-schema coordinates; never a value from the response.
+    "malformed_reason",
+    "schema_path",
     # The blueprint the getBlueprint-before-run gate refused
     # (`loop_blueprint_definition_not_read`). D25-safe: a blueprint id is
     # CORPUS-AUTHORED, never user content — the same class as the table/database
