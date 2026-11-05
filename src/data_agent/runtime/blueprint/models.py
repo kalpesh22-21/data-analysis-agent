@@ -54,7 +54,11 @@ SLOT_TYPE_GLOSS: dict[str, str] = {
     ),
     "positive_integer": "a whole number greater than zero, passed as a bare integer.",
     "nonnegative_integer": "a whole number zero or greater, passed as a bare integer.",
-    "period_range": "an explicit {start, end} date range.",
+    "period_range": (
+        "an explicit {start, end} date range: start inclusive, end exclusive. "
+        "For January 1 through March 31, pass start=2026-01-01 and end=2026-04-01; "
+        "a complete final day requires the following day as end."
+    ),
 }
 
 # Fallback gloss for a slot whose `type` is missing or unknown (a corrupt/legacy
