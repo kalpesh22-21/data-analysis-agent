@@ -32,6 +32,10 @@
 -- Load:  docker exec -i l2-ch clickhouse-client --multiquery < this-file
 -- =============================================================================
 
+-- Init scripts run alphabetically, so this one runs before hr-warehouse.sql (as that
+-- file requires) and must create the database itself on a fresh volume.
+CREATE DATABASE IF NOT EXISTS dbpcm_warehouse;
+
 -- -----------------------------------------------------------------------------
 -- 1. employee  (MergeTree ORDER BY employee_code)
 -- -----------------------------------------------------------------------------
@@ -79,11 +83,12 @@ CREATE TABLE dbpcm_warehouse.employee
     gender Nullable(String),
     ethnic_background Nullable(String),
     country_code Nullable(String),
-    street_address_1 Nullable(String),
-    street_address_2 Nullable(String),
-    city Nullable(String),
-    state Nullable(String),
-    zip_code Nullable(String),
+    primary_country_code Nullable(String) DEFAULT country_code,
+    primary_address_line_1 Nullable(String),
+    primary_address_line_2 Nullable(String),
+    primary_city_municipality Nullable(String),
+    primary_state_province Nullable(String),
+    primary_zip_postal_code Nullable(String),
     work_email Nullable(String),
     personal_email Nullable(String),
     secondary_email Nullable(String),
@@ -138,7 +143,7 @@ CREATE TABLE dbpcm_warehouse.employee
     salary_mid Nullable(Decimal(18, 6)),
     salary_max Nullable(Decimal(18, 6)),
     rate_1 Nullable(Decimal(18, 6)),
-    employee_pay_type LowCardinality(Nullable(String)),
+    pay_type LowCardinality(Nullable(String)),
     position_pay_type LowCardinality(Nullable(String)),
     paycode_profile_code Nullable(String),
     paycode_profile_description Nullable(String),
@@ -171,7 +176,16 @@ CREATE TABLE dbpcm_warehouse.employee
     labor_allocation_key_20 Nullable(String),
     -- physical (stripped from catalog; required for RLS)
     client_code String,
-    proc_center String
+    proc_center String,
+    -- Names before clickhouse-api 1082262 ("Align employee catalog and blueprint
+    -- columns with ClickHouse"), kept readable for MCP images built before it. ALIAS
+    -- columns are not stored and not in SELECT *; drop them once no such image runs.
+    employee_pay_type LowCardinality(Nullable(String)) ALIAS pay_type,
+    street_address_1 Nullable(String) ALIAS primary_address_line_1,
+    street_address_2 Nullable(String) ALIAS primary_address_line_2,
+    city Nullable(String) ALIAS primary_city_municipality,
+    state Nullable(String) ALIAS primary_state_province,
+    zip_code Nullable(String) ALIAS primary_zip_postal_code
 )
 ENGINE = MergeTree
 ORDER BY employee_code;
@@ -198,6 +212,8 @@ CREATE TABLE dbpcm_warehouse.payroll
     pay_period_end_date Nullable(Date32),
     transaction_number FixedString(9),
     check_number UInt32,
+    gross_to_net_key LowCardinality(FixedString(3)),
+    distributed_job_allocation_key String,
     labor_allocation_key_1 Nullable(String),
     labor_allocation_key_2 Nullable(String),
     labor_allocation_key_3 Nullable(String),
