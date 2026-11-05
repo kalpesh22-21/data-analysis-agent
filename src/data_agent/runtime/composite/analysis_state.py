@@ -396,6 +396,13 @@ def validate_block_evidence(
     if entry is None:
         return _missing_entry_reason(tool_call_id, trail, turn_index)
 
+    if reason_code == "NOT_SUPPORTED_HERE":
+        if (entry.status != "ok" and entry.error_code == "NOT_SUPPORTED_HERE"
+                and entry.tool_name == "declineOutOfScope"
+                and entry.args.get("reason") in {"action_not_supported", "product_documentation_unavailable"}):
+            return None
+        return "NOT_SUPPORTED_HERE requires a declineOutOfScope receipt for a configured deployment limitation."
+
     if reason_code == "OUT_OF_SCOPE_REQUEST":
         if (
             entry.status != "ok"
@@ -429,10 +436,14 @@ def validate_block_evidence(
                  or entry.tool_name in {"runQuery", "runBlueprint"}
                  and entry.error_code in {
                      "AGGREGATION_CHECK_UNAVAILABLE", "SOURCE_UNAVAILABLE", "TOOL_CALL_TIMEOUT",
-                 })
+                 }
+                 # A product how-to part cannot be done while its documentation is down,
+                 # including after repeated outages opened the runtime's circuit breaker.
+                 or entry.tool_name in {"searchHelpCenter", "getHelpCenterDocument"}
+                 and entry.error_code in {"HELP_CENTER_UNAVAILABLE", "HELP_CENTER_CIRCUIT_OPEN"})
         ):
             return None
-        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED or AGGREGATION_CHECK_UNAVAILABLE/SOURCE_UNAVAILABLE/TOOL_CALL_TIMEOUT receipt; other SQL errors do not establish exhaustion."
+        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED, AGGREGATION_CHECK_UNAVAILABLE/SOURCE_UNAVAILABLE/TOOL_CALL_TIMEOUT or Help Center HELP_CENTER_UNAVAILABLE/HELP_CENTER_CIRCUIT_OPEN receipt; other SQL errors do not establish exhaustion."
 
     # A targeted, complete schema check can establish unavailable fields
     # without executing speculative SQL. It says nothing about other datasets.

@@ -689,29 +689,46 @@ FINALIZE_ANSWER_SCHEMA = {
     "parameters": PROPOSAL_SCHEMA,
 }
 
-DECLINE_OUT_OF_SCOPE_SCHEMA = {
-    "type": "function",
-    "name": "declineOutOfScope",
-    "description": (
-        "Record a refusal for a request outside HR, payroll, and product usage. "
-        "Use only for an out-of-domain part of the original ask, never for missing data, "
-        "disabled features, unavailable services, access denials, or failed execution. "
-        "An incomplete topic/entity name is not an out-of-domain request: resolve it from "
-        "conversation context or ask what the user wants to know before classifying its scope. "
-        "Supply that part verbatim as request. Tag only its matching declared intents. "
-        "The result is a scope refusal receipt, not data or an execution failure. "
-        "Do not retry this refusal; finish supported parts and explain the scope in finalizeAnswer."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "request": {"type": "string", "minLength": 1},
-            "serves_intents": SERVES_INTENTS_PARAM,
-        },
-        "required": ["request"],
-        "additionalProperties": False,
-    },
-}
+def decline_out_of_scope_schema(*, actions_available: bool, product_documentation_available: bool = False) -> dict[str, Any]:
+    """One refusal mechanism; disabled-feature reasons are selected at startup."""
+    properties: dict[str, Any] = {"request": {"type": "string", "minLength": 1}}
+    reasons = ["outside_domain"]
+    limits = []
+    if not actions_available:
+        reasons.append("action_not_supported")
+        limits.append("Actions/navigation cannot be performed or prepared here: use reason=action_not_supported.")
+    if not product_documentation_available:
+        reasons.append("product_documentation_unavailable")
+        limits.append("Product documentation is not available in this deployment: use reason=product_documentation_unavailable for product definitions or how-to instructions.")
+    if limits:
+        properties["reason"] = {"type": "string", "enum": reasons,
+                                "description": "outside_domain (default): outside HR, payroll and product usage. " + " ".join(limits)}
+    properties["serves_intents"] = SERVES_INTENTS_PARAM
+    description = [
+        ("Record a refusal for an out-of-domain request or an explicitly listed deployment limitation."
+         if limits else "Record a refusal for an out-of-domain request."),
+        "Do not use for missing warehouse data, permission denials, transient outages or failed executions.",
+        "An incomplete topic/entity name is not out of domain: resolve context or clarify first.",
+        *limits,
+        "Supply only the affected part of the original request verbatim. Tag only its matching intents.",
+        "An outside-domain receipt supports OUT_OF_SCOPE_REQUEST.",
+    ]
+    if limits:
+        description.append("A deployment limitation supports NOT_SUPPORTED_HERE, not an execution failure.")
+    description.extend([
+        "Bind the receipt to that intent as blocked. It is not answer evidence.",
+        "Finish supported parts and explain the refusal in finalizeAnswer.",
+    ])
+    return {
+        "type": "function", "name": "declineOutOfScope",
+        "description": " ".join(description),
+        "parameters": {"type": "object", "properties": properties,
+                       "required": ["request"], "additionalProperties": False},
+    }
+
+
+# The default configuration (UI capability tools and Help Center off).
+DECLINE_OUT_OF_SCOPE_SCHEMA = decline_out_of_scope_schema(actions_available=False)
 
 _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     DECLINE_OUT_OF_SCOPE_SCHEMA,
@@ -786,8 +803,12 @@ async def fetch_function_schemas(
     jwt: str,
     session_id: str,
     additional_local_schemas: tuple[dict[str, Any], ...] = (),
+    actions_available: bool = False,
+    product_documentation_available: bool = False,
 ) -> list[dict[str, Any]]:
     """Fetch `list_tools()` from *mcp_client*, translate, and append `askUser`.
+
+    *actions_available* is `capability_tools_enabled`; it selects the decline tool's shape.
 
     *jwt*/*session_id* are required because the live MCP authenticates every request,
     including `tools/list`; no credential appears in the returned schemas (D5). No
@@ -799,7 +820,14 @@ async def fetch_function_schemas(
     # closed) rather than becoming a silent shadow in the loop's `runtime_tools`
     # interception — the runtime-tool registry is the source of truth for our names.
     mcp_names = {tool.name for tool in tools}
-    local_schemas = (*_LOCAL_TOOL_SCHEMAS, *additional_local_schemas)
+    local_schemas = (
+        *(
+            decline_out_of_scope_schema(actions_available=actions_available, product_documentation_available=product_documentation_available)
+            if schema["name"] == "declineOutOfScope" else schema
+            for schema in _LOCAL_TOOL_SCHEMAS
+        ),
+        *additional_local_schemas,
+    )
     local_names = frozenset(schema["name"] for schema in local_schemas)
     collisions = mcp_names & local_names
     if collisions:
@@ -837,9 +865,13 @@ class ToolSchemaCache:
         mcp_client: MCPClient,
         *,
         additional_local_schemas: tuple[dict[str, Any], ...] = (),
+        actions_available: bool = False,
+        product_documentation_available: bool = False,
     ) -> None:
         self._mcp_client = mcp_client
         self._additional_local_schemas = additional_local_schemas
+        self._actions_available = actions_available
+        self._product_documentation_available = product_documentation_available
         self._cache: list[dict[str, Any]] | None = None
 
     async def get_schemas(
@@ -851,5 +883,7 @@ class ToolSchemaCache:
                 jwt=jwt,
                 session_id=session_id,
                 additional_local_schemas=self._additional_local_schemas,
+                actions_available=self._actions_available,
+                product_documentation_available=self._product_documentation_available,
             )
         return self._cache

@@ -618,6 +618,8 @@ def create_app(
     tool_schema_cache = ToolSchemaCache(
         mcp_client,
         additional_local_schemas=(*help_center_schemas, *capability_schemas),
+        actions_available=settings.capability_tools_enabled,
+        product_documentation_available=settings.help_center_enabled,
     )
     capability_prefetch_provider = None
     if settings.capability_tools_enabled and settings.capability_prefetch_enabled:
@@ -758,7 +760,10 @@ def create_app(
         # assumptions into the turn result), so it is never subject to the
         # advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path.
         runtime_tools["recordAssumptions"] = RecordAssumptionsTool(observer=observer)
-        runtime_tools["declineOutOfScope"] = DeclineOutOfScopeTool(observer=observer)
+        runtime_tools["declineOutOfScope"] = DeclineOutOfScopeTool(
+            observer=observer, actions_available=settings.capability_tools_enabled,
+            product_documentation_available=settings.help_center_enabled,
+        )
         # `answerWithTable` (composite/answer_with_table.py): ALWAYS wired, same
         # reasoning — it only echoes the model's final prose + designated query into
         # the turn result and has no backing stack. It is TERMINAL: a successful call

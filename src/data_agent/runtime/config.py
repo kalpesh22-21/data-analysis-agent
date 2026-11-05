@@ -23,10 +23,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
 from data_agent.runtime.prompts import (
+    ACTIONS_UNAVAILABLE_SYSTEM_PROMPT,
     AGENT_SYSTEM_PROMPT,
     CAPABILITY_TOOLS_SYSTEM_PROMPT,
     HELP_CENTER_CAPABILITY_SYSTEM_PROMPT,
+    HELP_CENTER_ROUTE,
     HELP_CENTER_SYSTEM_PROMPT,
+    HELP_CENTER_UNAVAILABLE_ROUTE,
 )
 
 # enabled but paycompy is missing.
@@ -1163,9 +1166,11 @@ class RuntimeSettings(BaseSettings):
         if self.help_center_enabled:
             prompt = self.agent_system_prompt + HELP_CENTER_SYSTEM_PROMPT
         else:
-            prompt = self.agent_system_prompt
+            prompt = self.agent_system_prompt.replace(HELP_CENTER_ROUTE, HELP_CENTER_UNAVAILABLE_ROUTE)
         if self.capability_tools_enabled:
             prompt += CAPABILITY_TOOLS_SYSTEM_PROMPT
+        else:
+            prompt += ACTIONS_UNAVAILABLE_SYSTEM_PROMPT
         if self.help_center_enabled and self.capability_tools_enabled:
             prompt += HELP_CENTER_CAPABILITY_SYSTEM_PROMPT
         return prompt

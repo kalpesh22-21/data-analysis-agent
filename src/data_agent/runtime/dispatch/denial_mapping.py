@@ -149,6 +149,10 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         user_message="The data service returned an unsupported response encoding. Its response could not be read safely.",
     ),
 
+    "NOT_SUPPORTED_HERE": DenialInfo(
+        code="NOT_SUPPORTED_HERE", retryable=False, kind=DenialKind.GATE,
+        user_message="That part of the request is not supported in this deployment.",
+    ),
     OUT_OF_SCOPE_REQUEST_CODE: DenialInfo(
         code=OUT_OF_SCOPE_REQUEST_CODE,
         retryable=False,

@@ -209,3 +209,78 @@ async def test_scope_call_rejects_malformed_optional_or_unknown_args(extra):
     )
     assert result.error_code == "INVALID_TOOL_ARGUMENTS"
     assert result.retryable is True  # Correct malformed arguments; do not retry a valid refusal.
+
+
+
+# --- actions: declined when nothing can prepare them, prepared when UI options exist ---
+
+
+def test_the_prompt_says_actions_are_declined_without_ui_options_and_prepared_with_them():
+    """A live run answered "Fire the top 15 employees" by asking which ranking to use."""
+    from data_agent.runtime.config import RuntimeSettings
+    from data_agent.runtime.prompts import (
+        ACTIONS_UNAVAILABLE_SYSTEM_PROMPT,
+        CAPABILITY_TOOLS_SYSTEM_PROMPT,
+    )
+
+    off = RuntimeSettings(capability_tools_enabled=False).effective_agent_system_prompt()
+    assert ACTIONS_UNAVAILABLE_SYSTEM_PROMPT in off and CAPABILITY_TOOLS_SYSTEM_PROMPT not in off
+    assert "declineOutOfScope(reason=action_not_supported)" in off
+    assert "action intent as blocked" in off
+    on = RuntimeSettings(capability_tools_enabled=True).effective_agent_system_prompt()
+    assert ACTIONS_UNAVAILABLE_SYSTEM_PROMPT not in on
+    assert '"Terminate an employee"' in on and "an action is not out of scope" in on
+
+
+async def test_an_action_is_declined_honestly_when_no_ui_options_exist():
+    from data_agent.runtime.composite.scope_refusal import ACTION_RULE
+
+    events = []
+    tool = DeclineOutOfScopeTool(observer=lambda e, p: events.append((e, p)))
+    result = await tool.run({"request": "Fire the top 15 employees", "reason": "action_not_supported"},
+                            CREDS, TurnContext(0, "Fire the top 15 employees."))
+    assert result.error_code == "NOT_SUPPORTED_HERE" and result.retryable is False
+    assert "cannot perform or prepare actions" in result.user_message
+    assert "outside HR" not in result.user_message
+    assert "choosing them is part of the action" in result.denial_detail
+    assert "It is not answer evidence" in result.denial_detail
+    assert [e for e in events if e[0] == SCOPE_EVENT] == [
+        (SCOPE_EVENT, {"rule": ACTION_RULE, "site": "agent_scope_declaration"})]
+
+
+async def test_an_action_is_not_declined_while_ui_options_exist():
+    events = []
+    tool = DeclineOutOfScopeTool(observer=lambda e, p: events.append((e, p)), actions_available=True)
+    result = await tool.run({"request": "Fire the top 15 employees", "reason": "action_not_supported"},
+                            CREDS, TurnContext(0, "Fire the top 15 employees."))
+    assert result.error_code == "INVALID_TOOL_ARGUMENTS" and result.retryable is True
+    assert "searchCapabilityTools" in result.user_message
+    assert not any(e[0] == SCOPE_EVENT for e in events)
+    # An out-of-domain part is still declined normally with UI options on.
+    weather = await tool.run({"request": "weather"}, CREDS, TurnContext(0, "weather"))
+    assert weather.error_code == "OUT_OF_SCOPE_REQUEST"
+
+
+async def test_an_unknown_decline_reason_is_rejected():
+    result = await DeclineOutOfScopeTool().run({"request": "weather", "reason": "other"}, CREDS,
+                                               TurnContext(0, "weather"))
+    assert result.error_code == "INVALID_TOOL_ARGUMENTS"
+
+
+@pytest.mark.parametrize("actions_available", [False, True])
+async def test_the_decline_tool_is_shaped_by_the_capability_flag_not_left_to_the_model(actions_available):
+    """Without UI capability tools an action is declined, so the tool offers that reason and
+    says so; with them it is prepared, so neither appears for the model to misread."""
+    from data_agent.runtime.mcp.fake_client import FakeMCPClient
+    from data_agent.runtime.mcp.tool_schema import ToolSchemaCache
+    from tests.runtime.mcp.test_tool_schema import _FAKE_TOOLS
+
+    cache = ToolSchemaCache(FakeMCPClient(tools=_FAKE_TOOLS), actions_available=actions_available,
+                            product_documentation_available=True)
+    decline = next(s for s in await cache.get_schemas(jwt="tok", session_id="s1")
+                   if s["name"] == "declineOutOfScope")
+    offered = "reason" in decline["parameters"]["properties"]
+    worded = "action_not_supported" in decline["description"]
+    assert offered is worded is (not actions_available)
+    if offered:
+        assert decline["parameters"]["properties"]["reason"]["enum"] == ["outside_domain", "action_not_supported"]
