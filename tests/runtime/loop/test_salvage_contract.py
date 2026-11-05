@@ -7,7 +7,7 @@ from data_agent.runtime.loop.answer_judge import AnswerJudge, JudgeBrief, JudgeV
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from tests.runtime.final_answer import answer_arguments, recovery_sections
 from tests.runtime.loop.test_partial_answer import PART, TEXT, build, final, reject
-from tests.runtime.test_harness_improvements import Judge, batch, call, discovery, query, run
+from tests.runtime.test_harness_improvements import CREDS, Judge, batch, call, discovery, query, run
 
 
 class RecoveryClient(ScriptedModelClient):
@@ -402,7 +402,10 @@ async def test_salvage_falls_back_to_table_and_reviews_exact_document(approved):
     candidate = judge.briefs[-1].answer_document
     assert candidate['sections'][0]['presentation']['kind'] == 'table'
     assert 'shown as a table' in candidate['sections'][0]['explanation']
-    assert 'distinct category' in candidate['sections'][0]['explanation']
+    # The backend reason instructs the model, so only the reviewer sees it.
+    assert 'distinct category' not in candidate['sections'][0]['explanation']
+    assert 'distinct category' in judge.briefs[-1].presentation_fallbacks[0]['reason']
+    assert judge.briefs[-1].presentation_fallbacks[0]['requested_kind'] == 'bars'
     assert not candidate['sections'][0]['caveats']
     assert len(mcp.calls) == 1
     assert ('loop_recovery_fallback_reviewed', {'status': 'approved' if approved else 'rejected'}) in events
@@ -551,3 +554,73 @@ def test_repair_reservation_survives_restore_without_claiming_attempt():
     assert not ReviewState.restore(state.to_doc(), 'changed').repair_pending
     legacy = ReviewState.restore({'repaired': True, 'scope_hash': 'same'}, 'same')
     assert legacy.repaired and not legacy.repair_attempted
+
+
+async def test_timeout_before_tool_use_recovers_prior_answer_without_query():
+    from data_agent.runtime.model.scripted_client import ScriptedModelClient
+
+    class HistoricalJudge(Judge):
+        salvage_calls = 0
+
+        async def salvage(self, brief):
+            self.salvage_calls += 1
+            historical = [r for r in brief.results if r["tool_call_id"].startswith("reused_")]
+            assert len(historical) == 1
+            ref = historical[0]["tool_call_id"]
+            return {"takeaway": "The previously retrieved Sales count was 120.",
+                    "sections": recovery_sections([ref], evidence=[ref]),
+                    "evidence": [ref], "unfinished": [], "outcome": "full"}
+
+    class TimedOut(ScriptedModelClient):
+        async def send_turn(self, *args, **kwargs):
+            raise TimeoutError("simulated model timeout")
+
+    judge = HistoricalJudge()
+    loop, store, _, mcp, events = build([discovery(), query(), final()], judge)
+    first = await run(loop)
+    assert first.review["status"] == "approved"
+    loop._model_client = TimedOut([])
+    second = await run(loop, "Repeat the previously retrieved count.")
+    assert judge.salvage_calls == 1
+    assert second.review["status"] == "approved"
+    assert second.answer_document["sources"]
+    assert len(mcp.calls) == 1
+    assert any(name == "loop_recovery_history_bound" for name, _ in events)
+    # The cited candidate is part of the answer, so history keeps it.
+    from data_agent.runtime.session_history import project_history
+
+    doc = await store.get_or_create_session(CREDS.session_id)
+    turn = project_history(doc.messages, doc.tool_trail, CREDS.column_scope, None)["turns"][1]
+    assert [c["tool_name"] for c in turn["tool_calls"]] == ["runQuery"]
+
+
+async def test_recovery_candidates_salvage_did_not_use_are_not_shown_as_the_turn_s_calls():
+    """Recovery offers the last answer's sources before salvage decides; when the answer
+    does not use them, later turns and history must not show a query this turn never ran."""
+    from data_agent.runtime.context.assembly import ContextAssembler
+    from data_agent.runtime.loop.answer_judge import JudgeVerdict
+    from data_agent.runtime.session_history import project_history
+    from tests.runtime.test_answer_document import section
+
+    rejected = JudgeVerdict(False, "unsupported_by_evidence", "Unsupported claim.", True, repair_type="prose")
+    judge = Judge([JudgeVerdict(True, reviewed=True), rejected, rejected, rejected, rejected])
+    loop, store, _, _, events = build(
+        [discovery(), query(),
+         batch(call("finalizeAnswer", "a1", takeaway="Counts.", sections=[section()], evidence=["q"])),
+         batch(call("finalizeAnswer", "b1", takeaway="Weather is sunny.", sections=[], evidence=[])),
+         batch(call("finalizeAnswer", "b2", takeaway="Weather is sunny!", sections=[], evidence=[]))],
+        judge,
+    )
+    await run(loop)
+    await run(loop, "What is the weather?")
+    assert any(name == "loop_recovery_history_bound" for name, _ in events)
+    doc = await store.get_or_create_session(CREDS.session_id)
+    candidate = next(e for e in doc.tool_trail if e.tool_call_id.startswith("reused_"))
+    assert candidate.turn_index == 1 and candidate.model_response["bound_by"] == "recovery"
+    turns = project_history(doc.messages, doc.tool_trail, CREDS.column_scope, None)["turns"]
+    assert "runQuery" not in [c["tool_name"] for c in turns[1]["tool_calls"]]
+    assembler = ContextAssembler(store)
+    messages = (await assembler.assemble(CREDS.session_id, CREDS.column_scope, 2)).messages
+    assert candidate.tool_call_id not in str(messages)
+    replayed = [m.get("tool_call_id") for m in messages if m.get("role") == "tool"]
+    assert "q" in replayed and candidate.tool_call_id not in replayed

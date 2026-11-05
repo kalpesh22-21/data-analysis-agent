@@ -361,7 +361,7 @@ INTENT_STATUSES = frozenset({"pending", "completed", "blocked"})
 # "the model got the name wrong" bucket) and `TABLE_NOT_FOUND` is also how a
 # column-scope denial surfaces from `sampleRows`.
 MODEL_REASON_CODES = frozenset(
-    {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED", "OUT_OF_SCOPE_REQUEST"}
+    {"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE", "EXECUTION_FAILED", "OUT_OF_SCOPE_REQUEST", "NOT_SUPPORTED_HERE"}
 )
 # Written ONLY by the runtime's forced-block paths (05 §F), never by the model.
 # `ENFORCEMENT_EXHAUSTED` means "enforcement could not establish a disposition" —
@@ -698,3 +698,31 @@ def live_analysis_state(doc: SessionDoc, turn_index: int) -> AnalysisState | Non
     if state is None or state.turn_index != turn_index:
         return None
     return state
+
+
+# `model_response["bound_by"]` of a reference recovery offered as candidate evidence.
+RECOVERY_BINDING = "recovery"
+
+
+def uncited_recovery_references(messages, trail) -> frozenset[str]:
+    """Recovery's candidate references that the turn's delivered answer never cited.
+
+    With no new data, recovery binds the latest answer's sources before salvage decides
+    whether they answer the request. The trail is append-only, so the unused candidates
+    stay in it; later context and history hide them rather than show calls the turn made.
+    """
+    cited: dict[int, set[str]] = {}
+    for message in messages:
+        if message.role != "assistant":
+            continue
+        refs = cited.setdefault(message.turn_index, set())
+        document = message.answer_document or {}
+        refs.update(document.get("sources") or {})
+        for section in document.get("sections") or ():
+            refs.update(section.get("evidence_refs") or ())
+        refs.update(item.get("result_id") for item in message.extra_evidence or ())
+    return frozenset(
+        entry.tool_call_id for entry in trail
+        if (entry.model_response or {}).get("bound_by") == RECOVERY_BINDING
+        and entry.tool_call_id not in cited.get(entry.turn_index, ())
+    )

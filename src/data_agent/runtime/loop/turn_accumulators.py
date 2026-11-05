@@ -39,7 +39,7 @@ from data_agent.runtime.composite.answer_with_table import (
     blueprint_verification,
     rollup_verification,
 )
-from data_agent.runtime.composite.record_assumptions import fold_assumptions
+from data_agent.runtime.composite.record_assumptions import fold_assumptions, writes_assumptions
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
 from data_agent.runtime.sanitize import sanitize_text
 
@@ -345,11 +345,12 @@ class TurnAccumulators:
     def note_assumptions(
         self, tool_name: str, arguments: dict[str, Any], tool_result: ToolResult
     ) -> None:
-        """Replace the list after a SUCCESSFUL `recordAssumptions` call. Read from
+        """Replace the list after a SUCCESSFUL `recordAssumptions` call, or a finalizeAnswer
+        call carrying `assumptions` (`writes_assumptions`). Read from
         the call ARGUMENTS via the SAME `fold_assumptions` helper `session_history` uses,
         so the loop and the history read-surface agree exactly. A no-op for any other call.
         """
-        if tool_result.status != "ok" or tool_name != "recordAssumptions":
+        if tool_result.status != "ok" or not writes_assumptions(tool_name, arguments):
             return
         self.replace_assumptions(arguments.get("assumptions"))
 

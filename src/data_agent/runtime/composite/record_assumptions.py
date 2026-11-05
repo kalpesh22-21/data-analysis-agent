@@ -68,6 +68,23 @@ def fold_assumptions(target: list[str], raw: Any) -> None:
     target[:] = clean_assumptions(raw)
 
 
+def writes_assumptions(tool_name: str, arguments: Any) -> bool:
+    """Whether a successful call replaces the turn's assumptions with `arguments["assumptions"]`.
+
+    `recordAssumptions` always does. finalizeAnswer does only when it carries `assumptions`;
+    its trail entry is stored under the answer tool it was rewritten to, and keeps the
+    proposal's `sections`, which a direct legacy answer-tool call never has. Live, resume
+    and history all ask this one question, so they agree.
+    """
+    from data_agent.runtime.composite.answer_with_table import TOOL_NAME as ANSWER_TABLE
+    from data_agent.runtime.composite.answer_with_text import TOOL_NAME as ANSWER_TEXT
+
+    return tool_name == TOOL_NAME or (
+        tool_name in (ANSWER_TABLE, ANSWER_TEXT) and isinstance(arguments, dict)
+        and "assumptions" in arguments and "sections" in arguments
+    )
+
+
 
 class RecordAssumptionsTool(RuntimeToolBase):
     _INTERNAL_ERROR_CODE = "RUNTIME_TOOL_INTERNAL_ERROR"

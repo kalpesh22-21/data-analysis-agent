@@ -236,3 +236,41 @@ def test_capability_rejection_cannot_remove_a_valid_table_id():
         state, verdict, [{"kind": "table", "result_id": "salary", "sql": SQL}]
     )
     assert state.excluded_components == ()
+
+
+async def test_citing_the_original_of_an_omitted_reused_table_is_omitted_too():
+    """The judge omits a table by its reused ID; the model resubmits with the original ID.
+
+    Both IDs are one result, so the resubmission ships without it instead of bouncing as an
+    earlier-turn ID the runtime cannot bind ("run that query again").
+    """
+    import hashlib
+
+    from tests.runtime.test_answer_document import section
+
+    alias = "reused_" + hashlib.sha256(b"1:q").hexdigest()[:24]
+    old = {**section(), "id": "old", "table_reason": "Earlier counts."}
+    new = {**section(), "id": "new", "evidence_refs": ["q2"],
+           "presentation": {"kind": "table", "result_id": "q2"}, "table_reason": "New counts."}
+    judge = Judge([
+        JudgeVerdict(True, reviewed=True),
+        JudgeVerdict(False, "contradicts_result", "Drop the older table.", True,
+                     repair_type="omit_component", result_ids=(alias,)),
+        JudgeVerdict(True, reviewed=True),
+    ])
+    rows = {"columns": ["Department", "n"], "rows": [["Sales", 120]], "row_count": 1, "truncated": False}
+    loop, store, *_ = build(
+        [discovery(), query(),
+         batch(call("finalizeAnswer", "a1", takeaway="Counts.", sections=[section()], evidence=["q"])),
+         batch(call("searchBlueprints", "s2", query="headcount")),
+         batch(call("runQuery", "q2", sql=SQL + " LIMIT 1")),
+         batch(call("finalizeAnswer", "b1", takeaway="Both.", sections=[old, new], evidence=["q", "q2"])),
+         batch(call("finalizeAnswer", "b2", takeaway="Both again.", sections=[old, new], evidence=["q", "q2"]))],
+        judge=judge, rows=[rows, rows],
+    )
+    await run(loop)
+    out = await run(loop, "Show both.")
+    assert out.review["status"] == "approved" and out.review["attempts"] == 2
+    assert [t["sql"] for t in out.answer_tables] == [SQL + " LIMIT 1"]
+    doc = await store.get_or_create_session(CREDS.session_id)
+    assert all(e.status == "ok" for e in doc.tool_trail if e.turn_index == 1)

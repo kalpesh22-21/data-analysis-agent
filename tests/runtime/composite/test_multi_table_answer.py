@@ -1094,7 +1094,13 @@ async def test_result_table_repair_reuses_scoped_execution(invalid_ref: str) -> 
     assert tables == [] and carried
     assert refusal.error_code == "ANSWER_TABLE_RESULT_INVALID"
     assert 'Available table result IDs: ["headcount_result"]' in refusal.denial_detail
-    assert "do not rerun completed analysis" in refusal.denial_detail
+    if invalid_ref == "old":
+        # An earlier-turn result that could not be bound is never selectable, so the
+        # message says so; it still points at this turn's result before a rerun.
+        assert "from an earlier turn that cannot be reused here" in refusal.denial_detail
+        assert "select it instead of rerunning" in refusal.denial_detail
+    else:
+        assert "do not rerun completed analysis" in refusal.denial_detail
     tables, refusal, carried = await loop._resolve_answer_tables(
         {"tables": [{"result_id": "headcount_result", "caption": "Active employees"}]},
         **kwargs,

@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     ANALYSIS_STATE_INVALID_CODE,
@@ -373,13 +375,55 @@ async def test_model_supplied_declaration_id_is_ignored():
     assert result.result_full["intents"][0]["intent_id"] == "i1"
 
 
-async def test_a_second_initialize_is_rejected() -> None:
+async def test_redeclaring_a_declared_intent_is_rejected() -> None:
+    store = InMemorySessionStore()
+    tool = await _initialized(store, "Headcount by department")
+    result = await _reject(tool, {"intents": [{"description": "headcount  by DEPARTMENT"}]})
+    assert "'i1' already tracks" in result.denial_detail
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert [i.description for i in live_analysis_state(doc, TURN).intents] == ["Headcount by department"]
+
+
+async def test_a_missed_part_is_added_without_touching_declared_intents() -> None:
+    store = InMemorySessionStore()
+    recorder = _Recorder()
+    tool = await _initialized(store, "a", observer=recorder)
+    result = await tool.run({"intents": [{"description": "b"}, {"description": "c", "status": "pending"}]},
+                            _credentials(), turn=TurnContext(turn_index=TURN))
+    assert result.status == "ok", result
+    doc = await store.get_or_create_session(SESSION_ID)
+    intents = live_analysis_state(doc, TURN).intents
+    assert [(i.intent_id, i.description, i.status) for i in intents] == [
+        ("i1", "a", "pending"), ("i2", "b", "pending"), ("i3", "c", "pending")]
+    assert ("loop_analysis_state_intents_added", {"intent_count": 2, "turn_index": TURN}) in recorder.events
+
+
+async def test_a_part_can_be_added_while_another_intent_is_updated() -> None:
     store = InMemorySessionStore()
     tool = await _initialized(store, "a")
-    result = await _reject(tool, {"intents": [{"description": "b"}, {"description": "c"}]})
-    assert "already declared" in result.denial_detail
+    result = await tool.run({"intents": [{"description": "b"}, {"intent_id": "i1", "status": "pending"}]},
+                            _credentials(), turn=TurnContext(turn_index=TURN))
+    assert result.status == "ok", result
     doc = await store.get_or_create_session(SESSION_ID)
-    assert [i.description for i in live_analysis_state(doc, TURN).intents] == ["a"]
+    assert [i.intent_id for i in live_analysis_state(doc, TURN).intents] == ["i1", "i2"]
+
+
+@pytest.mark.parametrize("item", [{"description": "b", "status": "completed"},
+                                  {"description": "b", "result_id": "call_x"}])
+async def test_an_added_part_starts_pending(item) -> None:
+    store = InMemorySessionStore()
+    tool = await _initialized(store, "a")
+    result = await _reject(tool, {"intents": [item]})
+    assert "starts pending" in result.denial_detail
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert [i.intent_id for i in live_analysis_state(doc, TURN).intents] == ["i1"]
+
+
+async def test_adding_cannot_exceed_the_intent_cap() -> None:
+    store = InMemorySessionStore()
+    tool = await _initialized(store, *(f"part {n}" for n in range(MAX_INTENTS)))
+    result = await _reject(tool, {"intents": [{"description": "one more"}]})
+    assert "exceed" in result.denial_detail
 
 
 async def test_unknown_metadata_is_ignored_in_both_modes():

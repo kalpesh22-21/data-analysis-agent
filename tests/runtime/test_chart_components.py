@@ -79,6 +79,61 @@ def test_new_chart_opt_in_schema_and_exact_selector_output(kind):
         assert rendered["series"][1]["y_column"] == "Overtime"
 
 
+@pytest.mark.parametrize(("kind", "flag"), [("donut", "composition"), ("stacked_bars", "additive")])
+def test_part_to_whole_flags_are_declared_booleans_and_a_quoted_true_is_read_as_true(kind, flag):
+    """A schema with only `const: true` let the model send "true" (issues #51-67): the
+    same session failed 17 times on "check the declared field schema". A quoted "true"
+    can only mean true; every other wrong value is still rejected by name."""
+    from data_agent.runtime.composer import RECOVERY_SCHEMA
+
+    with enabled():
+        for schema in (restrict_schema(PROPOSAL_SCHEMA), restrict_schema(RECOVERY_SCHEMA),
+                       build_judge_tool("exit_table")):
+            wire = json.loads(json.dumps(schema))
+            declared = [n[flag] for n in _walk(wire) if isinstance(n, dict) and isinstance(n.get(flag), dict)
+                        and "const" in n[flag]]
+            assert declared and all(d["type"] == "boolean" and d["const"] is True for d in declared)
+        assert f'"{flag}": true (a JSON boolean, not a string)' in component_guidance()
+        extra = {k: v for k, v in selection(kind).items() if k not in {"kind", "result_id"}}
+        for quoted in ("true", " True "):
+            raw = proposal(kind, **extra | {flag: quoted})
+            assert proposal_to_internal(raw)["sections"][0]["presentation"][flag] is True
+            assert raw["sections"][0]["presentation"][flag] == quoted  # input not mutated
+        for wrong in ("yes", "false", 1):
+            with pytest.raises(PresentationError, match=f"{flag}: expected type: boolean"):
+                proposal_to_internal(proposal(kind, **extra | {flag: wrong}))
+        with pytest.raises(PresentationError, match=f"{flag}: must be exactly true"):
+            proposal_to_internal(proposal(kind, **extra | {flag: False}))
+
+
+async def test_a_quoted_composition_is_read_as_true_by_salvage_and_judge_corrections():
+    from data_agent.runtime.loop.answer_judge import _read_verdict
+    from tests.runtime.loop.test_judge_malformed_reasons import APPROVE_DOCUMENT, _turn
+
+    presentation = {**selection("donut"), "composition": "true"}
+    document = {"takeaway": "Split.", "evidence": ["q"],
+                "sections": [section("donut", **{k: v for k, v in presentation.items() if k not in {"kind", "result_id"}})]}
+    with enabled():
+        reading = _read_verdict(_turn({**APPROVE_DOCUMENT, "corrected_document": document}), "exit_table")
+    assert reading.malformed_reason is None
+    assert reading.verdict.corrected_document["sections"][0]["presentation"]["composition"] is True
+
+    from data_agent.runtime.loop.answer_judge import AnswerJudge, JudgeBrief
+    from tests.runtime.loop.test_salvage_contract import RecoveryClient, batch, call
+
+    client = RecoveryClient([batch(call("salvageAnswer", "donut", **document, unfinished=[], outcome="full"))])
+    with enabled():
+        result = await AnswerJudge(client, 10000).salvage(JudgeBrief("exit_prose", "Status split?"))
+    assert result["sections"][0]["presentation"]["composition"] is True
+    assert client.calls_made == 1  # accepted first time, no schema-correction retry
+
+
+def _walk(node):
+    yield node
+    for child in node.values() if isinstance(node, dict) else node if isinstance(node, list) else ():
+        yield from _walk(child)
+
+
 def test_defaults_hide_disabled_types_from_agent_judge_and_recovery_schemas():
     from data_agent.runtime.composer import RECOVERY_SCHEMA
 

@@ -157,3 +157,92 @@ async def test_invalid_reuse_requests_do_not_create_receipts(overrides):
 async def test_verified_blueprint_can_be_reused():
     tool, _ = await setup(original(tool_name="runBlueprint", authoritative=True))
     assert (await reuse(tool)).status == "ok"
+
+
+@pytest.mark.parametrize("excluded_turn", [0, 1])
+async def test_explicit_reuse_only_blocks_current_turn_exclusions(excluded_turn):
+    tool, store = await setup()
+    await store.write_review_state(CREDS.session_id, excluded_turn, {
+        "excluded_components": [{"result_id": "prior"}]
+    })
+    result = await reuse(tool)
+    assert (result.status == "ok") == (excluded_turn == 0)
+    assert len(await store.load_trail(CREDS.session_id)) == (2 if excluded_turn == 0 else 1)
+
+
+async def test_reuse_alias_across_successive_turns_resolves_original_and_is_idempotent():
+    tool, store = await setup()
+    assert (await reuse(tool)).status == "ok"
+    alias = (await store.load_trail(CREDS.session_id))[-1]
+    for turn_index in (2, 3):
+        turn = TurnContext(turn_index=turn_index)
+        assert (await tool.run({"intents": [{"description": "Restore the earlier total"}]},
+                               CREDS, turn=turn)).status == "ok"
+        args = {"intents": [{"intent_id": "i1", "status": "completed",
+                             "result_id": alias.tool_call_id, "reuse_previous_result": True}]}
+        assert (await tool.run(args, CREDS, turn=turn)).status == "ok"
+        trail = await store.load_trail(CREDS.session_id)
+        reference = trail[-1]
+        assert reference.model_response["reused_from_result_id"] == "prior"
+        assert reference.args == original().args
+        assert reference.ts == original().ts
+        assert reference.result_preview == original().result_preview
+        assert (await tool.run(args, CREDS, turn=turn)).status == "ok"
+        assert len(await store.load_trail(CREDS.session_id)) == len(trail)
+        alias = reference
+
+
+@pytest.mark.parametrize("failure", ["missing_origin", "cycle", "changed_scope", "failed_origin",
+                                    "unverified_origin", "excluded_origin", "excluded_alias"])
+async def test_alias_cannot_bypass_origin_eligibility_or_exclusions(failure):
+    from data_agent.runtime.composite.analysis_state import previous_result_reference
+
+    source = original()
+    alias = previous_result_reference(source, 1, compute_scope_hash(SCOPE))
+    if failure == "cycle":
+        alias = replace(alias, model_response={**alias.model_response,
+                                              "reused_from_result_id": alias.tool_call_id})
+    elif failure == "changed_scope":
+        source = replace(source, model_response={"scope_hash": "different"})
+    elif failure == "failed_origin":
+        source = replace(source, status="error")
+    elif failure == "unverified_origin":
+        source = replace(source, tool_name="runBlueprint", authoritative=False)
+    store = InMemorySessionStore()
+    if failure != "missing_origin":
+        await store.append_trail_entry(CREDS.session_id, source)
+    await store.append_trail_entry(CREDS.session_id, alias)
+    if failure.startswith("excluded_"):
+        await store.write_review_state(CREDS.session_id, 2, {"excluded_components": [
+            {"result_id": source.tool_call_id if failure == "excluded_origin" else alias.tool_call_id}
+        ]})
+    tool = UpdateAnalysisStateTool(session_store=store)
+    turn = TurnContext(turn_index=2)
+    await tool.run({"intents": [{"description": "Restore the earlier total"}]}, CREDS, turn=turn)
+    before = len(await store.load_trail(CREDS.session_id))
+    response = await tool.run({"intents": [{"intent_id": "i1", "status": "completed",
+        "result_id": alias.tool_call_id, "reuse_previous_result": True}]}, CREDS, turn=turn)
+    assert response.error_code == "ANALYSIS_STATE_INVALID"
+    assert len(await store.load_trail(CREDS.session_id)) == before
+
+
+@pytest.mark.parametrize("bad_intermediate", [False, True])
+def test_legacy_alias_chain_checks_every_link(bad_intermediate):
+    from data_agent.runtime.composite.analysis_state import (
+        AnalysisStateRejectedError,
+        previous_result_reference,
+        resolve_previous_result,
+    )
+
+    scope = compute_scope_hash(SCOPE)
+    source = original()
+    first = previous_result_reference(source, 1, scope)
+    second = replace(first, turn_index=2, tool_call_id="second-alias",
+                     model_response={"scope_hash": scope,
+                                     "reused_from_result_id": first.tool_call_id})
+    if bad_intermediate:
+        first = replace(first, model_response={**first.model_response, "scope_hash": "other"})
+        with pytest.raises(AnalysisStateRejectedError):
+            resolve_previous_result(second, [source, first, second], 3, scope)
+    else:
+        assert resolve_previous_result(second, [source, first, second], 3, scope) is source

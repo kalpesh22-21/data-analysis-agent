@@ -9,6 +9,7 @@ from data_agent.runtime.context.scope_filter import compute_scope_hash
 from data_agent.runtime.session.models import live_analysis_state
 
 from .approved_answer import normalize_approved_text
+from .measurement_repair import pending_measurement_rejections
 from .proposal import ReviewState, evidence_kind, extra_evidence, fingerprint, selected_components
 from .turn_accumulators import TurnAccumulators
 
@@ -80,6 +81,11 @@ def _validate_response(
 
     from data_agent.runtime.composer import PresentationError, build_document, proposal_to_internal
 
+    from .measurement_repair import unresolved_measurement
+
+    if isinstance(part, dict):
+        reassessments = part.get("measurement_reassessments", ())
+        part = {k: v for k, v in part.items() if k != "measurement_reassessments"}
     if not isinstance(part, dict) or set(part) != {"takeaway", "sections", "evidence", "unfinished"}:
         return invalid("invalid_partial_shape")
     if outcome not in {"full", "partial", "none"}:
@@ -88,6 +94,8 @@ def _validate_response(
         proposal = proposal_to_internal({k: v for k, v in part.items() if k != "unfinished"})
     except (PresentationError, TypeError):
         return invalid("invalid_presentation")
+    if unresolved_measurement(brief, proposal, reassessments):
+        return invalid("unresolved_measurement_repair")
     part = {
         "answer": proposal["answer"], "evidence": proposal["evidence"],
         "table_result_ids": [t["result_id"] for t in proposal["tables"]],
@@ -125,9 +133,7 @@ def _validate_response(
     visible = {r.get("tool_call_id") for r in brief.results}
     if (outcome != "none" and not part["evidence"]) or not set(part["evidence"]) <= visible:
         return invalid("evidence_not_visible")
-    text = answer + (
-        "\n\nUnfinished: " + " ".join(part["unfinished"]) if part["unfinished"] else ""
-    )
+    text = _with_unfinished(answer, part["unfinished"])
     provenance = set()
     for ref in part["evidence"]:
         columns = eligible[ref].provenance
@@ -191,11 +197,12 @@ def _validate_response(
     from data_agent.runtime.provenance.answer_formats import cached_formats
 
     format_overrides = cached_formats(list(eligible.values()), turn_index)
+    fallbacks = []
     try:
         candidate = build_document(
             {**proposal, "answer": text}, list(eligible.values()), turn_index=turn_index,
             cards=cards, sql_by_id=sql_by_id, business_values=values,
-            format_overrides=format_overrides,
+            format_overrides=format_overrides, fallbacks=fallbacks,
         )
     except (PresentationError, TypeError, ValueError):
         return invalid("invalid_presentation")
@@ -206,6 +213,7 @@ def _validate_response(
             "answer": text,
             "answer_document": candidate,
             "requires_presentation_review": needs_review,
+            "presentation_fallbacks": fallbacks,
             "result_sql_by_call_id": {r: sql_by_id[r] for r in part["table_result_ids"] if r in sql_by_id},
             "completion": outcome,
             "request_context": [brief.question, *brief.clarification_answers],
@@ -278,11 +286,26 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
         doc.review_states.get(str(turn_index)), compute_scope_hash(context.credentials.column_scope)
     )
     try:
+        from data_agent.runtime.composite.analysis_state import excluded_result_ids
+        from data_agent.runtime.context.scope_filter import filter_trail
+
+        from .historical_evidence import bind_recovery_history
+
+        excluded = excluded_result_ids(doc, turn_index)
+        scoped = filter_trail(tuple(doc.tool_trail), context.credentials.column_scope)
+        if not any(e.turn_index == turn_index and evidence_kind(e) == "warehouse"
+                   and e.tool_call_id not in excluded for e in scoped):
+            historical_sql = await bind_recovery_history(
+                loop._session_store, session_id, turn_index, context.credentials.column_scope
+            )
+            accum.result_sql_by_call_id.update(historical_sql)
+            if historical_sql:
+                loop._observer("loop_recovery_history_bound", {"result_count": len(historical_sql)})
         results, anchor, trail = await loop._judge_results(
             session_id,
             turn_index,
             context.credentials.column_scope,
-            exclude_result_ids=frozenset(c["result_id"] for c in state.excluded_components),
+            exclude_result_ids=excluded,
         )
         current = [e for e in trail if e.turn_index == turn_index]
         # Dependency failures can reach this path with a fresh accumulator. Restore
@@ -358,6 +381,7 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
                 allow_partial_answer=True,
                 terminal_partial_review=True,
                 previous_rejection=state.feedback or state.violation,
+                measurement_rejections=pending_measurement_rejections(state),
                 clarification_answers=tuple(
                     m.content
                     for m in doc.messages
@@ -419,6 +443,8 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
             fallback_brief = replace(
                 fallback_brief, clarification_answers=tuple(questions[1:]),
                 previous_rejection=state.feedback or state.violation,
+                measurement_rejections=pending_measurement_rejections(state),
+                presentation_fallbacks=tuple(snapshot.get("presentation_fallbacks") or ()),
             )
             fallback_brief = await enrich_brief(
                 fallback_brief, trail=trail, turn_index=turn_index, session_id=session_id,
@@ -468,3 +494,23 @@ async def _recover_partial(loop, session_id, turn_index, accum, draft):
             {"reason": reason, "exception_type": type(exc).__name__},
         )
         return None
+
+
+def _with_unfinished(answer, unfinished):
+    """Keep every distinct limitation, without repeating an already stated sentence.
+
+    Whole-statement matching is deliberate: fuzzy similarity could erase different
+    periods, populations or reasons. The structured unfinished list remains intact.
+    """
+    from data_agent.runtime.composite.assumption_text import (
+        assumption_key,
+        displayed_qualification_keys,
+    )
+    seen = displayed_qualification_keys({"takeaway": answer})
+    remaining = []
+    for item in unfinished:
+        key = assumption_key(item)
+        if key not in seen:
+            remaining.append(item)
+            seen.add(key)
+    return answer + ("\n\nUnfinished: " + " ".join(remaining) if remaining else "")

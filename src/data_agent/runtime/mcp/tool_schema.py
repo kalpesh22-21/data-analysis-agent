@@ -322,7 +322,7 @@ RECORD_ASSUMPTIONS_TOOL_SCHEMA: dict[str, Any] = {
         "Record the plain-English assumptions behind your answer so the user can see "
         "them. Use this when you interpreted an ambiguous term a particular way, applied "
         "a default filter or time period, or resolved a fuzzy concept to specific values. "
-        "Record only material interpretations not already clear in the title or answer. No boilerplate is required. Each call replaces the entire current-turn list; send [] to clear it. During repair, "
+        "Record only material interpretations not already clear in the title or answer. No boilerplate is required. Each call replaces the entire current-turn list; send [] to clear it. The same list can instead be sent as finalizeAnswer.assumptions. During repair, "
         "resubmit only assumptions that still apply. Consolidate paraphrases into one short "
         "business sentence per interpretation. Do not repeat them in answer prose or caveats; "
         "the backend displays this list. Section caveats add only distinct data limitations, not "
@@ -542,7 +542,8 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
     "name": "updateAnalysisState",
     "description": (
         "Track distinct requested deliverables, not editorial repairs, assumption wording, unrequested categories or organization-wide completeness checks unless requested. Preserve completed evidence bindings during presentation repair. First declare short descriptions; the runtime "
-        "returns IDs and freezes the list. Prefer declaring before work, but a late initial "
+        "returns IDs. A requested part you missed can be added later with only a description; "
+        "declared intents are never removed or reworded. Prefer declaring before work, but a late initial "
         "declaration is allowed. Tag each execution with serves_intents (one or several IDs). "
         "After receiving results, update intent_id and status, optionally binding a specific "
         "result_id from this turn. For an earlier successful snapshot, explicitly set reuse_previous_result=true and result_id; use the returned evidence ID for finalization. Reuse is historical, not a live refresh; rerun queries when current data is requested. Existing results can explicitly serve several intents; "
@@ -558,16 +559,17 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
         "properties": {
             "intents": {
                 "type": "array",
-                "description": "The intents to declare (first call) or update (later "
-                "calls). At most 8.",
+                "description": "The intents to declare (first call), update, or add "
+                "(a missed requested part, description only). At most 8 in total.",
                 "items": {
                     "type": "object",
                     "properties": {
                         "description": {
                             "type": "string",
-                            "description": "First call only. One short sentence naming "
-                            "the deliverable, in the user's own terms. Max 500 "
-                            "characters. Leave it empty on later calls — a "
+                            "description": "One short sentence naming the deliverable, in "
+                            "the user's own terms. Max 500 characters. Send it on "
+                            "the first call, or later without intent_id to add a "
+                            "missed part. Leave it empty on updates — a "
                             "description cannot be changed once declared.",
                         },
                         "reuse_previous_result": {
@@ -580,16 +582,16 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
                         },
                         "intent_id": {
                             "type": "string",
-                            "description": "Later calls only. The id the runtime "
-                            "assigned, e.g. 'i2'. Leave it EMPTY on the first call: "
-                            "the runtime assigns the ids and refuses one you invent.",
+                            "description": "Updates only. The id the runtime "
+                            "assigned, e.g. 'i2'. Leave it EMPTY when declaring or "
+                            "adding: the runtime assigns the ids and refuses one you invent.",
                         },
                         "status": {
                             "type": "string",
                             "enum": ["pending", "completed", "blocked"],
-                            "description": "Later calls only. The intent's new state. "
-                            "On the first call leave it as 'pending' — every intent "
-                            "starts pending and any other value there is refused.",
+                            "description": "Updates only. The intent's new state. "
+                            "When declaring or adding leave it as 'pending' — every "
+                            "intent starts pending and any other value there is refused.",
                         },
                     },
                 },
@@ -673,8 +675,8 @@ FINALIZE_ANSWER_SCHEMA = {
         "Propose one coherent answer document: takeaway and ordered sections. Select exact "
         "result IDs and returned column names; the UI fetches rows and builds visuals; never invent values. "
         "Prefer zero or one visible table. Scalars use figures. The UI owns table and CSV options for every data result except figures; do not add a visible table of the same result. "
-        "Extra visible tables require table_reason "
-        "explaining distinct requested value. Evidence-only queries stay hidden. Use only "
+        "With two or more visible tables, every table section, the first included, requires table_reason "
+        "explaining its distinct requested value. Answer-level assumptions go in assumptions, never in caveats. Evidence-only queries stay hidden. Use only "
         "prepared action references. A blocked field needs no section: state its limitation once in takeaway, "
         "retain its evidence, and omit duplicate text sections/caveats. The complete presentation will be reviewed before delivery. "
         'Every section requires id, evidence_refs, presentation, caveats and actions (use [] when empty). '

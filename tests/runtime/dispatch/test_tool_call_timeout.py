@@ -186,3 +186,21 @@ def test_a_timed_out_data_call_supports_an_execution_failed_block(tool_name) -> 
         result_preview=None, result_full_ref=None, ts="now",
     )
     assert classify_block_evidence("timed-out", [entry], 0) == "EXECUTION_FAILED"
+
+
+
+@pytest.mark.parametrize("error_code", ["HELP_CENTER_UNAVAILABLE", "HELP_CENTER_CIRCUIT_OPEN"])
+@pytest.mark.parametrize("tool_name", ["searchHelpCenter", "getHelpCenterDocument"])
+def test_a_help_center_outage_supports_an_execution_failed_block(tool_name, error_code) -> None:
+    """A mixed question's how-to part could not be closed while Help Center was down: the
+    model retried the ledger five times and the turn fell to salvage. After repeated
+    outages the runtime's breaker refuses the call itself, which is the same outage."""
+    from data_agent.runtime.composite.analysis_state import classify_block_evidence
+    from data_agent.runtime.session.models import TrailEntry
+
+    entry = TrailEntry(
+        turn_index=0, tool_call_id="help-down", tool_name=tool_name, args={},
+        status="error", error_code=error_code, provenance=None,
+        result_preview=None, result_full_ref=None, ts="now",
+    )
+    assert classify_block_evidence("help-down", [entry], 0) == "EXECUTION_FAILED"

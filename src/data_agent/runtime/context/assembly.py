@@ -38,7 +38,7 @@ from data_agent.runtime.retrieval.render import (
     render_retrieved_context_tool_entry,
 )
 from data_agent.runtime.sanitize import MAX_FIELD_CHARS, sanitize_text
-from data_agent.runtime.session.models import live_analysis_state
+from data_agent.runtime.session.models import live_analysis_state, uncited_recovery_references
 from data_agent.runtime.session.store import SessionStore
 
 from . import scope_filter
@@ -248,7 +248,16 @@ class ContextAssembler:
             # 1. load BOTH streams from the SAME doc (single get_or_create_session):
             # the tool pairs AND the user/assistant dialogue that interleave by turn.
             doc = await self._session_store.get_or_create_session(session_id)
-            raw_trail = self.available_tool_trail(doc.tool_trail)
+            from .review_feedback import with_historical_feedback
+
+            unused = uncited_recovery_references(doc.messages, doc.tool_trail)
+            raw_trail = with_historical_feedback(
+                [
+                    entry for entry in self.available_tool_trail(doc.tool_trail)
+                    if entry.tool_call_id not in unused or entry.turn_index == current_turn_index
+                ],
+                doc, current_turn_index, column_scope,
+            )
             raw_messages = doc.messages
 
             # 2. D44 filter EACH stream independently, order-preserving.

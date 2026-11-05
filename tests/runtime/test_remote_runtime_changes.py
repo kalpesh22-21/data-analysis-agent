@@ -820,10 +820,14 @@ async def test_help_unavailable_cannot_launder_instructions(name, status, payloa
             ),
         ],
         tools={name: HelpTool()},
-        judge=Judge([APPROVED]),
+        judge=Judge([JudgeVerdict(approved=True, reviewed=True)]),
     )
     outcome = await run(loop, "How do I clock in?")
     assert outcome.assistant_text == HELP_UNAVAILABLE_TEXT
+    # The decline is applied before review, so delivery keeps the judge's approval
+    # instead of finding a changed answer and falling back to salvage.
+    assert outcome.review["status"] == "approved"
+    assert outcome.answer_document["sections"] == []
     doc = await store.get_or_create_session(CREDS.session_id)
     assert (
         project_history(doc.messages, doc.tool_trail, frozenset(), None)["turns"][0]["answer"]

@@ -940,3 +940,25 @@ async def test_authorized_repair_cut_off_by_the_budget_is_reported_preempted(win
     else:
         assert outcome.status == "paused_budget_cap"
         assert not found
+
+
+async def test_the_runtime_budget_pause_is_not_reviewed_as_a_clarification():
+    """In the live battery both budget-cap pauses ("continue, refine, or stop?") were sent
+    to the clarification judge, rejected as process prompts, and shipped anyway marked
+    rejected. The runtime wrote that question, so there is nothing to review."""
+    rejecting = JudgeVerdict(approved=False, reviewed=True, violation="non_contextual_question",
+                             feedback="Do not ask whether to continue.")
+    judge = _ScriptedJudge([rejecting] * 3)
+    loop, store, events, _ = _build(
+        [ModelTurnResult(tool_calls=[_query("q1")]), ModelTurnResult(tool_calls=[_query("q2")])],
+        judge, mcp=_rows_mcp(2, 2),
+    )
+    loop._max_loop_iterations = 2
+    loop._max_budget_windows = 3
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="Department totals?")
+    assert outcome.status == "paused_budget_cap"
+    assert judge.calls_made == 0
+    assert outcome.review["status"] == "disabled"
+    assert _events(events, "loop_delivery_review")[-1]["reason"] == "runtime_pause"
+    state = (await store.get_or_create_session(SESSION_ID)).review_states.get("0", {})
+    assert not state.get("question_refusals")

@@ -809,20 +809,56 @@ def _validate_initialize_items(items: list[dict[str, Any]]) -> list[str]:
     return descriptions
 
 
+def _is_addition(item: dict[str, Any]) -> bool:
+    """A description without an id, sent after declaration: a requested part the model
+    missed. Items carrying an id are updates, whose echoed description is ignored."""
+    return "description" in item and "intent_id" not in item
+
+
+def _validate_added_items(items: list[dict[str, Any]]) -> list[str]:
+    """An added part starts pending, exactly like a declared one."""
+    for item in items:
+        if item.get("status", "pending") != "pending" or "result_id" in item or item.get("reuse_previous_result"):
+            raise _reject(
+                "invalid_status",
+                "a newly added intent starts pending. Add it with only a description, "
+                "then update it by the intent_id it is given.",
+            )
+    return _validate_initialize_items(items)
+
+
+def _added_intents(
+    intents: tuple[TrackedIntent, ...], descriptions: list[str]
+) -> tuple[TrackedIntent, ...]:
+    """Append parts the model missed at declaration. Existing intents are never removed
+    or rewritten, so this cannot drop a commitment; it only adds one."""
+    if not descriptions:
+        return intents
+    known = {" ".join(i.description.lower().split()): i.intent_id for i in intents}
+    for description in descriptions:
+        same = known.get(" ".join(description.lower().split()))
+        if same is not None:
+            raise _reject(
+                "second_initialize",
+                f"intent '{same}' already tracks that deliverable. Update it by "
+                "'intent_id' instead of declaring it again.",
+            )
+        known[" ".join(description.lower().split())] = ""
+    if len(intents) + len(descriptions) > MAX_INTENTS:
+        raise _reject(
+            "too_many_intents",
+            f"adding {len(descriptions)} intent(s) to the {len(intents)} declared would exceed "
+            f"the {MAX_INTENTS} that may be tracked. Track the distinct deliverables the user "
+            "asked for, not every sub-step.",
+        )
+    return (*intents, *(
+        TrackedIntent(intent_id=f"i{position}", description=description, status="pending")
+        for position, description in enumerate(descriptions, start=len(intents) + 1)
+    ))
+
+
 def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Validate required update information, ignoring extras and frozen descriptions."""
-    # A payload shaped ENTIRELY like an initialize (descriptions, no ids) sent
-    # while a live state exists is a RE-DECLARATION attempt, not a botched update.
-    # Both are rejected either way, but "you already declared these, update them by
-    # id" is the message that tells the model what to do next; falling through to
-    # the per-item description rule would say "cannot be rewritten" about a
-    # description it never sent.
-    if all("description" in item and "intent_id" not in item for item in items):
-        raise _reject(
-            "second_initialize",
-            "the intents for this question are already declared and cannot be "
-            "re-declared. Update them by 'intent_id' instead.",
-        )
     seen_ids: set[str] = set()
     validated: list[dict[str, Any]] = []
     for item in items:
@@ -832,7 +868,8 @@ def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(intent_id, str) or not intent_id.strip():
             raise _reject(
                 "missing_intent_id",
-                "every update needs the 'intent_id' of an intent you already declared.",
+                "every update needs the 'intent_id' of an intent you already declared. "
+                "To add a requested part you did not declare, send only its 'description'.",
             )
         intent_id = intent_id.strip()
         if intent_id in seen_ids:
@@ -864,17 +901,59 @@ def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return validated
 
 
-def previous_result_reference(source, turn_index, scope_hash):
-    """Shared fail-closed authorization and lineage for historical result bindings."""
+def excluded_result_ids(doc, turn_index):
+    """Protect this turn's omissions, including aliases; later turns may reconsider."""
+    excluded = {
+        component["result_id"]
+        for state in [doc.review_states.get(str(turn_index), {})]
+        for component in state.get("excluded_components", [])
+        if component.get("result_id")
+    }
+    # Closing both directions prevents an excluded alias resurrecting its origin.
+    changed = True
+    while changed:
+        before = len(excluded)
+        for entry in doc.tool_trail:
+            origin = (entry.model_response or {}).get("reused_from_result_id")
+            if origin and (origin in excluded or entry.tool_call_id in excluded):
+                excluded.update((origin, entry.tool_call_id))
+        changed = len(excluded) != before
+    return frozenset(excluded)
+
+
+def _validate_previous_result(source, turn_index, scope_hash, *, allow_reference=False):
     if (source is None or source.turn_index >= turn_index or source.status != "ok"
             or source.error_code or source.tool_name not in {"runQuery", "runBlueprint"}
             or source.provenance is None or not source.ts
             or source.result_preview is None
             or source.tool_name == "runBlueprint" and not source.authoritative
             or not scope_hash or (source.model_response or {}).get("scope_hash") != scope_hash
-            or (source.model_response or {}).get("reused_from_result_id")
+            or not allow_reference and (source.model_response or {}).get("reused_from_result_id")
             or any(table.split(".", 1)[0] in scratch_databases() for table, _ in source.provenance)):
         raise _reject("unresolved_evidence", "That prior result is not an eligible successful snapshot under the current scope. Use a fresh authorized query; failed, unknown-scope, scratch and unverified blueprint results cannot be reused.")
+
+
+def resolve_previous_result(source, trail, turn_index, scope_hash):
+    """Resolve aliases using only the caller's authorized, exclusion-filtered trail.
+
+    Validate every link and require strictly older origins. Never promote an alias's
+    copied rows when the real execution receipt is missing or no longer eligible.
+    """
+    by_id = {entry.tool_call_id: entry for entry in trail}
+    while True:
+        _validate_previous_result(source, turn_index, scope_hash, allow_reference=True)
+        origin_id = (source.model_response or {}).get("reused_from_result_id")
+        if not origin_id:
+            return source
+        origin = by_id.get(origin_id)
+        if origin is None or origin.turn_index >= source.turn_index:
+            raise _reject("unresolved_evidence", "The reused result has no eligible earlier execution receipt. Use the original authorized result or run a fresh query.")
+        source = origin
+
+
+def previous_result_reference(source, turn_index, scope_hash):
+    """Shared fail-closed authorization and lineage for historical result bindings."""
+    _validate_previous_result(source, turn_index, scope_hash)
     source_id = source.tool_call_id
     reference_id = "reused_" + hashlib.sha256(f"{turn_index}:{source_id}".encode()).hexdigest()[:24]
     return replace(
@@ -906,6 +985,7 @@ def _prepare_previous_result_reuse(updates, trail, turn_index, live, scope_hash)
             raise _reject("unresolved_evidence", "Prior snapshots may explicitly complete a declared intent; they cannot establish a current blocked condition.")
         source_id = update.get("evidence_tool_call_id")
         source = next((entry for entry in trail if entry.tool_call_id == source_id), None)
+        source = resolve_previous_result(source, trail, turn_index, scope_hash)
         reference = previous_result_reference(source, turn_index, scope_hash)
         reference_id = reference.tool_call_id
         if not any(e.tool_call_id == reference_id for e in (*trail, *receipts)):
@@ -981,7 +1061,7 @@ def _bind_evidence_against_trail(
                 if reason_code is None:
                     raise _reject(
                         "unresolved_evidence",
-                        "This result does not establish a blocked intent. Scope refusal receipts support OUT_OF_SCOPE_REQUEST; permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED, SOURCE_UNAVAILABLE or TOOL_CALL_TIMEOUT supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
+                        "This result does not establish a blocked intent. Scope refusal receipts support OUT_OF_SCOPE_REQUEST; configured deployment limitations support NOT_SUPPORTED_HERE; permissions denials support NO_ACCESS; SQL_REPAIR_EXHAUSTED, SOURCE_UNAVAILABLE, TOOL_CALL_TIMEOUT or a Help Center outage supports EXECUTION_FAILED. Other SQL errors need a corrected approach, not a claim that data is absent. Bind the exact failed result_id only after receiving its receipt.",
                     )
             tool_call_id, binding = explicit, EVIDENCE_BINDING_TAGGED
         else:
@@ -1317,8 +1397,13 @@ class UpdateAnalysisStateTool(RuntimeToolBase):
         """UPDATE — batched by design: several intents per call. Load-bearing, since one call
         per intent would reintroduce exactly the bookkeeping overhead this trim removes.
         """
-        updates = _validate_update_items(items)
-        receipts = _prepare_previous_result_reuse(updates, trail, turn_index, live, scope_hash)
+        added = _validate_added_items([item for item in items if _is_addition(item)])
+        rest = [item for item in items if not _is_addition(item)]
+        updates = _validate_update_items(rest) if rest else []
+        doc = await self._session_store.get_or_create_session(session_id)
+        excluded = excluded_result_ids(doc, turn_index)
+        reusable_trail = [entry for entry in trail if entry.tool_call_id not in excluded]
+        receipts = _prepare_previous_result_reuse(updates, reusable_trail, turn_index, live, scope_hash)
         trail = [*trail, *receipts]
         # Resolves the evidence INTO `updates` (and refuses what cannot be bound),
         # so everything downstream — the merge, 04 §B.3's distinctness check, the
@@ -1348,11 +1433,16 @@ class UpdateAnalysisStateTool(RuntimeToolBase):
                     "unknown_intent_id",
                     "there are no declared intents to update — declare them first.",
                 )
-            merged = _merged_intents(current, updates)
+            merged = _added_intents(_merged_intents(current, updates), added)
             _check_block_evidence_distinct(merged)
             return AnalysisState(turn_index=turn_index, intents=merged)
 
         state = await self._session_store.apply_analysis_state(session_id, turn_index, _merge)
+        if added:
+            self._observer(
+                "loop_analysis_state_intents_added",
+                {"intent_count": len(added), "turn_index": turn_index},
+            )
         # AFTER the write, never before: the merge can still refuse (an unknown id,
         # 04 §B.3's distinctness rule), and an `loop_analysis_state_auto_bound` for a
         # binding that was rolled back would make the backstop look busier than it

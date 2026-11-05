@@ -63,7 +63,7 @@ async def _call(judge, messages, name, schema):
             if name == "salvageAnswer":
                 # The recovery model is shown the rendered document; a chart section
                 # copied from it is returned to proposal form before validation.
-                args, mapped = proposal_from_rendered(normalize_answer_arguments(args))
+                args, mapped = proposal_from_rendered(normalize_answer_arguments(args, schema["properties"]))
                 if mapped and span is not None:
                     span.set_attribute("recovery_fields_mapped", mapped)
             Draft202012Validator(schema).validate(args)
@@ -139,9 +139,16 @@ def _retry_reason(exc):
 
 async def salvage(judge, brief):
     from data_agent.runtime.composer.components import restrict_schema, component_guidance
+    from .measurement_repair import REASSESSMENT_SCHEMA, unresolved_measurement
+
     schema = restrict_schema(RECOVERY_SCHEMA)
+    schema["properties"]["measurement_reassessments"] = REASSESSMENT_SCHEMA
     schema["properties"]["unfinished"].pop("minItems", None)
-    schema["properties"]["outcome"] = {"type": "string", "enum": ["full", "partial", "none"]}
+    schema["properties"]["outcome"] = {
+        "type": "string", "enum": ["full", "partial", "none"],
+        "description": "Make the lists match the outcome: " + "; ".join(rule for _, _, rule in _OUTCOME_LISTS)
+        + ". A limitation with no supporting evidence is outcome=none: state it in the takeaway and leave sections empty.",
+    }
     schema["required"].append("outcome")
     schema["allOf"] = [
         {"if": {"properties": {"outcome": {"const": outcome}}}, "then": {"properties": lists}}
@@ -169,6 +176,10 @@ async def salvage(judge, brief):
         "work in business terms, such as: The approved leave total could not be verified. "
         "Do not expose SQL, predicates or physical column names from rejection feedback. A schema-correction "
         "retry can repair this recovery response, but cannot create missing execution evidence. "
+        "Historical result references are candidates, not proof of the current request. "
+        "Use them only when their original period, population and measure answer it; "
+        "preserve their retrieval-time qualification and never present them as refreshed. "
+        "A request for new or current data cannot be satisfied merely by an older snapshot. "
         "Use only supplied evidence and selected_components; no new queries. Use the same "
         "presentation selectors as finalizeAnswer, including figures, bars and line charts. "
         "The UI fetches rows from the selected SQL; do not invent or aggregate cells. "
@@ -180,11 +191,12 @@ async def salvage(judge, brief):
         "An explained backend fallback is not itself a partial answer. "
         "Preview truncation is not a chart-size limit: the UI fetches the saved result and handles display fallback. "
         "None requires empty evidence and sections and an honest limitation. Never manufacture "
-        "a gap for a scope caveat or wording repair. Respect previous_rejection: do not approve "
-        "a rejected population/metric just by adding a caveat. If the correct result is already "
+        "a gap for a scope caveat or wording repair. Recheck previous_rejection against the executed SQL and "
+        "bound slots; do not repeat a coverage limitation whose premise those receipts directly disprove. "
+        "Do not approve a genuinely rejected population/metric just by adding a caveat. If the correct result is already "
         "available, select it. A direct sum of payroll and timecard earnings without verified lifecycle overlap handling is not a supported combined measure: omit that value and its column from the takeaway and presentation, even if SQL returned it. Preserve only separate supported subtotals and mark the combined outcome unfinished. A caveat cannot repair an invalid measurement. Put genuinely unfinished portions in unfinished only; the runtime "
         "appends them to the takeaway, so do not repeat them in takeaway, sections or caveats. Use one short business-language reason per missing outcome, scoped to checked records. Prefer one "
-        "coherent answer and at most one visible table; extra tables need table_reason. "
+        "coherent answer and at most one visible table; with two or more, every table section needs table_reason, the first included. "
         "State each qualification once; consolidate paraphrases without dropping distinct scope or limitations. "
         "Review titles, explanations, caveats, actions and presentation together. Return only "
         "the declared fields. Comparison bars require kind, result_id, category_column, "
@@ -195,7 +207,15 @@ async def salvage(judge, brief):
     async def attempts():
         for attempt in range(2):
             try:
-                return await _call(judge, messages, "salvageAnswer", schema)
+                response = await _call(judge, messages, "salvageAnswer", schema)
+                unresolved = unresolved_measurement(brief, response, response.get("measurement_reassessments", ()))
+                if unresolved:
+                    raise PresentationError(
+                        f"Recovery still selects {', '.join(json.dumps(ref) for ref in unresolved[1])}, a result "
+                        "rejected for its measurement. Select the corrected execution and update the claims, or "
+                        "explicitly reassess that result in measurement_reassessments."
+                    )
+                return response
             except (ValidationError, PresentationError) as exc:
                 if attempt:
                     raise
@@ -214,8 +234,8 @@ async def approve_presentation_fallback(judge, brief):
     messages = judge.messages_for(brief)
     messages[0]["content"] += (
         "\nFALLBACK REVIEW overrides the verdict format. Review the exact materialized "
-        "answer_document, including the backend's reason for showing a table instead of "
-        "a requested visual. Approve when the findings, scope, sources and caveats are "
+        "answer_document and presentation_fallbacks, the backend's reason for showing a table "
+        "instead of a requested visual. Approve when the findings, scope, sources and caveats are "
         "supported. A chart datatype/completeness limitation alone is not grounds for "
         "rejection. Do not propose queries, repairs, or a different document. Return "
         "approvePresentationFallback with approved=true or false."

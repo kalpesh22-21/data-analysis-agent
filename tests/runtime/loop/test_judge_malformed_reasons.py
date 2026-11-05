@@ -199,3 +199,31 @@ def test_a_salvage_outcome_mismatch_is_explained_in_words() -> None:
     reason = _retry_reason(error)
     assert "outcome=full needs unfinished=[]" in reason
     assert "allOf" not in reason
+
+
+
+def test_a_chart_correction_with_json_encoded_sections_is_mapped_back_too():
+    """Rendered names were mapped back before encoded arrays were decoded, so the same
+    correction applied as an array and was discarded as a JSON-encoded string."""
+    import json
+
+    rendered = {"kind": "bars", "result_id": "c1", "x_column": "Department", "y_column": "Headcount",
+                "label": "Headcount", "ranking": {"direction": "descending", "ties": "dense"}}
+    section = {**DOCUMENT["sections"][0], "evidence_refs": ["c1"], "presentation": rendered}
+    for sections in ([section], json.dumps([section])):
+        document = {**DOCUMENT, "sections": sections, "evidence": ["c1"]}
+        reading = _read_verdict(_turn({**APPROVE_DOCUMENT, "corrected_document": document}), "exit_table")
+        assert reading.malformed_reason is None, sections
+        assert reading.verdict.corrected_document["sections"][0]["presentation"]["category_column"] == "Department"
+
+
+def test_a_partial_answer_keeps_its_unfinished_list_through_decoding():
+    import json
+
+    partial = {"takeaway": "Partial.", "evidence": ["c1"], "unfinished": ["The ranking."],
+               "sections": json.dumps([{**DOCUMENT["sections"][0], "evidence_refs": ["c1"],
+                                        "presentation": {"kind": "bars", "result_id": "c1", "x_column": "Dept",
+                                                         "y_column": "Headcount", "label": "Headcount"}}])}
+    verdict = parse_verdict(_turn({**REJECTION, "partial_answer": partial}), "exit_table")
+    assert verdict.partial_answer["unfinished"] == ["The ranking."]
+    assert verdict.partial_answer["sections"][0]["presentation"]["category_column"] == "Dept"

@@ -110,9 +110,13 @@ def materialize(case, *, count=4, numeric_strings=False, reverse=False, null_mea
                                   provenance=frozenset(), args={'sql': 'SELECT synthetic_audit'}, ts='2026-10-29T00:00:00Z', retrieved_at=None, freshness=None,
                                   result_preview=ResultPreview(columns=columns, row_count=count+1 if truncated else count,
                                                                truncated=truncated, preview_rows=rows))
-        document = build_document(normalized, [receipt], turn_index=0)
+        fallbacks = []
+        document = build_document(normalized, [receipt], turn_index=0, fallbacks=fallbacks)
         section = document['sections'][0]
-        return {'rendered': section['presentation']['kind'], 'reasons': section['caveats'], 'document': document}
+        # The user-facing notice first, then the backend reason review receives.
+        reasons = [*([section['explanation']] if section.get('explanation') else []),
+                   *section['caveats'], *(f['reason'] for f in fallbacks)]
+        return {'rendered': section['presentation']['kind'], 'reasons': reasons, 'document': document}
     except PresentationError as exc:
         return {'rendered': 'rejected', 'reasons': [str(exc)]}
     finally:

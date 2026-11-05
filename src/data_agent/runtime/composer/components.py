@@ -171,11 +171,11 @@ def component_guidance():
         )
     if "stacked_bars" in available:
         notes.append(
-            "Stacked bars require additive=true: measures must be disjoint additive components of the same total, never rates, overlapping counts or a total plus its parts."
+            'Stacked bars require "additive": true (a JSON boolean, not a string): measures must be disjoint additive components of the same total, never rates, overlapping counts or a total plus its parts.'
         )
     if "donut" in available:
         notes.append(
-            "Donut requires composition=true, category_column and measure_column: exhaustive mutually exclusive parts of the stated whole, nonnegative additive values. Never use a truncated top-N or rates as shares; Other must be computed in SQL."
+            'Donut requires "composition": true (a JSON boolean, not a string), category_column and measure_column: exhaustive mutually exclusive parts of the stated whole, nonnegative additive values. Never use a truncated top-N or rates as shares; Other must be computed in SQL.'
         )
     if "heatmap" in available:
         notes.append(

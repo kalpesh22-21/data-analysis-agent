@@ -332,14 +332,22 @@ async def test_assumptions_survive_live_document_and_existing_history():
     assert history["turns"][0]["assumptions"] == ["Only accessible records are included."]
 
 
-@pytest.mark.parametrize("field", ["actions", "caveats", "evidence_refs"])
-def test_missing_section_field_feedback_identifies_the_repair(field):
+def test_missing_section_field_feedback_identifies_the_repair():
     proposed = section()
-    proposed.pop(field)
+    proposed.pop("evidence_refs")
     with pytest.raises(
-        PresentationError, match=f"sections.0: missing required field\\(s\\): {field}"
+        PresentationError, match="sections.0: missing required field\\(s\\): evidence_refs"
     ):
         proposal_to_internal({"takeaway": "Employee counts.", "sections": [proposed]})
+
+
+@pytest.mark.parametrize("field", ["actions", "caveats"])
+def test_a_missing_caveats_or_actions_list_means_none(field):
+    """Absence and [] mean the same thing (issues #11, #34), so absence is not a repair."""
+    proposed = section()
+    proposed.pop(field)
+    assert proposal_to_internal({"takeaway": "Employee counts.", "sections": [proposed]})["sections"][0][field] == []
+    assert field not in proposed
 
 
 @pytest.mark.parametrize("kind", ["bars", "line"])
@@ -634,3 +642,50 @@ async def test_blueprint_followup_preserves_saved_sql_and_uses_normal_judge():
     source = next(iter(second.answer_document["sources"].values()))
     assert source["sql"] == SQL
     assert source["retrieved_at"] == first.answer_document["sources"]["q"]["retrieved_at"]
+
+
+
+async def test_an_explicitly_reused_blueprint_result_keeps_its_sql_at_finalization():
+    """updateAnalysisState(reuse_previous_result=true) bound an earlier blueprint result into
+    the turn; finalization then could not find its SQL ("needs its exact executed SQL"), the
+    model read that as a request to disclose SQL, repairs failed and salvage answered."""
+    import hashlib
+    from dataclasses import replace
+
+    from tests.runtime.test_harness_improvements import SQL, Tool
+
+    class Blueprint(Tool):
+        calls = 0
+
+        async def run(self, *args, **kwargs):
+            self.calls += 1
+            value = {
+                "status": "verified", "blueprint_id": "bp", "terminal_sql": SQL,
+                "verify": {"grain_ok": True, "signature_ok": True, "grain_checked": True},
+                "columns": ["Department", "n"], "rows": [["Sales", 120]],
+                "row_count": 1, "truncated": False,
+            }
+            return replace(await Tool("runBlueprint", value).run(), authoritative=True)
+
+    blueprint = Blueprint("runBlueprint")
+    reference = "reused_" + hashlib.sha256(b"1:q").hexdigest()[:24]
+    shown = {**section("bars", category_column="Department", measure_column="n", label="Employees"),
+             "evidence_refs": [reference]}
+    shown["presentation"] = {**shown["presentation"], "result_id": reference}
+    loop, store, _, _, _ = build([
+        batch(call("getBlueprint", "g", id="bp")),
+        batch(call("runBlueprint", "q", id="bp", slot_bindings={})),
+        final(section()),
+        batch(call("updateAnalysisState", "declare", intents=[{"description": "Show the earlier breakdown"}])),
+        batch(call("updateAnalysisState", "reuse", intents=[
+            {"intent_id": "i1", "status": "completed", "result_id": "q", "reuse_previous_result": True}])),
+        batch(call("finalizeAnswer", "followup", takeaway="Employees by department.",
+                   sections=[shown], evidence=[reference])),
+    ], Judge(), extra={"getBlueprint": Tool("getBlueprint", {"found": True}), "runBlueprint": blueprint})
+    await run(loop)
+    second = await run(loop, "Show that same breakdown as bars.")
+    assert second.review["status"] == "approved" and second.review["attempts"] == 1
+    assert blueprint.calls == 1
+    assert second.answer_document["sources"][reference]["sql"] == SQL
+    doc = await store.get_or_create_session(CREDS.session_id)
+    assert not [e for e in doc.tool_trail if e.turn_index == 1 and e.status != "ok"]

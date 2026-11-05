@@ -216,8 +216,8 @@ async def test_two_answers_in_one_batch_are_refused_twice_and_spend_one_block() 
 async def test_dropping_the_hard_intent_does_not_let_the_turn_finalize() -> None:
     """03 §C.4 end-to-end: merge-by-id means an intent the model simply stops
     mentioning KEEPS its disposition — there is no "full replace" shape to shorten
-    — and a re-declaration is rejected outright. Either way the turn is still
-    refused for the intent it tried to drop."""
+    — and a re-declaration can only ADD an intent beside it, never replace it.
+    Either way the turn is still refused for the intent it tried to drop."""
     loop, store, events, _ = _build(
         [
             ModelTurnResult(
@@ -257,14 +257,12 @@ async def test_dropping_the_hard_intent_does_not_let_the_turn_finalize() -> None
     doc = await store.get_or_create_session(SESSION_ID)
     state = live_analysis_state(doc, 0)
     # The dropped intent survives, with its ORIGINAL description.
-    assert [i.intent_id for i in state.intents] == ["i1", "i2"]
+    assert [i.intent_id for i in state.intents] == ["i1", "i2", "i3"]
     assert state.intents[1].description == ATTRITION
-    # The re-declaration was rejected, not applied.
+    # The "re-declaration" was added as one more intent, replacing nothing.
     redeclare = next(e for e in doc.tool_trail if e.tool_call_id == "s3")
-    assert redeclare.error_code == ANALYSIS_STATE_INVALID_CODE
-    assert ("loop_analysis_state_rejected", {"reason": "second_initialize", "intent_count": 1}) in (
-        events
-    )
+    assert redeclare.error_code is None
+    assert state.intents[2].description == "just the headcount"
     # And the finalization was refused for exactly the intent it tried to drop.
     refusal = next(e for e in doc.tool_trail if e.tool_call_id == "a1")
     assert refusal.status == "ok"
@@ -274,7 +272,8 @@ async def test_dropping_the_hard_intent_does_not_let_the_turn_finalize() -> None
         outcome.assistant_text
         == "I could not verify every requested part from the available evidence."
     )
-    assert _events(events, "loop_enforcement_exhausted") == [{"intent_count": 1}]
+    # Both the dropped intent and the one it added are unresolved.
+    assert _events(events, "loop_enforcement_exhausted") == [{"intent_count": 2}]
 
 
 async def test_completing_an_intent_on_a_search_result_is_rejected_and_still_refused() -> None:

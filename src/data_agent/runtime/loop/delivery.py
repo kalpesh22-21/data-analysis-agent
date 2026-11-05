@@ -110,6 +110,43 @@ def delivery_boundary(method):
     return wrapped
 
 
+async def _guard_measurement(loop, brief, verdict, remaining, per_call):
+    """Withhold an approval that still selects a result rejected for its measurement.
+
+    The judge is asked once whether it meant to reassess that result, so a mistaken
+    rejection can still be reversed; only a reasoned reassessment or a corrected binding
+    clears it. Without that answer the override stands.
+    """
+    import asyncio
+
+    from .measurement_repair import guard_measurement_approval
+
+    checked = guard_measurement_approval(verdict, brief)
+    if checked is verdict:
+        return verdict
+    stale, status = checked.result_ids, "skipped"
+    if remaining > 0:
+        try:
+            second = await asyncio.wait_for(
+                loop._answer_judge.review(replace(brief, measurement_recheck=stale)),
+                timeout=min(remaining, per_call),
+            )
+        except Exception:
+            second = None
+        if second is None or not second.reviewed:
+            status = "unavailable"
+        elif not second.approved:
+            status, checked = "rejected", second
+        else:
+            rechecked = guard_measurement_approval(second, brief)
+            status = "cleared" if rechecked is second else "overridden"
+            checked = rechecked
+    loop._observer("loop_answer_judge_measurement_override", {
+        "site": brief.site, "status": status, "result_count": len(stale),
+    })
+    return checked
+
+
 async def review_once(loop, brief, *, repair=False, terminal=False):
     loop._observer("loop_presentation_review_started", {
         "phase": "checking_information_need" if brief.site == "ask_user" else "checking_answer"
@@ -163,7 +200,9 @@ async def review_once(loop, brief, *, repair=False, terminal=False):
                 raise TimeoutError("Judge review timed out")
         if context and verdict.approved and not verdict.reviewed:
             context.review_failure_reason = verdict.failure_reason or "unreviewed"
-        return verdict
+        return await _guard_measurement(
+            loop, brief, verdict, available - (time.monotonic() - started), per_call
+        )
     except Exception as exc:
         if context:
             context.review_failure_reason = (
@@ -288,6 +327,13 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
     state = ReviewState.restore(
         doc.review_states.get(str(turn_index)), compute_scope_hash(context.credentials.column_scope)
     )
+    if checkpoint is not None and checkpoint.reason == "budget_cap":
+        # The runtime wrote this pause ("continue, refine, or stop?"), not the model:
+        # there is no clarification to review, and a rejection could not stop it
+        # shipping. Nothing is recorded, so it cannot read as a refused question later.
+        _observe_delivery_review(loop, context, state, site=site, status="disabled",
+                                 reason="runtime_pause")
+        return envelope("disabled"), False
     version = delivery_version(text, accum, pending) if pending else answer_version(
         text, accum, doc.tool_trail, turn_index, state.scope_hash, state.approved_evidence
     )
@@ -348,7 +394,10 @@ async def review_delivery(loop, session_id, turn_index, text, accum, checkpoint)
                 pending_question=(pending or {}).get("question", ""),
                 pending_options=tuple((pending or {}).get("options") or ()),
             )
-            brief = replace(brief, clarification_answers=tuple(questions[1:]))
+            from .measurement_repair import pending_measurement_rejections
+
+            brief = replace(brief, clarification_answers=tuple(questions[1:]),
+                            measurement_rejections=pending_measurement_rejections(state))
             from .judge_evidence import enrich_brief
 
             brief = await enrich_brief(

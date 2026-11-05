@@ -32,6 +32,7 @@ class ReviewState:
     violation: str = ""
     site: str = "exit_prose"
     feedback: str = ""
+    rejection_history: tuple[dict[str, Any], ...] = ()
     measured_population: str = ""
     required_population: str = ""
     intent_id: str = ""
@@ -52,6 +53,7 @@ class ReviewState:
         if not isinstance(value, dict):
             return cls(scope_hash=scope_hash)
         state = cls(**{k: v for k, v in value.items() if k in cls.__dataclass_fields__})
+        state.rejection_history = tuple(state.rejection_history)
         state.excluded_components = tuple(state.excluded_components)
         state.result_ids = tuple(state.result_ids)
         state.approved_evidence = tuple(state.approved_evidence)
@@ -68,6 +70,7 @@ class ReviewState:
             state.approved_partial = {}
             state.repair_pending = False
             state.feedback = ""
+            state.rejection_history = ()
             state.measured_population = ""
             state.required_population = ""
             state.result_ids = ()
@@ -78,6 +81,10 @@ class ReviewState:
     def reject(self, verdict: JudgeVerdict, version: str, assumptions=()) -> None:
         if not self.violation:
             self.assumptions_before_refusal = tuple(assumptions or ())
+        record = {"violation": verdict.violation, "feedback": verdict.feedback,
+                  "result_ids": list(verdict.result_ids), "repair_type": verdict.repair_type}
+        if record not in self.rejection_history:
+            self.rejection_history = (*self.rejection_history, record)
         self.violation, self.feedback = verdict.violation, verdict.feedback
         self.measured_population = verdict.measured_population
         self.required_population = verdict.required_population

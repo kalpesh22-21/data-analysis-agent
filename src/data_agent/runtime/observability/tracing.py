@@ -741,6 +741,9 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "table_count",
     "blueprint_table_count",
     "verified_table_count",
+    # `loop_recovery_history_bound.result_count` — how many earlier results recovery
+    # offered salvage; a count only, never their IDs or SQL.
+    "result_count",
     # --- the answer-shape gate (05 §J) ---
     # `loop_answer_shape_refused.multi_row_calls` — how many successful multi-row
     # `runQuery`/`runBlueprint` calls the turn was holding when it tried to finish in

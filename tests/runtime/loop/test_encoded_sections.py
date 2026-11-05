@@ -54,7 +54,8 @@ def test_normalization_does_not_parse_prose_nested_or_derived_fields():
     raw = {'takeaway': '[]', 'sections': '[{"title":"[]","caveats":"[]"}]',
            'tables': '[]', 'deliverables': '[]'}
     result = normalize_answer_arguments(raw)
-    assert result['sections'] == [{'title': '[]', 'caveats': '[]'}]
+    # Nested text stays text; only the missing actions list is filled in.
+    assert result['sections'] == [{'title': '[]', 'caveats': '[]', 'actions': []}]
     assert result['takeaway'] == result['tables'] == result['deliverables'] == '[]'
 
 

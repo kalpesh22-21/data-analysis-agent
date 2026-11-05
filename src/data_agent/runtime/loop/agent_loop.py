@@ -42,6 +42,9 @@ from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_answer_prose
+from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.capabilities.preparation import PreparationCache
 from data_agent.runtime.composer.components import (
     DEFAULT_COMPONENTS,
     component_guidance,
@@ -49,9 +52,6 @@ from data_agent.runtime.composer.components import (
     restrict_schema,
     validate_components,
 )
-from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_answer_prose
-from data_agent.runtime.auth.credentials import RuntimeCredentials
-from data_agent.runtime.capabilities.preparation import PreparationCache
 from data_agent.runtime.composite.analysis_state import (
     MAX_STATE_CALLS,
     split_serves_intent,
@@ -73,7 +73,10 @@ from data_agent.runtime.composite.answer_with_table import (
     terminal_sql_by_id,
 )
 from data_agent.runtime.composite.answer_with_text import TOOL_NAME as ANSWER_TEXT_TOOL_NAME
-from data_agent.runtime.composite.record_assumptions import fold_assumptions
+from data_agent.runtime.composite.record_assumptions import (
+    TOOL_NAME as RECORD_ASSUMPTIONS_TOOL_NAME,
+)
+from data_agent.runtime.composite.record_assumptions import fold_assumptions, writes_assumptions
 from data_agent.runtime.composite.scope_refusal import scope_request_refused
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
@@ -197,6 +200,7 @@ from .loop_safety import (
     NO_PROGRESS_TEXT,
     LoopSafety,
 )
+from .measurement_repair import pending_measurement_rejections
 from .proposal import SUPPORTING_LOOKUP_TOOLS, ReviewState, assess_deliverable_evidence, fingerprint
 from .read_guard import ReadGuard, repeated_read_guard_event
 from .turn_accumulators import (
@@ -586,17 +590,31 @@ class _CanonicalRequest:
 ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE = "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
 
 
-def _answer_table_result_invalid(result_id: str, available: Sequence[str]) -> ToolResult:
-    detail = (
-        f"Table result_id '{result_id}' does not identify an accessible, successful "
-        "warehouse execution from this turn. Discovery and capability preparation "
-        "results cannot be displayed as warehouse tables. Select an existing runQuery "
-        "or verified runBlueprint result_id; put prepared UI options in section actions. "
-        "This is a presentation repair: do not rerun completed analysis or pass a "
-        "result_id to runBlueprint. Available table result IDs: "
-        + json.dumps(list(available))
-        + ". Correct the table and evidence references, then call finalizeAnswer again."
-    )
+def _answer_table_result_invalid(
+    result_id: str, available: Sequence[str], *, earlier_turn: bool = False
+) -> ToolResult:
+    if earlier_turn:
+        # An eligible earlier result is bound automatically (historical_evidence), so one
+        # that reaches here cannot be reused: say so instead of "do not rerun".
+        detail = (
+            f"Table result_id '{result_id}' is a result from an earlier turn that cannot be "
+            "reused here: its answer was not delivered, it did not succeed, it is not a "
+            "verified warehouse result, or its access scope has changed. If one of this turn's "
+            "results below is the one you mean, select it instead of rerunning; otherwise run "
+            "that query again in this turn, then call finalizeAnswer with the new result_id. "
+            "Available table result IDs: " + json.dumps(list(available)) + "."
+        )
+    else:
+        detail = (
+            f"Table result_id '{result_id}' does not identify an accessible, successful "
+            "warehouse execution from this turn. Discovery and capability preparation "
+            "results cannot be displayed as warehouse tables. Select an existing runQuery "
+            "or verified runBlueprint result_id; put prepared UI options in section actions. "
+            "This is a presentation repair: do not rerun completed analysis or pass a "
+            "result_id to runBlueprint. Available table result IDs: "
+            + json.dumps(list(available))
+            + ". Correct the table and evidence references, then call finalizeAnswer again."
+        )
     return ToolResult(
         status="error",
         tool_name=ANSWER_TABLE_TOOL_NAME,
@@ -1534,9 +1552,36 @@ class AgentLoop:
             union.update(entry.provenance)
         return frozenset(union)
 
+    async def _record_corrected_assumptions(
+        self, session_id: str, turn_index: int, assumptions: Sequence[str] | None
+    ) -> None:
+        """Persist a judge correction's assumption list where resume and history read it.
+
+        The correction replaces the live list; without a trail write, resume and history
+        would rebuild the model's original list instead. Prior-turn `recordAssumptions`
+        entries are never replayed to the model, so this only reaches those readers.
+        """
+        await self._session_store.append_trail_entry(
+            session_id,
+            TrailEntry(
+                turn_index=turn_index,
+                tool_call_id=f"judge_assumptions_{turn_index}_{uuid.uuid4().hex[:12]}",
+                tool_name=RECORD_ASSUMPTIONS_TOOL_NAME,
+                args={"assumptions": list(assumptions or ())},
+                status="ok",
+                error_code=None,
+                provenance=frozenset(),
+                result_preview=None,
+                result_full_ref=None,
+                ts=_now_iso(),
+                model_response={"source": "answer_judge_correction"},
+            ),
+        )
+
     async def _compute_turn_assumptions(self, session_id: str, turn_index: int) -> list[str]:
         """Reconstruct the plain-English assumptions recorded at *turn_index* from the
-        latest successful `recordAssumptions` entry (normalized via the
+        latest successful assumption write — `recordAssumptions`, or finalizeAnswer carrying
+        `assumptions` (`writes_assumptions`) — normalized via the
         SAME `fold_assumptions` the loop and `session_history` use). Seeds a resumed
         window on BOTH resume paths, so assumptions recorded in an earlier window are not
         dropped and the live result matches what `project_history` reconstructs.
@@ -1547,7 +1592,7 @@ class AgentLoop:
             if (
                 entry.turn_index == turn_index
                 and entry.status == "ok"
-                and entry.tool_name == "recordAssumptions"
+                and writes_assumptions(entry.tool_name, entry.args)
             ):
                 fold_assumptions(gathered, entry.args.get("assumptions"))
         return gathered
@@ -2056,13 +2101,20 @@ class AgentLoop:
             )
             if e.tool_call_id not in exclude_result_ids
         ]
+        from data_agent.runtime.context.review_feedback import with_historical_feedback
+
+        # Feedback notes are for the judge to read only. The returned trail stays exactly
+        # as stored: approval fingerprints it, and delivery re-checks against the stored
+        # trail, so an annotated copy here withheld every approved answer that reused a
+        # previously rejected result.
+        annotated = with_historical_feedback(in_scope, doc, turn_index, column_scope)
         rendered = tuple(
             {
                 k: v
                 for k, v in render_entry(entry, self._preview_row_count).items()
                 if k != "model_response"
             }
-            for entry in in_scope
+            for entry in annotated
             if entry.turn_index == turn_index
             and entry.status == "ok"
             and (
@@ -2263,6 +2315,8 @@ class AgentLoop:
             ship_disposition = "decline_only"
         retained_assumption_count = None
         if assistant_text == HELP_UNAVAILABLE_TEXT:
+            # An approved decline already had this applied before its approval was bound,
+            # so this changes nothing then; without a review it is applied here.
             ship_disposition = "decline_only"
             accum.apply_ship_disposition(ship_disposition, ())
             retained_assumption_count = 0
@@ -2830,10 +2884,13 @@ class AgentLoop:
         }
         blueprint_runs = dict(blueprint_runs)
         result_runs: dict[str, BlueprintRun] = {}
+        earlier_results: set[str] = set()
         trail = await self._session_store.load_trail(session_id)
         for entry in scope_filter.filter_trail(
             trail, credentials.column_scope, current_turn_index=None
         ):
+            if entry.turn_index < turn_index:
+                earlier_results.add(entry.tool_call_id)
             if entry.turn_index != turn_index or entry.status != "ok":
                 continue
             if entry.tool_name == "runQuery" and isinstance(entry.args.get("sql"), str):
@@ -2857,7 +2914,10 @@ class AgentLoop:
             if isinstance(item, dict) and item.get("result_id"):
                 ref = item["result_id"]
                 if not isinstance(ref, str) or ref.strip() not in result_runs:
-                    return [], _answer_table_result_invalid(str(ref), list(result_runs)), True
+                    return [], _answer_table_result_invalid(
+                        str(ref), list(result_runs),
+                        earlier_turn=isinstance(ref, str) and ref.strip() in earlier_results,
+                    ), True
         blueprint_runs.update(result_runs)
         designation = resolve_designations(arguments, terminal_sql_by_id(blueprint_runs))
         # Read BEFORE anything is dropped. `designation.items` holds every entry that
@@ -3033,7 +3093,8 @@ class AgentLoop:
                     tool['description'] = (
                         'Propose one coherent answer with takeaway and ordered sections, exact execution result IDs and column names. '
                         'The UI fetches the selected result; never invent values. Every section requires id, evidence_refs, presentation, caveats and actions. '
-                        'Use [] for optional caveats/actions. Evidence-only results stay hidden. Prefer one visible table; extras require table_reason. '
+                        'Use [] for optional caveats/actions. Evidence-only results stay hidden. Prefer one visible table; with two or more, every table section, the first included, needs table_reason. '
+                        'Answer-level assumptions go in the top-level assumptions list (it replaces recordAssumptions), never in caveats. '
                         'Prepared actions need capability_ref. A presentation repair reuses existing correct results. '
                         + component_guidance()
                     )
@@ -3573,6 +3634,18 @@ class AgentLoop:
             other_calls = [
                 tc for tc in result.tool_calls if tc.name != UPDATE_ANALYSIS_STATE_TOOL_NAME
             ][: self._max_tool_calls_per_iteration]
+            # finalizeAnswer.assumptions is the answer's final word: a recordAssumptions call
+            # sent after the finalizer in the same response runs just before it instead, so
+            # the finalizer's list replaces it. Nothing else moves.
+            names = [tc.name for tc in other_calls]
+            if "finalizeAnswer" in names:
+                first = names.index("finalizeAnswer")
+                later = other_calls[first:]
+                other_calls = [
+                    *other_calls[:first],
+                    *(tc for tc in later if tc.name == RECORD_ASSUMPTIONS_TOOL_NAME),
+                    *(tc for tc in later if tc.name != RECORD_ASSUMPTIONS_TOOL_NAME),
+                ]
 
             # SCANNED OVER THE RAW LIST, for the same reason the state partition is
             # (03 §E.2): `other_calls` is TRUNCATED to
@@ -3725,9 +3798,20 @@ class AgentLoop:
                 if tool_call.name in {ANSWER_TABLE_TOOL_NAME, ANSWER_TEXT_TOOL_NAME}:
                     from .proposal import filter_excluded_components
 
-                    call_args = filter_excluded_components(
-                        call_args, review_state.excluded_components
-                    )
+                    excluded = list(review_state.excluded_components)
+                    if excluded:
+                        # An omitted reused result also excludes its original and other
+                        # copies: citing the original must be dropped silently, not bounce
+                        # back as an unbindable earlier-turn ID ("run that query again").
+                        from data_agent.runtime.composite.analysis_state import excluded_result_ids
+
+                        doc_now = await self._session_store.get_or_create_session(session_id)
+                        known = {c.get("result_id") for c in excluded}
+                        excluded += [
+                            {"result_id": rid, "kind": "result"}
+                            for rid in excluded_result_ids(doc_now, turn_index) - known
+                        ]
+                    call_args = filter_excluded_components(call_args, excluded)
                     if tool_call.name == ANSWER_TABLE_TOOL_NAME and call_args.get("tables") == []:
                         if not is_unified_finalizer:
                             self._observer("loop_answer_table_empty_designation", {})
@@ -4785,7 +4869,12 @@ class AgentLoop:
                 if help_grounding.needs_decline(
                     successful_text_evidence_tools, bool(accum.capability_cards)
                 ):
+                    # The reviewed candidate is the canned decline with no components. The
+                    # accumulator is NOT cleared here: a gate or the judge can still send the
+                    # model another round, which must keep its work. The disposition is applied
+                    # only once the decline is approved (and again in `_finish`, idempotently).
                     final_text = HELP_UNAVAILABLE_TEXT
+                    proposal_args = {**proposal_args, "sections": []}
                 component_catalog = selected_components(
                     proposal_args,
                     evidence_trail,
@@ -4804,7 +4893,7 @@ class AgentLoop:
                         **{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
                         **accum.result_sql_by_call_id,
                     },
-                ) if not evidence_error else None
+                ) if not evidence_error and final_text != HELP_UNAVAILABLE_TEXT else None
                 from data_agent.runtime.composer import PresentationError, build_document
                 from data_agent.runtime.provenance.answer_formats import cached_formats
 
@@ -4815,6 +4904,7 @@ class AgentLoop:
                                   for s in proposal_args.get("sections", [])},
                     )
                 accum.answer_document = None
+                presentation_fallbacks = []
                 try:
                     accum.answer_document = build_document(
                         {**proposal_args, "answer": final_text}, evidence_trail,
@@ -4824,6 +4914,7 @@ class AgentLoop:
                         format_overrides=cached_formats(evidence_trail, turn_index),
                         sql_by_id={**{key: run.terminal_sql for key, run in accum.blueprint_runs.items()},
                                    **accum.result_sql_by_call_id},
+                        fallbacks=presentation_fallbacks,
                     )
                 except PresentationError as exc:
                     evidence_complaints.append(str(exc))
@@ -5004,11 +5095,13 @@ class AgentLoop:
                                 guard_findings=editorial_findings,
                                 allow_partial_answer=True,
                                 previous_rejection=review_state.feedback or review_state.violation,
+                                measurement_rejections=pending_measurement_rejections(review_state),
                                 deliverables=tuple(deliverables),
                                 presentation_reasons=tuple(
                                     {"section_id": s["id"], "table_reason": s["table_reason"]}
                                     for s in proposal_args["sections"] if s.get("table_reason")
                                 ),
+                                presentation_fallbacks=tuple(presentation_fallbacks),
                                 selected_components=tuple(component_catalog),
                                 referenced_result_ids=evidence_assessment.references,
                                 capability_presented=tuple(
@@ -5060,6 +5153,7 @@ class AgentLoop:
                                 },
                             )
                             verdict = APPROVED
+                    corrected_assumptions = False
                     if verdict.reviewed and verdict.approved and verdict.corrected_document is not None:
                         from data_agent.runtime.composer import proposal_to_internal
 
@@ -5089,6 +5183,7 @@ class AgentLoop:
                             # No LLM-authored SQL or values: the normal materializer owns sources.
                             accum.answer_document = candidate
                             accum.replace_assumptions(assumptions or [])
+                            corrected_assumptions = "assumptions" in verdict.corrected_document
                             accum.select_answer_tables(tables)
                             accum.select_capabilities(corrected["capability_refs"])
                             proposal_args = corrected
@@ -5166,9 +5261,17 @@ class AgentLoop:
                         review_state.answer_version = version
                         review_state.approved_version = version
                         review_state.violation = ""
+                        if corrected_assumptions:
+                            # Persist only an approved correction: a rejected one never ships.
+                            await self._record_corrected_assumptions(
+                                session_id, turn_index, accum.assumptions
+                            )
                         ship_guard.note_approval()
                         from .approved_answer import approve_answer
 
+                        if final_text == HELP_UNAVAILABLE_TEXT:
+                            # Bind the approval to what ships: the decline, no components.
+                            accum.apply_ship_disposition("decline_only", ())
                         approve_answer(review_state, final_text, accum, in_scope, turn_index)
                     elif verdict.approved:
                         # An unavailable review is a disposition, never an approval.
@@ -5227,6 +5330,12 @@ class AgentLoop:
                                     "repair_type": verdict.repair_type,
                                 }
                             )
+                            if pending_measurement_rejections(review_state):
+                                finalization_nudge += (
+                                    " After correcting the query, use its returned result ID in finalizeAnswer evidence, "
+                                    "section evidence_refs, presentation selectors and deliverables. Update the takeaway "
+                                    "from that result. Running a corrected query does not update an older result ID."
+                                )
                             if omit_components(review_state, verdict, component_catalog):
                                 accum.exclude_components(review_state.excluded_components)
                                 finalization_nudge = omission_nudge(

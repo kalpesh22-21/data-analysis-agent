@@ -89,8 +89,10 @@ PRESENTATION_SCHEMA['properties'].update({
     'series': {'type': 'array', 'minItems': 2, 'maxItems': 4,
                'items': _object({'measure_column': ID, 'label': {**TEXT, 'minLength': 1}}, ['measure_column', 'label'])},
     'series_column': ID,
-    'composition': {'const': True, 'description': 'Exhaustive mutually exclusive additive parts of the stated whole; not top-N or rates.'},
-    'additive': {'const': True, 'description': 'Disjoint additive measures, not a total plus its components or rates.'},
+    # `type` before `const`: a quoted "true" then fails as a type error, which names the
+    # expected JSON type, rather than as an opaque const mismatch.
+    'composition': {'type': 'boolean', 'const': True, 'description': 'The JSON boolean true, never the string "true". Exhaustive mutually exclusive additive parts of the stated whole; not top-N or rates.'},
+    'additive': {'type': 'boolean', 'const': True, 'description': 'The JSON boolean true, never the string "true". Disjoint additive measures, not a total plus its components or rates.'},
 })
 for kind in ('multi_series_line', 'grouped_bars', 'stacked_bars', 'heatmap', 'donut'):
     fields = ['result_id', 'category_column', 'label']
@@ -121,10 +123,20 @@ SECTION_SCHEMA = _object(
             "maxItems": 8,
             "items": _object({"capability_ref": ID, "label": TEXT}, ["capability_ref", "label"]),
         },
-        "table_reason": {**TEXT, "description": "When the answer has two or more table presentations, every table requires a non-blank reason explaining its distinct requested purpose."},
+        "table_reason": {**TEXT, "description": "When the answer has two or more table presentations, every table section, the first included, requires a non-blank reason explaining its distinct requested purpose."},
     },
     ["id", "evidence_refs", "presentation", "caveats", "actions"],
 )
+ASSUMPTIONS = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "Optional. The plain-English interpretations behind this answer, one short sentence each, "
+        "in the user's terms; no SQL, codes or column names. When present it replaces the turn's "
+        "assumptions exactly as recordAssumptions does, and [] clears them; omit it to keep what "
+        "recordAssumptions recorded. They are shown with the answer: do not repeat them in caveats."
+    ),
+}
 PROPOSAL_SCHEMA = _object(
     {
         "takeaway": TEXT,
@@ -143,6 +155,7 @@ PROPOSAL_SCHEMA = _object(
                 ["intent_id", "answer", "result_ids"],
             ),
         },
+        "assumptions": ASSUMPTIONS,
     },
     ["takeaway", "sections"],
 )
@@ -179,11 +192,68 @@ RECOVERY_SCHEMA = _object(
 )
 
 
-def normalize_answer_arguments(raw):
+_EMPTY = (None, "", [], {})
+# Presentation flags whose only valid value is true. A quoted "true" can mean nothing
+# else, so it is read as true; any other value is left for the schema to reject.
+_TRUE_ONLY_FLAGS = ("composition", "additive")
+# Section lists where absence and [] mean the same thing.
+_SECTION_LISTS = ("caveats", "actions")
+# Undeclared answer-level fields models invent that never carry answer content
+# (`sections_note`: "ok", "na", "omit", "single section"). Dropped whatever their value;
+# any other undeclared field is still rejected by name, so real content such as
+# top-level caveats is never lost silently. Add a name only when its values are junk.
+_JUNK_ANSWER_FIELDS = frozenset({"sections_note"})
+
+
+def _drop_empty(obj, declared, *, any_field=False, keep=(), junk=frozenset()):
+    """Drop an empty (null, "", [] or {}) undeclared field, or any empty field with
+    `any_field`, and any undeclared field named in `junk`. A declared null stays: an
+    explicit null `evidence` is not an absent one. Returns `obj` itself when nothing
+    is dropped."""
+    drop = [
+        key for key, value in obj.items()
+        if key not in keep and (
+            (any_field or key not in declared) and value in _EMPTY
+            or key in junk and key not in declared
+        )
+    ]
+    return {key: value for key, value in obj.items() if key not in drop} if drop else obj
+
+
+def _normalize_section(section):
+    if not isinstance(section, dict):
+        return section
+    out = _drop_empty(section, SECTION_SCHEMA["properties"])
+    missing = [key for key in _SECTION_LISTS if key not in out]
+    if missing:
+        out = {**out, **{key: [] for key in missing}}
+    presentation = out.get("presentation")
+    if isinstance(presentation, dict):
+        # Every declared presentation field except markdown is invalid when empty, so an
+        # empty one is a field that does not apply (e.g. `column: ""` on bars).
+        cleaned = _drop_empty(presentation, PRESENTATION_SCHEMA["properties"], any_field=True,
+                              keep=("kind", "markdown"))
+        quoted = [
+            flag for flag in _TRUE_ONLY_FLAGS
+            if isinstance(cleaned.get(flag), str) and cleaned[flag].strip().lower() == "true"
+        ]
+        if quoted:
+            cleaned = {**cleaned, **dict.fromkeys(quoted, True)}
+        if cleaned is not presentation:
+            out = {**out, "presentation": cleaned}
+    return out
+
+
+def normalize_answer_arguments(raw, fields=None):
     """Decode only allowlisted, top-level JSON-encoded arrays, without mutation.
 
     Invalid JSON and non-arrays remain untouched so the schema owns path/type
-    feedback. Prose and nested fields are never interpreted as JSON.
+    feedback. Prose and nested fields are never interpreted as JSON. Beyond that, only
+    conversions that cannot change meaning: empty undeclared fields and known-junk ones
+    (`_JUNK_ANSWER_FIELDS`) are dropped, empty
+    presentation selectors are absent, a section without caveats or actions has [],
+    and a quoted "true" in a true-only presentation flag is true. `fields` are the
+    top-level fields the calling tool declares (default: finalizeAnswer's).
     """
     if not isinstance(raw, dict):
         return raw
@@ -203,6 +273,13 @@ def normalize_answer_arguments(raw):
             if normalized is raw:
                 normalized = dict(raw)
             normalized[field] = value
+    normalized = _drop_empty(normalized, PROPOSAL_SCHEMA["properties"] if fields is None else fields,
+                             junk=_JUNK_ANSWER_FIELDS)
+    sections = normalized.get("sections")
+    if isinstance(sections, list):
+        cleaned = [_normalize_section(section) for section in sections]
+        if any(new is not old for new, old in zip(cleaned, sections, strict=True)):
+            normalized = {**normalized, "sections": cleaned}
     return normalized
 
 
@@ -264,6 +341,107 @@ def proposal_from_rendered(document):
     return (kept, changed) if changed else (document, 0)
 
 
+_SECTION_FIELD = "is a section field: put it in the section it belongs to (with no sections, say it in the takeaway)"
+_PRESENTATION_FIELD = "belongs inside presentation"
+# Where an undeclared field the model sends actually belongs, by the level it was sent at.
+_FIELD_HOMES = {
+    "answer": {
+        **dict.fromkeys(("caveats", "actions", "table_reason", "title", "explanation"), _SECTION_FIELD),
+        **dict.fromkeys(("recordAssumptions", "record_assumptions"), "is not a field: send the list as assumptions"),
+    },
+    "section": {
+        **dict.fromkeys(PRESENTATION_SCHEMA["properties"], _PRESENTATION_FIELD),
+        "assumptions": "is an answer-level field: send it next to takeaway, not inside a section",
+    },
+    "presentation": {
+        **dict.fromkeys(("title", "explanation", "caveats", "actions", "table_reason", "evidence_refs"),
+                        "is a section field, not a presentation field"),
+        "composite": "is not a field: use composition",
+    },
+}
+# Only identifier-like names are echoed back, so a value sent as a key is never repeated.
+_FIELD_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_JSON_TYPES = {str: "string", list: "array", dict: "object", bool: "boolean",
+               int: "number", float: "number", type(None): "null"}
+
+
+def _schema_problem(error):
+    """Say what is wrong in terms the model can act on; never echo response values."""
+    if error.validator == "required" and isinstance(error.instance, dict):
+        missing = [key for key in error.validator_value if key not in error.instance]
+        detail = "missing required field(s): " + ", ".join(missing)
+        if "table_reason" in missing:
+            detail += " (with two or more table sections, every table section needs a table_reason, the first included)"
+        return detail
+    if error.validator == "type":
+        detail = "expected type: " + str(error.validator_value) + ", got: " + _JSON_TYPES.get(type(error.instance), "unknown")
+        if isinstance(error.instance, str) and error.validator_value in ("array", "object"):
+            try:
+                decoded = json.loads(error.instance)
+            except RecursionError:
+                # Nesting too deep to decode at all; the normalizer gives up the same way.
+                detail += f" (text nested too deeply to read). Send the {error.validator_value} itself, not a string"
+            except ValueError as exc:
+                detail += (
+                    f" (text that is not valid JSON: {exc.msg} at character {exc.pos} of {len(error.instance)}). "
+                    f"Send the {error.validator_value} itself, not a string, and close each {{ with }} and each [ with ]"
+                )
+            else:
+                detail += f" (text that decodes to {_JSON_TYPES.get(type(decoded), 'unknown')})"
+        return detail
+    if error.validator == "const":
+        return "must be exactly " + json.dumps(error.validator_value)
+    if error.validator == "enum":
+        return "must be one of: " + ", ".join(map(str, error.validator_value))
+    if error.validator == "additionalProperties" and isinstance(error.instance, dict):
+        declared = error.schema.get("properties", {})
+        level = "answer" if "takeaway" in declared else "section" if "evidence_refs" in declared else (
+            "presentation" if "kind" in declared else "")
+        homes = _FIELD_HOMES.get(level, {})
+        extras = [
+            f"{key} ({homes.get(key, 'is not a declared field: remove it')})"
+            if isinstance(key, str) and _FIELD_NAME.fullmatch(key) else "an unnamed field (remove it)"
+            for key in error.instance if key not in declared
+        ]
+        return "undeclared field(s): " + "; ".join(extras) + ". Use only declared fields: " + ", ".join(declared)
+    named = _required_names(error.validator_value)
+    if error.validator == "oneOf" and named and isinstance(error.instance, dict):
+        sent = [key for key in named if key in error.instance]
+        return ("send only one of: " if sent else "send exactly one of: ") + ", ".join(named)
+    if error.validator == "not" and named and isinstance(error.instance, dict):
+        sent = [key for key in named if key in error.instance]
+        return "remove field(s) this kind does not use: " + ", ".join(sent)
+    if error.validator == "pattern":
+        return "must contain text, not only spaces" if error.validator_value == r"\S" else "has the wrong format"
+    if error.validator in _LIMIT_PROBLEMS:
+        return _LIMIT_PROBLEMS[error.validator].format(n=error.validator_value)
+    return "check the declared field schema"
+
+
+_LIMIT_PROBLEMS = {
+    "minLength": "must have at least {n} character(s)",
+    "maxLength": "must have at most {n} characters",
+    "minItems": "needs at least {n} item(s)",
+    "maxItems": "allows at most {n} items",
+    "uniqueItems": "must not repeat an item",
+}
+
+
+def _required_names(clause):
+    """The field names a `required` clause, or alternatives of them, names; else ()."""
+    alternatives = clause if isinstance(clause, list) else clause.get("anyOf") if isinstance(clause, dict) else None
+    if isinstance(clause, dict) and "required" in clause:
+        alternatives = [clause]
+    if not isinstance(alternatives, list):
+        return ()
+    names = []
+    for option in alternatives:
+        if not isinstance(option, dict) or set(option) != {"required"}:
+            return ()
+        names.extend(key for key in option["required"] if key not in names)
+    return tuple(names)
+
+
 def proposal_to_internal(raw):
     """Project the new proposal into internal evidence/selection bookkeeping only.
 
@@ -276,17 +454,7 @@ def proposal_to_internal(raw):
     error = next(Draft202012Validator(restrict_schema(PROPOSAL_SCHEMA)).iter_errors(raw), None)
     if error:
         location = ".".join(map(str, error.absolute_path)) or "root"
-        detail = "check the declared field schema"
-        if error.validator == "required" and isinstance(error.instance, dict):
-            missing = [key for key in error.validator_value if key not in error.instance]
-            detail = "missing required field(s): " + ", ".join(missing)
-        elif error.validator == "type":
-            received = {str: "string", list: "array", dict: "object", bool: "boolean",
-                        int: "number", float: "number", type(None): "null"}.get(type(error.instance), "unknown")
-            detail = "expected type: " + str(error.validator_value) + ", got: " + received
-        elif error.validator == "additionalProperties":
-            detail = "use only declared fields: " + ", ".join(error.schema.get("properties", {}))
-        raise PresentationError(f"Invalid answer proposal at {location}: {detail}.")
+        raise PresentationError(f"Invalid answer proposal at {location}: {_schema_problem(error)}.")
     sections = raw["sections"]
     if len({s["id"] for s in sections}) != len(sections):
         raise PresentationError("Section IDs must be unique.")
@@ -299,7 +467,10 @@ def proposal_to_internal(raw):
             rid = p.get("result_id")
             if not rid or rid not in section["evidence_refs"]:
                 raise PresentationError(
-                    "Every visual must cite its exact result_id in section evidence_refs."
+                    "Every visual must cite its exact result_id in section evidence_refs: section "
+                    f"{json.dumps(section['id'])} shows result_id {json.dumps(rid)} but its evidence_refs "
+                    f"are {json.dumps(section['evidence_refs'])}. Copy the one exact result ID of the "
+                    "result this section shows into both."
                 )
             if rid not in seen:
                 tables.append({"result_id": rid, "caption": section.get("title")})
@@ -337,8 +508,8 @@ def _text(value, business_values=frozenset()):
     if _FRESHNESS_CLAIM.search(re.sub(r"[*`_]", "", value)):
         raise PresentationError(
             "Freshness belongs only in code-provided metadata. Remove freshness prose; "
-            "if recorded as an assumption, call recordAssumptions with the corrected full list "
-            "or [] to clear it. Reuse existing results and preserve requested reporting dates."
+            "if it is in an assumption, send the corrected full list as finalizeAnswer.assumptions "
+            "(or recordAssumptions), or [] to clear it. Reuse existing results and preserve requested reporting dates."
         )
     value = strip_redundant_identifier_annotations(value, business_values=business_values)
     clean, redactions = scrub_answer_prose(value, provenance=None, business_values=business_values)
@@ -394,6 +565,13 @@ def _index(columns, name):
     return columns.index(name)
 
 
+_VISUAL_NAMES = {
+    "figure": "figure", "facts": "summary", "bars": "bar chart", "line": "line chart",
+    "multi_series_line": "line chart", "grouped_bars": "grouped bar chart",
+    "stacked_bars": "stacked bar chart", "heatmap": "heatmap", "donut": "donut chart",
+}
+
+
 def build_document(
     args,
     trail,
@@ -404,8 +582,13 @@ def build_document(
     sql_by_id=None,
     business_values=frozenset(),
     format_overrides=None,
+    fallbacks=None,
 ):
-    """Materialize a candidate for judge review. trail MUST already be scope-filtered."""
+    """Materialize a candidate for judge review. trail MUST already be scope-filtered.
+
+    `fallbacks`, when given, collects each visual shown as a table with the backend's
+    reason. The reason is model-facing, so it is for review only and never shipped.
+    """
     from data_agent.runtime.loop.proposal import evidence_kind
 
     if "sections" not in args:
@@ -423,9 +606,14 @@ def build_document(
     sql_by_id = sql_by_id or {}
     sources, sections = {}, []
     for proposed in args["sections"]:
-        if any(ref not in entries for ref in proposed["evidence_refs"]):
+        unusable = [ref for ref in proposed["evidence_refs"] if ref not in entries]
+        if unusable:
             raise PresentationError(
-                "Section evidence must reference successful accessible current-turn receipts."
+                "Section evidence must reference successful accessible current-turn receipts: "
+                f"section {json.dumps(proposed['id'])} cites {json.dumps(unusable)}, which are not "
+                "successful data or document results from this turn (for example a refusal receipt "
+                "or a failed call). Remove them; a section that states a refusal or limitation uses "
+                "evidence_refs: []."
             )
         section = {
             "id": proposed["id"],
@@ -478,7 +666,12 @@ def build_document(
         }
         sql = sql_by_id.get(rid) or (entry.args.get("sql") if entry.tool_name == "runQuery" else None)
         if not isinstance(sql, str) or not sql.strip():
-            raise PresentationError("A data presentation needs its exact executed SQL.")
+            # Says what to change: "needs its executed SQL" read as a request to show SQL.
+            raise PresentationError(
+                f"Result {json.dumps(rid)} cannot be displayed: the runtime has no saved query for it. "
+                "This is not a request for SQL; never put SQL in the answer. Present a result from a "
+                "query or verified blueprint run in this turn, or run the query again."
+            )
         source["sql"] = sql
         if entry.freshness is not None:
             source["freshness"] = deepcopy(entry.freshness)
@@ -494,10 +687,15 @@ def build_document(
                     raise PresentationError("Figures and facts require exactly one returned row.")
                 rendered = _visual(p, columns, rows, business_values=business_values, column_formats=formats)
             except PresentationError as exc:
-                fallback = f"The requested {kind} presentation is shown as a table: {exc}"
+                # The error text instructs the model ("or use a table"), so the user sees
+                # a plain notice and review gets the reason separately.
+                fallback = (f"The requested {_VISUAL_NAMES.get(kind, 'chart')} couldn't be drawn "
+                            "from this result, so it is shown as a table.")
                 section["explanation"] = " ".join(
                     value for value in (section.get("explanation"), fallback) if value
                 )
+                if fallbacks is not None:
+                    fallbacks.append({"section_id": section["id"], "requested_kind": kind, "reason": str(exc)})
                 rendered = {"kind": "table", "result_id": rid}
         if rendered["kind"] in {"line", "multi_series_line"}:
             column = rendered["x_column"]

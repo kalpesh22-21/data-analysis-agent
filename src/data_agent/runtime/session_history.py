@@ -29,9 +29,14 @@ from data_agent.runtime.composite.answer_with_table import (
     resolve_designations,
     terminal_sql_by_id,
 )
-from data_agent.runtime.composite.record_assumptions import fold_assumptions
+from data_agent.runtime.composite.record_assumptions import fold_assumptions, writes_assumptions
 from data_agent.runtime.context.scope_filter import filter_messages, filter_trail
-from data_agent.runtime.session.models import PauseCheckpoint, TrailEntry, TurnMessage
+from data_agent.runtime.session.models import (
+    PauseCheckpoint,
+    TrailEntry,
+    TurnMessage,
+    uncited_recovery_references,
+)
 
 
 def _noop_observer(event: str, payload: dict[str, Any]) -> None:  # pragma: no cover - default
@@ -87,7 +92,11 @@ def project_history(
     # A read has NO in-progress turn — pass `current_turn_index=None` so every
     # trail entry is subject to the strict `is_entry_in_scope` check (§2). The
     # two filters run INDEPENDENTLY; the join below never couples them.
-    surviving_trail = filter_trail(trail, column_scope, current_turn_index=None)
+    unused = uncited_recovery_references(messages, trail)
+    surviving_trail = [
+        entry for entry in filter_trail(trail, column_scope, current_turn_index=None)
+        if entry.tool_call_id not in unused
+    ]
 
     # Anchor turns on the user question — always kept (§2.1), so a turn always
     # renders at least its question. First user message per turn is the question
@@ -120,7 +129,7 @@ def project_history(
     # below). If the answer is withheld, its assumptions are withheld with it.
     raw_assumptions_by_turn: dict[int, list[str]] = {}
     for entry in trail:
-        if entry.status == "ok" and entry.tool_name == "recordAssumptions":
+        if entry.status == "ok" and writes_assumptions(entry.tool_name, entry.args):
             fold_assumptions(
                 raw_assumptions_by_turn.setdefault(entry.turn_index, []),
                 entry.args.get("assumptions"),
