@@ -1,0 +1,108 @@
+Date boundary and multi-turn live verification — 2026-11-05
+
+Scope: current data-analysis-agent and clickhouse-api working trees; DeepSeek V4.1 Flash via Fireworks; real local warehouse MCP; synthetic warehouse records only. Help Center ON uses a local HTTP fixture, not production Help Center. All turns and model tool calls are serial.
+
+Date contract: period_range.start is inclusive; end is exclusive. Jan 1 through Mar 31 uses [2026-01-01, 2026-04-01). 50 inclusive predicates corrected; descriptions added to 69 blueprints. Canonical corpus, fingerprint, agent snapshot and local retrieval corpus synchronized.
+Corpus BLUEPRINTS_SHA: 868ba2365964bc1f6aa532d7cbda928895c0eedd.
+Boundary fixture: approved request rows at Jan 1 midnight (24), February (48), Mar 31 23:59:59.999999 (72), Apr 1 midnight (900); three payout rows (3000 each). Quarter expected: Operations 72, Sales 48, Engineering 24. March 31 expected: Operations 72 only.
+Before fix: inclusive BETWEEN with Apr 1 bound returned Operations 972 (trace 59c7ccb378599ededc5d0d0527218f08).
+
+Automated validation:
+- Agent full suite: 11,084 passed, 24 failed, 249 skipped. Exact same failing test IDs as the pre-change baseline; no new failures.
+- MCP full suite: 3,441 passed, 2 failed, 83 skipped, 1 xfailed. Both failing tests also fail on baseline: test_description_backend_neutrality::test_no_backend_named_descriptions and test_export_routes::TestMainRegistration::test_routes_registered_only_when_export_enabled.
+- Final focused date suite: 74 passed, including corpus-wide contract checks and executable time-off/expense boundary fixtures. Covers year, quarter, leap February, single day, last microsecond, next midnight. One expense test was added after the full MCP run.
+- Corpus parity and git whitespace checks pass. Existing changed-file lint findings remain; the new date test passes Ruff.
+
+Known limitations (not fixed in this pass):
+- OFF injected missing-event-filter case: judge correctly requested an analysis repair; runtime granted it with ~136 seconds left; agent resubmitted the old result with prose changes; second judge rejected; salvage withheld figures. Proposed gate requiring actual execution before resubmission was explicitly put on hold by the user. Trace a2f0a69a9233908ec818a5782e99d173.
+- OFF subsequent saved-result follow-up timed out and produced an explicit limitation, not invented numbers. Trace aa6bc90c55a0858530cdcb0f3415f740.
+- OFF forced-timeout recovery repeats the Unfinished sentence and includes a table despite lacking the requested time-off ranking. This is not a clean task completion. Trace e434d223cecc106baa8860f7868ca48a.
+- Historical recovery prioritization/candidate limits remain deferred by request.
+
+Controlled faults: timeoff_filter replaces only the first time-off execution with SQL missing event_type; chart_fallback forces a presentation error; history_timeout prevents agent execution to exercise salvage. Judge/final answer outputs are not scripted.
+Both chart fallback turns explicitly explain that the requested bars could not be drawn and show a table. They are not silent shape substitutions.
+Wire/history checks validate schema v2, source linkage, no embedded chart values, history parity, absence of legacy assistant answer-document blobs, serial tool calls, bounded judge/salvage calls. These structural checks do not by themselves establish numeric correctness.
+
+BATTERY date-boundary-fix-20261105
+
+help_off — qa-multiturn-help_off-8e4f7bed
+1. headcount: How many Active employees are there by department? Show a bar chart. Include only Active employees.
+   Trace: 01ac0ed06e9042ef67db889c662cfd8b; elapsed 43.99s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 2
+   Takeaway: There are 7 Active employees across 3 departments: Sales has the most with 3, followed by Engineering and Operations with 2 each.
+2. reuse: Summarize the department breakdown you just showed using those same results. Do not refresh it.
+   Trace: 99b518c7309723966ada1b39f8cc2625; elapsed 40.51s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_prose'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: Active headcount totals 7 employees across 3 departments: Sales leads with 3, while Engineering and Operations have 2 each.
+3. timeoff_filter: Show the top 10 departments by approved time-off request hours from January 1 through March 31, 2026. Include all leave categories, exclude payouts, and rank by hours.
+   Trace: a2f0a69a9233908ec818a5782e99d173; elapsed 70.61s; review {'status': 'approved', 'attempts': 2, 'site': 'exit_prose', 'completion': 'none'}; calls {'record_judgement': 2, 'salvageAnswer': 1}; executed queries 2
+   Takeaway: The requested top-10 department ranking by approved time-off request hours (January 1 – March 31, 2026) could not be verified: the approved hours total available to me also includes approved accrual events beyond time-off requests (such as payouts), so it does not isolate the measure you asked for. As a result, no ranked figures are reported here.  Unfinished: Top 10 departments by approved time-off request hours for January 1 – March 31, 2026 (all leave categories, payouts excluded) could not be verified, because the available hours total was not restricted to time-off request events.
+4. expense: Show total paid expense approved amount and paid line count for January 1 through March 31, 2026, using paid date.
+   Trace: fe31eaab17383df036765f81808d10c7; elapsed 41.43s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 1
+   Takeaway: For expenses paid January 1 – March 31, 2026, the total approved amount was $3,600.00 across 9 paid expense lines.
+5. multiseries: Show a multi-series line chart of requested and approved amounts for paid expenses by paid month from January through March 2026. Use the same population and a wide result.
+   Trace: cbc1720e12acbb439a487cf6c2fad7c3; elapsed 50.77s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 1
+   Takeaway: For paid expenses (status "Paid") with a paid date from January through March 2026, both requested and approved amounts rise each month: requested amounts went $660.00 → $1,320.00 → $1,980.00, and approved amounts went $600.00 → $1,200.00 → $1,800.00.
+6. mixed: Show Active employee counts by department again using the earlier results, and explain how I submit an expense reimbursement in Paycom. Answer both parts.
+   Trace: 708da23f164712ead010b3d4ebb01d87; elapsed 75.93s; review {'status': 'approved', 'attempts': 2, 'site': 'exit_table'}; calls {'record_judgement': 2, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: Active headcount by department (unchanged from earlier results): Sales 3, Engineering 2, Operations 2 — 7 Active employees total across 3 departments. For the second part, I can't provide the steps to submit an expense reimbursement in Paycom: the product documentation (Help Center) content is not available to me, so no how-to answer can be given.
+7. after_help: Return to the approved time-off ranking from earlier. Summarize the leading department and hours using the saved results, without refreshing them.
+   Trace: aa6bc90c55a0858530cdcb0f3415f740; elapsed 125.94s; review {'status': 'approved', 'attempts': 0, 'site': 'exit_prose', 'completion': 'none'}; calls {'record_judgement': 0, 'salvageAnswer': 1}; executed queries 0
+   Takeaway: The earlier approved time-off ranking cannot be summarized: the saved results on hand do not include any time-off request hours by department. The three saved results cover paid expenses (approved amount and line count), requested/approved expense amounts by paid month, and Active headcount by department — none of which is the approved time-off request hours ranking.  Unfinished: Leading department and approved time-off request hours from the earlier ranking (January 1 – March 31, 2026) could not be summarized, because no saved result contains department-level approved time-off request hours.
+8. chart_fallback: Show Active employee counts by department as a bar chart.
+   Trace: e11deeaf7d10986e9dda277e98a62a5f; elapsed 39.59s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: Active headcount totals 7 employees across 3 departments: Sales leads with 3, while Engineering and Operations have 2 each.
+9. history_timeout: Return to the approved time-off ranking from earlier and summarize the leading department and its hours. Use saved results without refreshing.
+   Trace: e434d223cecc106baa8860f7868ca48a; elapsed 7.27s; review {'status': 'approved', 'attempts': 0, 'site': 'exit_table', 'completion': 'partial'}; calls {'record_judgement': 0, 'salvageAnswer': 1}; executed queries 0
+   Takeaway: The approved time-off request hours ranking by department is not among the saved results, so the leading department and its hours cannot be summarized. The saved results available here cover paid expenses and Active headcount by department instead.  Unfinished: Leading department and approved time-off request hours from the earlier ranking — no saved result contains department-level approved time-off request hours.  Unfinished: Leading department and approved time-off request hours from the earlier ranking — no saved result contains department-level approved time-off request hours.
+
+help_on — qa-multiturn-help_on-992c7430
+1. headcount: How many Active employees are there by department? Show a bar chart. Include only Active employees.
+   Trace: 9bdad968cef16fa83ac55967cb1866f2; elapsed 41.59s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 2
+   Takeaway: There are 7 Active employees across 3 departments, led by Sales with 3.
+2. reuse: Summarize the department breakdown you just showed using those same results. Do not refresh it.
+   Trace: 87ccdbe1c35c7396323b48877356baa5; elapsed 25.38s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_prose'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: The Active headcount breakdown totals 7 employees across 3 departments: Sales 3, Engineering 2, Operations 2.
+3. timeoff_filter: Show the top 10 departments by approved time-off request hours from January 1 through March 31, 2026. Include all leave categories, exclude payouts, and rank by hours.
+   Trace: 07f9bb9a22a279e07778df1e70ff008a; elapsed 56.68s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 4
+   Takeaway: Operations leads with 72 approved time-off hours, followed by Sales (48) and Engineering (24); only these three departments had approved time-off hours in the period.
+4. expense: Show total paid expense approved amount and paid line count for January 1 through March 31, 2026, using paid date.
+   Trace: 3aabccdb9bec8025d3b59160d0529f0e; elapsed 37.3s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 1
+   Takeaway: For expenses paid January 1 through March 31, 2026, the total approved amount is $3,600.00 across 9 paid expense lines.
+5. multiseries: Show a multi-series line chart of requested and approved amounts for paid expenses by paid month from January through March 2026. Use the same population and a wide result.
+   Trace: 71ee811f6aaeabf62ba9c1032280629c; elapsed 47.06s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 1
+   Takeaway: Across paid expenses from January through March 2026, both requested and approved amounts rose each month: requested $660 → $1,320 → $1,980 and approved $600 → $1,200 → $1,800.
+6. mixed: Show Active employee counts by department again using the earlier results, and explain how I submit an expense reimbursement in Paycom. Answer both parts.
+   Trace: 389541c9aa61dc990e8b7bf56ab2dd24; elapsed 42.13s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: Active headcount by department is unchanged: Sales 3, Engineering 2, Operations 2 (7 total). To submit an expense reimbursement, open Expense Management, create a new expense, choose the category, enter the date and amount, attach a receipt, review, and select Submit.
+7. after_help: Return to the approved time-off ranking from earlier. Summarize the leading department and hours using the saved results, without refreshing them.
+   Trace: 62d469a613a75110c7f45051955cc5c8; elapsed 22.87s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_prose'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: From the earlier saved results, Operations leads approved time-off request hours with 72 hours for January 1 through March 31, 2026.
+8. chart_fallback: Show Active employee counts by department as a bar chart.
+   Trace: f57b7b4683459c8774a3b428b29b2149; elapsed 52.9s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 2
+   Takeaway: There are 7 Active employees across 3 departments: Sales 3, Engineering 2, Operations 2.
+9. history_timeout: Return to the approved time-off ranking from earlier and summarize the leading department and its hours. Use saved results without refreshing.
+   Trace: 261d79dafba8e9b151afb39fa3ca8ae4; elapsed 5.62s; review {'status': 'approved', 'attempts': 0, 'site': 'exit_table', 'completion': 'full'}; calls {'record_judgement': 0, 'salvageAnswer': 1}; executed queries 0
+   Takeaway: From the saved approved time-off results, **Operations** leads with **72 approved time-off request hours** for January 1 through March 31, 2026, ahead of Sales (48) and Engineering (24). These are approved time-off request hours (assumed taken), not payroll-paid hours. Coverage is limited to the accessible records in the saved results.
+
+BATTERY date-boundary-natural-20261105
+
+help_off — qa-multiturn-help_off-9c371726
+1. timeoff_natural: Show the top 10 departments by approved time-off request hours from January 1 through March 31, 2026. Include all leave categories, exclude payouts, and rank by hours.
+   Trace: 80e36456a6b07d04a36434826fdb9be6; elapsed 89.41s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 4
+   Takeaway: For January 1 – March 31, 2026, only three departments had approved time-off request hours, so the ranking stops at 3 rather than 10: Operations 72 hours, Sales 48 hours and Engineering 24 hours (144 hours total). Payout requests were excluded, and all leave categories were included — the only category recorded in this window was Paid time off.
+2. last_day: Now change that ranking to March 31, 2026 only. Include the complete day and use the same measure and population.
+   Trace: bca7e09e13ef20cbf0ee96ee9eb37988; elapsed 44.76s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 2
+   Takeaway: Restricting the same measure to March 31, 2026 only (the complete day), just one department has approved time-off request hours: Operations with 72 hours. No other department recorded approved time-off hours that day, so the ranking stops at 1.
+3. reuse: Summarize that March 31 ranking using the saved results. Do not refresh it.
+   Trace: 24d98866505982d41a25aff61c2f4995; elapsed 39.59s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: Summary of the saved March 31, 2026 ranking: a single department — Operations — recorded approved time-off request hours that day, at 72 hours. Because no other department had any approved time-off hours on March 31, the top-10 ranking resolves to just one entry. This is the previously computed result, not a refresh.
+
+help_on — qa-multiturn-help_on-c7abc307
+1. timeoff_natural: Show the top 10 departments by approved time-off request hours from January 1 through March 31, 2026. Include all leave categories, exclude payouts, and rank by hours.
+   Trace: 642ebeabe8205a9ca916033f550e140f; elapsed 87.88s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 2
+   Takeaway: Only three departments had approved time-off request hours from January 1 through March 31, 2026: Operations (72.00 hours), Sales (48.00 hours) and Engineering (24.00 hours). Fewer than 10 departments qualified, so the ranking is shorter than the requested top 10.
+2. last_day: Now change that ranking to March 31, 2026 only. Include the complete day and use the same measure and population.
+   Trace: afa6dd09b867d80d5f23b68ca21c2c4e; elapsed 50.83s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 2
+   Takeaway: For March 31, 2026 only, a single department recorded approved time-off request hours: Operations, with 72.00 hours.
+3. reuse: Summarize that March 31 ranking using the saved results. Do not refresh it.
+   Trace: 8e998a65450dc497fd3caaca0ea917c7; elapsed 37.92s; review {'status': 'approved', 'attempts': 1, 'site': 'exit_table'}; calls {'record_judgement': 1, 'salvageAnswer': 0}; executed queries 0
+   Takeaway: For March 31, 2026 alone, only one department recorded approved time-off request hours: Operations, at 72.00 hours.
