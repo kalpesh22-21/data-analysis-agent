@@ -10,6 +10,7 @@ import dataclasses
 import json
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.dispatch.denial_mapping import classify_denial
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
 from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -673,8 +674,12 @@ async def test_raw_transport_exception_stays_generic_canned_message() -> None:
 
     assert result.status == "error"
     assert result.error_code == "INTERNAL_TRANSPORT_ERROR"
+    assert result.retryable is False
+    replay = classify_denial(result.error_code)
+    assert replay.retryable is False
+    assert replay.user_message == result.user_message
     assert result.user_message == (
-        "Something went wrong reaching the data warehouse. Please try again."
+        "The data warehouse could not be reached. Report this limitation; the result is unknown, not empty."
     )
     assert "ConnectionRefusedError" not in result.user_message
     assert "10.0.0.5" not in result.user_message

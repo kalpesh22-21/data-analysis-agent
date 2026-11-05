@@ -627,7 +627,7 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         # union redundant rather than load-bearing, which is the direction H1 pushed
         # every one of these lists.
         kind=DenialKind.INFRA_FAILED,
-        user_message="Something went wrong reaching the data warehouse. Please try again.",
+        user_message="The data warehouse could not be reached. Report this limitation; the result is unknown, not empty.",
     ),
     # `TOOL_CALL_TIMEOUT` (`dispatch/tool_dispatcher.py::TOOL_CALL_TIMEOUT_CODE`): the
     # call was cancelled at its time limit — the dispatcher's per-MCP-call limit or the

@@ -84,7 +84,7 @@ _logger = logging.getLogger(__name__)
 # exception text.
 INTERNAL_TRANSPORT_ERROR_CODE = "INTERNAL_TRANSPORT_ERROR"
 _INTERNAL_TRANSPORT_ERROR_MESSAGE = (
-    "Something went wrong reaching the data warehouse. Please try again."
+    "The data warehouse could not be reached. Report this limitation; the result is unknown, not empty."
 )
 
 # A call that did not return within its limit is cancelled. The API stops a slow

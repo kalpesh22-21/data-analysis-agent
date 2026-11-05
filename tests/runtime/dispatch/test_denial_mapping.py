@@ -117,7 +117,7 @@ _EXPECTED_RETRYABLE = {
     "RUN_BLUEPRINT_UNSUPPORTED": False,
     "RUN_BLUEPRINT_VERIFY_FAILED": True,
     "RUN_BLUEPRINT_ABORTED": True,
-    # B4 raw transport blowup: the dispatcher itself sets retryable=False.
+    # Transport retry belongs to the MCP client, not the model or replay.
     "INTERNAL_TRANSPORT_ERROR": False,
     # Cancelled at its time limit: a narrower request can finish where this did not.
     "TOOL_CALL_TIMEOUT": True,

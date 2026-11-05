@@ -16,6 +16,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
+import anyio
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -74,12 +75,19 @@ def _unwrap_fastmcp_result(structured: Any) -> Any:
 _READ_TOOLS = frozenset({"runQuery", "listDatabases", "listTables", "getTableSchema", "explainQuery", "sampleRows"})
 
 
+_TRANSPORT_RETRY_BACKOFF_SECONDS = 0.2
+
+
 def transient_transport_error(exc):
     if isinstance(exc, BaseExceptionGroup):
         return bool(exc.exceptions) and all(transient_transport_error(e) for e in exc.exceptions)
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in {429, 500, 502, 503, 504}
-    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError, httpx.RemoteProtocolError))
+    return isinstance(exc, (
+        httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError,
+        ConnectionError, TimeoutError,
+        anyio.EndOfStream, anyio.BrokenResourceError,
+    ))
 
 
 class RealMCPClient:
@@ -164,7 +172,15 @@ class RealMCPClient:
                     continue
                 if attempt or tool_name not in _READ_TOOLS or not transient_transport_error(exc):
                     raise
-                await asyncio.sleep(0.2)
+                # One retry of a read, within the dispatcher's ORIGINAL deadline.
+                # Never return retry guidance to the model or replay the call there.
+                from opentelemetry import trace
+
+                trace.get_current_span().add_event("mcp.transport_retry", {
+                    "tool_name": tool_name, "retry": 1,
+                    "backoff_ms": int(_TRANSPORT_RETRY_BACKOFF_SECONDS * 1000),
+                })
+                await asyncio.sleep(_TRANSPORT_RETRY_BACKOFF_SECONDS)
 
         if result.isError:
             text = result.content[0].text if result.content else "unknown MCP tool error"

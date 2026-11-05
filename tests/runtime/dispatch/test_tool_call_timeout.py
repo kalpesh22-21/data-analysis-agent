@@ -173,8 +173,9 @@ async def test_a_runtime_tool_is_cancelled_at_the_end_of_the_turn_window() -> No
 # --- the ledger: a timeout lets the model close the intent honestly ---------
 
 
+@pytest.mark.parametrize("error_code", [TOOL_CALL_TIMEOUT_CODE, "INTERNAL_TRANSPORT_ERROR"])
 @pytest.mark.parametrize("tool_name", ["runQuery", "runBlueprint"])
-def test_a_timed_out_data_call_supports_an_execution_failed_block(tool_name) -> None:
+def test_a_timed_out_data_call_supports_an_execution_failed_block(tool_name, error_code) -> None:
     """The timeout message offers "deliver verified results with this limitation", which
     needs the ledger to accept the timeout as the reason the intent is blocked."""
     from data_agent.runtime.composite.analysis_state import classify_block_evidence
@@ -182,7 +183,7 @@ def test_a_timed_out_data_call_supports_an_execution_failed_block(tool_name) -> 
 
     entry = TrailEntry(
         turn_index=0, tool_call_id="timed-out", tool_name=tool_name, args={},
-        status="error", error_code=TOOL_CALL_TIMEOUT_CODE, provenance=None,
+        status="error", error_code=error_code, provenance=None,
         result_preview=None, result_full_ref=None, ts="now",
     )
     assert classify_block_evidence("timed-out", [entry], 0) == "EXECUTION_FAILED"

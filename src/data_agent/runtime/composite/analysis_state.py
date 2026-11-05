@@ -436,6 +436,7 @@ def validate_block_evidence(
                  or entry.tool_name in {"runQuery", "runBlueprint"}
                  and entry.error_code in {
                      "AGGREGATION_CHECK_UNAVAILABLE", "SOURCE_UNAVAILABLE", "TOOL_CALL_TIMEOUT",
+                     "INTERNAL_TRANSPORT_ERROR",
                  }
                  # A product how-to part cannot be done while its documentation is down,
                  # including after repeated outages opened the runtime's circuit breaker.
@@ -443,7 +444,7 @@ def validate_block_evidence(
                  and entry.error_code in {"HELP_CENTER_UNAVAILABLE", "HELP_CENTER_CIRCUIT_OPEN"})
         ):
             return None
-        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED, AGGREGATION_CHECK_UNAVAILABLE/SOURCE_UNAVAILABLE/TOOL_CALL_TIMEOUT or Help Center HELP_CENTER_UNAVAILABLE/HELP_CENTER_CIRCUIT_OPEN receipt; other SQL errors do not establish exhaustion."
+        return "EXECUTION_FAILED requires a runtime SQL_REPAIR_EXHAUSTED, AGGREGATION_CHECK_UNAVAILABLE/SOURCE_UNAVAILABLE/TOOL_CALL_TIMEOUT/INTERNAL_TRANSPORT_ERROR or Help Center HELP_CENTER_UNAVAILABLE/HELP_CENTER_CIRCUIT_OPEN receipt; other SQL errors do not establish exhaustion."
 
     # A targeted, complete schema check can establish unavailable fields
     # without executing speculative SQL. It says nothing about other datasets.
