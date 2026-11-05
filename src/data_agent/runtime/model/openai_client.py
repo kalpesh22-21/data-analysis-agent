@@ -346,6 +346,8 @@ class OpenAIModelClient:
         client = self.begin_turn()
         client._api_mode = "chat"
         client._thinking_token_budget = None
+        # A reasoning_effort beside the template kwargs turns thinking back on (Fireworks).
+        client._reasoning_effort = None
         # GPT-4.1 is already non-reasoning; OpenAI rejects vLLM's template kwargs.
         client._chat_template_kwargs = (
             {} if self._model.startswith("gpt-4.1") else dict(template_kwargs)

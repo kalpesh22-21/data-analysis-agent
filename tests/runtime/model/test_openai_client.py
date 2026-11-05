@@ -555,13 +555,19 @@ async def test_non_reasoning_openai_salvage_omits_provider_template_kwargs(model
     assert not client._chat_template_kwargs
 
 
-async def test_reasoning_effort_uses_chat_and_survives_begin_turn_and_retry():
-    transport = _FakeOpenAIClient([], [_chat_message_result("a"), _chat_message_result("b")])
+async def test_reasoning_effort_uses_chat_survives_begin_turn_and_is_dropped_without_thinking():
+    transport = _FakeOpenAIClient([], [_chat_message_result("a"), _chat_message_result("b"), _chat_message_result("c")])
     client = OpenAIModelClient(transport, model="deepseek", reasoning_effort="low")
     await client.begin_turn().send_turn([{"role": "user", "content": "Plan"}], [])
-    await client.without_thinking({"enable_thinking": False}).begin_turn().send_turn([], [])
+    retry = client.without_thinking({"enable_thinking": False})
+    await retry.begin_turn().send_turn([], [])
+    await client.begin_turn().send_turn([], [])
+    calls = transport.chat.completions.calls
     assert not transport.responses.calls
-    assert [c["reasoning_effort"] for c in transport.chat.completions.calls] == ["low", "low"]
+    assert calls[0]["reasoning_effort"] == calls[2]["reasoning_effort"] == "low"
+    # Sent beside the no-thinking kwargs, an effort re-enables thinking on Fireworks.
+    assert "reasoning_effort" not in calls[1]
+    assert calls[1]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 async def test_unset_reasoning_effort_is_not_sent():

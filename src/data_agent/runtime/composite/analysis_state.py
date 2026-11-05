@@ -835,16 +835,18 @@ def _added_intents(
     or rewritten, so this cannot drop a commitment; it only adds one."""
     if not descriptions:
         return intents
-    known = {" ".join(i.description.lower().split()): i.intent_id for i in intents}
+    from .ranking import normalize_exact
+
+    known = {normalize_exact(i.description): i.intent_id for i in intents}
     for description in descriptions:
-        same = known.get(" ".join(description.lower().split()))
+        same = known.get(normalize_exact(description))
         if same is not None:
             raise _reject(
                 "second_initialize",
                 f"intent '{same}' already tracks that deliverable. Update it by "
                 "'intent_id' instead of declaring it again.",
             )
-        known[" ".join(description.lower().split())] = ""
+        known[normalize_exact(description)] = ""
     if len(intents) + len(descriptions) > MAX_INTENTS:
         raise _reject(
             "too_many_intents",
