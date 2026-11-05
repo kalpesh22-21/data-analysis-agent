@@ -1280,3 +1280,34 @@ def test_selected_table_is_delivered_once_in_the_document(monkeypatch):
     assert not {"assistant_text", "answer_tables", "answer_sql", "capability_cards"} & data.keys()
     history = client.get("/session/history", headers=HEADERS).json()["turns"][0]
     assert history["answer_tables"][0]["sql"] == _RAW_SQL
+
+
+@pytest.mark.parametrize("agent, judge, dedicated, judge_effort", [
+    ("", "", False, None),
+    ("low", "", False, None),
+    ("low", "medium", True, "medium"),
+    ("", "low", True, "low"),
+])
+def test_reasoning_effort_reaches_agent_and_judge_clients(monkeypatch, agent, judge, dedicated, judge_effort):
+    calls = []
+
+    def build_client(**kwargs):
+        calls.append(kwargs)
+        return ScriptedModelClient([])
+
+    monkeypatch.setattr(app_module, "build_openai_model_client", build_client)
+    create_app(
+        settings=RuntimeSettings(
+            _env_file=None, openai_api_key="test-key", openai_model="deepseek",
+            model_reasoning_effort=agent, answer_judge_enabled=True,
+            answer_judge_reasoning_effort=judge, progress_summary_enabled=False,
+            help_center_enabled=False, capability_tools_enabled=False, retrieval_enabled=False,
+        ),
+        session_store=InMemorySessionStore(),
+        mcp_client=FakeMCPClient(tools=[], scripted={}),
+    )
+    assert calls[0]["reasoning_effort"] == (agent or None)
+    # The judge reuses the agent client unless its effort differs.
+    assert len(calls) == 1 + dedicated
+    if dedicated:
+        assert calls[1]["reasoning_effort"] == judge_effort

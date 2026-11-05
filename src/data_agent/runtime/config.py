@@ -371,6 +371,14 @@ class RuntimeSettings(BaseSettings):
         description="Provider tool-choice mode. Use auto for thinking endpoints that reject required; runtime finalization remains enforced.",
     )
     openai_model: str = Field("gpt-4.1", description="Model name for Responses/Chat Completions.")
+    model_reasoning_effort: Literal["", "none", "low", "medium", "high"] = Field(
+        "",
+        description=(
+            "Agent reasoning_effort sent on Chat Completions. EMPTY sends none and keeps the "
+            "provider default. Bounds long single calls (one DeepSeek call reasoned for 14k "
+            "tokens / 115 s); measure answer quality before lowering it."
+        ),
+    )
     answer_format_enabled: bool = True
     answer_format_model: str = ""  # Empty uses the main endpoint/model without reasoning.
     answer_format_timeout_seconds: float = Field(8.0, gt=0, le=30)
@@ -496,6 +504,9 @@ class RuntimeSettings(BaseSettings):
             "api_key/base_url with the main client — the same arrangement "
             "progress_summary_model uses."
         ),
+    )
+    answer_judge_reasoning_effort: Literal["", "none", "low", "medium", "high"] = Field(
+        "", description="Judge reasoning_effort. EMPTY means reuse model_reasoning_effort."
     )
     answer_judge_thinking_budget_enabled: bool = Field(
         False, description="Enable a judge-only vLLM thinking token limit via Chat Completions."

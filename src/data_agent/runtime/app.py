@@ -352,6 +352,7 @@ def create_app(
         tool_choice=settings.model_tool_choice,
         api_mode=settings.model_api,
         base_url=settings.openai_base_url,
+        reasoning_effort=settings.model_reasoning_effort or None,
     )
 
     if settings.help_center_enabled:
@@ -425,6 +426,7 @@ def create_app(
     # wall-clock headroom skip — and `loop_answer_judge_called.tokens` is the only
     # place the spend is observable at all.
     judge_model_client: Any = None
+    judge_effort = settings.answer_judge_reasoning_effort or settings.model_reasoning_effort
     if settings.answer_judge_enabled and settings.openai_api_key:
         judge_model_client = (
             build_openai_model_client(
@@ -439,8 +441,10 @@ def create_app(
                     if settings.answer_judge_thinking_budget_enabled
                     else None
                 ),
+                reasoning_effort=judge_effort or None,
             )
             if settings.answer_judge_model or settings.answer_judge_thinking_budget_enabled
+            or judge_effort != settings.model_reasoning_effort
             else model_client
         )
 

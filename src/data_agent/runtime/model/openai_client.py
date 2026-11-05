@@ -304,9 +304,12 @@ class OpenAIModelClient:
         api_mode: Literal["auto", "chat"] = "auto",
         thinking_token_budget: int | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._chat_template_kwargs = dict(chat_template_kwargs or {})
         self._thinking_token_budget = thinking_token_budget
+        # Provider-native reasoning cap (OpenAI and Fireworks accept it on Chat Completions).
+        self._reasoning_effort = reasoning_effort or None
         self._use_reasoning_metadata = use_reasoning_metadata
         self._tool_choice = tool_choice
         self._api_mode = api_mode
@@ -335,6 +338,7 @@ class OpenAIModelClient:
             api_mode=self._api_mode,
             thinking_token_budget=self._thinking_token_budget,
             chat_template_kwargs=self._chat_template_kwargs,
+            reasoning_effort=self._reasoning_effort,
         )
 
     def without_thinking(self, template_kwargs: dict[str, Any]) -> OpenAIModelClient:
@@ -369,6 +373,7 @@ class OpenAIModelClient:
             or self._use_reasoning_metadata
             or self._thinking_token_budget is not None
             or self._chat_template_kwargs
+            or self._reasoning_effort
         ):
             return await self._call_chat_with_retry(messages, tools)
         if not self._fell_back_this_turn:
@@ -418,6 +423,7 @@ class OpenAIModelClient:
                         **({"chat_template_kwargs": self._chat_template_kwargs}
                            if self._chat_template_kwargs else {}),
                     }} if self._thinking_token_budget is not None or self._chat_template_kwargs else {}),
+                    **({"reasoning_effort": self._reasoning_effort} if self._reasoning_effort else {}),
                     **({"tool_choice": self._tool_choice} if chat_tools else {}),
                 )
                 return _chat_result_to_turn(response)
@@ -437,6 +443,7 @@ def build_openai_model_client(
     tool_choice: Literal["required", "auto"] = "required",
     api_mode: Literal["auto", "chat"] = "auto",
     thinking_token_budget: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> OpenAIModelClient:
     """Construct an `OpenAIModelClient` wired to a real `AsyncOpenAI` client.
 
@@ -451,6 +458,7 @@ def build_openai_model_client(
         tool_choice=tool_choice,
         api_mode=api_mode,
         thinking_token_budget=thinking_token_budget,
+        reasoning_effort=reasoning_effort,
     )
 
 

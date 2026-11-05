@@ -553,3 +553,18 @@ async def test_non_reasoning_openai_salvage_omits_provider_template_kwargs(model
     assert result.assistant_text == "salvaged"
     assert "extra_body" not in transport.chat.completions.calls[0]
     assert not client._chat_template_kwargs
+
+
+async def test_reasoning_effort_uses_chat_and_survives_begin_turn_and_retry():
+    transport = _FakeOpenAIClient([], [_chat_message_result("a"), _chat_message_result("b")])
+    client = OpenAIModelClient(transport, model="deepseek", reasoning_effort="low")
+    await client.begin_turn().send_turn([{"role": "user", "content": "Plan"}], [])
+    await client.without_thinking({"enable_thinking": False}).begin_turn().send_turn([], [])
+    assert not transport.responses.calls
+    assert [c["reasoning_effort"] for c in transport.chat.completions.calls] == ["low", "low"]
+
+
+async def test_unset_reasoning_effort_is_not_sent():
+    transport = _FakeOpenAIClient([], [_chat_message_result("a")])
+    await OpenAIModelClient(transport, model="deepseek", api_mode="chat", reasoning_effort="").begin_turn().send_turn([], [])
+    assert "reasoning_effort" not in transport.chat.completions.calls[0]
