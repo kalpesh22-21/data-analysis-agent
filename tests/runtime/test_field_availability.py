@@ -53,6 +53,37 @@ def test_incomplete_or_untrusted_absence_does_not_close_request(change):
     assert classify_block_evidence("schema", [entry], 0) is None
 
 
+def test_a_name_with_similar_columns_is_not_evidence_the_field_is_unavailable():
+    """getTableSchema returns columns named like a missed name (`city` ->
+    `primary_city_municipality`); such a name must not close the request as unavailable."""
+    entry = replace(receipt(), args={"database": "hr", "table": "employee", "columns": ["city", "ssn"]})
+    payload = entry.result_preview.preview_rows[0][0]
+    payload["columns_not_found"] = ["city", "ssn"]
+    payload["similar_columns"] = {"city": ["primary_city_municipality"]}
+    assert field_availability(entry)["unavailable_fields"] == ["ssn"]
+
+    payload["columns_not_found"] = ["city"]
+    assert field_availability(entry) is None
+    assert classify_block_evidence("schema", [entry], 0) is None
+    message = validate_block_evidence("schema", "REQUIRED_DATA_UNAVAILABLE", [entry], 0)
+    assert "similar_columns" in message and "request each one by name" in message
+
+
+def test_a_name_is_unavailable_once_every_similar_column_was_requested_too():
+    """The model asked for `city` and its candidate together and saw the candidate's
+    documentation: `city` itself is still missing, so the check closes it."""
+    columns = ["city", "primary_city_municipality"]
+    entry = replace(receipt(), args={"database": "hr", "table": "employee", "columns": columns})
+    payload = entry.result_preview.preview_rows[0][0]
+    payload["columns_not_found"] = ["city"]
+    payload["similar_columns"] = {"city": ["primary_city_municipality"]}
+    assert field_availability(entry)["unavailable_fields"] == ["city"]
+    assert classify_block_evidence("schema", [entry], 0) == "REQUIRED_DATA_UNAVAILABLE"
+
+    payload["similar_columns"] = {"city": ["primary_city_municipality", "work_city"]}
+    assert field_availability(entry) is None
+
+
 def test_column_documentation_trimming_does_not_erase_authoritative_receipt():
     entry = receipt()
     entry = replace(entry, result_preview=replace(entry.result_preview, truncated=True))

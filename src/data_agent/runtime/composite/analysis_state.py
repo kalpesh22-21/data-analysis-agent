@@ -447,9 +447,25 @@ def validate_block_evidence(
 
     # A targeted, complete schema check can establish unavailable fields
     # without executing speculative SQL. It says nothing about other datasets.
-    from data_agent.runtime.provenance.field_availability import field_availability
+    from data_agent.runtime.provenance.field_availability import (
+        field_availability,
+        unchecked_similar,
+    )
     if field_availability(entry):
         return None
+    if entry.tool_name == "getTableSchema" and entry.status == "ok":
+        preview = entry.result_preview
+        result = preview.preview_rows[0][0] if preview and preview.preview_rows and preview.preview_rows[0] else None
+        similar = result.get("similar_columns") if isinstance(result, dict) else None
+        if isinstance(similar, dict) and any(
+            unchecked_similar(names, entry.args.get("columns") or []) for names in similar.values()
+        ):
+            return (
+                f"tool call '{tool_call_id}' answered the missing names with similar_columns, so it "
+                "does not show they are unavailable. Use a similar column that fits, or request "
+                "each one by name in getTableSchema columns: a name is shown missing once every "
+                "similar column was checked."
+            )
 
     # REQUIRED_DATA_UNAVAILABLE — otherwise a successful call with no rows.
     if entry.status != "ok":
