@@ -202,6 +202,7 @@ class TrailEntry:
     # message (D45 determinism). Defaults False for every other entry (runQuery,
     # denials, discovery), so the field is additive and legacy docs load unchanged.
     authoritative: bool = False
+    blueprint_execution: dict[str, Any] | None = None
     # `denial_detail` (additive, 2026-08): the SPECIFIC model-actionable reason for
     # a non-`ok` entry — the out-of-scope column name, the blueprint that was never
     # run. `None` (the default, and every ordinary denial) means the canned
@@ -288,6 +289,7 @@ class TrailEntry:
             "result_full_ref": self.result_full_ref,
             "ts": self.ts,
             "authoritative": self.authoritative,
+            **({"blueprint_execution": self.blueprint_execution} if self.blueprint_execution else {}),
             "denial_detail": self.denial_detail,
             "serves_intent": self.serves_intent,
             "answer_table_provenance": (
@@ -320,6 +322,8 @@ class TrailEntry:
             result_full_ref=doc.get("result_full_ref"),
             ts=doc["ts"],
             authoritative=bool(doc.get("authoritative", False)),
+            blueprint_execution=(doc.get("blueprint_execution")
+                                 if isinstance(doc.get("blueprint_execution"), dict) else None),
             # `.get` (not `[...]`): a document written before this field existed
             # loads with `None` and renders exactly as it always did.
             denial_detail=doc.get("denial_detail"),

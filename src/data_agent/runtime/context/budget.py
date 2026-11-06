@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from data_agent.runtime.context.blueprint_execution import blueprint_execution_receipt
 from data_agent.runtime.dispatch.denial_mapping import classify_denial
 from data_agent.runtime.dispatch.sql_diagnostics import compact_model_diagnostic, decode_diagnostic
 from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
@@ -119,6 +120,9 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         "result_preview": preview,
         **({"freshness": entry.freshness, "retrieved_at": entry.retrieved_at, "data_as_of": entry.data_as_of} if entry.freshness is not None else {}),
     }
+    execution = blueprint_execution_receipt(entry.tool_name, entry.status, entry.blueprint_execution)
+    if execution:
+        rendered["execution"] = execution
     if diagnostic:
         # Project before context/judge consumers see the receipt. Final request fitting
         # already happens after canonicalization; persisted denial_detail stays intact.

@@ -85,6 +85,7 @@ from data_agent.runtime.context.assembly import (
     ContextAssembler,
     turn_date_anchor_day,
 )
+from data_agent.runtime.context.blueprint_execution import blueprint_execution_receipt
 from data_agent.runtime.context.budget import fit_request_to_budget, render_entry
 from data_agent.runtime.dispatch.denial_mapping import UNKNOWN_TOOL_CODE
 from data_agent.runtime.dispatch.source_availability import (
@@ -819,6 +820,9 @@ def _tool_trail_entry_to_canonical(
             "result_id": tool_call_id,
             "measurement_review": entry.get("measurement_review"),
         }
+        if entry.get("execution") and entry.get("tool_name") == "runBlueprint":
+            content["execution"] = entry["execution"]
+            content["blueprint_id"] = entry["execution"]["blueprint_id"]
         if entry.get("sql_diagnostic"):
             content["sql_diagnostic"] = entry["sql_diagnostic"]
         if (
@@ -2762,6 +2766,7 @@ class AgentLoop:
             result_full_ref=result_full_ref,
             ts=_now_iso(),
             authoritative=tool_result.authoritative,
+            blueprint_execution=blueprint_execution_receipt("runBlueprint", tool_result.status, tool_result.result_full),
             denial_detail=tool_result.denial_detail,
             # J7: a resumed blueprint's window is anchored the same way an unpaused
             # one's is, so the note has to survive the pause too — dropping it here is
@@ -4330,6 +4335,7 @@ class AgentLoop:
                     result_full_ref=result_full_ref,
                     ts=_now_iso(),
                     authoritative=tool_result.authoritative,
+                    blueprint_execution=blueprint_execution_receipt(tool_call.name, tool_result.status, tool_result.result_full),
                     denial_detail=tool_result.denial_detail,
                     # J7 — set only by a `runBlueprint` whose blueprint DECLARES a
                     # data-anchored window; `None` for every other call, so every other

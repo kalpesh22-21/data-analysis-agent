@@ -3,7 +3,6 @@
 import asyncio
 import json
 import time
-from copy import deepcopy
 
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -138,7 +137,8 @@ def _retry_reason(exc):
 
 
 async def salvage(judge, brief):
-    from data_agent.runtime.composer.components import restrict_schema, component_guidance
+    from data_agent.runtime.composer.components import component_guidance, restrict_schema
+
     from .measurement_repair import REASSESSMENT_SCHEMA, unresolved_measurement
 
     schema = restrict_schema(RECOVERY_SCHEMA)
@@ -192,7 +192,9 @@ async def salvage(judge, brief):
         "Preview truncation is not a chart-size limit: the UI fetches the saved result and handles display fallback. "
         "None requires empty evidence and sections and an honest limitation. Never manufacture "
         "a gap for a scope caveat or wording repair. Recheck previous_rejection against the executed SQL and "
-        "bound slots; do not repeat a coverage limitation whose premise those receipts directly disprove. "
+        "bound slots. Use execution.blueprint_id only as provenance; assess execution.terminal_sql "
+        "and upstream execution.sql, not the blueprint name, template defaults or verified status. "
+        "Do not repeat a coverage limitation whose premise those receipts directly disprove. "
         "Do not approve a genuinely rejected population/metric just by adding a caveat. If the correct result is already "
         "available, select it. A direct sum of payroll and timecard earnings without verified lifecycle overlap handling is not a supported combined measure: omit that value and its column from the takeaway and presentation, even if SQL returned it. Preserve only separate supported subtotals and mark the combined outcome unfinished. A caveat cannot repair an invalid measurement. Put genuinely unfinished portions in unfinished only; the runtime "
         "appends them to the takeaway, so do not repeat them in takeaway, sections or caveats. Use one short business-language reason per missing outcome, scoped to checked records. Prefer one "

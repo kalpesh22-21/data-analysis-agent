@@ -15,6 +15,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
+from data_agent.runtime.context.blueprint_execution import EXECUTION_KEYS as _EXECUTION_KEYS
+from data_agent.runtime.context.blueprint_execution import blueprint_execution_receipt
 from data_agent.runtime.context.scope_filter import compute_scope_hash
 from data_agent.runtime.dispatch.denial_mapping import ACCESS_DENIAL_CODES, classify_denial
 from data_agent.runtime.dispatch.tool_dispatcher import resolve_catalog
@@ -37,18 +39,7 @@ _METADATA_KEYS = (
     "default_filters",
     "ambiguities",
 )
-_EXECUTION_KEYS = (
-    "blueprint_id",
-    "sql",
-    "terminal_sql",
-    "bound_slots",
-    "omitted_slots",
-    "uses_rules",
-    "resolved_rule_bindings",
-    "window_anchor",
-    "window_end",
-    "verify",
-)
+
 
 
 def recent_conversation(messages, column_scope, turn_index):
@@ -310,6 +301,8 @@ async def enrich_brief(
                 full = await store.read_full_result(session_id, entry.result_full_ref)
             except Exception:
                 pass  # Missing evidence is marked below, never inferred.
+        if entry.tool_name == "runBlueprint" and not isinstance(full, dict):
+            full = blueprint_execution_receipt(entry.tool_name, entry.status, entry.blueprint_execution)
         if entry.tool_name == "runQuery":
             result["execution"] = {"sql": entry.args.get("sql"), "semantic_review": "pending"}
         elif entry.tool_name == "runBlueprint":
@@ -322,7 +315,7 @@ async def enrich_brief(
                 "requested_slot_bindings": entry.args.get("slot_bindings", {}),
                 "semantic_review": "pending",
             }
-            blueprints.add(entry.args.get("id"))
+            blueprints.add((full.get("blueprint_id") if isinstance(full, dict) else None) or entry.args.get("id"))
         elif entry.tool_name == "getHelpCenterDocument" and entry.result_full_ref:
             if isinstance(full, dict):
                 result["document"] = full
