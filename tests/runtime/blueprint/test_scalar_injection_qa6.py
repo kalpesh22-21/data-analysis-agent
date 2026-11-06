@@ -20,10 +20,8 @@ from sqlglot import exp
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.blueprint.executor import (
-    SLOT_INVALID_CODE,
     BlueprintExecutor,
     ExecCompleted,
-    ExecFailed,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -235,22 +233,15 @@ async def test_string_number_scalar_stays_a_string_literal() -> None:
     assert "55000" in _string_literals(mcp.calls[1].args["sql"])  # bound AS a string
 
 
-async def test_null_scalar_fails_closed_never_binds_null_as_sql() -> None:
-    # A scalar that came back NULL cannot be bound as a typed literal — fail-closed
-    # (SLOT_INVALID → raw loop), never emitting a broken `WHERE Department = NULL`
-    # or a smuggled literal. The downstream node must NOT dispatch.
-    mcp = FakeMCPClient(
-        scripted={
-            "runQuery": [
-                _rq(["tok"], [[None]]),  # NULL scalar
-            ]
-        }
-    )
+async def test_null_scalar_binds_sql_null_without_inventing_a_value() -> None:
+    mcp = FakeMCPClient(scripted={"runQuery": [
+        _rq(["tok"], [[None]]), _rq(["department"], []),
+        _rq(["__bp_n", "__bp_d"], [[0, 0]]),
+    ]})
     outcome = await _executor(mcp, _string_scalar_dag()).execute(
         blueprint_id="bp-inj", slot_bindings={}, credentials=_creds()
     )
-    assert isinstance(outcome, ExecFailed)
-    assert outcome.error_code == "RUN_BLUEPRINT_INTERMEDIATE_UNAVAILABLE"
-    assert outcome.retryable is False
-    assert "tok" in outcome.user_message and "NULL" in outcome.user_message
-    assert len(mcp.calls) == 1  # node 1 (the consumer) never dispatched
+    assert isinstance(outcome, ExecCompleted)
+    tree = sqlglot.parse_one(mcp.calls[1].args["sql"], read="clickhouse")
+    assert tree.find(exp.Null) is not None
+    assert "NULL" not in _string_literals(mcp.calls[1].args["sql"])

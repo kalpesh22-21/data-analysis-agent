@@ -15,8 +15,10 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
-from data_agent.runtime.context.blueprint_execution import EXECUTION_KEYS as _EXECUTION_KEYS
-from data_agent.runtime.context.blueprint_execution import blueprint_execution_receipt
+from data_agent.runtime.context.blueprint_execution import (
+    blueprint_execution_receipt,
+    judge_execution,
+)
 from data_agent.runtime.context.scope_filter import compute_scope_hash
 from data_agent.runtime.dispatch.denial_mapping import ACCESS_DENIAL_CODES, classify_denial
 from data_agent.runtime.dispatch.tool_dispatcher import resolve_catalog
@@ -301,29 +303,27 @@ async def enrich_brief(
                 full = await store.read_full_result(session_id, entry.result_full_ref)
             except Exception:
                 pass  # Missing evidence is marked below, never inferred.
-        if entry.tool_name == "runBlueprint" and not isinstance(full, dict):
-            full = blueprint_execution_receipt(entry.tool_name, entry.status, entry.blueprint_execution)
+        sql = []
         if entry.tool_name == "runQuery":
-            result["execution"] = {"sql": entry.args.get("sql"), "semantic_review": "pending"}
+            sql = entry.args.get("sql")
+            result["execution"] = {"sql": sql}
         elif entry.tool_name == "runBlueprint":
-            result["execution"] = {
-                **(
-                    {k: full[k] for k in _EXECUTION_KEYS if k in full}
-                    if isinstance(full, dict)
-                    else {"execution_metadata_unavailable": True}
-                ),
-                "requested_slot_bindings": entry.args.get("slot_bindings", {}),
-                "semantic_review": "pending",
-            }
-            blueprints.add((full.get("blueprint_id") if isinstance(full, dict) else None) or entry.args.get("id"))
+            receipt = blueprint_execution_receipt(entry.tool_name, entry.status, full)
+            if receipt is None:
+                receipt = blueprint_execution_receipt(entry.tool_name, entry.status, entry.blueprint_execution)
+            if receipt:
+                result["blueprint_id"] = receipt["blueprint_id"]
+                result["execution"] = judge_execution(receipt)
+                uses_rules.extend(receipt.get("uses_rules", ()))
+                sql = receipt.get("sql", [])
+            else:
+                result["execution"] = {"execution_metadata_unavailable": True}
+            blueprints.add(receipt["blueprint_id"] if receipt else entry.args.get("id"))
         elif entry.tool_name == "getHelpCenterDocument" and entry.result_full_ref:
             if isinstance(full, dict):
                 result["document"] = full
             else:
                 result["document_unavailable"] = True
-        execution = result.get("execution", {})
-        uses_rules.extend(execution.get("uses_rules", ()))
-        sql = execution.get("sql", [])
         if not referenced or entry.tool_call_id in referenced:
             sqls.extend([sql] if isinstance(sql, str) else sql if isinstance(sql, list) else [])
     # Matching definitions carry uses_rules and optional-slot semantics. All have

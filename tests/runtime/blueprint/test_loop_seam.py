@@ -177,7 +177,7 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
     assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint", "answerWithText"]
     assert trail[0].status == "ok"
     assert trail[1].blueprint_execution["blueprint_id"] == _BID
-    assert trail[1].blueprint_execution["bound_slots"]["department"] == "Sales"
+    assert "bound_slots" not in trail[1].blueprint_execution
     assert "Sales" in trail[1].blueprint_execution["terminal_sql"]
 
 

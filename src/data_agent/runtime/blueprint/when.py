@@ -241,12 +241,16 @@ def _eval_operand(node: ast.expr, env: dict[str, Any]) -> Any:
 
 def _eval_compare(node: ast.Compare, env: dict[str, Any]) -> bool:
     left = _eval_operand(node.left, env)
+    if left is None:
+        raise WhenClauseError("NULL scalar comparison requires an explicit empty(...) guard")
     op = node.ops[0]
     if isinstance(op, (ast.In, ast.NotIn)):
         members = {el.value for el in node.comparators[0].elts}  # type: ignore[attr-defined]
         present = left in members
         return present if isinstance(op, ast.In) else not present
     right = _eval_operand(node.comparators[0], env)
+    if right is None:
+        raise WhenClauseError("NULL scalar comparison requires an explicit empty(...) guard")
     if isinstance(op, ast.Gt):
         return left > right
     if isinstance(op, ast.GtE):

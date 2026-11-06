@@ -107,6 +107,7 @@ async def test_blueprint_review_reads_actual_execution_without_sending_full_rows
         CREDS.session_id,
         "full",
         {
+            "blueprint_id": "bp",
             "sql": ["SELECT count(id) FROM hr.employee WHERE TRUE"],
             "terminal_sql": "SELECT count(id) FROM hr.employee WHERE TRUE",
             "bound_slots": {},
@@ -139,8 +140,8 @@ async def test_blueprint_review_reads_actual_execution_without_sending_full_rows
         analysis_state=None,
     )
     execution = enriched.results[0]["execution"]
-    assert execution["terminal_sql"].endswith("WHERE TRUE")
-    assert execution["omitted_slots"] == ["department"]
+    assert execution["terminal_sql"].endswith("TRUE")
+    assert set(execution) == {"terminal_sql"}
     assert "must not enter judge" not in json.dumps(enriched.payload())
     assert (
         enriched.evidence_package["blueprint_rules"][0]["matches"][0]["definition"]["predicate"]
@@ -157,6 +158,7 @@ async def test_raw_query_executes_before_only_semantic_review():
     brief = judge.briefs[0]
     execution = next(r["execution"] for r in brief.results if r["tool_call_id"] == "q")
     assert execution["sql"]
+    assert set(execution) == {"sql"}
     assert "record_measurement_review" not in str(model.calls)
     assert "figures_found_in_results" not in brief.payload()
     assert (await store.get_or_create_session(CREDS.session_id)).tool_trail
@@ -517,6 +519,7 @@ def test_nested_cte_name_does_not_hide_a_physical_table_in_another_scope():
 
 async def test_access_denials_reach_both_judges_without_restricted_content():
     from dataclasses import replace
+
     from data_agent.runtime.context.scope_filter import compute_scope_hash
 
     store = InMemorySessionStore()
@@ -554,6 +557,7 @@ async def test_access_denials_reach_both_judges_without_restricted_content():
 
 async def test_join_verification_failures_are_minimal_current_scope_receipts():
     from dataclasses import replace
+
     from data_agent.runtime.context.scope_filter import compute_scope_hash
 
     store = InMemorySessionStore()
@@ -607,6 +611,7 @@ async def test_join_verification_failures_are_minimal_current_scope_receipts():
 
 async def test_missing_source_receipts_are_scoped_and_not_data_evidence():
     from dataclasses import replace
+
     from data_agent.runtime.context.scope_filter import compute_scope_hash
     from tests.runtime.dispatch.test_source_availability import DETAIL, SOURCE
 

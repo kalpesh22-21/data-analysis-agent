@@ -814,9 +814,11 @@ def _tool_trail_entry_to_canonical(
             "result_id": tool_call_id,
             "measurement_review": entry.get("measurement_review"),
         }
+        if isinstance(entry.get("retryable"), bool) and entry.get("status") != "ok":
+            content["retryable"] = entry["retryable"]
         if entry.get("execution") and entry.get("tool_name") == "runBlueprint":
             content["execution"] = entry["execution"]
-            content["blueprint_id"] = entry["execution"]["blueprint_id"]
+            content["blueprint_id"] = entry.get("blueprint_id")
         if entry.get("sql_diagnostic"):
             content["sql_diagnostic"] = entry["sql_diagnostic"]
         if (
@@ -2782,6 +2784,7 @@ class AgentLoop:
             authoritative=tool_result.authoritative,
             blueprint_execution=blueprint_execution_receipt("runBlueprint", tool_result.status, tool_result.result_full),
             denial_detail=tool_result.denial_detail,
+            retryable=tool_result.retryable,
             # J7: a resumed blueprint's window is anchored the same way an unpaused
             # one's is, so the note has to survive the pause too — dropping it here is
             # exactly how the resume path lost the `authoritative` marker before.
@@ -4415,6 +4418,7 @@ class AgentLoop:
                     authoritative=tool_result.authoritative,
                     blueprint_execution=blueprint_execution_receipt(tool_call.name, tool_result.status, tool_result.result_full),
                     denial_detail=tool_result.denial_detail,
+                    retryable=tool_result.retryable,
                     # J7 — set only by a `runBlueprint` whose blueprint DECLARES a
                     # data-anchored window; `None` for every other call, so every other
                     # entry serialises byte-identically.

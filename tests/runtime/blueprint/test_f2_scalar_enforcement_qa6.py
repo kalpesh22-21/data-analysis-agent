@@ -3,7 +3,7 @@
 runblueprint-design §2.4 (F2): Phase-1 passes ONLY scalar intermediates; a table
 intermediate needs scratch materialization no Phase-1 MCP tool can do → the DAG is
 `RUN_BLUEPRINT_UNSUPPORTED` (raw-loop fallback). And a node consumed as a scalar
-must be a genuine single cell — 0 rows / NULL fail-closed (never binds a broken
+must be a genuine single cell — 0 rows fail-closed; NULL is a valid cell (never binds a broken
 literal); >1 row / >1 column are the "silent row[0][0]" hazard the brief pins.
 
 All fakes.
@@ -156,7 +156,7 @@ async def test_terminal_table_output_is_fine_only_consumed_table_is_rejected() -
 
 
 # ---------------------------------------------------------------------------
-# Scalar cell integrity: 0 rows / NULL fail-closed (these DO work today).
+# Scalar cell integrity: 0 rows fail-closed; NULL is a valid cell (these DO work today).
 # ---------------------------------------------------------------------------
 
 
@@ -170,16 +170,18 @@ async def test_scalar_node_zero_rows_fails_closed() -> None:
     assert len(mcp.calls) == 1  # consumer never dispatched on an empty scalar
 
 
-async def test_scalar_node_null_cell_fails_closed() -> None:
-    mcp = FakeMCPClient(scripted={"runQuery": [_rq(["tok"], [[None]])]})
+async def test_scalar_node_null_cell_binds_sql_null() -> None:
+    mcp = FakeMCPClient(scripted={"runQuery": [
+        _rq(["tok"], [[None]]), _rq(["department"], []),
+        _rq(["__bp_n", "__bp_d"], [[0, 0]]),
+    ]})
     outcome = await _executor(mcp, _scalar_consumer_dag()).execute(
         blueprint_id="bp-f2", slot_bindings={}, credentials=_creds()
     )
-    assert isinstance(outcome, ExecFailed)
-    assert outcome.error_code == "RUN_BLUEPRINT_INTERMEDIATE_UNAVAILABLE"
-    assert outcome.retryable is False
-    assert "tok" in outcome.user_message and "NULL" in outcome.user_message
-    assert len(mcp.calls) == 1
+    assert isinstance(outcome, ExecCompleted)
+    assert outcome.result_full["scalar_bindings"] == [dict(step=2, parameter="tok", source_step=1, source_output="tok", value=None)]
+    assert "NULL" in mcp.calls[1].args["sql"]
+    assert "\'NULL\'" not in mcp.calls[1].args["sql"]
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +248,60 @@ async def test_scalar_node_multi_column_should_fail_closed() -> None:
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == SLOT_INVALID_CODE
     assert len(mcp.calls) == 1
+
+
+def test_nullable_multi_scalar_survives_checkpoint_and_keeps_row_shape():
+    from data_agent.runtime.blueprint.executor import (
+        _dumps_completed,
+        _extract_scalar_output,
+        _load_completed_into_outputs,
+        _node_record,
+        _rehydrate_completed,
+    )
+    from data_agent.runtime.blueprint.models import Node
+    from data_agent.runtime.blueprint.when import evaluate_when
+
+    node = Node(order=0, output={"salary": "scalar", "hourly": "scalar"})
+    for values in ([100000, None], [None, None]):
+        output = _extract_scalar_output(node, _rq(["salary", "hourly"], [values]))
+        assert output == dict(zip(["salary", "hourly"], values, strict=True))
+        completed = {0: _node_record(output, frozenset(), "SELECT 1")}
+        env = {}
+        _load_completed_into_outputs(_rehydrate_completed(_dumps_completed(completed)), env)
+        assert env["$0.hourly"] is None
+        assert evaluate_when("count($0) == 1", env)
+        assert evaluate_when("empty($0.hourly)", env)
+    assert _extract_scalar_output(node, _rq(["salary", "wrong"], [[100000, None]])) is None
+    assert _extract_scalar_output(node, _rq(["salary", "hourly"], [])) is None
+    assert _extract_scalar_output(node, _rq(["salary", "hourly"], [[1, None], [2, None]])) is None
+
+
+def test_null_when_comparison_requires_explicit_empty_guard():
+    import pytest
+
+    from data_agent.runtime.blueprint.when import WhenClauseError, evaluate_when
+    env = {"$0.hourly": None}
+    with pytest.raises(WhenClauseError, match="NULL scalar"):
+        evaluate_when("$0.hourly > 0", env)
+    assert not evaluate_when("not empty($0.hourly) and $0.hourly > 0", env)
+
+
+def test_scalar_lineage_uses_executed_steps_and_survives_checkpoint():
+    from data_agent.runtime.blueprint.executor import (
+        _dumps_completed,
+        _node_record,
+        _rehydrate_completed,
+        _scalar_binding_receipts,
+    )
+    from data_agent.runtime.blueprint.models import Node
+    nodes = [Node(order=2, output={'salary': 'scalar', 'hourly': 'scalar'}),
+             Node(order=3),  # skipped node has no executed SQL
+             Node(order=7, consumes={'s': '$2.salary', 'h': '$2.hourly', 'unused': '$2.salary'},
+                  sql_template='SELECT {s}, {h}')]
+    running = {2: _node_record({'salary': 107000, 'hourly': None}, frozenset(), 'SELECT averages'),
+               3: _node_record({}, frozenset(), None),
+               7: _node_record({}, frozenset(), 'SELECT 107000, NULL')}
+    expected = [dict(step=2, parameter='s', source_step=1, source_output='salary', value=107000),
+                dict(step=2, parameter='h', source_step=1, source_output='hourly', value=None)]
+    assert _scalar_binding_receipts(nodes, running) == expected
+    assert _scalar_binding_receipts(nodes, _rehydrate_completed(_dumps_completed(running))) == expected

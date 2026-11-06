@@ -223,6 +223,8 @@ def _to_literal(name: str, value: Any) -> exp.Expression:
     The value is untrusted (came from the model/user) but becomes a typed literal
     node, so `.sql()` renders it ClickHouse-escaped, never concatenated (D10).
     """
+    if value is None:
+        return exp.Null()  # A valid upstream SQL scalar, never zero or omission.
     # `bool` before `int` (bool is an int subclass) so True/False bind as booleans.
     if isinstance(value, dt.datetime):
         if value.tzinfo is not None:

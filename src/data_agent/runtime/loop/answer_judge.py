@@ -1114,10 +1114,15 @@ _POST_EXECUTION_PROMPT = """
 Review the completed analytical work and proposed answer together. Execution success and
 structural blueprint verification are not semantic approval. Assess the ACTUAL executed SQL,
 bound slots, rows and catalog evidence against each requested outcome: metric, population,
-exclusions, period and anchor, units, grain and join multiplicity. Use each result's execution.blueprint_id to identify the blueprint that actually ran,
-execution.terminal_sql to review the query producing its rows, and execution.sql for
-upstream queries in composed blueprints. execution.bound_slots and resolved_rule_bindings
-are resolved execution values; requested_slot_bindings are only the caller's request.
+exclusions, period and anchor, units, grain and join multiplicity. Use each result's blueprint_id as provenance only.
+Review execution.terminal_sql for a simple blueprint, or execution.steps in order for
+composed blueprints. These are formatted queries that actually executed.
+execution.scalar_bindings links a consuming step/parameter to a producing source_step,
+source_output and returned value. The executor substitutes upstream scalar results as SQL
+literals (including NULL); these linked literals are computed inputs, not arbitrary hard-coded
+thresholds or prior-turn assumptions. Check both steps' population and measure, plus the
+binding value, before judging the comparison. This lineage does not itself approve the metric.
+Missing lineage is unknown; do not infer it merely from equal literal values.
 Do not approve or reject by blueprint name, intent, template defaults, or verified status.
 Judge the actual executed SQL against the user's request and applicable catalog rules;
 a fetched blueprint is not proof that it ran. A blueprint template is

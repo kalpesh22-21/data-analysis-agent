@@ -185,6 +185,12 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
     bp_entries = [e for e in trail if e.tool_name == "runBlueprint"]
     assert bp_entries and bp_entries[-1].status == "ok"
     assert bp_entries[-1].blueprint_execution["terminal_sql"] == resume_mcp.calls[0].args["sql"]
+    from data_agent.runtime.context.blueprint_execution import model_execution
+    projected = model_execution(bp_entries[-1].blueprint_execution)
+    assert [step["step"] for step in projected["steps"]] == [1, 2]
+    assert "count()" in projected["steps"][0]["sql"].lower()
+    assert "count()" not in projected["steps"][1]["sql"].lower()
+
     assert bp_entries[-1].blueprint_execution["blueprint_id"] == bp_entries[-1].args["id"]
 
 

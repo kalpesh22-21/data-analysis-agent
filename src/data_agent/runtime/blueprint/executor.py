@@ -109,6 +109,7 @@ _unpack_grain_probe = unpack_grain_probe
 # runBlueprint error family (§5.4). Every non-clean outcome either PAUSES (needs
 # user input) or falls back to the raw loop — never a wrong answer, never a crash.
 NOT_FOUND_CODE = "RUN_BLUEPRINT_NOT_FOUND"
+ENTITY_NOT_FOUND_CODE = "BLUEPRINT_ENTITY_NOT_FOUND"
 SLOT_INVALID_CODE = "RUN_BLUEPRINT_SLOT_INVALID"
 UNSUPPORTED_CODE = "RUN_BLUEPRINT_UNSUPPORTED"
 VERIFY_FAILED_CODE = "RUN_BLUEPRINT_VERIFY_FAILED"
@@ -483,8 +484,9 @@ class BlueprintExecutor:
         running: dict[int, dict[str, Any]] = dict(completed)
         # B2: the completed nodes' captured provenance + node SQL are carried in
         # the checkpoint (not re-derivable — those nodes never re-run), so the
-        # final union + the `sql` transparency list span the WHOLE DAG, not just
-        # the post-resume tail. Seed both from the rehydrated records (in order); a
+        # final union spans the WHOLE DAG, not just the post-resume tail. The SQL
+        # list is rebuilt in dependency order at finalization. Seed provenance from
+        # rehydrated records; a
         # `None` provenance POISONS the union exactly as a live undetermined call.
         # The materialized TABLE NAME + row count of a table-producing node ride the
         # same records, for the same reason: a rehydrated producer is skipped below
@@ -492,13 +494,9 @@ class BlueprintExecutor:
         # consumer's `$N` had no binding and every paused table-intermediate
         # blueprint died on SLOT_INVALID at resume. They are re-validated, not
         # trusted — `_restore_materialized`.
-        node_sqls: list[str] = []
         for order in sorted(running):
             record = running[order]
             provenances.append(record.get("provenance"))
-            carried_sql = record.get("sql")
-            if isinstance(carried_sql, str):
-                node_sqls.append(carried_sql)
         materialized.update(
             await self._restore_materialized(bid, running, table_consumed_orders, credentials)
         )
@@ -667,7 +665,6 @@ class BlueprintExecutor:
                     provenance=result.provenance,
                 )
             provenances.append(result.provenance)
-            node_sqls.append(node_sql)
             # Table producer (§2.2 steps 1-2): a node whose table output is consumed
             # downstream is MATERIALIZED to a session-scoped scratch table via the
             # D93 side-channel, then the consumer's JOIN is rewritten to it. This
@@ -697,30 +694,13 @@ class BlueprintExecutor:
                 _record_empty_output(node, node_outputs)
                 continue
             # B1/F2: a node with a declared SCALAR output MUST return a single cell
-            # (1 row, 1 column per declared scalar). >1 row (fan-out), 0 rows, a
-            # NULL cell, or an extra column → fail-closed to SLOT_INVALID BEFORE the
+            # (1 row, 1 column per declared scalar). >1 row (fan-out), 0 rows, or an
+            # extra column → fail-closed to SLOT_INVALID BEFORE the
             # consumer dispatches (the D56 grain gate only guards the TERMINAL node,
             # so a fanned-out INTERMEDIATE would otherwise bind an arbitrary cell
             # downstream and return a "verified" wrong answer, §2.4).
             scalar_out = _extract_scalar_output(node, result.result_full)
             if scalar_out is None:
-                columns, rows, _, _ = _unpack_result(result.result_full)
-                missing = [
-                    name
-                    for name, kind in node.output.items()
-                    if kind == "scalar"
-                    and name in columns
-                    and len(rows) == 1
-                    and len(rows[0]) == len(columns)
-                    and rows[0][columns.index(name)] is None
-                ]
-                if missing:
-                    return ExecFailed(
-                        "RUN_BLUEPRINT_INTERMEDIATE_UNAVAILABLE",
-                        f"Blueprint node {node.order} returned NULL for intermediate "
-                        f"{', '.join(missing)}; the dependent calculation cannot run with this data.",
-                        retryable=False,
-                    )
                 _logger.warning(
                     "blueprint %s node %s declared a scalar output but did not return "
                     "a single cell; SLOT_INVALID (no arbitrary fanned-out bind)",
@@ -744,7 +724,8 @@ class BlueprintExecutor:
         return await self._finalize(
             blueprint,
             terminal,
-            node_sqls,
+            [running[n.order]["sql"] for n in topo
+             if n.order in running and isinstance(running[n.order].get("sql"), str)],
             provenances,
             credentials,
             bound_slots=bound_slots,
@@ -752,6 +733,7 @@ class BlueprintExecutor:
             freshness=freshness,
             retrieved_at=max((r["retrieved_at"] for r in running.values() if r.get("retrieved_at")), default=None),
             resolved_rule_bindings=rule_bindings,
+            scalar_bindings=_scalar_binding_receipts(topo, running),
         )
 
     async def _resolve_all_slots(
@@ -805,7 +787,7 @@ class BlueprintExecutor:
                     # An exact-value miss is a discovery gap, not necessarily
                     # user ambiguity (e.g. an abbreviation or an empty department).
                     return bound, omitted_patterns, ExecFailed(
-                        "BLUEPRINT_ENTITY_NOT_FOUND",
+                        ENTITY_NOT_FOUND_CODE,
                         f"The supplied value for {spec.name} was not found by an exact scoped lookup. "
                         "Resolve every requested value; the matched subset is not a list of alternatives. "
                         "Resolve it against the scoped directory before retrying; do not repeat "
@@ -939,6 +921,7 @@ class BlueprintExecutor:
         freshness: dict | None = None,
         retrieved_at: str | None = None,
         resolved_rule_bindings: dict[str, Any] | None = None,
+        scalar_bindings: list[dict[str, Any]] | None = None,
     ) -> ExecOutcome:
         """Run the D56 gate over the FINAL node result and build the verified
         answer (§2.2 step 5 / §5.2). Identical teeth to the single-node path."""
@@ -976,14 +959,9 @@ class BlueprintExecutor:
             "truncated": truncated,
             "preview_rows": rows[: self._preview_row_count],
             "sql": node_sqls,  # every per-node SQL (transparency, D56)
-            # The TERMINAL node's SQL — the one whose rows are the blueprint's
-            # answer. Exposed explicitly rather than left as "the last element of
-            # `sql`": rehydrated nodes (D45 exactly-once resume) are appended to
-            # `node_sqls` FIRST, so that positional assumption is not safe. It is
-            # what lets `answerWithTable(blueprint_id=…)` resolve a designation to
-            # a concrete pageable query WITHOUT re-running the blueprint (see
-            # `composite/answer_with_table.py`).
+            # Keep terminal identity explicit for paging, independent of DAG order.
             "terminal_sql": terminal_sql,
+            **({"scalar_bindings": scalar_bindings} if scalar_bindings else {}),
             "bound_slots": {
                 key: value.isoformat() if isinstance(value, (date, datetime)) else value
                 for key, value in (bound_slots or {}).items()
@@ -1832,8 +1810,9 @@ def _extract_scalar_output(node: Node, result_full: Any) -> dict[str, Any] | Non
 
     A scalar intermediate is a single cell per declared scalar. Fail-closed: returns `None` —
     a hard contract violation the caller maps to SLOT_INVALID — when the node does NOT return
-    exactly one row, when the column count does not equal the declared-scalar count, or when
-    a mapped cell is NULL. This closes the "silently take `rows[0][0]`" hazard: the D56 grain
+    exactly one row or when the column count differs from the declared-scalar count.
+    A mapped NULL is a valid scalar value. This closes the "silently take `rows[0][0]`"
+    hazard: the D56 grain
     gate only guards the TERMINAL node, so a fanned-out or wide intermediate would otherwise
     bind an ARBITRARY cell downstream and still return a "verified" answer. A node with NO
     declared scalar output yields `{}`.
@@ -1856,8 +1835,6 @@ def _extract_scalar_output(node: Node, result_full: Any) -> dict[str, Any] | Non
         # Single scalar: match by name, else the sole column by position.
         idx = col_index.get(scalars[0], 0)
         value = first[idx]
-        if value is None:
-            return None  # NULL scalar — cannot bind a typed literal
         out[scalars[0]] = value
         return out
     # Multiple scalars: EACH declared name must map to a distinct result column.
@@ -1865,8 +1842,6 @@ def _extract_scalar_output(node: Node, result_full: Any) -> dict[str, Any] | Non
         if name not in col_index:
             return None
         value = first[col_index[name]]
-        if value is None:
-            return None
         out[name] = value
     return out
 
@@ -1887,6 +1862,37 @@ def _record_empty_output(node: Node, node_outputs: dict[str, Any]) -> None:
     node_outputs[f"${node.order}"] = {"row_count": 0, "rows": []}
     for name in node.output:
         node_outputs[f"${node.order}.{name}"] = None
+
+
+def _scalar_binding_receipts(topo: list[Node], running: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Link executed scalar consumes to actual producer outputs, including resumed nodes.
+
+    Step numbers match the SQL-only receipt, not the DAG's potentially sparse node IDs.
+    Never infer a binding by matching SQL literal values or from a blueprint default.
+    """
+    steps = {node.order: i + 1 for i, node in enumerate(
+        node for node in topo if isinstance(running.get(node.order, {}).get("sql"), str)
+    )}
+    receipts = []
+    for node in topo:
+        if node.order not in steps:
+            continue
+        referenced = referenced_slots(node.sql_template or "")
+        for placeholder, ref in node.consumes.items():
+            if placeholder not in referenced or not isinstance(ref, str):
+                continue
+            match = re.fullmatch(r"\$(\d+)\.(.+)", ref)
+            if match is None:
+                continue
+            source_order, output = int(match[1]), match[2]
+            record = running.get(source_order, {})
+            values = record.get("output", {})
+            if source_order not in steps or output not in values:
+                continue
+            receipts.append({"step": steps[node.order], "parameter": placeholder,
+                             "source_step": steps[source_order], "source_output": output,
+                             "value": values[output]})
+    return receipts
 
 
 def _node_bindings(
@@ -1914,10 +1920,6 @@ def _node_bindings(
         if not isinstance(ref, str) or ref not in node_outputs:
             return {}, ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
         value = node_outputs[ref]
-        if value is None:
-            # An upstream scalar that came back NULL cannot be bound as a typed
-            # literal — fail-closed rather than emit a broken query.
-            return {}, ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
         bindings[placeholder] = value
     # (b)/(c) slots + rule IN-lists.
     for ref in refs:
@@ -2196,7 +2198,7 @@ def _load_completed_into_outputs(
     value, and is consumed by `_node_table_bindings` — never by this env."""
     for order, record in completed.items():
         output = record.get("output", {})
-        has_value = any(v is not None for v in output.values())
+        has_value = bool(output)  # A row of NULL scalars is still one row.
         node_outputs[f"${order}"] = {"row_count": 1 if has_value else 0, "rows": []}
         for name, value in output.items():
             node_outputs[f"${order}.{name}"] = value

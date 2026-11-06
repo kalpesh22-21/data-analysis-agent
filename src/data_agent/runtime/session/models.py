@@ -220,6 +220,7 @@ class TrailEntry:
     # turn, so a prior-turn denial never replays at all. The detail can only render
     # inside the turn whose scope produced it.
     denial_detail: str | None = None
+    retryable: bool | None = None
     # `serves_intent` (additive, Release 1 call-time intent tagging): the
     # `intent_id` of the tracked intent this call was made FOR, as the model named
     # it at the moment it dispatched the work. `None` (the default) for every
@@ -291,6 +292,7 @@ class TrailEntry:
             "authoritative": self.authoritative,
             **({"blueprint_execution": self.blueprint_execution} if self.blueprint_execution else {}),
             "denial_detail": self.denial_detail,
+            **({"retryable": self.retryable} if self.retryable is not None else {}),
             "serves_intent": self.serves_intent,
             "answer_table_provenance": (
                 None
@@ -327,6 +329,7 @@ class TrailEntry:
             # `.get` (not `[...]`): a document written before this field existed
             # loads with `None` and renders exactly as it always did.
             denial_detail=doc.get("denial_detail"),
+            retryable=doc.get("retryable") if isinstance(doc.get("retryable"), bool) else None,
             serves_intent=doc.get("serves_intent"),
             answer_table_provenance=_answer_table_provenance_from_doc(
                 doc.get("answer_table_provenance")

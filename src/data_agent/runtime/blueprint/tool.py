@@ -33,6 +33,12 @@ from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
 from data_agent.runtime.observability.redaction import tool_span_args
 
 from .executor import (
+    ABORTED_CODE,
+    ENTITY_NOT_FOUND_CODE,
+    NOT_FOUND_CODE,
+    SLOT_INVALID_CODE,
+    UNSUPPORTED_CODE,
+    VERIFY_FAILED_CODE,
     BlueprintExecutor,
     ExecCompleted,
     ExecFailed,
@@ -164,6 +170,14 @@ def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
             ),
         )
     if isinstance(outcome, ExecFailed):
+        authored_failure = outcome.error_code in {
+            SLOT_INVALID_CODE, UNSUPPORTED_CODE,
+            VERIFY_FAILED_CODE, ABORTED_CODE, NOT_FOUND_CODE,
+            ENTITY_NOT_FOUND_CODE,
+        }
+        detail = outcome.user_message
+        if authored_failure and outcome.retryable is False:
+            detail += " Do not repeat this blueprint unchanged; use another supported approach or explain the limitation."
         # A runBlueprint-family code OR an inner denial passed through verbatim
         # (relabeled tool_name="runBlueprint", §5.4) → the raw-loop fallback.
         return ToolResult(
@@ -171,10 +185,10 @@ def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
             tool_name=TOOL_NAME,
             error_code=outcome.error_code,
             retryable=outcome.retryable,
-            user_message=outcome.user_message,
+            user_message=detail,
             denial_detail=(
-                outcome.user_message
-                if outcome.error_code in ACCESS_DENIAL_CODES
+                detail
+                if authored_failure or outcome.error_code in ACCESS_DENIAL_CODES
                 or (outcome.error_code in AGGREGATION_QUERY_CODES | {"AGGREGATION_CHECK_UNAVAILABLE", "SQL_SYNTAX_ERROR", "SOURCE_UNAVAILABLE"}
                     and decode_diagnostic(outcome.user_message))
                 else None

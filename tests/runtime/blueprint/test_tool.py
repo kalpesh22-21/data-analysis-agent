@@ -234,3 +234,30 @@ def test_redact_tool_args_masks_slot_binding_values() -> None:
     blob = json.dumps(redacted)
     assert "Warehouse" not in blob
     assert "May 2026" not in blob
+
+
+async def test_authored_failure_feedback_and_retryability_survive_replay():
+    import json
+
+    from data_agent.runtime.context.budget import render_entry
+    from data_agent.runtime.loop.agent_loop import _tool_trail_entry_to_canonical
+    from data_agent.runtime.session.models import TrailEntry
+
+    tool, _ = _tool(ExecFailed("RUN_BLUEPRINT_UNSUPPORTED",
+        "Blueprint node 0 has no usable comparison population.", retryable=False))
+    result = await tool.run({"id": "bp", "slot_bindings": {}}, _creds())
+    entry = TrailEntry(turn_index=0, tool_call_id="failed", tool_name="runBlueprint",
+        args={"id": "bp"}, status=result.status, error_code=result.error_code,
+        provenance=result.provenance, result_preview=None, result_full_ref=None, ts="now",
+        denial_detail=result.denial_detail, retryable=result.retryable)
+    restored = TrailEntry.from_doc(entry.to_doc())
+    packet = json.loads(_tool_trail_entry_to_canonical(render_entry(restored, 5))[-1]["content"])
+    assert "no usable comparison population" in packet["user_message"]
+    assert "Do not repeat this blueprint unchanged" in packet["user_message"]
+    assert packet["retryable"] is False
+
+
+async def test_forwarded_unknown_failure_does_not_persist_raw_message():
+    tool, _ = _tool(ExecFailed("UNEXPECTED_BACKEND_ERROR", "private backend detail", retryable=False))
+    result = await tool.run({"id": "bp", "slot_bindings": {}}, _creds())
+    assert result.denial_detail is None
