@@ -123,6 +123,9 @@ def run_http_daemon(
     # loop factory. The APP is NOT built here — `factory=True` defers that to
     # `config.load()` inside `serve()`.
     config = uvicorn.Config(app_factory, factory=True, **config_kwargs)
+    from data_agent.access_logging import install_probe_access_filter
+
+    install_probe_access_filter()
     server = uvicorn.Server(config)
 
     async def _main() -> int:
