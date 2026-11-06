@@ -122,11 +122,10 @@ async def test_substantive_rejection_still_returns_to_agent_for_repair():
         {"approved": False},
         {"repair_type": "analysis"},
         {"violation": "unsupported_by_evidence"},
-        {"feedback": "Fix it"},
     ],
 )
 async def test_malformed_correction_is_never_reviewed_approval(overrides):
-    judge = AnswerJudge(ScriptedModelClient([response(**overrides)]), token_budget=10000)
+    judge = AnswerJudge(ScriptedModelClient([response(**overrides), response(**overrides)]), token_budget=10000)
     verdict = await judge.review(
         JudgeBrief("exit_table", "Ranking?", draft=ORIGINAL, allow_prose_correction=True)
     )
@@ -183,14 +182,15 @@ async def test_runtime_defers_numeric_corrections_to_judge(original, corrected):
     assert not any(name == "loop_answer_judge_refused" for name, _ in events)
 
 
-async def test_correction_cannot_request_new_components():
+async def test_unused_table_field_cannot_request_new_components():
     judge = AnswerJudge(
         ScriptedModelClient([response(tables=[{"result_id": "other"}])]), token_budget=10000
     )
     verdict = await judge.review(
         JudgeBrief("exit_table", "Ranking?", draft=ORIGINAL, allow_prose_correction=True)
     )
-    assert not verdict.reviewed
+    assert verdict.reviewed and verdict.corrected_answer == CORRECTED
+    assert verdict.corrected_document is None
 
 
 async def test_q011_repeated_verified_number_ships_correction_and_table_without_salvage():
@@ -276,10 +276,12 @@ async def test_judge_correction_repairs_caveat_without_query_or_agent_round(enco
 
     bad_section = {**section(), "caveats": ["Data through the current date."]}
     judge_client = ScriptedModelClient([_raw_turn({
-        "approved": True, "violation": "", "feedback": "", "repair_type": "presentation",
+        "approved": True, "violation": None, "feedback": None, "repair_type": "presentation",
         "corrected_document": {"takeaway": "There are 120 employees in the accessible records.",
                                "sections": json.dumps([section()]) if encoded else [section()],
-                               "evidence": json.dumps(["q"]) if encoded else ["q"]},
+                               "evidence": json.dumps(["q"]) if encoded else ["q"],
+                               "deliverables": [{"intent_id": "", "result_ids": ["unused"]}]},
+        "evidence": [],
     })])
     judge = AnswerJudge(judge_client, token_budget=100000)
     loop, store, model, mcp, events = build([

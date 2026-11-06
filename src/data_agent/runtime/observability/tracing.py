@@ -686,7 +686,11 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "exception_type",  # Exception class only; messages may contain scoped data.
     "schema_keyword",  # Recovery validator diagnostics, no response values.
     "schema_path",
+    "instance_path",
+    "unknown_fields",
     "missing_fields",
+    "expected",
+    "dropped_fields",
     "removed_count",
     "evidence_tool_name",
     # HOW the evidence binding was established — `tagged` (the model named the
@@ -702,14 +706,12 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     # `loop_intent_tag_dropped.reason` instead (D25).
     "evidence_binding",
     "exit",
-    "pending_count",
     "proposed_count",
     "blocking_tool_name",
     "reason",
     # `loop_answer_judge_failed`: why a judgement could not be read. A closed runtime
     # vocabulary and trusted judge-schema coordinates; never a value from the response.
     "malformed_reason",
-    "schema_path",
     # The blueprint the getBlueprint-before-run gate refused
     # (`loop_blueprint_definition_not_read`). D25-safe: a blueprint id is
     # CORPUS-AUTHORED, never user content — the same class as the table/database

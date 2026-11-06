@@ -60,7 +60,7 @@ def _turn(arguments: Any) -> ModelTurnResult:
 async def _review(arguments: Any, *, site: str = "exit_prose", allow: bool = True):
     events: list[tuple[str, dict]] = []
     judge = AnswerJudge(
-        ScriptedModelClient([_turn(arguments)]), token_budget=20000,
+        ScriptedModelClient([_turn(arguments), _turn(arguments)]), token_budget=20000,
         observer=lambda event, payload: events.append((event, payload)),
     )
     verdict = await judge.review(JudgeBrief(site, "How do I update direct deposit?",
@@ -104,12 +104,10 @@ def test_a_missing_repair_type_is_fixed_by_the_one_correction_carried(correction
         (_turn({"approved": "true"}), "approved_not_boolean"),
         (_turn({"approved": True, "partial_answer": {"takeaway": "x"}}), "approval_with_partial_answer"),
         (_turn({**APPROVE_DOCUMENT, "corrected_answer": "Also this."}), "correction_count"),
-        (_turn({**APPROVE_DOCUMENT, "feedback": "Fixed the takeaway."}), "correction_with_feedback"),
+        (_turn({**APPROVE_DOCUMENT, "violation": "unsupported_by_evidence", "feedback": "Still unsupported."}), "correction_with_violation"),
         (_turn({**APPROVE_DOCUMENT, "repair_type": "analysis"}), "correction_repair_type"),
         (_turn({"approved": True, "repair_type": "prose", "corrected_question": {"question": "Which?", "options": []}}),
          "correction_site"),
-        (_turn({"approved": True, "repair_type": "prose", "corrected_answer": "Text.", "evidence": ["c1"]}),
-         "correction_unknown_fields"),
         (_turn({"approved": True, "repair_type": "prose", "corrected_answer": " "}), "correction_text"),
         (_turn({**REJECTION, "violation": ""}), "unknown_violation"),
         (_turn({**REJECTION, "feedback": ""}), "unusable_feedback"),
