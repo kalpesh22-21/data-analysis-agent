@@ -1,5 +1,7 @@
 # Multi-value implementation self-review — 2026-11-05
 
+Historical engineering record. Localhost trace URLs and `/tmp` or gitignored artifact paths refer to the original test machine; those artifacts are not distributed with this repository. The observations below are recorded results, not a portable reproduction bundle.
+
 Reviewed the multi-value resolver/executor/binder changes, load-time validation, retrieval-mode cleanup, assembler flag call sites, batching guidance, and their regression coverage. Existing staged work was preserved. No commits or pushes.
 
 ## Findings fixed

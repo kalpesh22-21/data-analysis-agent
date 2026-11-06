@@ -1,5 +1,7 @@
 # Multi-value filter review follow-up — 2026-11-05
 
+Historical engineering record. Localhost trace URLs and `/tmp` or gitignored artifact paths refer to the original test machine; those artifacts are not distributed with this repository. The observations below are recorded results, not a portable reproduction bundle.
+
 Implemented in data-analysis-agent; no commits or pushes. Existing work in both repositories was preserved.
 
 | Review finding | Resolution |
