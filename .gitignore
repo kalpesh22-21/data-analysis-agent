@@ -37,3 +37,6 @@ docs/remote-*
 kimi_api_key.txt
 /NEW_FEATURE.md
 /EMBER-CARDS.md
+
+# Generated verification captures (keep reports, not raw artifacts).
+/docs/verification/artifacts/
