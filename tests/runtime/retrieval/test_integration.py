@@ -93,7 +93,7 @@ def _pipeline(embedder: FakeEmbeddingClient) -> RetrievalPipeline:
 
 async def test_assemble_prepends_retrieval_user_message() -> None:
     store = InMemorySessionStore()
-    assembler = ContextAssembler(store, retrieval=_pipeline(FakeEmbeddingClient()))
+    assembler = ContextAssembler(store, retrieval_hints_enabled=True, retrieval=_pipeline(FakeEmbeddingClient()))
     assembled = await assembler.assemble(
         SESSION_ID, frozenset(), user_message=_Q, retrieval_memo={}
     )
@@ -104,48 +104,22 @@ async def test_assemble_prepends_retrieval_user_message() -> None:
     assert assembled.retrieved_counts == (1, 0)
 
 
-async def test_feature_flag_renders_retrieval_as_prefetch_tool_pair() -> None:
+async def test_hint_flag_emits_reference_context_not_simulated_calls():
     store = InMemorySessionStore()
-    await store.append_message(
-        SESSION_ID,
-        TurnMessage(
-            turn_index=4,
-            role="user",
-            content=_Q,
-            ts="2026-09-02T12:00:00+00:00",
-        ),
-    )
-    assembler = ContextAssembler(
-        store,
-        retrieval=_pipeline(FakeEmbeddingClient()),
-        retrieval_prefetch_tool_enabled=True,
-    )
-    assembled = await assembler.assemble(
-        SESSION_ID,
-        frozenset(),
-        current_turn_index=4,
-        user_message=_Q,
-        retrieval_memo={},
-    )
-    assert [message["role"] for message in assembled.messages] == ["user", "user", "tool"]
-    assert assembled.messages[-2]["content"] == _Q
-    entry = assembled.messages[-1]
-    assert entry["tool_name"] == "prefetchContext"
-    assert entry["tool_call_id"] == "prefetched-retrieval-context-4"
-    assert entry["prefetch_context"] is True
-    assert "sales overtime rollup" in entry["content"]
-    assert assembled.retrieved_counts == (1, 0)
-    canonical = _assembled_to_canonical(assembled.messages)
-    assert [message["role"] for message in canonical] == [
-        "user",
-        "user",
-        "assistant",
-        "tool",
-    ]
-    call = canonical[-2]["tool_calls"][0]
-    assert call["function"]["name"] == "prefetchContext"
-    assert canonical[-1]["tool_call_id"] == call["id"]
-    assert canonical[-2]["context_kind"] == canonical[-1]["context_kind"] == "retrieval"
+    await store.append_message(SESSION_ID, TurnMessage(
+        turn_index=4, role="user", content=_Q, ts="2026-09-02T12:00:00+00:00"))
+    for enabled in (False, True):
+        embedder = FakeEmbeddingClient()
+        assembler = ContextAssembler(store, retrieval=_pipeline(embedder),
+                                     retrieval_hints_enabled=enabled)
+        assembled = await assembler.assemble(SESSION_ID, frozenset(),
+            current_turn_index=4, user_message=_Q, retrieval_memo={})
+        canonical = _assembled_to_canonical(assembled.messages)
+        assert all(m["role"] == "user" for m in canonical)
+        assert canonical[-1]["content"] == _Q
+        assert not any("prefetchContext" in str(m) for m in canonical)
+        assert assembled.retrieved_counts == ((1, 0) if enabled else (0, 0))
+        assert bool(embedder.calls) == enabled
 
 
 async def test_unconfigured_retrieval_is_byte_identical() -> None:
@@ -154,7 +128,7 @@ async def test_unconfigured_retrieval_is_byte_identical() -> None:
     store = InMemorySessionStore()
     await _seed_history(store, n=40)
     scope = frozenset({f"{_COL[0]}.{_COL[1]}"})
-    plain = ContextAssembler(store)  # retrieval=None
+    plain = ContextAssembler(store, retrieval_hints_enabled=True)  # retrieval=None
     with_user_msg = await plain.assemble(SESSION_ID, scope, user_message=_Q, user_id="u1")
     without = await plain.assemble(SESSION_ID, scope)
     assert len(without.messages) > 1  # guard: history is genuinely present
@@ -165,7 +139,7 @@ async def test_unconfigured_retrieval_is_byte_identical() -> None:
 async def test_configured_retrieval_but_no_user_message_does_not_run() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval_hints_enabled=True, retrieval=_pipeline(embedder))
     assembled = await assembler.assemble(SESSION_ID, frozenset())  # no user_message
     assert embedder.calls == []  # retrieval never ran
     assert assembled.retrieved_counts == (0, 0)
@@ -174,7 +148,7 @@ async def test_configured_retrieval_but_no_user_message_does_not_run() -> None:
 async def test_memo_prevents_re_embedding_within_a_turn() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval_hints_enabled=True, retrieval=_pipeline(embedder))
     memo: dict = {}
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q, retrieval_memo=memo)
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q, retrieval_memo=memo)
@@ -184,7 +158,7 @@ async def test_memo_prevents_re_embedding_within_a_turn() -> None:
 async def test_no_memo_re_embeds_each_call() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval_hints_enabled=True, retrieval=_pipeline(embedder))
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q)
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q)
     assert embedder.calls == [[_Q], [_Q]]
@@ -202,7 +176,7 @@ async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
 async def test_loop_embeds_once_per_turn_across_iterations() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
-    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval_hints_enabled=True, retrieval=_pipeline(embedder))
     # Two round-trips: a tool call, then a tool-call-free response.
     model = ScriptedModelClient(
         [

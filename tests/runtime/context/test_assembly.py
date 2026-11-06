@@ -174,7 +174,7 @@ async def test_base_prompt_is_index_zero_and_sole_system_message_after_retrieval
     assembler = ContextAssembler(
         store,
         base_system_prompt=AGENT_SYSTEM_PROMPT,
-        retrieval=_StubRetrieval(),
+        retrieval_hints_enabled=True, retrieval=_StubRetrieval(),
     )
     assembled = await assembler.assemble(
         "sess-1", frozenset(), current_turn_index=0, user_message="how many employees?"
@@ -416,7 +416,7 @@ async def test_the_anchor_is_the_outermost_of_the_three_pre_question_blocks() ->
     assembler = ContextAssembler(
         store,
         base_system_prompt="BASE",
-        retrieval=_StubAnchorRetrieval(),
+        retrieval_hints_enabled=True, retrieval=_StubAnchorRetrieval(),
     )
     assembled = await assembler.assemble(
         "sess-1",

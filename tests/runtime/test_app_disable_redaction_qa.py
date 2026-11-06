@@ -201,7 +201,7 @@ def _read_tools_app(monkeypatch, *, disable_redaction: bool, pii_query: str) -> 
         top_k_knowledge=3,
     )
     return create_app(
-        settings=RuntimeSettings(_env_file=None, otlp_disable_redaction=disable_redaction),
+        settings=RuntimeSettings( _env_file=None, otlp_disable_redaction=disable_redaction),
         session_store=InMemorySessionStore(),
         mcp_client=FakeMCPClient(scripted={}),
         model_client=ScriptedModelClient(

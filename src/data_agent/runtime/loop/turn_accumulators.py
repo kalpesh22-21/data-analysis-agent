@@ -223,6 +223,8 @@ class TurnAccumulators:
         # `answerWithTable` wins over the WHOLE set, never appends.
         self._answer_tables: list[AnswerTable] = list(answer_tables or ())
         self.extra_evidence: list[dict[str, Any]] | None = None
+        # Window-local credentials fingerprint; independent of HTTP/delivery context.
+        self.search_scope_hash: str | None = None
         # `blueprint_id -> BlueprintRun` (terminal SQL + D56 verification + slots)
         # for every blueprint that ran SUCCESSFULLY this turn, captured at dispatch
         # (the result is in hand there, so this needs no D46 KV de-reference). It is

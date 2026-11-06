@@ -17,6 +17,36 @@ uv run pytest
 uv run ruff check
 ```
 
+## Retrieval mode
+
+`RETRIEVAL_MODE` selects how the agent discovers supporting context:
+
+| Value | Retrieval hints | Mandatory searches before other work |
+| --- | --- | --- |
+| `hints` (default) | Ordinary reference context when retrieval is available | None |
+| `required_search` | Not injected | `searchBlueprints`, `searchKnowledge`, plus `searchCapabilityTools` when capabilities are enabled |
+
+Hint mode works without Neo4j/retrieval and retains normal recovery. Required-search
+mode is an explicit strict experiment: startup fails clearly unless retrieval is
+configured and enabled. It adds search calls to every turn, including chat,
+clarifications, Help Center questions and saved-result summaries. A runtime retrieval
+outage or timeout before discovery completes prevents answering/recovery in that
+mode. Use hints mode when graceful degradation is required.
+
+The deprecated `RETRIEVAL_PREFETCH_TOOL_ENABLED` is ignored, with a startup warning: both
+of its values only chose how hints were shown, so neither opts into required_search. Only
+`RETRIEVAL_MODE=required_search` does. No simulated `prefetchContext` tool calls are
+created in either mode.
+
+The main prompt describes the selected mode. Required searches use the current
+request and conversation; empty successful searches count, failures do not. The gate
+enforces completion, not semantic relevance. Successful receipts survive same-scope
+resume, but not a new turn or scope. Mixed batches retain pending searches and drop
+premature work. Gate violations have their own bounded correction path, separate
+from answer repair. Normal wall-clock, token, iteration and read limits still apply.
+`loop_required_search_gate` records waiting, completed, ready, blocked and incomplete
+states without recording query text.
+
 ## Project structure
 
 ```

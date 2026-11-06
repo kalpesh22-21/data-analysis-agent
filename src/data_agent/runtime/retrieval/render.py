@@ -1,11 +1,8 @@
 """render.py — `RetrievedContext` -> model-facing context messages.
 
-Pure formatting over an already-cut, already-ordered block. The established path
-produces one `user` message; the feature-flagged path wraps that same deterministic
-content in a paired synthetic `prefetchContext` assistant/tool exchange.
-
-Neither path adds a system message, so the base prompt stays the SOLE `role: "system"`
-message. A leading prefix also marks the payload as retrieved prior-context.
+Pure formatting over an already-cut, already-ordered block, producing one `user`
+message when retrieval hints are enabled. No simulated tool calls are emitted.
+The renderer adds no system message. A leading prefix also marks the payload as retrieved prior-context.
 
 Trust boundary (H2): even though the corpus is written offline and passes the write-time
 leakage gate — so its CONTENT is trusted — the retrieved TEXT must not be able to forge the
@@ -30,12 +27,6 @@ from .models import RetrievedContext, ThinCard
 # Marks the block as retrieved prior-context under the `user` role, so the model
 # reads it as candidate reference material rather than the current question.
 _USER_CONTEXT_PREFIX = "[Retrieved context — candidate blueprints/knowledge for this question]\n\n"
-
-# The synthetic call is application-initiated prefetch, not a claim that the model
-# chose to invoke a tool. The provider adapters already translate canonical paired
-# assistant/tool messages to both Responses and Chat-Completions shapes.
-PREFETCH_CONTEXT_TOOL_NAME = "prefetchContext"
-PREFETCH_CONTEXT_CALL_ID_PREFIX = "prefetched-retrieval-context-"
 
 _HEADER = (
     "Relevant context retrieved for this request "
@@ -81,6 +72,8 @@ def _card_detail_lines(card: ThinCard) -> list[str]:
             slot_type = _sanitize(slot.type, _MAX_FIELD_CHARS)
             requirement = "required" if slot.required else "optional"
             qualifier = f"{slot_type}, {requirement}" if slot_type else requirement
+            if slot.multiple:
+                qualifier += ", accepts a list"
             rendered.append(f"{name} ({qualifier})")
         more = f" (+{card.slots_omitted} more)" if card.slots_omitted > 0 else ""
         lines.append(f"{_CARD_DETAIL_INDENT}slots: {', '.join(rendered)}{more}")
@@ -144,26 +137,5 @@ def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None
     return {"role": "user", "content": _USER_CONTEXT_PREFIX + "\n".join(lines)}
 
 
-def render_retrieved_context_tool_entry(
-    context: RetrievedContext, *, turn_index: int
-) -> dict[str, Any] | None:
-    """Render retrieval as one prefetch trail item for canonical expansion.
 
-    ``ContextAssembler`` carries tool results as render items, not canonical API
-    messages. The loop expands this marker into the valid assistant/tool exchange.
-    """
-    rendered = render_retrieved_context(context)
-    if rendered is None:
-        return None
-    call_id = f"{PREFETCH_CONTEXT_CALL_ID_PREFIX}{turn_index}"
-    return {
-        "role": "tool",
-        "tool_call_id": call_id,
-        "tool_name": PREFETCH_CONTEXT_TOOL_NAME,
-        "args": {},
-        "prefetch_context": True,
-        "content": rendered["content"],
-    }
-
-
-__all__ = ["render_retrieved_context", "render_retrieved_context_tool_entry"]
+__all__ = ["render_retrieved_context"]

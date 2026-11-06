@@ -41,11 +41,11 @@ def test_procedure_has_each_stage(step):
 @pytest.mark.parametrize(
     "rule",
     [
-        "distinct deliverables",
-        "if late, bind existing result IDs",
+        "Track multiple requested outcomes",
+        "bind existing result IDs if created late",
         "Descriptions are frozen",
         "names alongside codes",
-        "a search in the same response does not qualify",
+        "Read results before proposing SQL, never in the same response",
         "never SQL",
         "before running it with runBlueprint in a subsequent response",
         "Structural verification alone is not proof",
@@ -59,13 +59,13 @@ def test_procedure_has_each_stage(step):
         "State calls execute first",
         "empty result answers a matching-records request",
         "do not rerun SQL to re-derive or reformat",
-        "Do not repeat a successful query already executed",
-        "a bounded re-fetch is supported",
+        "Reuse successful queries unless repairing their measurement",
+        "bounded re-fetch is allowed for trimmed documentation",
         "SELECT or WITH...SELECT",
-        "SHOW, DESCRIBE, EXPLAIN",
+        "SHOW/DESCRIBE/EXPLAIN",
         "SET/SETTINGS/FORMAT",
         "today()/now()",
-        "Honor declared relative-window anchors",
+        "Honor relative-window anchors unless user periods override them",
         "exact execution result_id",
         "Choose rendering without asking",
         "never limit scope for display",
@@ -173,8 +173,8 @@ def test_active_is_explicit_scope_while_current_uses_catalog_default():
 
 
 def test_authorized_personal_fields_are_not_refused_for_sensitivity():
-    from data_agent.runtime.prompts import ACCESS_SCOPE_GUIDANCE
     from data_agent.runtime.loop.answer_judge import _system_prompt
+    from data_agent.runtime.prompts import ACCESS_SCOPE_GUIDANCE
 
     assert ACCESS_SCOPE_GUIDANCE in AGENT_SYSTEM_PROMPT
     for site in ("ask_user", "exit_prose", "exit_table", "exit_capability"):

@@ -186,7 +186,7 @@ def test_behavior_instructions_and_guard_agree():
         "applicable catalog defaults"
         in _ANSWER_JUDGE_PROMPT
     )
-    assert "execute the independently correct part" in AGENT_SYSTEM_PROMPT
+    assert "Execute correct blueprint subsets" in AGENT_SYSTEM_PROMPT
     assert "execute it for that part" in BLUEPRINT_NOT_SEARCHED_MESSAGE
     assert "omit repetition of supporting metrics, table rows" in AGENT_SYSTEM_PROMPT
 

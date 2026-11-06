@@ -30,6 +30,8 @@ from data_agent.runtime.prompts import (
     HELP_CENTER_ROUTE,
     HELP_CENTER_SYSTEM_PROMPT,
     HELP_CENTER_UNAVAILABLE_ROUTE,
+    RETRIEVAL_HINTS_GUIDANCE,
+    required_search_guidance,
 )
 
 # enabled but paycompy is missing.
@@ -974,12 +976,11 @@ class RuntimeSettings(BaseSettings):
     retrieval_enabled: bool = Field(
         True, description="Master switch; False => empty RetrievedContext (Phase-0 parity)."
     )
-    retrieval_prefetch_tool_enabled: bool = Field(
-        False,
-        description=(
-            "When True, inject per-question retrieved context as a synthetic "
-            "prefetchContext assistant/tool exchange instead of a user-role message."
-        ),
+    retrieval_mode: Literal["hints", "required_search"] = Field(
+        "hints", description="Hints are optional by default; required_search opts into mandatory per-turn discovery."
+    )
+    retrieval_prefetch_tool_enabled: bool | None = Field(
+        None, description="Deprecated and ignored: both values only chose how hints were shown. Use retrieval_mode."
     )
 
     retrieval_recall_k: int = Field(
@@ -1173,7 +1174,14 @@ class RuntimeSettings(BaseSettings):
             prompt += ACTIONS_UNAVAILABLE_SYSTEM_PROMPT
         if self.help_center_enabled and self.capability_tools_enabled:
             prompt += HELP_CENTER_CAPABILITY_SYSTEM_PROMPT
-        return prompt
+        if self.retrieval_mode == "required_search":
+            prompt = prompt.replace(
+                "Chat: finalizeAnswer with takeaway and empty sections/evidence, no lookup/refusal.",
+                "Chat: complete required searches, then finalizeAnswer with takeaway and empty sections/evidence.",
+            )
+        discovery = (RETRIEVAL_HINTS_GUIDANCE if self.retrieval_mode == "hints"
+                     else required_search_guidance(self.capability_tools_enabled))
+        return discovery + "\n\n" + prompt
 
     def request_token_budget(self) -> int:
         """Absolute cap on the FULL assembled request (all messages) handed to `send_turn`: the

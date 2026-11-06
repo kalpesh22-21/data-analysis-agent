@@ -284,12 +284,6 @@ def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
     * `conversation` — anything else (a prior-turn user/assistant exchange).
     """
     first = messages[start]
-    if (
-        first.get("role") == "assistant"
-        and first.get("tool_calls")
-        and first.get("context_kind") == "retrieval"
-    ):
-        return _UNIT_KIND_RETRIEVAL
     if first.get("role") == "assistant" and first.get("tool_calls"):
         return _UNIT_KIND_TRAIL
     if first.get("role") == "user" and end - start == 1:

@@ -73,7 +73,7 @@ async def test_base_prompt_precedes_retrieval_block() -> None:
     assembler = ContextAssembler(
         store,
         base_system_prompt=AGENT_SYSTEM_PROMPT,
-        retrieval=_StubRetrieval(),
+        retrieval_hints_enabled=True, retrieval=_StubRetrieval(),
     )
     assembled = await assembler.assemble(
         "s1", frozenset(), current_turn_index=0, user_message="how many employees?"

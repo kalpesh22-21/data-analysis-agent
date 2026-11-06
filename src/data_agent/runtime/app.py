@@ -77,6 +77,7 @@ from data_agent.runtime.help_center.tools import (
 )
 from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
 from data_agent.runtime.loop.answer_judge import AnswerJudge
+from data_agent.runtime.loop.required_searches import SEARCHES
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
@@ -575,6 +576,18 @@ def create_app(
     # are simply absent from the registry → the loop advertises them but returns
     # RETRIEVAL_TOOL_UNAVAILABLE (Phase-0 parity, read-tools §6).
     active_retrieval = retrieval if settings.retrieval_enabled else None
+    retrieval_mode = settings.retrieval_mode
+    if settings.retrieval_prefetch_tool_enabled is not None:
+        _logger.warning(
+            "RETRIEVAL_PREFETCH_TOOL_ENABLED is deprecated and ignored; using RETRIEVAL_MODE=%s",
+            retrieval_mode,
+        )
+    if retrieval_mode == "required_search" and active_retrieval is None:
+        raise ValueError(
+            "RETRIEVAL_MODE=required_search requires RETRIEVAL_ENABLED=true and a configured "
+            "retrieval pipeline (Neo4j and embedding service). Use RETRIEVAL_MODE=hints "
+            "for deployments without retrieval."
+        )
 
     # Live sessions own their persisted catalog. Explicit injection and fixture
     # mode remain available for offline tests; neither is a live fallback.
@@ -622,7 +635,8 @@ def create_app(
         product_documentation_available=settings.help_center_enabled,
     )
     capability_prefetch_provider = None
-    if settings.capability_tools_enabled and settings.capability_prefetch_enabled:
+    if (settings.capability_tools_enabled and settings.capability_prefetch_enabled
+        and (retrieval_mode == "hints")):
         assert capability_client is not None
 
         async def capability_prefetch_provider(query: str, user_jwt: str | None = None):
@@ -633,7 +647,7 @@ def create_app(
             store,
             preview_row_count=settings.preview_row_count,
             retrieval=active_retrieval,
-            retrieval_prefetch_tool_enabled=settings.retrieval_prefetch_tool_enabled,
+            retrieval_hints_enabled=(retrieval_mode == "hints"),
             capability_tools_enabled=settings.capability_tools_enabled,
             capability_prefetch_provider=capability_prefetch_provider,
             base_system_prompt=settings.effective_agent_system_prompt(),
@@ -926,6 +940,11 @@ def create_app(
             context_assembler=_context_assembler(session_store),
             session_store=session_store,
             tools_provider=_tools_provider,
+            required_search_tools=(
+                () if (retrieval_mode == "hints") else
+                SEARCHES
+                + (("searchCapabilityTools",) if settings.capability_tools_enabled else ())
+            ),
             max_loop_iterations=settings.max_loop_iterations,
             max_wall_clock_seconds=settings.max_wall_clock_seconds,
             model_call_timeout_seconds=settings.model_call_timeout_seconds,

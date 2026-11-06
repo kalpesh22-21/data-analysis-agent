@@ -220,6 +220,8 @@ def _enrich_slot(raw: Any) -> dict[str, Any]:
         required = True
     if required:
         note = _REQUIRED_SLOT_NOTE
+    elif slot.get("default") is not None:
+        note = "If omitted, uses the declared default. A supplied value replaces that default."
     elif isinstance(pattern := slot.get("optional_pattern"), str) and pattern.strip():
         note = (
             _OPTIONAL_ALL_VALUES_NOTE if pattern.strip().upper() == "TRUE"
@@ -236,9 +238,25 @@ def _enrich_slot(raw: Any) -> dict[str, Any]:
         "requirement": "required" if required else "optional",
         "note": note,
     }
-    for key in ("binds_to", "enum_values", "min_value", "max_value", "temporal_type"):
+    for key in ("default", "allowed_columns", "binds_to", "enum_values", "min_value", "max_value", "temporal_type"):
         if slot.get(key) is not None:
             enriched[key] = slot[key]
+    if slot.get("multiple") is True:
+        enriched["multiple"] = True
+        enriched["type_meaning"] = "one or more categorical values; match any listed value (OR/IN)"
+        enriched["note"] += " Send a JSON list, not comma-separated text. Single text values remain accepted."
+        items = {"type": "string", "minLength": 1}
+        if slot.get("enum_values"):
+            items["enum"] = slot["enum_values"]
+        enriched["value_schema"] = {"type": "array", "minItems": 1, "maxItems": MULTI_VALUE_LIMIT, "items": items}
+    if type_ == "sort_order":
+        enriched["value_schema"] = {
+            "type": "array", "minItems": 1, "maxItems": 3,
+            "items": {"type": "object", "required": ["column", "direction"],
+                      "additionalProperties": False,
+                      "properties": {"column": {"type": "string", "enum": slot.get("allowed_columns", [])},
+                                     "direction": {"type": "string", "enum": ["ASC", "DESC"]}}},
+        }
     return enriched
 
 
@@ -308,7 +326,8 @@ def _search_card(card: ThinCard) -> dict[str, Any]:
     _put_if_present(entry, "resolves", card.resolves)
     if card.slots is not None:
         entry["slots"] = [
-            {"name": slot.name, "type": slot.type, "required": slot.required} for slot in card.slots
+            {"name": slot.name, "type": slot.type, "required": slot.required,
+             **({"multiple": True} if slot.multiple else {})} for slot in card.slots
         ]
         # Only when the per-card cap actually dropped slots — a `0` on every
         # enriched card would break the "omit what is absent" shape, and its

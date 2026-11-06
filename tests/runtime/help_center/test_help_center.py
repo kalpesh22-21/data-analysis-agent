@@ -95,7 +95,7 @@ def test_disabled_prompt_says_product_questions_have_no_source() -> None:
 
     assert HELP_CENTER_ROUTE in disabled.agent_system_prompt  # the line the swap replaces
     off = disabled.effective_agent_system_prompt()
-    assert off.startswith(disabled.agent_system_prompt.replace(HELP_CENTER_ROUTE, HELP_CENTER_UNAVAILABLE_ROUTE))
+    assert disabled.agent_system_prompt.replace(HELP_CENTER_ROUTE, HELP_CENTER_UNAVAILABLE_ROUTE) in off
     assert HELP_CENTER_ROUTE not in off and "searchHelpCenter" not in off
     on = enabled.effective_agent_system_prompt()
     assert HELP_CENTER_ROUTE in on and HELP_CENTER_UNAVAILABLE_ROUTE not in on

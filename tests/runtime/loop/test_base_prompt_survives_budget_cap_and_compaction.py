@@ -383,7 +383,7 @@ async def test_base_prompt_is_sole_system_message_with_retrieval_wired_through_c
     assembler = ContextAssembler(
         store,
         base_system_prompt=AGENT_SYSTEM_PROMPT,
-        retrieval=_StubRetrieval(),  # production wiring: retrieval cards block present
+        retrieval_hints_enabled=True, retrieval=_StubRetrieval(),  # production wiring: retrieval cards block present
     )
     loop = AgentLoop(
         model_client=main_model,

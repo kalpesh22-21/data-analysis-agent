@@ -204,6 +204,9 @@ from .loop_safety import (
 from .measurement_repair import pending_measurement_rejections
 from .proposal import SUPPORTING_LOOKUP_TOOLS, ReviewState, assess_deliverable_evidence, fingerprint
 from .read_guard import ReadGuard, repeated_read_guard_event
+from .required_searches import LIMITATION as SEARCH_LIMITATION
+from .required_searches import RequiredSearchGate
+from .required_searches import tool_name as search_tool_name
 from .turn_accumulators import (
     AnswerEnvelope,
     TurnAccumulators,
@@ -784,8 +787,6 @@ def _tool_trail_entry_to_canonical(
             }
         ],
     }
-    if entry.get("prefetch_context"):
-        assistant_message["context_kind"] = "retrieval"
     # D94 Part 1: an entry flagged `withheld_sentinel` is a synthetic,
     # non-data-bearing sentinel injected by `context/assembly.py` for a
     # current-turn `ok`+`None` stranded result — its `content` is used verbatim as
@@ -793,14 +794,7 @@ def _tool_trail_entry_to_canonical(
     # tool_call's required slot to break the retry-until-budget-cap loop. The
     # explicit flag (not a bare `content` key) keeps a future `_render_entry` field
     # from ever silently rerouting a normal tool entry to verbatim rendering.
-    if entry.get("prefetch_context"):
-        tool_message = {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": entry["content"],
-            "context_kind": "retrieval",
-        }
-    elif entry.get("withheld_sentinel") or entry.get("historical_delivery"):
+    if entry.get("withheld_sentinel") or entry.get("historical_delivery"):
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -980,6 +974,7 @@ def _assembled_to_canonical(
     return canonical
 
 
+
 class AgentLoop:
     """The turn state machine — wires `ModelClient`, `ToolDispatcher`,
     `ContextAssembler`, and `SessionStore` into one askUser/budget-aware loop."""
@@ -996,6 +991,7 @@ class AgentLoop:
         max_wall_clock_seconds: float,
         max_budget_windows: int,
         model_call_timeout_seconds: float = 120.0,
+        required_search_tools: tuple[str, ...] = (),
         max_read_calls_per_tool: int = 3,
         max_no_progress_rounds: int = 4,
         help_center_failure_limit: int = 2,
@@ -1045,6 +1041,7 @@ class AgentLoop:
         self._tool_dispatcher = tool_dispatcher
         self._context_assembler = context_assembler
         self._session_store = session_store
+        self._required_search_tools = required_search_tools
         self._tools_provider = tools_provider
         # The runtime-tool registry (read-tools-design §2): model-facing tools
         # implemented in the runtime (`resolveValues` + the three read tools),
@@ -2386,10 +2383,27 @@ class AgentLoop:
             provenance = frozenset()
         if accum.answer_document is not None:
             accum.answer_document = {**accum.answer_document, "takeaway": assistant_text or ""}
-        review, withheld = await review_delivery(
-            self, session_id, turn_index, assistant_text, accum, checkpoint
-        )
-        if (withheld or review.get("status") == "exhausted") and not checkpoint:
+        search_pending = False
+        if self._required_search_tools and checkpoint is None:
+            search_doc = await self._session_store.get_or_create_session(session_id)
+            delivery = CURRENT_DELIVERY.get()
+            search_scope = (scope_filter.compute_scope_hash(delivery.credentials.column_scope)
+                            if delivery else accum.search_scope_hash)
+            search_pending = bool(RequiredSearchGate.restore(
+                self._required_search_tools, search_doc.tool_trail, turn_index, search_scope,
+            ).pending)
+        if search_pending:
+            accum.apply_ship_disposition("decline_only", ())
+            capability_cards = None
+            completion_notice = None
+            review, withheld = ({"status": "rejected", "attempts": 0,
+                "site": "exit_prose", "reason": SEARCH_LIMITATION}, True)
+            self._observer("loop_required_search_gate", {"status": "incomplete"})
+        else:
+            review, withheld = await review_delivery(
+                self, session_id, turn_index, assistant_text, accum, checkpoint
+            )
+        if (withheld or review.get("status") == "exhausted") and not checkpoint and not search_pending:
             # No agent repair remains; reuse a valid subset or salvage independently.
             from .partial_answer import recover_partial
 
@@ -2416,7 +2430,7 @@ class AgentLoop:
         # A resilient exit has already applied the ship guard and rendered its
         # rationale. Preserve that safe disposition instead of replacing it with
         # a generic decline merely because another review was unavailable.
-        if terminal_failure and ship_disposition == "decline_only":
+        if terminal_failure and ship_disposition == "decline_only" and not search_pending:
             provenance = frozenset()
         # Withholding a clarification is not evidence that the answer is ungrounded.
         # If its repair allowance is spent (or a resumed tool pauses), retain the
@@ -3166,6 +3180,10 @@ class AgentLoop:
         # session doc carries both, and `load_trail` is itself just a read of this
         # same document, so this is that read — not an extra one.
         session_doc = await self._session_store.get_or_create_session(session_id)
+        search_gate = RequiredSearchGate.restore(
+            self._required_search_tools, session_doc.tool_trail, turn_index,
+            scope_filter.compute_scope_hash(credentials.column_scope),
+        )
         used_call_ids = {entry.tool_call_id for entry in session_doc.tool_trail}
         for prior in scope_filter.filter_trail(session_doc.tool_trail, credentials.column_scope):
             if prior.turn_index == turn_index:
@@ -3197,6 +3215,7 @@ class AgentLoop:
         # is one of its reads: a resumed window that already has the user's table
         # must not re-arm a gate whose whole job is to notice a missing one.
         accum = accumulators if accumulators is not None else TurnAccumulators()
+        accum.search_scope_hash = scope_filter.compute_scope_hash(credentials.column_scope)
         # --- ANSWER-SHAPE GATE state (05 §J), `loop/finalization.py` ---------
         #
         # How many SUCCESSFUL multi-row `runQuery`/`runBlueprint` calls this TURN has
@@ -3249,6 +3268,10 @@ class AgentLoop:
             # entry: it proves the signature was served, but the READ it deduped is
             # where the result lives, so it must not become the pointer the
             # readability test follows.
+            if (prior_entry.tool_name in search_gate.required
+                and (prior_entry.model_response or {}).get("scope_hash")
+                != scope_filter.compute_scope_hash(credentials.column_scope)):
+                continue
             read_guard.observe_prior_read(
                 prior_entry.tool_name,
                 prior_entry.args,
@@ -3353,6 +3376,7 @@ class AgentLoop:
         # non-`ok` entries, but a FAILED runQuery locks late init just the same, which
         # is why this is a separate call and not folded into that walk.
 
+        search_gate_violations = 0
         discovery_rounds = 0
         stagnation_finalization_pending = False
         while True:
@@ -3369,11 +3393,25 @@ class AgentLoop:
                 retrieval_memo=retrieval_memo,
                 capability_memo=capability_memo,
                 withheld_call_ids=withheld_call_ids,
-                finalization_nudge=finalization_nudge,
+                finalization_nudge="\n\n".join(filter(None, (
+                    finalization_nudge, search_gate.instruction() if search_gate.pending else None,
+                ))) or None,
                 intent_note_call_ids=intent_note_call_ids,
                 user_jwt=credentials.jwt,
             )
             canonical_messages = request.messages
+            if search_gate.pending:
+                missing = set(search_gate.pending) - {search_tool_name(t) for t in tools}
+                if missing:
+                    return await self._finish(
+                        session_id=session_id, turn_index=turn_index, status="done",
+                        exit_label="runtime_fallback", assistant_text=SEARCH_LIMITATION,
+                        tool_calls_made=tool_calls_made, accum=accum, provenance=frozenset(),
+                    )
+                self._observer("loop_required_search_gate", {
+                    "status": "waiting", "pending_count": len(search_gate.pending),
+                    "iteration": guard.usage().iterations + 1,
+                })
             if loop_safety.help_open:
                 tools = [
                     t
@@ -3446,7 +3484,7 @@ class AgentLoop:
                             "calls": review_state.calls,
                             "repair_attempted": True,
                         })
-                    result = await model_client.send_turn(canonical_messages, tools)
+                    result = await model_client.send_turn(canonical_messages, search_gate.offered_tools(tools))
             except TimeoutError:
                 mark_current_span_error("model_call_timeout")
                 self._observer(
@@ -3489,6 +3527,27 @@ class AgentLoop:
                 if failure:
                     raise failure from exc
                 raise
+            if search_gate.pending:
+                allowed_calls = [c for c in result.tool_calls if c.name in search_gate.pending]
+                if len(allowed_calls) != len(result.tool_calls) or not allowed_calls:
+                    self._observer("loop_required_search_gate", {
+                        "status": "blocked", "pending_count": len(search_gate.pending),
+                    })
+                    # Keep genuine searches from mixed batches. Drop premature work
+                    # before normalization/dispatch, without spending answer repair.
+                    result = replace(result, tool_calls=allowed_calls, assistant_text=None)
+                if not allowed_calls:
+                    search_gate_violations += 1
+                    guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
+                    if search_gate_violations >= 2 or guard.exceeded:
+                        return await self._finish(
+                            session_id=session_id, turn_index=turn_index, status="done",
+                            exit_label="runtime_fallback", assistant_text=SEARCH_LIMITATION,
+                            tool_calls_made=tool_calls_made, accum=accum, provenance=frozenset(),
+                        )
+                    # The request builder adds the pending-search instruction itself.
+                    finalization_nudge = None
+                    continue
             used_call_ids.update(conversation_call_ids(canonical_messages))
             result = assign_unique_call_ids(result, used_call_ids, self._observer)
             last_assistant_text = result.assistant_text
@@ -4247,6 +4306,13 @@ class AgentLoop:
                         },
                     )
 
+                was_pending = search_gate.pending
+                search_gate.observe(tool_call.name, tool_result.status, tool_result.error_code)
+                if was_pending != search_gate.pending:
+                    self._observer("loop_required_search_gate", {
+                        "status": "ready" if not search_gate.pending else "completed",
+                        "tool_name": tool_call.name, "pending_count": len(search_gate.pending),
+                    })
                 if gate_refusal is None:
                     loop_safety.observe_help(tool_call.name, tool_result.error_code)
                 loop_safety.observe_result(
@@ -5434,6 +5500,16 @@ class AgentLoop:
             guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
 
             stagnant = loop_safety.end_round()
+            if search_gate.pending:
+                # Pending discovery cannot act on the normal "finalize now" nudge.
+                if stagnant or guard.exceeded:
+                    return await self._finish(
+                        session_id=session_id, turn_index=turn_index, status="done",
+                        exit_label="runtime_fallback", assistant_text=SEARCH_LIMITATION,
+                        tool_calls_made=tool_calls_made, accum=accum, provenance=frozenset(),
+                    )
+                finalization_nudge = None
+                continue
             repair_granted = repair_authorized_this_round or finalization_gate.refused_this_round
             if repair_granted:
                 # Only durable, bounded repair grants reset stagnation. Preserve
