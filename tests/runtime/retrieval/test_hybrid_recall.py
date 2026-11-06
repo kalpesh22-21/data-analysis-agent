@@ -108,14 +108,12 @@ def test_fusion_deduplicates_and_does_not_compare_channel_score_scales():
     assert len(results) == 2
 
 
-@pytest.mark.parametrize("optional_query", [{}, {"query": None}, {"query": ""}, {"query": "  "}])
-async def test_deliverables_are_separately_embedded_ranked_and_share_card_budget(optional_query):
+async def test_deliverables_are_separately_embedded_ranked_and_share_card_budget():
     index = HybridIndex([candidate("one"), candidate("two"), candidate("three")])
     p = pipeline(index)
     tool = SearchBlueprintsTool(pipeline=p, default_k=3, max_k=8)
     result = await tool.run(
         {
-            **optional_query,
             "deliverables": ["salary by department in 2025", "monthly hires in 2024"],
             "k": 3,
         },
@@ -136,7 +134,11 @@ async def test_deliverables_are_separately_embedded_ranked_and_share_card_budget
 @pytest.mark.parametrize(
     "args",
     [
+        {},
         {"query": "x", "deliverables": ["y"]},
+        {"query": None, "deliverables": ["y"]},
+        {"query": "", "deliverables": ["y"]},
+        {"deliverables": None},
         {"deliverables": []},
         {"deliverables": ["a"] * 5},
         {"deliverables": ["a", "a"]},
@@ -149,6 +151,7 @@ async def test_invalid_deliverable_batch_performs_no_search(args):
     tool = SearchBlueprintsTool(pipeline=pipeline(index), default_k=3, max_k=8)
     result = await tool.run(args, _creds())
     assert result.error_code == "RETRIEVAL_TOOL_INVALID_ARGS"
+    assert result.denial_detail == result.user_message
     assert not index.calls and not index.keyword_calls
 
 

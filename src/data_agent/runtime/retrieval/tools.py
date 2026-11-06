@@ -33,10 +33,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from itertools import zip_longest
 from typing import TYPE_CHECKING, Any
 
-from data_agent.runtime.blueprint.models import slot_type_gloss, window_anchor_declaration
+from data_agent.runtime.blueprint.models import (
+    MULTI_VALUE_LIMIT,
+    slot_type_gloss,
+    window_anchor_declaration,
+)
 from data_agent.runtime.composer.components import suggested_presentation
 from data_agent.runtime.dispatch.tool_dispatcher import (
     _DEFAULT_MAX_TOOL_RESULT_TOKENS,
@@ -111,6 +116,13 @@ class _ReadTool(RuntimeToolBase):
         # actually needs it — an enriched `searchBlueprints` card list at a large
         # `k` (release-1 §02).
         self._max_result_tokens = max_result_tokens
+
+    def _error(self, code: str, message: str, *, retryable: bool) -> ToolResult:
+        result = super()._error(code, message, retryable=retryable)
+        if code == INVALID_ARGS_CODE:
+            # Authored argument guidance only; never persist backend exception text.
+            result = replace(result, denial_detail=message)
+        return result
 
     def _span_args(self, model_args: dict[str, Any]) -> dict[str, Any]:
         return tool_span_args(self.tool_name, model_args, disable_redaction=self._disable_redaction)
@@ -534,15 +546,14 @@ class SearchBlueprintsTool(_ReadTool):
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
     ) -> ToolResult:
+        if ("query" in model_args) == ("deliverables" in model_args):
+            return self._error(
+                INVALID_ARGS_CODE,
+                "Supply exactly one of query or deliverables; omit the other field entirely.",
+                retryable=True,
+            )
         raw_deliverables = model_args.get("deliverables")
-        if raw_deliverables is not None:
-            query_arg = model_args.get("query")
-            # Optional fields may arrive as empty placeholders. Only an actual
-            # second query is ambiguous; null/blank carries no competing intent.
-            if query_arg is not None and (not isinstance(query_arg, str) or query_arg.strip()):
-                return self._error(
-                    INVALID_ARGS_CODE, "Supply query OR deliverables, not both.", retryable=True
-                )
+        if "deliverables" in model_args:
             if (
                 not isinstance(raw_deliverables, list)
                 or not 1 <= len(raw_deliverables) <= min(4, self._max_k)

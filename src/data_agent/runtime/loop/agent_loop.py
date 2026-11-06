@@ -4101,7 +4101,12 @@ class AgentLoop:
                             tool_call.name, self._observer, site="answer_scope_rule"
                         )
 
-                if gate_refusal is None:
+                # Retrieval validates arguments before doing any read. Charge it
+                # after validation; malformed calls still consume loop/time limits.
+                retrieval_read = tool_call.name in {
+                    "searchBlueprints", "searchKnowledge", "getBlueprint"
+                }
+                if gate_refusal is None and not retrieval_read:
                     loop_safety.record_attempt(tool_call.name)
                 if gate_refusal is None and tool_call.name == "runQuery":
                     from .measurement import validate_join_cardinality
@@ -4224,6 +4229,13 @@ class AgentLoop:
                         question=question,
                         timeout_seconds=_remaining_window(guard),
                     )
+
+                if (
+                    gate_refusal is None
+                    and retrieval_read
+                    and tool_result.error_code != "RETRIEVAL_TOOL_INVALID_ARGS"
+                ):
+                    loop_safety.record_attempt(tool_call.name)
 
                 if local_dispatch:
                     self._observer(

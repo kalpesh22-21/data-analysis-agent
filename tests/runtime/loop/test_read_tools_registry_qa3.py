@@ -545,3 +545,29 @@ async def test_loop_validates_runtime_tool_provenance_type_coerces_to_none() -> 
     assert outcome.status == "done"
     trail = await work_trail(store, SESSION_ID)
     assert trail[0].provenance is None  # coerced fail-closed, not the bad string
+
+
+async def test_invalid_search_preserves_feedback_and_read_allowance():
+    model = ScriptedModelClient([
+        ModelTurnResult(tool_calls=[ToolCallRequest(
+            id="bad", name="searchBlueprints",
+            arguments={"query": "x", "deliverables": ["y"]},
+        )]),
+        *[ModelTurnResult(tool_calls=[ToolCallRequest(
+            id=f"read-{i}", name="searchBlueprints", arguments={"query": f"search {i}"},
+        )]) for i in range(4)],
+        final_answer(assistant_text="I don't have any information to answer your question."),
+    ])
+    loop, store = _build(
+        model=model, mcp=FakeMCPClient(),
+        runtime_tools={"searchBlueprints": _real_search_tool()},
+    )
+    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="find reports")
+    trail = await work_trail(store, SESSION_ID)
+    searches = [e for e in trail if e.tool_name == "searchBlueprints"]
+    assert searches[0].error_code == "RETRIEVAL_TOOL_INVALID_ARGS"
+    assert "exactly one of query or deliverables" in searches[0].denial_detail
+    assert [e.status for e in searches[1:4]] == ["ok", "ok", "ok"]
+    assert searches[4].error_code == "READ_REFETCH_LIMIT"
+    from data_agent.runtime.context.budget import render_entry
+    assert "exactly one of query or deliverables" in render_entry(searches[0], 5)["user_message"]

@@ -377,3 +377,16 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
         RECORD_ASSUMPTIONS_TOOL_SCHEMA,
         UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
     ]
+
+
+def test_search_blueprints_requires_exactly_one_nonempty_input():
+    from jsonschema import Draft202012Validator
+
+    validator = Draft202012Validator(SEARCH_BLUEPRINTS_TOOL_SCHEMA["parameters"])
+    for args in ({"query": "salary"}, {"deliverables": ["salary", "headcount"]}):
+        assert validator.is_valid(args)
+    for args in ({}, {"query": "salary", "deliverables": ["headcount"]},
+                 {"query": " "}, {"deliverables": [" "]},
+                 {"deliverables": ["salary", "salary"]},
+                 {"query": None, "deliverables": ["salary"]}):
+        assert not validator.is_valid(args)

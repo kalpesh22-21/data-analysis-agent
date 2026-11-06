@@ -151,11 +151,14 @@ SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
         "properties": {
             "query": {
                 "type": "string",
+                "minLength": 1,
+                "pattern": r"\S",
                 "description": "The intent to search for, in your own words. Free text.",
             },
             "deliverables": {
                 "type": "array",
-                "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "items": {"type": "string", "minLength": 1, "maxLength": 2000, "pattern": r"\S"},
+                "uniqueItems": True,
                 "minItems": 1,
                 "maxItems": 4,
                 "description": "Focused queries, one per analytical deliverable. Include metric, grouping, period and relevant filters. Use instead of query; for more than four deliverables, make another batch.",
@@ -167,6 +170,10 @@ SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
             },
         },
         "required": [],
+        "oneOf": [
+            {"required": ["query"], "not": {"required": ["deliverables"]}},
+            {"required": ["deliverables"], "not": {"required": ["query"]}},
+        ],
     },
 }
 
@@ -295,7 +302,12 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "description": "A flat map of {slot_name: raw_value} — the model's best "
                 "natural-language read of each slot (a string, number, boolean, or a list "
-                "for IN/enum-list slots; a {start,end} object for period_range). The runtime resolves each to a concrete, "
+                "for IN slots or categorical slots marked multiple=true; those lists match ANY value. "
+                "Use the declared default when it matches the request; never use All to mean Active and On Leave. "
+                "All must stand alone. A {start,end} object for period_range; "
+                "for sort_order, a list of 1–3 {column,direction} objects using exact allowed_columns "
+                "and ASC/DESC, without duplicate columns or a separate order_direction slot). "
+                "The runtime resolves each to a concrete, "
                 "scope-safe value. Omit a slot to leave it unfilled (a required one will "
                 "pause to ask).",
             },
