@@ -77,7 +77,7 @@ def _build_app(monkeypatch, *, disable_redaction: bool | None, span_exporter: An
             ]
         },
     )
-    settings = RuntimeSettings(
+    settings = RuntimeSettings(retrieval_mode="hints",
         _env_file=None,
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
@@ -201,7 +201,7 @@ def _read_tools_app(monkeypatch, *, disable_redaction: bool, pii_query: str) -> 
         top_k_knowledge=3,
     )
     return create_app(
-        settings=RuntimeSettings( _env_file=None, otlp_disable_redaction=disable_redaction),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None, otlp_disable_redaction=disable_redaction),
         session_store=InMemorySessionStore(),
         mcp_client=FakeMCPClient(scripted={}),
         model_client=ScriptedModelClient(

@@ -28,7 +28,7 @@ def test_upload_attaches_scope_and_preserves_multipart(monkeypatch, path):
             return httpx.Response(200, json={'row_count': 3})
     monkeypatch.setattr(app_module.httpx, 'AsyncClient', Client)
     app = app_module.create_app(
-        settings=RuntimeSettings(_env_file=None, catalog_source='mcp', retrieval_enabled=False,
+        settings=RuntimeSettings(retrieval_mode="hints", _env_file=None, catalog_source='mcp', retrieval_enabled=False,
                                  mcp_url='http://mcp.test/mcp', scratch_enabled=True),
         session_store=InMemorySessionStore(), mcp_client=FakeMCPClient(tools=[], scripted={}),
         model_client=ScriptedModelClient([]),

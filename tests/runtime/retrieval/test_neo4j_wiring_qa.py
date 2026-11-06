@@ -51,7 +51,7 @@ def _build(monkeypatch, *, neo4j_url: str, embedding_url: str, **settings_over: 
         "embedding_model": "all-mpnet-base-v2",
     }
     kwargs.update(settings_over)
-    settings = RuntimeSettings(**kwargs)
+    settings = RuntimeSettings(retrieval_mode="hints", **kwargs)
     create_app(
         settings=settings,
         session_store=InMemorySessionStore(),
@@ -109,7 +109,7 @@ def test_injected_retrieval_is_not_rebuilt(monkeypatch) -> None:
     # a Neo4jVectorIndex even when neo4j_url is set.
     _RecordingIndex.instances.clear()
     monkeypatch.setattr(app_module, "Neo4jVectorIndex", _RecordingIndex)
-    settings = RuntimeSettings(
+    settings = RuntimeSettings(retrieval_mode="hints",
         _env_file=None,
         neo4j_url="bolt://localhost:7687",
         embedding_api_url=_EMBED_URL,

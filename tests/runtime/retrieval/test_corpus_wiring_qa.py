@@ -39,7 +39,7 @@ def test_runtime_app_has_no_rebuild_path() -> None:
 
 
 def test_rebuild_config_fields_removed() -> None:
-    settings = RuntimeSettings(_env_file=None)
+    settings = RuntimeSettings(retrieval_mode="hints", _env_file=None)
     assert not hasattr(settings, "neo4j_rebuild_from_mcp")
     assert not hasattr(settings, "rebuild_mcp_jwt")
     assert not hasattr(settings, "rebuild_mcp_session_id")
@@ -63,7 +63,7 @@ def test_app_builds_without_seed_side_effects(monkeypatch) -> None:
             return None
 
     monkeypatch.setattr(app_module, "Neo4jVectorIndex", _RecordingIndex)
-    settings = RuntimeSettings(_env_file=None)  # no neo4j_url → reader with no index
+    settings = RuntimeSettings(retrieval_mode="hints", _env_file=None)  # no neo4j_url → reader with no index
     app = create_app(
         settings=settings,
         session_store=InMemorySessionStore(),

@@ -100,7 +100,7 @@ def _settings(**over: Any) -> RuntimeSettings:
         "embedding_model": "all-mpnet-base-v2",
     }
     base.update(over)
-    return RuntimeSettings(**base)
+    return RuntimeSettings(retrieval_mode="hints", **base)
 
 
 # --------------------------------------------------------------------------

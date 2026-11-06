@@ -656,7 +656,7 @@ async def test_capability_registry_is_reloaded_on_http_resume(monkeypatch, avail
     )
     store = InMemorySessionStore()
     app = app_module.create_app(
-        settings=RuntimeSettings(
+        settings=RuntimeSettings(retrieval_mode="hints",
             _env_file=None,
             openai_api_key="",
             capability_tools_enabled=True,

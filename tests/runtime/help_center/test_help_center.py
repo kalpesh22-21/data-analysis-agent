@@ -90,8 +90,8 @@ def test_disabled_prompt_says_product_questions_have_no_source() -> None:
     with an unrelated schema read. Off, the one routing line says there is no source."""
     from data_agent.runtime.prompts import HELP_CENTER_ROUTE, HELP_CENTER_UNAVAILABLE_ROUTE
 
-    disabled = RuntimeSettings(help_center_enabled=False)
-    enabled = RuntimeSettings(help_center_enabled=True)
+    disabled = RuntimeSettings(retrieval_mode="hints", help_center_enabled=False)
+    enabled = RuntimeSettings(retrieval_mode="hints", help_center_enabled=True)
 
     assert HELP_CENTER_ROUTE in disabled.agent_system_prompt  # the line the swap replaces
     off = disabled.effective_agent_system_prompt()
@@ -244,7 +244,7 @@ async def test_default_decline_configuration_matches_runtime_settings():
         fetch_function_schemas,
     )
 
-    settings = RuntimeSettings(_env_file=None)
+    settings = RuntimeSettings(retrieval_mode="hints", _env_file=None)
     assert settings.help_center_enabled is False and settings.capability_tools_enabled is False
     expected = decline_out_of_scope_schema(
         actions_available=settings.capability_tools_enabled,

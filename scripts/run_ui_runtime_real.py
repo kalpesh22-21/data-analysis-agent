@@ -12,6 +12,8 @@ Loop tunables are the PRODUCTION defaults, not the scripted demo's low caps.
 Retrieval (neo4j blueprint recall) is OFF by default: it needs the corpus seeded with an
 `embedding_model` matching `RuntimeSettings`, or recall parity-filters to an empty
 corpus. Set `REAL_RETRIEVAL=1` to opt in (points at l2-neo4j + l2-embedding).
+Without that opt-in this launcher selects hints mode; with it, required_search.
+An explicit RETRIEVAL_MODE overrides either choice.
 
 Traced to Phoenix, project `data-agent-runtime`, in the D25 default posture
 (`otlp_hide_llm_content=True`). `OTLP_DISABLE_REDACTION=1` flips the master telemetry
@@ -114,7 +116,7 @@ def build_real_app():
     model = os.environ.get("OPENAI_MODEL") or pick_openai_model(api_key, label=_PREFLIGHT_LABEL)
 
     retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
-    retrieval_mode = os.environ.get("RETRIEVAL_MODE", "").strip().lower() or "required_search"
+    retrieval_mode = os.environ.get("RETRIEVAL_MODE", "").strip().lower() or ("required_search" if retrieval_on else "hints")
     # LLM progress summaries (docs/08-ui.md): ON by default for THIS dev launcher
     # (production RuntimeSettings default stays False). Relaxes D25 for the progress
     # channel only — the streamed line may carry business values from tool args.

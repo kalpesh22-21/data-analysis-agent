@@ -47,7 +47,7 @@ def _app(monkeypatch, *, neo4j_url: str, ready: bool) -> TestClient:
     monkeypatch.setattr(
         app_module, "Neo4jVectorIndex", lambda **kw: _ReadyIndex(ready=ready, **kw)
     )
-    settings = RuntimeSettings(
+    settings = RuntimeSettings(retrieval_mode="hints",
         _env_file=None,
         neo4j_url=neo4j_url,
         neo4j_username="neo4j",

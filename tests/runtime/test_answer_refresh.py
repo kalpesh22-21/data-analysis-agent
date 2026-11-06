@@ -122,7 +122,7 @@ async def test_refresh_endpoint_stream_history_conflict_and_trace(monkeypatch):
 
     monkeypatch.setattr(AgentLoop, "run", refreshed_run)
     app = app_module.create_app(
-        settings=RuntimeSettings(_env_file=None, otlp_endpoint="", openai_api_key="test-only"),
+        settings=RuntimeSettings(retrieval_mode="hints", _env_file=None, otlp_endpoint="", openai_api_key="test-only"),
         session_store=store,
         mcp_client=FakeMCPClient(),
         catalog=CatalogHandle({}),

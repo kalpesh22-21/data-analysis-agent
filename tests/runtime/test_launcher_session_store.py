@@ -150,3 +150,21 @@ def test_real_launcher_reranker_follows_either_retrieval_consumer(retrieval, hel
         "retrieval_on": retrieval, "help_center_on": help_center,
     })
     assert bool(result) is enabled
+
+
+@pytest.mark.parametrize('retrieval,override,expected', [
+    (False, None, 'hints'), (True, None, 'required_search'),
+    (False, 'required_search', 'required_search'), (True, 'hints', 'hints'),
+])
+def test_real_launcher_mode_matches_opt_in_retrieval(monkeypatch, retrieval, override, expected):
+    import ast
+    import os
+    from pathlib import Path
+    monkeypatch.delenv('RETRIEVAL_MODE', raising=False)
+    if override is not None:
+        monkeypatch.setenv('RETRIEVAL_MODE', override)
+    tree = ast.parse(Path('scripts/run_ui_runtime_real.py').read_text())
+    value = next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == 'retrieval_mode' for t in n.targets))
+    assert eval(compile(ast.Expression(value), 'launcher-mode', 'eval'),
+                {'os': os, 'retrieval_on': retrieval}) == expected

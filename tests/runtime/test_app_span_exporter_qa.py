@@ -99,7 +99,7 @@ def _build_app(
             ]
         },
     )
-    settings = RuntimeSettings(
+    settings = RuntimeSettings(retrieval_mode="hints",
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
