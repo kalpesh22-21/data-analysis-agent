@@ -51,5 +51,6 @@ def test_every_declared_slot_type_produces_a_bindable_sample() -> None:
     for slot_type in sorted(SLOT_TYPES):
         value = _sample_value("x", slot_type)
         assert value not in (None, ""), slot_type
-        bound = bind_template("SELECT 1 FROM t WHERE c = {x}", {"x": value})
+        template = "SELECT 1 FROM t WHERE c IN ({x})" if slot_type == "list" else "SELECT 1 FROM t WHERE c = {x}"
+        bound = bind_template(template, {"x": value})
         assert "{x}" not in bound, slot_type

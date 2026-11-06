@@ -108,6 +108,7 @@ def _project_slots(raw: Any) -> tuple[tuple[SlotSummary, ...] | None, int]:
                 name=name,
                 type=slot_type if isinstance(slot_type, str) else "",
                 required=required if isinstance(required, bool) else True,
+                multiple=entry.get("multiple") is True,
             )
         )
     if not summaries:

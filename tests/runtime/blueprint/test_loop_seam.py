@@ -176,6 +176,9 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
     # ONE runBlueprint entry despite three inner runQuery probes.
     assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint", "answerWithText"]
     assert trail[0].status == "ok"
+    assert trail[1].blueprint_execution["blueprint_id"] == _BID
+    assert trail[1].blueprint_execution["bound_slots"]["department"] == "Sales"
+    assert "Sales" in trail[1].blueprint_execution["terminal_sql"]
 
 
 # ---------------------------------------------------------------------------

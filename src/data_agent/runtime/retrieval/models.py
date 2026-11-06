@@ -33,7 +33,7 @@ class Candidate:
 class SlotSummary:
     """One slot as it appears on a blueprint SEARCH card.
 
-        DELIBERATELY `{name, type, required}` and nothing else — enough to judge applicability
+        DELIBERATELY `{name, type, required}` plus opt-in `multiple` — enough to judge applicability
         and to fill `runBlueprint`. The AUTHORED slot (`slots_json`, `blueprint.models.SlotSpec`)
         additionally carries `binds_to` ("database.table.column"), `enum_values`,
         `optional_pattern` and numeric bounds: those are execution detail `getBlueprint` exists
@@ -48,6 +48,7 @@ class SlotSummary:
     name: str
     type: str
     required: bool
+    multiple: bool = False
 
 
 def coerce_result_grain(raw: Any) -> tuple[str, ...] | None:

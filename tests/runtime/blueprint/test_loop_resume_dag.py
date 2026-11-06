@@ -184,6 +184,8 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
     trail = await store.load_trail(SESSION_ID)
     bp_entries = [e for e in trail if e.tool_name == "runBlueprint"]
     assert bp_entries and bp_entries[-1].status == "ok"
+    assert bp_entries[-1].blueprint_execution["terminal_sql"] == resume_mcp.calls[0].args["sql"]
+    assert bp_entries[-1].blueprint_execution["blueprint_id"] == bp_entries[-1].args["id"]
 
 
 async def test_verified_resume_persists_authoritative_marker() -> None:

@@ -148,8 +148,7 @@ def test_in_list_becomes_one_typed_list_slot_without_double_parentheses():
 
     template = rewrite_sql_to_template(sql, parameterization, strict=True)
 
-    assert "department IN {departments}" in template
-    assert "IN ({departments})" not in template
+    assert "department IN ({departments})" in template
     assert "department IN ('Legal', 'HR')" in bind_template(
         template, {"departments": ["Legal", "HR"]}
     )

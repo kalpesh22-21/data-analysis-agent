@@ -306,3 +306,137 @@ async def test_default_enum_renders_as_literal_and_explicit_value_overrides() ->
         assert f"'{expected}' = 'DESC'" in mcp.calls[0].args["sql"]
         assert outcome.result_full["bound_slots"] == {"direction": expected}
         assert len(mcp.calls) == 2  # no extra domain query for the authored default
+
+
+async def test_optional_display_limit_executes_with_and_without_binding() -> None:
+    for bindings, expected_limit in [({}, False), ({"top_n": 1}, True)]:
+        detail = _detail(
+            slots=[{"name": "top_n", "type": "positive_integer", "required": False,
+                    "optional_pattern": "TRUE", "min_value": 1, "max_value": 1000}],
+            sql_template=_BY_DEPT_SQL.replace(" WHERE Department = {department}", "").replace("AS department", "AS Department")
+            + " ORDER BY AVG(AnnualSalary) DESC, Department LIMIT {top_n}",
+        )
+        mcp = FakeMCPClient(scripted={"runQuery": [
+            _rq(["Department", "avg_salary"], [["Sales", 10.0]]),
+            _rq(["__bp_n", "__bp_d"], [[1, 1]]),
+        ]})
+        outcome = await _executor(mcp, detail).execute(
+            blueprint_id="bp-c", slot_bindings=bindings, credentials=_creds(),
+        )
+        assert isinstance(outcome, ExecCompleted)
+        assert ("LIMIT 1" in mcp.calls[0].args["sql"]) is expected_limit
+        assert outcome.result_full["verify"]["grain_ok"] is True
+
+
+async def test_invalid_optional_display_limit_never_executes_sql() -> None:
+    for value in [0, -1, 1001, 1.5, "1; SELECT secret FROM private"]:
+        detail = _detail(
+            slots=[{"name": "top_n", "type": "positive_integer", "required": False,
+                    "optional_pattern": "TRUE", "min_value": 1, "max_value": 1000}],
+            sql_template=_BY_DEPT_SQL.replace(" WHERE Department = {department}", "").replace("AS department", "AS Department")
+            + " ORDER BY AVG(AnnualSalary) DESC, Department LIMIT {top_n}",
+        )
+        mcp = FakeMCPClient()
+        outcome = await _executor(mcp, detail).execute(
+            blueprint_id="bp-c", slot_bindings={"top_n": value}, credentials=_creds(),
+        )
+        assert not isinstance(outcome, ExecCompleted)
+        assert not mcp.calls
+
+
+async def test_output_order_is_resolved_and_applied_to_executed_sql():
+    from data_agent.runtime.blueprint.template import parse_template
+
+    for bindings in [{}, {"order_by": [{"column": "Average", "direction": "DESC"}]},
+                     {"order_by": [{"column": "Average", "direction": "DESC"},
+                                   {"column": "Department", "direction": "ASC"}]}]:
+        detail = _detail(
+            sql_template='SELECT Department AS Department, AVG(AnnualSalary) AS "Average" FROM dbpcm_warehouse.employee GROUP BY Department ORDER BY {order_by} LIMIT 10',
+            slots=[
+                {"name": "order_by", "type": "sort_order", "required": False,
+                 "default": [{"column": "Department", "direction": "ASC"}], "allowed_columns": ["Department", "Average"]},
+            ],
+        )
+        mcp = FakeMCPClient(scripted={"runQuery": [
+            _rq(["Department", "Average"], [["Sales", 10.0]]),
+            _rq(["__bp_n", "__bp_d"], [[1, 1]]),
+        ]})
+        outcome = await _executor(mcp, detail).execute(
+            blueprint_id="bp-c", slot_bindings=bindings, credentials=_creds(),
+        )
+        assert isinstance(outcome, ExecCompleted), outcome
+        sql = mcp.calls[0].args["sql"]
+        first = parse_template(sql).args["order"].expressions[0]
+        assert first.this.name == ("Average" if bindings else "Department")
+        assert outcome.result_full["terminal_sql"] == sql
+        assert "LIMIT 10" in sql
+        assert len(parse_template(sql).args["order"].expressions) == len(bindings.get("order_by", [None]))
+
+
+async def test_output_order_only_changes_terminal_node_of_composed_blueprint():
+    detail = _dag_detail()
+    detail.composes[1]["sql_template"] = _ABOVE_AVG_FILTERED_SQL.replace("AS department", "AS Department") + " ORDER BY {order_by}"
+    detail.slots.extend([
+        {"name": "order_by", "type": "sort_order", "required": False,
+         "default": [{"column": "Department", "direction": "ASC"}], "allowed_columns": ["Department"]},
+    ])
+    mcp = FakeMCPClient(scripted={"runQuery": [
+        _rq(["company_avg"], [[55000.0]]),
+        _rq(["Department"], [["Sales"], ["Eng"]]),
+        _rq(["__bp_n", "__bp_d"], [[2, 2]]),
+    ]})
+    outcome = await _executor(mcp, detail).execute(
+        blueprint_id="bp-c-dag",
+        slot_bindings={"order_by": [{"column": "Department", "direction": "DESC"}]},
+        credentials=_creds(),
+    )
+    assert isinstance(outcome, ExecCompleted), outcome
+    assert "ORDER BY" not in mcp.calls[0].args["sql"]
+    assert "ORDER BY" in mcp.calls[1].args["sql"]
+    assert outcome.result_full["terminal_sql"] == mcp.calls[1].args["sql"]
+
+
+async def test_fixed_ranking_rejects_undeclared_sort_before_any_mcp_call():
+    for bindings in [{"order_by": "Department"}, {"order_direction": "ASC"},
+                     {"order_by": "Department", "order_direction": "ASC"}]:
+        detail = _detail(
+            slots=[],
+            sql_template='SELECT Department AS Department, AVG(AnnualSalary) AS Average FROM dbpcm_warehouse.employee GROUP BY Department ORDER BY Average DESC LIMIT 2',
+        )
+        mcp = FakeMCPClient()
+        outcome = await _executor(mcp, detail).execute(
+            blueprint_id="bp-c", slot_bindings=bindings, credentials=_creds(),
+        )
+        assert isinstance(outcome, ExecFailed)
+        assert outcome.error_code == SLOT_INVALID_CODE
+        assert "does not accept" in outcome.user_message
+        assert "authored ranking" in outcome.user_message
+        assert not mcp.calls
+
+
+async def test_sort_order_invalid_arguments_never_reach_mcp():
+    detail = _detail(
+        sql_template='SELECT Department AS Department FROM dbpcm_warehouse.employee ORDER BY {order_by}',
+        slots=[{'name': 'order_by', 'type': 'sort_order', 'required': False,
+                'allowed_columns': ['Department'],
+                'default': [{'column': 'Department', 'direction': 'ASC'}]}],
+    )
+    for bindings in [
+        {'order_direction': 'ASC'},
+        {'order_by': 'Department'},
+        {'order_by': []},
+        {'order_by': [{'column': 'Department'}]},
+        {'order_by': [{'column': 'AnnualSalary', 'direction': 'ASC'}]},
+        {'order_by': [{'column': 'Department', 'direction': 'ASC; DROP TABLE employee'}]},
+        {'order_by': [{'column': 'Department', 'direction': 'ASC'}] * 2},
+    ]:
+        mcp = FakeMCPClient()
+        outcome = await _executor(mcp, detail).execute(
+            blueprint_id='bp-c', slot_bindings=bindings, credentials=_creds(),
+        )
+        assert isinstance(outcome, ExecFailed), outcome
+        assert outcome.error_code == SLOT_INVALID_CODE and outcome.retryable
+        if "order_by" in bindings:
+            assert "Allowed columns" in outcome.user_message
+            assert "Department" in outcome.user_message
+        assert not mcp.calls

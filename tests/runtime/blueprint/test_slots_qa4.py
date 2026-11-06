@@ -93,9 +93,9 @@ def test_period_number_with_domain_stringifies_and_matches() -> None:
 # -- list / IN edge cases ---------------------------------------------------
 
 
-def test_list_empty_asks_user() -> None:
+def test_list_empty_is_invalid() -> None:
     out = resolve_slot([], _spec("list"))
-    assert isinstance(out, AskUser) and out.reason == "no_match"
+    assert isinstance(out, AskUser) and out.reason == "invalid"
 
 
 def test_list_heterogeneous_elements_all_stringify_no_domain() -> None:
@@ -109,23 +109,18 @@ def test_list_one_hostile_element_no_match_asks_user() -> None:
     assert isinstance(out, AskUser) and out.reason == "no_match"
 
 
-def test_list_nested_list_element_stringifies_no_domain() -> None:
+def test_list_nested_list_element_is_invalid() -> None:
     out = resolve_slot([[1, 2]], _spec("list"), domain=None)
-    assert isinstance(out, SlotBinding) and out.value == ["[1, 2]"]
+    assert isinstance(out, AskUser) and out.reason == "invalid"
 
 
-def test_list_of_enum_does_not_enforce_enum_membership() -> None:
-    # PIN (Slice B): SlotSpec has a single `type`, so a "list of enum" is not
-    # expressible — a `list` slot resolves each element as a SCALAR and does NOT
-    # check `enum_values`, even when the spec carries them. An out-of-enum element
-    # binds instead of asking. Flagged as a Slice-B gap for list-of-enum slots.
+def test_list_of_enum_enforces_declared_membership() -> None:
+    # Shared list resolution now honors declared enum values on both slot shapes.
     out = resolve_slot(
-        ["A", "NOT_IN_ENUM"],
-        _spec("list", enum_values=("A", "D")),
-        domain=None,
+        ["A", "NOT_IN_ENUM"], _spec("list", enum_values=("A", "D")), domain=None,
     )
-    assert isinstance(out, SlotBinding)
-    assert out.value == ["A", "NOT_IN_ENUM"]  # enum membership NOT enforced
+    assert isinstance(out, AskUser) and out.reason == "no_match"
+    assert out.options == ["A", "D"]
 
 
 # -- optional presence ------------------------------------------------------

@@ -41,6 +41,7 @@ from .template import (
     SLOT_TOKEN,
     TemplateBindError,
     assert_read_only_select,
+    bind_native_order,
     contains_star,
     parse_template,
     referenced_slots,
@@ -776,6 +777,18 @@ def _inline_reference(
             f"session scratch source(s) {scratch}. A referenced blueprint must be runnable "
             "on its own; nothing in this DAG can materialize them for it."
         )
+    # Referenced detail queries retain their own declared sort defaults. The
+    # parent's output selector must not be applied to a differently shaped child.
+    if "order_by" in referenced_slots(template) and "order_by" not in ref.slot_map:
+        specs = _seed_slot_specs(child)
+        spec = specs.get("order_by")
+        if spec and spec.type == "sort_order" and spec.default is not None:
+            tree = parse_template(template)
+            try:
+                bind_native_order(tree, {"order_by": spec.default})
+            except TemplateBindError as exc:
+                raise CorpusLoadError(f"blueprint {child.id}: {exc}") from exc
+            template = re.sub(r"\{([A-Za-z_]\w*):\s*\}", r"{\1}", tree.sql(dialect="clickhouse"))
     rename = _reference_token_rename(parent, child, ref, template)
     # SIMULTANEOUS substitution in ONE pass. Sequential per-token replacement would
     # chain (`a`→`b` then `b`→`c` renames the original `a` twice), and swapping two
@@ -1526,6 +1539,37 @@ def validate_blueprint_dag(bp: BlueprintSeed) -> None:
             "declared but referenced by NO template — an unreferenced required slot is a "
             "silent dropped filter (D56 wrong-answer class). Reference it or make it optional."
         )
+
+    # Every multi-value occurrence must occupy the entire authored IN value list.
+    # A scalar override is normalized to a singleton list too, so equality is never valid.
+    multi_names = {slot.name for slot in blueprint.slots if slot.multiple}
+    if multi_names:
+        for _, template, _extra in templates:
+            for placeholder in parse_template(template).find_all(exp.Placeholder):
+                if placeholder.name not in multi_names:
+                    continue
+                parent = placeholder.parent
+                if not (isinstance(parent, exp.In) and len(parent.expressions) == 1
+                        and parent.expressions[0] is placeholder):
+                    raise CorpusLoadError(
+                        f"blueprint {bp.id}: multi-value slot {placeholder.name!r} requires IN ({{slot}})"
+                    )
+
+    for slot in blueprint.slots:
+        if slot.type != "sort_order":
+            continue
+        for _, template, _extra in templates:
+            if slot.name not in referenced_slots(template):
+                continue
+            tree = parse_template(template)
+            if not set(slot.allowed_columns or ()) <= set(tree.named_selects):
+                raise CorpusLoadError(f"blueprint {bp.id}: sort_order names unavailable output columns")
+            try:
+                bind_native_order(tree, {slot.name: slot.default or [
+                    {"column": slot.allowed_columns[0], "direction": "ASC"}
+                ]})
+            except TemplateBindError as exc:
+                raise CorpusLoadError(f"blueprint {bp.id}: {exc}") from exc
 
     # (e2) Referenced optional slots need an omission pattern or a declared default.
     # Defaults bind a value; patterns replace a predicate. Without either, the

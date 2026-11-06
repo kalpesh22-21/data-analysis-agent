@@ -914,6 +914,5 @@ def test_the_prompt_states_the_standing_rule_the_two_surfaces_instantiate() -> N
     decision to re-derive. `getBlueprint` and the result note carry the specifics."""
     from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
-    assert "Honor declared relative-window anchors" in AGENT_SYSTEM_PROMPT
-    assert "explicit user periods override them" in AGENT_SYSTEM_PROMPT
+    assert "Honor relative-window anchors unless user periods override them" in AGENT_SYSTEM_PROMPT
     assert "Event dates do not prove period completeness" in AGENT_SYSTEM_PROMPT

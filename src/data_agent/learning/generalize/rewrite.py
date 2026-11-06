@@ -454,8 +454,5 @@ def rewrite_sql_to_template(
         # grammar `INTERVAL {n} UNIT`; remove only the parentheses around tokens this
         # rewrite created, never arbitrary authored expressions.
         rendered = rendered.replace(f"INTERVAL ({{{name}}}) ", f"INTERVAL {{{name}}} ")
-        # A list binding expands to its own tuple. Keeping sqlglot's IN-parentheses
-        # would bind `IN (('a', 'b'))` (one tuple member) instead of `IN ('a', 'b')`.
-        rendered = rendered.replace(f" IN ({{{name}}})", f" IN {{{name}}}")
     _check_rewritten(rendered, before, ast)
     return rendered

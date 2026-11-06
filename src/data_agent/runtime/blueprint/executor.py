@@ -41,8 +41,13 @@ from data_agent.runtime.mcp.scratch_client import (
     ScratchClientProtocol,
 )
 from data_agent.runtime.provenance.capture import capture_data_as_of
-from data_agent.runtime.provenance.freshness import capture_freshness, ingestion_date, merge_freshness, timestamp
 from data_agent.runtime.provenance.catalog_handle import SemanticCatalogHandle
+from data_agent.runtime.provenance.freshness import (
+    capture_freshness,
+    ingestion_date,
+    merge_freshness,
+    timestamp,
+)
 from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
 from data_agent.runtime.retrieval.scope_filter import is_blueprint_in_scope
 from data_agent.runtime.session.models import ResultPreview
@@ -78,6 +83,7 @@ from .slots import (
     OmitSlot,
     SlotBinding,
     expand_binding,
+    normalize_list_values,
     resolve_slot,
     slot_token_names,
 )
@@ -356,6 +362,22 @@ class BlueprintExecutor:
         `awaiting_node=None`. Resume: `completed` rehydrated + `awaiting_node` set."""
         bid = blueprint.id
 
+        # Sorting is opt-in per blueprint. In particular, named top-N rankings
+        # deliberately expose neither control: ignoring an old/guessed binding
+        # would claim to have applied an order that the query did not perform.
+        declared_slots = {slot.name for slot in blueprint.slots}
+        unsupported_sort = sorted(
+            {"order_by", "order_direction"}.intersection(slot_bindings) - declared_slots
+        )
+        if unsupported_sort:
+            return ExecFailed(
+                SLOT_INVALID_CODE,
+                "This blueprint does not accept " + ", ".join(unsupported_sort)
+                + ". Preserve its authored ranking and use only declared slots. "
+                "If a different ordering is required, use a separate query.",
+                retryable=True,
+            )
+
         # 1. Topo-order + the F2 boundary. A TABLE intermediate (a node output
         # consumed downstream by a table `consumes`) is now MATERIALIZED to a
         # session-scoped scratch table via the D93 side-channel, then the consumer's
@@ -438,7 +460,6 @@ class BlueprintExecutor:
 
         provenances: list[frozenset[tuple[str, str]] | None] = []
         all_referenced = _all_referenced_slots(blueprint)
-
         # 2. Resolve every slot up-front (deterministic, D49). A slot `askUser`
         # pauses BEFORE any node runs (awaiting_node=None — resume re-runs via the
         # model loop, the Slice-B contract).
@@ -752,7 +773,12 @@ class BlueprintExecutor:
         omitted_patterns: dict[str, str] = {}
         for spec in blueprint.slots:
             raw = slot_bindings.get(spec.name)
-            if _is_present(raw) and spec.binds_to and spec.type != "enum":
+            # Shape validation precedes lookup; resolve values only after its domain returns.
+            shape = (normalize_list_values(raw, spec)
+                     if (spec.multiple or spec.type == "list") and _is_present(raw) else None)
+            if isinstance(shape, list):
+                raw = shape
+            if not isinstance(shape, AskUser) and _is_present(raw) and spec.binds_to and spec.type != "enum":
                 domain, probe_entries, failure = await self._probe_domain(
                     spec.binds_to, credentials, raw=raw, slot_type=spec.type
                 )
@@ -761,14 +787,27 @@ class BlueprintExecutor:
                 provenances.extend(probe_entries)
             else:
                 domain = None
-            outcome = resolve_slot(raw, spec, domain=domain)
+            outcome = shape if isinstance(shape, AskUser) else resolve_slot(raw, spec, domain=domain)
             if isinstance(outcome, AskUser):
-                if spec.type == "entity" and outcome.reason == "no_match":
+                if (spec.type == "sort_order" or
+                        ((spec.multiple or spec.type == "list") and
+                         (outcome.reason == "invalid" or (spec.enum_values and outcome.reason == "no_match")))):
+                    allowed = (f"Allowed columns: {json.dumps(list(spec.allowed_columns))}. "
+                               if spec.allowed_columns else
+                               f"Allowed values: {json.dumps(list(spec.enum_values))}. "
+                               if spec.enum_values else "")
+                    return bound, omitted_patterns, ExecFailed(
+                        SLOT_INVALID_CODE, f"Invalid {spec.name}: {outcome.question} " + allowed +
+                        "Correct the tool arguments and retry; do not ask the user to format slots. "
+                        "Omit an optional slot to use its declared default.", retryable=True,
+                    )
+                if (spec.type == "entity" or spec.multiple or spec.type == "list") and outcome.reason == "no_match":
                     # An exact-value miss is a discovery gap, not necessarily
                     # user ambiguity (e.g. an abbreviation or an empty department).
                     return bound, omitted_patterns, ExecFailed(
                         "BLUEPRINT_ENTITY_NOT_FOUND",
-                        "The supplied entity was not found by an exact scoped lookup. "
+                        f"The supplied value for {spec.name} was not found by an exact scoped lookup. "
+                        "Resolve every requested value; the matched subset is not a list of alternatives. "
                         "Resolve it against the scoped directory before retrying; do not repeat "
                         "unchanged bindings or substitute a different business concept. "
                         "A resolved entity with no matching facts is a valid empty result. "
@@ -1014,7 +1053,7 @@ class BlueprintExecutor:
 
         Concrete string/entity/period bindings use a targeted predicate. The same
         credentialed dispatcher enforces access; failed probes never masquerade as
-        successful resolution. Lists retain the bounded domain resolver for now.
+        successful resolution. Categorical lists target every supplied value; legacy list slots retain the bounded domain resolver.
         """
         db_table, sep, column = binds_to.rpartition(".")
         if not sep or not db_table or not column:
@@ -1030,6 +1069,12 @@ class BlueprintExecutor:
                     expression=exp.Literal.string(value.casefold()),
                 )
             query = query.where(predicate)
+        elif (isinstance(raw, (list, tuple)) and raw and slot_type in {"string", "entity"}
+              and all(isinstance(v, str) for v in raw)):
+            query = query.where(exp.In(
+                this=exp.func("lowerUTF8", exp.func("toString", exp.column(column))),
+                expressions=[exp.Literal.string(v.strip().casefold()) for v in raw],
+            ))
         probe = await self._tool_dispatcher.dispatch(
             "runQuery",
             {"sql": query.limit(_DOMAIN_PROBE_LIMIT).sql(dialect="clickhouse"), "limit": None},

@@ -1287,6 +1287,13 @@ def _validate_roles(
                     f"{at}.slot.type is missing or not a known slot type; it must be "
                     f"exactly one of {sorted(SLOT_TYPES - UNSUPPORTED_SLOT_TYPES)}"
                 )
+            if p.slot.type == "sort_order":
+                return Decline(
+                    "blueprint", REASON_BAD_ROLE,
+                    "sort_order is supported by the runtime but extraction has no structural ORDER BY "
+                    "locator. Preserve the accepted ORDER BY in learned SQL; do not model it as a "
+                    "predicate slot or discard the ordering.",
+                )
             # A type the RUNTIME executes but this pipeline cannot GENERALIZE. Declined
             # FIRST, before the `binds_to` rules below, so the reason names the actual
             # blocker rather than a consequence of it.

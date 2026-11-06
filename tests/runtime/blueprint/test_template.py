@@ -148,3 +148,30 @@ def test_scratch_binding_preserves_materializer_database(api_scratch_namespace):
     assert table.db == "tenant_uploads"
     assert table.name == "s_session_bp_123"
     assert table.alias == "x"
+
+
+def test_optional_top_n_preserves_full_result_and_applies_after_aggregation():
+    import sqlite3
+
+    template = 'SELECT department, SUM(hours) AS hours FROM events GROUP BY department ORDER BY hours DESC, department LIMIT {top_n}'
+    full = bind_template(template, {}, optional_patterns={"top_n": "TRUE"})
+    limited = bind_template(template, {"top_n": 2})
+    assert "LIMIT" not in full
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE events(department TEXT, hours INTEGER)")
+        db.executemany("INSERT INTO events VALUES (?, ?)", [("A", 2), ("A", 5), ("B", 6), ("C", 6)])
+        assert db.execute(full).fetchall() == [("A", 7), ("B", 6), ("C", 6)]
+        assert db.execute(limited).fetchall() == [("A", 7), ("B", 6)]
+
+
+@pytest.mark.parametrize("template,pattern", [
+    ("SELECT x FROM t LIMIT {top_n}", "FALSE"),
+    ("SELECT x FROM t LIMIT {top_n} OFFSET 2", "TRUE"),
+    ("SELECT x FROM (SELECT x FROM t LIMIT {top_n})", "TRUE"),
+    ("SELECT x FROM t LIMIT {top_n} + 1", "TRUE"),
+    ("SELECT x FROM t LIMIT {top_n} BY x", "TRUE"),
+    ("SELECT x FROM t LIMIT {top_n} WITH TIES", "TRUE"),
+])
+def test_optional_limit_ambiguous_shapes_fail_closed(template, pattern):
+    with pytest.raises(TemplateBindError):
+        bind_template(template, {}, optional_patterns={"top_n": pattern})

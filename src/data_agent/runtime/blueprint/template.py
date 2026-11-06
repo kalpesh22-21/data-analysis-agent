@@ -22,8 +22,8 @@ the executor never emits half-bound SQL.
 
 from __future__ import annotations
 
-import math
 import datetime as dt
+import math
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -32,6 +32,8 @@ import sqlglot
 from sqlglot import exp
 
 from data_agent.sqlparse.scratch_namespace import scratch_databases
+
+from .models import validate_sort_order
 
 # A slot bind-site token: `{name}` where name is an identifier. Deliberately
 # strict — a `{` followed by anything non-identifier is NOT treated as a slot
@@ -188,6 +190,31 @@ def parse_template(sql_template: str) -> exp.Expression:
     if tree is None:
         raise TemplateBindError("template parsed to an empty AST")
     return tree
+
+
+def bind_native_order(tree: exp.Expression, bindings: dict[str, Any]) -> None:
+    """Expand a validated sort list at the authored ORDER BY placeholder only."""
+    for node in list(tree.find_all(exp.Placeholder)):
+        if node.name != "order_by":
+            continue
+        ordered = node.parent
+        if not isinstance(ordered, exp.Ordered) or not isinstance(ordered.parent, exp.Order):
+            raise TemplateBindError("order_by must be the ORDER BY placeholder")
+        order = ordered.parent
+        if len(order.expressions) != 1:
+            raise TemplateBindError("order_by cannot be combined with implicit secondary ordering")
+        aliases = order.parent.named_selects
+        try:
+            items = validate_sort_order(bindings.get("order_by"), aliases)
+        except ValueError as exc:
+            raise TemplateBindError(str(exc)) from exc
+        if any(aliases.count(item["column"]) != 1 or item["column"] == "*" for item in items):
+            raise TemplateBindError("order_by requires unambiguous output columns")
+        order.set("expressions", [exp.Ordered(
+            this=exp.column(item["column"], quoted=True),
+            desc=item["direction"] == "DESC", nulls_first=False,
+        ) for item in items])
+
 
 
 def _to_literal(name: str, value: Any) -> exp.Expression:
@@ -409,9 +436,10 @@ def validate_optional_pattern(name: str, pattern: str) -> None:
 def _apply_optional_patterns(
     tree: exp.Expression, optional_patterns: Mapping[str, str]
 ) -> exp.Expression:
-    """Replace, for every omitted OPTIONAL slot in *optional_patterns*, the whole boolean
-        predicate containing its `:name` placeholder with the slot's parsed `optional_pattern`
-        condition.
+    """Replace omitted OPTIONAL predicates, or remove a plain outer LIMIT with TRUE.
+
+        Predicate placeholders are replaced with the parsed `optional_pattern` condition.
+        A sole outer LIMIT placeholder with TRUE removes that display cap instead.
 
         Every occurrence of the placeholder is handled; replacing the enclosing predicate removes
         it, so the downstream value-binding step never sees it. A pattern whose placeholder does
@@ -455,6 +483,24 @@ def _apply_optional_patterns(
         if target is None:
             return tree
         name = target.args["this"]
+        # An optional display cap may be omitted without changing the population.
+        # Only an exact, outer LIMIT {slot} with TRUE (no restriction) qualifies.
+        # Never remove a nested limit, offset, expression, or LIMIT BY/ties clause.
+        limit = target.parent
+        if isinstance(limit, exp.Limit):
+            pattern = parsed_patterns[name]
+            if (
+                limit.parent is tree
+                and limit.args.get("expression") is target
+                and isinstance(pattern, exp.Boolean) and pattern.this is True
+                and not tree.args.get("offset")
+                and not any(v for k, v in limit.args.items() if k != "expression")
+            ):
+                tree.set("limit", None)
+                continue
+            raise TemplateBindError(
+                f"optional_pattern for slot {name!r} can omit only a plain outer LIMIT with TRUE"
+            )
         predicate = _enclosing_predicate(target)
         if predicate is tree or not isinstance(predicate, exp.Condition):
             # The placeholder is not inside a boolean predicate (e.g. it sits in a
@@ -543,6 +589,8 @@ def bind_template(
     # placeholder node (`{name}` alone parses as a ClickHouse map literal — unusable).
     tree = parse_template(sql_template)
 
+    bind_native_order(tree, bindings)
+
     # Rewrite table-consume placeholders (scratch.<placeholder> → the materialized
     # scratch table) FIRST — a structural identifier swap, injection-safe.
     # NOTE: this `if` is also what scopes `_rewrite_scratch_tables`' unbound-placeholder
@@ -558,6 +606,16 @@ def bind_template(
         tree = _apply_optional_patterns(tree, optional_patterns)
 
     def _replace(node: exp.Expression) -> exp.Expression:
+        # Expand a list at an authored IN ({slot}) site; never change the operator.
+        if isinstance(node, exp.In) and len(node.expressions) == 1:
+            placeholder = node.expressions[0]
+            if (isinstance(placeholder, exp.Placeholder)
+                    and isinstance(value := bindings.get(placeholder.name), (list, tuple))):
+                # Keep this node so transform also visits other placeholders, e.g.
+                # the scalar on the left of {value} IN ({choices}). The tree was
+                # copied by transform; the caller's template remains untouched.
+                node.set("expressions", _to_literal(placeholder.name, value).expressions)
+                return node
         if isinstance(node, exp.Placeholder):
             name = node.args.get("this")
             if not isinstance(name, str) or name not in bindings:
@@ -565,6 +623,10 @@ def bind_template(
                 # binding (should be impossible given the checks above).
                 raise TemplateBindError(f"unbound placeholder {name!r} in template")
             value = bindings[name]
+            if isinstance(value, (list, tuple)) and not (
+                isinstance(node.parent, exp.In) and node.arg_key == "field"
+            ):
+                raise TemplateBindError(f"List binding for {name!r} requires an authored IN predicate")
             literal = _to_literal(name, value)
             parent = node.parent
             if isinstance(value, dt.date) and (
@@ -581,6 +643,7 @@ def bind_template(
 
     bound = tree.transform(_replace)
     return bound.sql(dialect="clickhouse")
+
 
 
 __all__ = [

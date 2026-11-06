@@ -24,6 +24,7 @@ SLOT_TYPES: frozenset[str] = frozenset(
         "string",
         "entity",
         "enum",
+        "sort_order",
         "period",
         "as_of_date",
         "list",
@@ -42,6 +43,7 @@ SLOT_TYPES: frozenset[str] = frozenset(
 SLOT_TYPE_GLOSS: dict[str, str] = {
     "string": "a named value (e.g. a specific department).",
     "entity": "a named value (e.g. a specific department or employee).",
+    "sort_order": "an ordered list of 1 to 3 objects: {column: exact allowed output column, direction: ASC or DESC}; no duplicate columns.",
     "enum": "one value from a fixed, closed set of allowed options.",
     "period": "a warehouse pay-period key, NOT a free calendar date.",
     "as_of_date": (
@@ -232,6 +234,7 @@ NODE_REF_KEY = "ref"
 RELATIVE_WINDOW_FLOOR = 1
 RELATIVE_WINDOW_CEILING = 120
 INTEGER_CEILING = 2**31 - 1
+MULTI_VALUE_LIMIT = 100
 
 # Hard cap on declared `slots` (reviewer S3). Each `binds_to` slot can fire an
 # unbudgeted inner DISTINCT domain probe at execution, so a poisoned READ record
@@ -253,6 +256,7 @@ class SlotSpec:
     required: bool = True
     binds_to: str | None = None  # "database.table.column" the value validates against
     enum_values: tuple[str, ...] | None = None  # closed set for `type: enum`
+    allowed_columns: tuple[str, ...] | None = None
     optional_pattern: str | None = None  # SQL fragment for an absent optional slot
     # Inclusive bounds for a `relative_window` integer (trailing "last N <unit>",
     # D41/D49), or numeric parameter. Numeric types have independent bounds.
@@ -264,6 +268,7 @@ class SlotSpec:
 
     default: Any | None = None
     description: str | None = None
+    multiple: bool = False
 
     @property
     def needs_omission_pattern(self) -> bool:
@@ -296,6 +301,7 @@ class SlotSpec:
         # values are validated structurally, not matched against a DISTINCT set), so
         # a `binds_to` here would only fire a useless probe — reject it at parse.
         if binds_to is not None and type_ in (
+            "sort_order",
             "relative_window",
             "positive_integer",
             "nonnegative_integer",
@@ -318,9 +324,29 @@ class SlotSpec:
         optional_pattern = raw.get("optional_pattern")
         if optional_pattern is not None and not isinstance(optional_pattern, str):
             raise BlueprintParseError(f"slot {name!r} 'optional_pattern' must be a string")
+        allowed_columns = raw.get("allowed_columns")
+        if type_ == "sort_order":
+            if (name != "order_by" or not isinstance(allowed_columns, list) or not allowed_columns
+                    or any(not isinstance(c, str) or not c.strip() for c in allowed_columns)
+                    or len(set(allowed_columns)) != len(allowed_columns)
+                    or optional_pattern is not None or enum_values is not None):
+                raise BlueprintParseError("sort_order requires order_by and unique nonempty allowed_columns")
+        elif allowed_columns is not None:
+            raise BlueprintParseError("allowed_columns is only valid for sort_order")
         default = raw.get("default")
+        multiple = raw.get("multiple", False)
+        if not isinstance(multiple, bool) or (multiple and type_ not in {"enum", "entity", "string"}):
+            raise BlueprintParseError("multiple is a boolean supported only on categorical slots")
         if default is not None:
-            if not isinstance(default, (str, int, float, bool)):
+            if multiple:
+                if (not isinstance(default, list) or not 1 <= len(default) <= MULTI_VALUE_LIMIT
+                        or any(not isinstance(v, str) or not v.strip() for v in default)
+                        or len(set(default)) != len(default)
+                        or (enum_values and any(v not in enum_values for v in default))
+                        or (enum_values and "All" in enum_values and "All" in default and len(default) != 1)):
+                    raise BlueprintParseError(f"slot {name!r} default must be a nonempty list of distinct allowed values; All must stand alone")
+                default = list(default)
+            elif type_ != "sort_order" and not isinstance(default, (str, int, float, bool)):
                 raise BlueprintParseError(
                     f"slot {name!r} default must be scalar, got {type(default).__name__}"
                 )
@@ -332,10 +358,15 @@ class SlotSpec:
                 raise BlueprintParseError(f"slot {name!r} of type {type_!r} must not declare default")
             if optional_pattern is not None:
                 raise BlueprintParseError(f"slot {name!r} must not declare both optional_pattern and default")
-            if type_ == "enum" and default not in enum_values:
+            if type_ == "enum" and not multiple and default not in enum_values:
                 raise BlueprintParseError(
                     f"slot {name!r} default {default!r} is not in enum_values {enum_values!r}"
                 )
+        if type_ == "sort_order" and default is not None:
+            try:
+                default = validate_sort_order(default, allowed_columns)
+            except ValueError as exc:
+                raise BlueprintParseError(str(exc)) from exc
         description = raw.get("description")
         if description is not None and (not isinstance(description, str) or not description):
             raise BlueprintParseError(f"slot {name!r} description must be a non-empty string or null")
@@ -373,12 +404,14 @@ class SlotSpec:
             required=required,
             binds_to=binds_to,
             enum_values=enum_values,
+            allowed_columns=tuple(allowed_columns) if allowed_columns else None,
             optional_pattern=optional_pattern,
             min_value=min_value,
             max_value=max_value,
             temporal_type=temporal_type,
             default=default,
             description=description,
+            multiple=multiple,
         )
 
 
@@ -657,3 +690,22 @@ class Blueprint:
             column_formats=formats,
             window_anchor=window_anchor,
         )
+
+
+def validate_sort_order(value: Any, allowed_columns) -> list[dict[str, str]]:
+    """Validate without coercing SQL fragments or mutating model/author input."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 3:
+        raise ValueError("order_by must be a list of 1 to 3 {column, direction} objects")
+    seen = set()
+    result = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"column", "direction"}:
+            raise ValueError("Each order_by item must contain only column and direction")
+        column, direction = item["column"], item["direction"]
+        if not isinstance(column, str) or column not in allowed_columns or column in seen:
+            raise ValueError("order_by columns must be distinct exact allowed output columns")
+        if not isinstance(direction, str) or direction not in {"ASC", "DESC"}:
+            raise ValueError("Each order_by direction must be ASC or DESC")
+        seen.add(column)
+        result.append({"column": column, "direction": direction})
+    return result

@@ -16,10 +16,18 @@ from __future__ import annotations
 import datetime as _dt
 import re
 from collections.abc import Iterable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import INTEGER_CEILING, RELATIVE_WINDOW_CEILING, RELATIVE_WINDOW_FLOOR, SlotSpec
+from .models import (
+    INTEGER_CEILING,
+    MULTI_VALUE_LIMIT,
+    RELATIVE_WINDOW_CEILING,
+    RELATIVE_WINDOW_FLOOR,
+    SlotSpec,
+    validate_sort_order,
+)
 
 # Deictic / relative period words — never resolved to a concrete period here
 # (D49: fuzzy NL is never guessed); they route to `AskUser` (or, in Slice B, to a
@@ -147,14 +155,22 @@ def resolve_slot(
             )
         if spec.default is not None:
             # Author defaults were validated at parse time; keep their exact type/value.
-            return SlotBinding(name=spec.name, value=spec.default, resolved_from="default")
+            return SlotBinding(name=spec.name, value=deepcopy(spec.default), resolved_from="default")
         return OmitSlot(name=spec.name, optional_pattern=spec.optional_pattern)
+
+    if spec.multiple or spec.type == "list":
+        return _resolve_list(raw, spec, domain)
 
     # The windowed-period types resolve BEFORE the string/entity container guard
     # (line below): a `period_range` value is legitimately a dict/list, which that
     # guard would otherwise reject as "not a single value" (F1 windowed-slot gap).
     if spec.type in ("relative_window", "positive_integer", "nonnegative_integer"):
         return _resolve_integer(raw, spec)
+    if spec.type == "sort_order":
+        try:
+            return SlotBinding(name=spec.name, value=validate_sort_order(raw, spec.allowed_columns or ()))
+        except ValueError as exc:
+            return AskUser(slot=spec.name, reason="invalid", question=str(exc))
     if spec.type == "period_range":
         return _resolve_period_range(raw, spec)
 
@@ -178,8 +194,6 @@ def resolve_slot(
         return _resolve_enum(raw, spec)
     if spec.type in ("period", "as_of_date"):
         return _resolve_period(raw, spec, domain)
-    if spec.type == "list":
-        return _resolve_list(raw, spec, domain)
     # `models.SLOT_TYPES` is the closed set the parse layer enforces, so this is
     # unreachable for a parsed spec — fail-closed rather than bind blindly.
     return AskUser(
@@ -282,24 +296,38 @@ def _resolve_period(raw: Any, spec: SlotSpec, domain: Iterable[str] | None) -> S
     )
 
 
+def normalize_list_values(raw: Any, spec: SlotSpec) -> list[Any] | AskUser:
+    """Check list shape before any lookup; legacy lists retain scalar coercion."""
+    elements = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+    invalid = not 1 <= len(elements) <= MULTI_VALUE_LIMIT
+    invalid |= any(isinstance(v, (list, tuple, dict)) or v is None for v in elements)
+    if spec.multiple:
+        invalid |= any(not isinstance(v, str) or not v.strip() for v in elements)
+    else:
+        invalid |= any(isinstance(v, str) and not v.strip() for v in elements)
+    if invalid:
+        return AskUser(slot=spec.name, reason="invalid",
+                       question=f"'{spec.name}' expects 1 to {MULTI_VALUE_LIMIT} nonempty scalar values, with no nested lists or objects.")
+    return elements
+
+
 def _resolve_list(raw: Any, spec: SlotSpec, domain: Iterable[str] | None) -> SlotResolution:
-    """A `list`/`IN` slot — each element resolved like a scalar; binds as a list
-    (the template binder renders it as a sqlglot `IN (…)` tuple). Any element that
-    multi-/no-matches → `AskUser` (never a partial IN set on a guess)."""
-    elements = raw if isinstance(raw, (list, tuple)) else [raw]
-    if not elements:
-        return AskUser(
-            slot=spec.name,
-            reason="no_match",
-            question=f"'{spec.name}' needs at least one value.",
-        )
+    """Shared bounded resolver; never bind a partial set after a failed element."""
+    elements = normalize_list_values(raw, spec)
+    if isinstance(elements, AskUser):
+        return elements
     resolved: list[Any] = []
+    domain = tuple(domain) if domain is not None else None
     for element in elements:
-        outcome = _resolve_scalar(element, spec, domain, resolved_from="list")
+        outcome = (_resolve_enum(element, spec) if spec.enum_values else
+                   _resolve_scalar(element, spec, domain, resolved_from="list"))
         if isinstance(outcome, AskUser):
-            return outcome  # surface the first ambiguous element's clarification
-        if isinstance(outcome, SlotBinding):
+            return outcome
+        if outcome.value not in resolved:
             resolved.append(outcome.value)
+    if spec.enum_values and "All" in spec.enum_values and "All" in resolved and len(resolved) > 1:
+        return AskUser(slot=spec.name, reason="invalid",
+                       question=f"'{spec.name}': use All alone, or list specific values; do not combine them.")
     return SlotBinding(name=spec.name, value=resolved, resolved_from="list")
 
 

@@ -85,7 +85,9 @@ DOMAINLESS_SLOT_TYPES: frozenset[str] = WINDOWED_SLOT_TYPES | frozenset({"positi
 # change, and a rule deciding WHICH bound each predicate is — and getting that last one
 # wrong silently inverts a date filter, which is the D56 wrong-answer class. Tracked in
 # the plan doc; pinned by `test_period_range_withdrawn_qa.py`.
-UNSUPPORTED_SLOT_TYPES: frozenset[str] = frozenset({"period_range"})
+# sort_order is an ORDER BY list, not a predicate literal. Keep accepted ordering
+# fixed until extraction has a validated structural ORDER BY locator and replay path.
+UNSUPPORTED_SLOT_TYPES: frozenset[str] = frozenset({"period_range", "sort_order"})
 
 
 @dataclass(frozen=True)
