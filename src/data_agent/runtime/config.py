@@ -977,7 +977,7 @@ class RuntimeSettings(BaseSettings):
         True, description="Master switch; False => empty RetrievedContext (Phase-0 parity)."
     )
     retrieval_mode: Literal["hints", "required_search"] = Field(
-        "hints", description="Hints are optional by default; required_search opts into mandatory per-turn discovery."
+        "required_search", description="Require per-turn discovery by default, without retrieval hints; hints opts into optional prefetched context."
     )
     retrieval_prefetch_tool_enabled: bool | None = Field(
         None, description="Deprecated and ignored: both values only chose how hints were shown. Use retrieval_mode."

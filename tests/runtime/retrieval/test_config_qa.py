@@ -41,7 +41,7 @@ def test_retrieval_defaults() -> None:
     s = RuntimeSettings(_env_file=None)
     assert s.retrieval_enabled is True  # master switch on by default
     assert s.retrieval_prefetch_tool_enabled is None
-    assert s.retrieval_mode == "hints"
+    assert s.retrieval_mode == "required_search"
     assert s.retrieval_recall_k == 30
     assert s.retrieval_top_k_blueprints == 3  # 03 fixes 3
     assert s.retrieval_top_k_knowledge == 3
@@ -119,7 +119,7 @@ def _client(monkeypatch, *, retrieval_enabled: bool, embedder: FakeEmbeddingClie
         max_wall_clock_seconds=60,
         max_budget_windows=3,
         retrieval_enabled=retrieval_enabled,
-        retrieval_prefetch_tool_enabled=True,
+        retrieval_mode="hints",
     )
     app = create_app(
         settings=settings,

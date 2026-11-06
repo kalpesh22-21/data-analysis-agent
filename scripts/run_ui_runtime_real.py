@@ -114,7 +114,7 @@ def build_real_app():
     model = os.environ.get("OPENAI_MODEL") or pick_openai_model(api_key, label=_PREFLIGHT_LABEL)
 
     retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
-    retrieval_mode = os.environ.get("RETRIEVAL_MODE", "").strip().lower() or "hints"
+    retrieval_mode = os.environ.get("RETRIEVAL_MODE", "").strip().lower() or "required_search"
     # LLM progress summaries (docs/08-ui.md): ON by default for THIS dev launcher
     # (production RuntimeSettings default stays False). Relaxes D25 for the progress
     # channel only — the streamed line may carry business values from tool args.

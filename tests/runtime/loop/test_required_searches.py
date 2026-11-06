@@ -288,11 +288,10 @@ async def test_gate_violation_uses_search_guidance_not_finalization_repair():
 def test_default_and_legacy_retrieval_modes():
     from data_agent.runtime.config import RuntimeSettings
 
-    assert RuntimeSettings(_env_file=None).retrieval_mode == "hints"
-    # Helm shipped the deprecated flag as "false" (hints as a user message), so neither
-    # value may switch a deployment into required_search.
+    assert RuntimeSettings(_env_file=None).retrieval_mode == "required_search"
+    # Neither deprecated flag value overrides the required-search default.
     for flag in (True, False):
-        assert RuntimeSettings(_env_file=None, retrieval_prefetch_tool_enabled=flag).retrieval_mode == "hints"
+        assert RuntimeSettings(_env_file=None, retrieval_prefetch_tool_enabled=flag).retrieval_mode == "required_search"
     assert RuntimeSettings(_env_file=None, retrieval_mode="required_search",
                            retrieval_prefetch_tool_enabled=True).retrieval_mode == "required_search"
 
@@ -308,14 +307,14 @@ def test_required_search_rejects_missing_retrieval_at_startup(enabled):
 
     with pytest.raises(ValueError, match="RETRIEVAL_MODE=required_search requires"):
         create_app(
-            settings=RuntimeSettings(_env_file=None, retrieval_mode="required_search",
+            settings=RuntimeSettings(_env_file=None,
                                      retrieval_enabled=enabled, neo4j_url=""),
             model_client=ScriptedModelClient([]), mcp_client=FakeMCPClient(),
             catalog=CatalogHandle({}), session_store=InMemorySessionStore(),
         )
 
 
-def test_deprecated_flag_starts_in_hints_mode_with_a_warning(caplog):
+def test_explicit_hints_with_deprecated_flag_warns(caplog):
     from data_agent.runtime.app import create_app
     from data_agent.runtime.config import RuntimeSettings
     from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -323,11 +322,10 @@ def test_deprecated_flag_starts_in_hints_mode_with_a_warning(caplog):
     from data_agent.runtime.provenance.catalog_handle import CatalogHandle
     from data_agent.runtime.session.memory_store import InMemorySessionStore
 
-    # Helm shipped RETRIEVAL_PREFETCH_TOOL_ENABLED="false"; without retrieval that must
-    # still start, in hints mode, rather than fail the required_search startup check.
+    # Explicit hints mode remains available without retrieval.
     with caplog.at_level("WARNING", logger="data_agent.runtime.app"):
         create_app(
-            settings=RuntimeSettings(_env_file=None, retrieval_prefetch_tool_enabled=False,
+            settings=RuntimeSettings(_env_file=None, retrieval_mode="hints", retrieval_prefetch_tool_enabled=False,
                                      retrieval_enabled=False, neo4j_url=""),
             model_client=ScriptedModelClient([]), mcp_client=FakeMCPClient(),
             catalog=CatalogHandle({}), session_store=InMemorySessionStore(),
@@ -345,7 +343,7 @@ def test_helm_values_select_retrieval_mode_not_the_deprecated_flag():
         assert "RETRIEVAL_PREFETCH_TOOL_ENABLED" not in text
         values = yaml.safe_load(text)
         modes = [v["RETRIEVAL_MODE"] for v in values.values() if isinstance(v, dict) and "RETRIEVAL_MODE" in v]
-        assert modes == ["hints"], name
+        assert modes == ["required_search"], name
 
 
 async def test_finish_uses_window_credentials_without_delivery_context():
@@ -373,7 +371,7 @@ async def test_finish_uses_window_credentials_without_delivery_context():
     assert not any(e == "loop_required_search_gate" and p["status"] == "incomplete" for e, p in events)
 
 
-def test_default_without_retrieval_answers_chat(monkeypatch):
+def test_explicit_hints_without_retrieval_answers_chat(monkeypatch):
     from fastapi.testclient import TestClient
 
     from data_agent.runtime import app as app_module
@@ -390,7 +388,7 @@ def test_default_without_retrieval_answers_chat(monkeypatch):
     model = ScriptedModelClient([final_answer(assistant_text="Hello! How can I help?")])
     monkeypatch.setattr(app_module, "build_openai_model_client", lambda **kw: model)
     app = app_module.create_app(
-        settings=RuntimeSettings(_env_file=None, neo4j_url="", answer_judge_enabled=True, openai_api_key="test-only",
+        settings=RuntimeSettings(_env_file=None, retrieval_mode="hints", neo4j_url="", answer_judge_enabled=True, openai_api_key="test-only",
                                  progress_summary_enabled=False),
         model_client=model, mcp_client=FakeMCPClient(), catalog=CatalogHandle({}),
         session_store=InMemorySessionStore(),

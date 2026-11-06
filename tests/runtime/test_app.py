@@ -65,7 +65,7 @@ def _build_client(monkeypatch, model_client: ScriptedModelClient) -> TestClient:
         ],
         scripted={},
     )
-    settings = RuntimeSettings(
+    settings = RuntimeSettings(retrieval_mode="hints",
         answer_judge_enabled=False,
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
@@ -150,7 +150,7 @@ def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch)
         ]
     )
     app = create_app(
-        settings=RuntimeSettings(
+        settings=RuntimeSettings(retrieval_mode="hints",
             _env_file=None,
             catalog_source="fixture",
         ),
@@ -188,7 +188,7 @@ def test_turn_endpoint_does_not_inject_discovery(monkeypatch, legacy_enabled) ->
         ]
     )
     app = create_app(
-        settings=RuntimeSettings( _env_file=None, discovery_emulation_enabled=legacy_enabled),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None, discovery_emulation_enabled=legacy_enabled),
         session_store=InMemorySessionStore(),
         mcp_client=mcp_client,
         model_client=model_client,
@@ -385,7 +385,7 @@ def _read_tools_app(
             top_k_knowledge=3,
         )
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -546,7 +546,7 @@ def _run_blueprint_app(
         }
     )
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -678,7 +678,7 @@ def _raw_loop_app(
         }
     )
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -800,7 +800,7 @@ def test_raw_loop_multi_query_sql_list_ordered_and_deduped(monkeypatch) -> None:
         ]
     )
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model,
@@ -863,7 +863,7 @@ def _history_client(
     end-to-end under a chosen scope."""
     monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: column_scope)
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=store,
         mcp_client=FakeMCPClient(tools=[], scripted={}),
         model_client=ScriptedModelClient([]),
@@ -1041,7 +1041,7 @@ def test_history_survives_an_unreadable_blueprint_result(monkeypatch) -> None:
     monkeypatch.setattr(store, "read_full_result", _boom, raising=False)
 
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=store,
         mcp_client=FakeMCPClient(),
         model_client=ScriptedModelClient([final_answer(assistant_text="hi")]),
@@ -1132,7 +1132,7 @@ def test_update_analysis_state_is_wired_and_gets_the_loops_own_turn_index(
     )
     mcp_client = FakeMCPClient(tools=[], scripted={})
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -1194,7 +1194,7 @@ def test_extra_observers_receive_loop_events_on_both_endpoints(monkeypatch) -> N
         ]
     )
     app = create_app(
-        settings=RuntimeSettings( _env_file=None),
+        settings=RuntimeSettings(retrieval_mode="hints",  _env_file=None),
         session_store=InMemorySessionStore(),
         mcp_client=FakeMCPClient(tools=[], scripted={}),
         model_client=model_client,
@@ -1243,7 +1243,7 @@ def test_judge_thinking_budget_builds_only_a_dedicated_judge_client(monkeypatch,
 
     monkeypatch.setattr(app_module, "build_openai_model_client", build_client)
     create_app(
-        settings=RuntimeSettings(
+        settings=RuntimeSettings(retrieval_mode="hints",
             _env_file=None,
             openai_api_key="test-key",
             openai_model="kimi",
@@ -1297,7 +1297,7 @@ def test_reasoning_effort_reaches_agent_and_judge_clients(monkeypatch, agent, ju
 
     monkeypatch.setattr(app_module, "build_openai_model_client", build_client)
     create_app(
-        settings=RuntimeSettings(
+        settings=RuntimeSettings(retrieval_mode="hints",
             _env_file=None, openai_api_key="test-key", openai_model="deepseek",
             model_reasoning_effort=agent, answer_judge_enabled=True,
             answer_judge_reasoning_effort=judge, progress_summary_enabled=False,

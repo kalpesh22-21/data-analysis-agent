@@ -23,19 +23,19 @@ uv run ruff check
 
 | Value | Retrieval hints | Mandatory searches before other work |
 | --- | --- | --- |
-| `hints` (default) | Ordinary reference context when retrieval is available | None |
-| `required_search` | Not injected | `searchBlueprints`, `searchKnowledge`, plus `searchCapabilityTools` when capabilities are enabled |
+| `hints` | Ordinary reference context when retrieval is available | None |
+| `required_search` (default) | Not injected | `searchBlueprints`, `searchKnowledge`, plus `searchCapabilityTools` when capabilities are enabled |
 
 Hint mode works without Neo4j/retrieval and retains normal recovery. Required-search
-mode is an explicit strict experiment: startup fails clearly unless retrieval is
+mode is the default: startup fails clearly unless retrieval is
 configured and enabled. It adds search calls to every turn, including chat,
 clarifications, Help Center questions and saved-result summaries. A runtime retrieval
 outage or timeout before discovery completes prevents answering/recovery in that
 mode. Use hints mode when graceful degradation is required.
 
 The deprecated `RETRIEVAL_PREFETCH_TOOL_ENABLED` is ignored, with a startup warning: both
-of its values only chose how hints were shown, so neither opts into required_search. Only
-`RETRIEVAL_MODE=required_search` does. No simulated `prefetchContext` tool calls are
+of its values only chose how hints were shown. It does not override `RETRIEVAL_MODE`
+or its `required_search` default. Set `RETRIEVAL_MODE=hints` explicitly to enable hints. No simulated `prefetchContext` tool calls are
 created in either mode.
 
 The main prompt describes the selected mode. Required searches use the current
