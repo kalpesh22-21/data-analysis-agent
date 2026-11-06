@@ -51,6 +51,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     _default_observer,
 )
 from data_agent.runtime.observability import tracing
+from data_agent.runtime.observability.phoenix_payloads import BLUEPRINT_DEFINITION_TOOLS, sanitize
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -78,7 +79,7 @@ class SpanOutcome(Protocol):
 
 
 def _stamp[OutcomeT: SpanOutcome](
-    span: Span, outcome: OutcomeT, *, reveal_result: bool = False, include_result: bool = False
+    span: Span, outcome: OutcomeT, *, reveal_result: bool = False, include_result: bool = False, definition_result: bool = False
 ) -> OutcomeT:
     """Overwrite the span's optimistic `status="ok"` with what actually happened.
 
@@ -108,10 +109,12 @@ def _stamp[OutcomeT: SpanOutcome](
         span.set_attribute("tool.result.column_count", len(preview.columns))
         span.set_attribute("tool.result.columns", list(preview.columns))
         span.set_attribute("tool.result.truncated", preview.truncated)
-        if reveal_result:
-            encoded = json.dumps(preview.preview_rows, default=str)
-            span.set_attribute("tool.result.preview_rows", encoded[:8000])
-            span.set_attribute("tool.result.preview_omitted_for_size", len(encoded) > 8000)
+        if reveal_result or definition_result:
+            rows = sanitize(preview.preview_rows) if definition_result else preview.preview_rows
+            encoded = json.dumps(rows, default=str)
+            limit = 16000 if definition_result else 8000
+            span.set_attribute("tool.result.preview_rows", encoded[:limit])
+            span.set_attribute("tool.result.preview_omitted_for_size", len(encoded) > limit)
     else:
         span.set_attribute("tool.result.kind", "empty" if outcome.status == "ok" else "error")
     return outcome
@@ -145,7 +148,8 @@ async def in_tool_span[OutcomeT: SpanOutcome](
             span,
             await work(),
             reveal_result=reveal_complex_args,
-            include_result=tool_name in {"getBlueprint", "runBlueprint"},
+            include_result=tool_name in BLUEPRINT_DEFINITION_TOOLS | {"runBlueprint"},
+            definition_result=tool_name in BLUEPRINT_DEFINITION_TOOLS,
         )
 
 

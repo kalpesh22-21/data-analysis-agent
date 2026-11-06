@@ -640,6 +640,7 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "retryable",
     "calls",
     "review_state_calls",
+    "pending_count",
     "delivery_review_calls",
     "review_budget_remaining_ms",
     "terminal_reserve_seconds",

@@ -60,6 +60,7 @@ _METRICS = frozenset(
     }
 )
 _ROW_KEYS = frozenset({"rows", "preview_rows", "result_rows"})
+BLUEPRINT_DEFINITION_TOOLS = frozenset({"searchBlueprints", "getBlueprint"})
 
 
 def _json(value):
@@ -105,7 +106,16 @@ def sanitize(value, *, redact=False, compact=False, key="", depth=0):
                     if isinstance(v, list)
                 }
                 continue
-            result[name] = sanitize(item, redact=redact, compact=compact, key=name, depth=depth + 1)
+            # Catalog definitions are metadata, not warehouse result cells. Keep
+            # their SQL, slots and scores readable; secret scrubbing still applies.
+            definition = (
+                value.get("tool_name") in BLUEPRINT_DEFINITION_TOOLS
+                and name in {"result_preview", "result_full"}
+            ) if isinstance(value.get("tool_name"), str) else False
+            result[name] = sanitize(
+                item, redact=redact and not definition, compact=compact and not definition,
+                key=name, depth=depth + 1,
+            )
         return result
     if isinstance(value, (list, tuple)):
         return [
@@ -291,6 +301,7 @@ class PhoenixPayloadExporter(SpanExporter):
     def transform(self, span):
         attrs = dict(span.attributes or {})
         compact = True
+        definition_tool = attrs.get("tool.name") in BLUEPRINT_DEFINITION_TOOLS
         namespace = attrs.get("session.id") or format(span.context.trace_id, "032x")
         output = self._message_attributes(attrs, span, namespace)
         if compact and "input.value" not in attrs:
@@ -312,7 +323,7 @@ class PhoenixPayloadExporter(SpanExporter):
         for key, value in attrs.items():
             if compact and (key.startswith(("llm.input_messages.", "llm.tools."))):
                 continue
-            if attrs.get("openinference.span.kind") == "TOOL" and key in {
+            if not definition_tool and attrs.get("openinference.span.kind") == "TOOL" and key in {
                 "output.value",
                 "output.mime_type",
             }:
@@ -349,7 +360,7 @@ class PhoenixPayloadExporter(SpanExporter):
                     output[key] = _json(self._request(value, span, namespace))
             elif key == "input.mime_type" and "input.mime_type" in output:
                 continue
-            elif key == "tool.result.preview_rows" and (compact or self.redact):
+            elif key == "tool.result.preview_rows" and not definition_tool and (compact or self.redact):
                 output["tool.result.values_omitted"] = True
             elif key == "llm.invocation_parameters" and compact:
                 try:
@@ -378,7 +389,13 @@ class PhoenixPayloadExporter(SpanExporter):
                         "exception.",
                     )
                 )
-                clean = sanitize(value, redact=self.redact and content, compact=compact, key=key)
+                definition_result = definition_tool and (
+                    key == "output.value" or key.startswith("tool.result.")
+                )
+                clean = sanitize(
+                    value, redact=self.redact and content and not definition_result,
+                    compact=compact and not definition_result, key=key,
+                )
                 if content and key.startswith("tool.args."):
                     clean = sanitize(
                         value, redact=self.redact, compact=compact, key=key.rsplit(".", 1)[-1]

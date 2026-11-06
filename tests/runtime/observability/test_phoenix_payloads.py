@@ -214,3 +214,98 @@ def test_ask_user_pause_exports_question_and_options(redact):
     assert span.attributes["tool.status"] == "paused_ask_user"
     assert "output.value" not in span.attributes
     provider.shutdown()
+
+
+@pytest.mark.parametrize("tool_name", ["searchBlueprints", "getBlueprint"])
+@pytest.mark.parametrize("redact", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+def test_blueprint_results_readable_in_model_trace(tool_name, redact, native):
+    definition = {
+        "id": "bp-approved-hours",
+        "sql_template": "SELECT round(sum(hours), 2) FROM requests LIMIT 10",
+        "score": 0.95,
+        "slots": [{"name": "top_n", "default": 10}],
+        "service_key": "private-test-secret",
+    }
+    packet = {"tool_name": tool_name, "result_preview": {"preview_rows": [[definition]]}}
+    message = {"role": "tool", "content": json.dumps(packet)}
+    span = make_span({"messages": [message]})
+    if native:
+        span = ReadableSpan("llm", context=span.context, attributes={
+            **dict(span.attributes),
+            "llm.input_messages.0.message.role": "tool",
+            "llm.input_messages.0.message.content": message["content"],
+        })
+    original = dict(span.attributes)
+    exported = PhoenixPayloadExporter(InMemorySpanExporter(), redact=redact).transform(span)
+    content = exported.attributes[
+        "llm.input_messages.0.message.content" if native else "input.value"
+    ]
+    assert definition["sql_template"] in content
+    assert "0.95" in content
+    assert "SQL result values omitted" not in content
+    assert "private-test-secret" not in content
+    assert span.attributes == original
+
+
+@pytest.mark.parametrize("tool_name", ["searchBlueprints", "getBlueprint", "runBlueprint", "runQuery"])
+@pytest.mark.parametrize("redact", [False, True])
+def test_blueprint_tool_spans_preserve_definitions_only(tool_name, redact):
+    rows = [[{"sql_template": "SELECT 42", "password": "private-test-secret"}]]
+    span = ReadableSpan("tool." + tool_name, context=SpanContext(1, 1, False), attributes={
+        "openinference.span.kind": "TOOL", "tool.name": tool_name,
+        "tool.result.preview_rows": json.dumps(rows),
+        "output.value": json.dumps({"preview_rows": rows}),
+        "output.mime_type": "application/json",
+    })
+    original = dict(span.attributes)
+    result = PhoenixPayloadExporter(InMemorySpanExporter(), redact=redact).transform(span)
+    attrs = result.attributes
+    if tool_name in {"searchBlueprints", "getBlueprint"}:
+        assert "SELECT 42" in attrs["tool.result.preview_rows"]
+        assert "SELECT 42" in attrs["output.value"]
+        assert "tool.result.values_omitted" not in attrs
+    else:
+        assert attrs["tool.result.values_omitted"] is True
+        assert "output.value" not in attrs
+    assert "private-test-secret" not in json.dumps(dict(attrs))
+    assert span.attributes == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["searchBlueprints", "getBlueprint", "runBlueprint"])
+async def test_blueprint_definition_capture_without_debug_switch(tool_name):
+    from types import SimpleNamespace
+
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    from data_agent.runtime.dispatch.tool_envelope import in_tool_span
+
+    sink = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(PhoenixPayloadExporter(sink, redact=True)))
+    outcome = SimpleNamespace(
+        status="ok", error_code=None,
+        result_preview=SimpleNamespace(
+            columns=[], row_count=1, truncated=False,
+            preview_rows=[[{"sql_template": "SELECT 42", "password": "private-test-secret"}]],
+        ),
+    )
+
+    async def work():
+        return outcome
+
+    try:
+        assert await in_tool_span(
+            provider.get_tracer(__name__), tool_name=tool_name, args={}, work=work,
+        ) is outcome
+        attrs = sink.get_finished_spans()[0].attributes
+        if tool_name == "runBlueprint":
+            assert "tool.result.preview_rows" not in attrs
+        else:
+            assert "SELECT 42" in attrs["tool.result.preview_rows"]
+        assert "private-test-secret" not in json.dumps(dict(attrs))
+        assert outcome.result_preview.preview_rows[0][0]["password"] == "private-test-secret"
+    finally:
+        provider.shutdown()

@@ -15,7 +15,7 @@ from tests.runtime.blueprint.test_executor import _creds, _detail, _index
 
 
 @pytest.mark.parametrize("reveal", [False, True])
-async def test_blueprint_result_spans_are_bounded_and_honor_redaction(reveal):
+async def test_blueprint_definitions_are_visible_but_execution_rows_honor_redaction(reveal):
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -42,7 +42,10 @@ async def test_blueprint_result_spans_are_bounded_and_honor_redaction(reveal):
     for span in spans:
         assert span.attributes["tool.result.kind"] == "result"
         assert span.attributes["tool.result.row_count"] >= 1
-        if reveal:
+        if span.name == "tool.getBlueprint":
+            assert "PRIVATE BLUEPRINT DESCRIPTION" in span.attributes["tool.result.preview_rows"]
+            assert len(span.attributes["tool.result.preview_rows"]) <= 16000
+        elif reveal:
             assert len(span.attributes["tool.result.preview_rows"]) <= 8000
         else:
             assert "PRIVATE" not in str(span.attributes)

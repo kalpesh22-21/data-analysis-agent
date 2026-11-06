@@ -43,7 +43,7 @@ def test_root_input_output_and_jti_metadata(monkeypatch, redact):
     sink = InMemorySpanExporter()
     answer = "I don't have any information to answer your question."
     app = create_app(
-        settings=RuntimeSettings(
+        settings=RuntimeSettings(retrieval_prefetch_tool_enabled=True,
             _env_file=None,
             otlp_endpoint="",
             answer_judge_enabled=False,
