@@ -72,7 +72,11 @@ def main() -> None:
             f"ERROR: failed to import the MCP catalog serializer from {mcp_repo}:\n  {exc}"
         ) from exc
 
-    payload = export.build_catalog_export()
+    # A fixture must not depend on local service credentials or backend settings.
+    # Use the same serializer with an explicit ClickHouse flavor for this fixture.
+    payload = export.build_catalog_export_from(
+        export.get_semantic_catalog(), export.get_catalog_sha(), trino_enabled=False,
+    )
 
     out_path = Path(
         os.environ.get("CATALOG_FIXTURE_OUT", str(_DEFAULT_FIXTURE_OUT))

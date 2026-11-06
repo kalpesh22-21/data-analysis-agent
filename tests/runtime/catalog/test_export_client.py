@@ -179,9 +179,9 @@ async def test_built_handles_match_fixture_values() -> None:
         == "type_code_description"
     )
 
-    # Semantic grain view: both employee and payroll declare a verifiable grain
-    # in the Wave-1 catalog (payroll now carries an explicit line-item grain).
-    assert semantic_handle.is_grain_verifiable(_E) is True
+    # Employee keys are tenant-scoped, not a globally verifiable unique grain.
+    # Payroll retains its declared line-item grain.
+    assert semantic_handle.is_grain_verifiable(_E) is False
     assert semantic_handle.is_grain_verifiable("dbpcm_warehouse.payroll") is True
 
 

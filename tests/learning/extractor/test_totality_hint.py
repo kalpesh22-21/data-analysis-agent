@@ -139,8 +139,8 @@ _COVERED = _candidate(
 )
 
 
-def _validate(raw: dict, *, sql: str = _RATIO_SQL, index=_INDEX):
-    return to_candidate(raw, _summary(sql), known_rules=_KNOWN, rule_index=index)
+def _validate(raw: dict, *, sql: str = _RATIO_SQL, index=_INDEX, known_rules=_KNOWN):
+    return to_candidate(raw, _summary(sql), known_rules=known_rules, rule_index=index)
 
 
 def _predicate(sql: str, index: int = 0):
@@ -457,6 +457,10 @@ def test_a_rule_the_catalog_cannot_parse_is_accepted_unchecked() -> None:
     out = _validate(
         _cited("exclude_not_hired_default", "A", column="employee_status"),
         sql="SELECT count(*) AS n FROM dbpcm_warehouse.employee WHERE employee_status = 'A'",
+        known_rules=_KNOWN | {"exclude_not_hired_default"},
+        index=rule_index_from_catalog({"dbpcm_warehouse.employee": {"rules": [
+            {"id": "exclude_not_hired_default", "predicate": "employee_status != 'N' OR employee_status IS NULL"}
+        ]}}),
     )
     assert isinstance(out, ExtractedCandidate)
 
@@ -480,6 +484,10 @@ def test_an_in_list_corresponds_whatever_order_it_is_written_in() -> None:
             ]
         ),
         sql=sql,
+        known_rules=_KNOWN | {"rejected_applications"},
+        index=rule_index_from_catalog({"dbpcm_warehouse.applicant_tracking_application": {"rules": [
+            {"id": "rejected_applications", "predicate": "application_status_enum IN ('Rejected', 'Knocked Out')"}
+        ]}}),
     )
     assert isinstance(out, ExtractedCandidate)
 

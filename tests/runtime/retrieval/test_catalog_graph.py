@@ -177,7 +177,7 @@ def test_catalog_graph_rows_over_fixture() -> None:
     emp_status = next(r for r in column_rows if r["key"] == emp_status_key)
     assert emp_status["props"]["type"] == "Nullable(String)"
     # The Wave-1 catalog authors employee_status `values` as the enum-code list.
-    assert "A" in json.loads(emp_status["props"]["values_json"])
+    assert "Active" in json.loads(emp_status["props"]["values_json"])
 
 
 def test_catalog_graph_rows_tolerates_non_dict_entry() -> None:

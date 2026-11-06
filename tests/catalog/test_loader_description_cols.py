@@ -117,7 +117,6 @@ def test_extract_empty_columns_block() -> None:
 
 def test_real_catalog_declared_links_present() -> None:
     result = load_description_cols_from_catalog(_CATALOG)
-    assert result[_PAF] == {"field_id": "field_label"}
     # payroll declares the code<->label sibling link on type_code.
     assert result[_P]["type_code"] == "type_code_description"
 

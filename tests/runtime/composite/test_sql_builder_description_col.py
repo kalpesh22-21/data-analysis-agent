@@ -232,13 +232,11 @@ def test_convention_unchanged_when_description_cols_map_absent_entirely() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_real_catalog_field_id_discovers_field_label() -> None:
+def test_real_catalog_earn_code_discovers_nonconventional_category_label() -> None:
     catalog = fixture_catalog_handle()
-    target = resolve_target(catalog, table=_PAF, column="field_id", period=None)
-    # field_id -> field_label is the non-convention case (Label is not a convention
-    # suffix, Id is not stripped): only the AUTHORED linkage discovers it.
-    assert target.description_col == "field_label"
-    assert "field_label" in build_sql(target, period=None, limit=200)
+    target = resolve_target(catalog, table="dbpcm_warehouse.earning_category", column="earn_code", period=None)
+    assert target.description_col == "category_name"
+    assert "category_name" in build_sql(target, period=None, limit=200)
 
 
 def test_real_catalog_payroll_type_code_discovers_declared_label() -> None:
@@ -255,7 +253,7 @@ def test_real_catalog_convention_still_works_for_earn_code() -> None:
     """Regression: earn_code -> earn_description is now BOTH declared and a convention
     match in the real catalog; either way it must resolve."""
     catalog = fixture_catalog_handle()
-    target = resolve_target(catalog, table=_ACC, column="earn_code", period=None)
+    target = resolve_target(catalog, table="dbpcm_warehouse.time_off_request", column="earn_code", period=None)
     assert target.description_col == "earn_description"
 
 

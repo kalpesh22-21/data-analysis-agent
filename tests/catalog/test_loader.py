@@ -29,23 +29,14 @@ _CATALOG = fixture_catalog()
 
 _E = "dbpcm_warehouse.employee"
 _P = "dbpcm_warehouse.payroll"
-_CE = "dbpcm_warehouse.candidate_education"
 
 # Expected table keys — one per table entry in the frozen MCP export fixture.
 EXPECTED_TABLE_KEYS = frozenset(
-    [
-        "dbpcm_warehouse.accrual_events",
-        "dbpcm_warehouse.applicant_tracking_application",
-        "dbpcm_warehouse.applicant_tracking_requisition",
-        "dbpcm_warehouse.candidate_education",
-        "dbpcm_warehouse.candidate_employment_history",
-        "dbpcm_warehouse.department",
-        "dbpcm_warehouse.employee",
-        "dbpcm_warehouse.labor_allocation",
-        "dbpcm_warehouse.payroll",
-        "dbpcm_warehouse.performance_discussions",
-        "dbpcm_warehouse.personnel_action_form_changes",
-    ]
+    "dbpcm_warehouse." + name for name in (
+        "department", "earning_category", "employee", "employee_change", "expense",
+        "labor_allocation", "payroll", "punch_pair", "time_off_balance",
+        "time_off_request", "total_earning",
+    )
 )
 
 
@@ -76,7 +67,7 @@ def test_employee_rules_contains_active_employee_rule() -> None:
     assert len(rules) >= 1
     active_rule = next((r for r in rules if r.get("id") == "active_employee"), None)
     assert active_rule is not None, "expected an 'active_employee' rule in employee.yaml rules[]"
-    assert active_rule["predicate"] == "employee_status = 'A'"
+    assert active_rule["predicate"] == "employee_status = 'Active'"
 
 
 def test_employee_ambiguities_contains_department_term() -> None:
@@ -95,7 +86,7 @@ def test_employee_status_enum_values_map() -> None:
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
     status_col = catalog[_E]["columns"]["employee_status"]
     # The Wave-1 catalog authors `values` as the observed enum-code list.
-    assert status_col["values"] == ["A", "D", "I", "R", "T", "V"]
+    assert status_col["values"] == ["Active", "Deceased", "Inactive", "Retired", "Terminated", "On Leave", "Not Hired", "Prehire", "Unknown"]
 
 
 def test_employee_column_with_unit() -> None:
@@ -119,13 +110,7 @@ def test_flow_style_decimal_types_are_not_truncated_by_yaml_comma() -> None:
     trap can't silently reappear.
     """
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
-    affected = [
-        (_E, "annual_salary"),
-        (_E, "rate_1"),
-        ("dbpcm_warehouse.candidate_education", "student_gpa"),
-        ("dbpcm_warehouse.applicant_tracking_application", "application_job_wage_start"),
-        ("dbpcm_warehouse.applicant_tracking_application", "application_job_wage_end"),
-    ]
+    affected = [(_E, "annual_salary"), (_E, "rate_1"), (_E, "hourly_salary")]
     for table_key, col in affected:
         meta = catalog[table_key]["columns"][col]
         assert meta["type"] == "Nullable(Decimal(18, 6))", (table_key, col)
@@ -133,15 +118,12 @@ def test_flow_style_decimal_types_are_not_truncated_by_yaml_comma() -> None:
 
 
 def test_column_with_sensitive_true() -> None:
-    """candidate_education.education_phone_number is marked sensitive: true in the YAML."""
+    """The loader preserves authored metadata without interpreting it as access policy."""
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
-    phone_col = catalog[_CE]["columns"]["education_phone_number"]
-    assert phone_col["sensitive"] is True
-    assert phone_col["type"] == "Nullable(String)"
-
-    # A representative non-sensitive column in the same table should not carry the flag.
-    institute_name_col = catalog[_CE]["columns"]["institute_name"]
-    assert "sensitive" not in institute_name_col
+    columns = catalog["dbpcm_warehouse.employee_change"]["columns"]
+    assert columns["old_value_description"]["sensitive"] is True
+    assert columns["old_value_description"]["type"] == "String"
+    assert "sensitive" not in catalog[_E]["columns"]["employee_code"]
 
 
 def test_employee_client_defined_flag() -> None:
