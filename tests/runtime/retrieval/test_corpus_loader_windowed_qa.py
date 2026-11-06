@@ -49,8 +49,8 @@ def test_windowed_seed_slot_types() -> None:
     by_id = {b.id: b for b in blueprints}
     per_month_slots = {s["name"]: s["type"] for s in by_id["bp-hires-per-month"].slots}
     in_range_slots = {s["name"]: s["type"] for s in by_id["bp-hires-in-range"].slots}
-    assert per_month_slots == {"window_months": "relative_window"}
-    assert in_range_slots == {"hire_window": "period_range"}
+    assert per_month_slots == {"window_months": "relative_window", "order_by": "sort_order"}
+    assert in_range_slots == {"hire_window": "period_range", "order_by": "sort_order"}
 
 
 # ===========================================================================

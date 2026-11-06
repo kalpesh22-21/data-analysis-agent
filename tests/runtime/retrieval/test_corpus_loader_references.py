@@ -963,7 +963,8 @@ def test_the_canon_composite_inlines_to_exactly_what_it_used_to_declare_inline()
     in the pay-period slot; they now reference `bp-employee-check-detail-for-period`.
     The inlined SQL must be byte-identical to the SQL those nodes carried before, which
     is why the composite's structural key did not move across the change."""
-    resolved = _resolved(load_seed_fixtures(_FIXTURE_DIR)[0])
+    from tests.runtime.retrieval.test_corpus_loader_references_qa import _historical_reference_seeds
+    resolved = _resolved(_historical_reference_seeds())
     composite = resolved["bp-compare-employee-check-detail-two-periods"]
     child = resolved["bp-employee-check-detail-for-period"]
 

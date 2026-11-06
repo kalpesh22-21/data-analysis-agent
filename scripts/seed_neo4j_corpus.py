@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """seed_neo4j_corpus — CLI wrapper that seeds the neo4j retrieval corpus.
 
-Reads the hand-authored fixtures under `tests/fixtures/corpus/`, builds a real
+Reads fixtures under `tests/fixtures/corpus/` (blueprints generated from the canonical
+snapshot by ID), builds a real
 `HttpEmbeddingClient` + an async neo4j driver from environment variables, and runs
 `corpus_loader.load_corpus` (schema DDL + embed + idempotent MERGE upsert +
 `:Column`/`:Table` edges + write-time model parity). The write logic stays in

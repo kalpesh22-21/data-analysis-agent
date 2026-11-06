@@ -238,6 +238,24 @@ _PRE_2B_COMPOSES: list[dict[str, Any]] = [
 ]
 
 
+def _historical_reference_seeds():
+    """Freeze the historical reference migration; live canon may evolve independently."""
+    from copy import deepcopy
+    from dataclasses import replace
+    seeds = {bp.id: bp for bp in load_seed_fixtures(_FIXTURE_DIR)[0]}
+    child = replace(seeds[_CHILD], sql_template=_PRE_2B_COMPOSES[0]["sql_template"].replace("{period_a}", "{period}"),
+                    slots=[s for s in seeds[_CHILD].slots if s["name"] != "order_by"],
+                    result_grain=["register_type", "type_code"])
+    nodes = deepcopy(_PRE_2B_COMPOSES)
+    for i, period in enumerate(("period_a", "period_b")):
+        nodes[i].pop("sql_template")
+        nodes[i]["ref"] = {"blueprint": _CHILD, "slots": {"employee": "employee", "period": period}}
+    parent = replace(seeds[_COMPOSITE], composes=nodes,
+                     slots=[s for s in seeds[_COMPOSITE].slots if s["name"] != "order_by"],
+                     result_grain=["register_type", "type_code"])
+    return [parent, child]
+
+
 def test_the_resolved_canon_composite_is_byte_identical_to_the_pre_conversion_yaml() -> None:
     """Requirement 1, checked against the SQL the composite carried before §2b rather
     than against anything the conversion produced.
@@ -248,7 +266,7 @@ def test_the_resolved_canon_composite_is_byte_identical_to_the_pre_conversion_ya
     node dicts survives nothing. And it covers the node KEY SETS, not just the
     templates — `_inline_reference` builds a fresh dict, and a dropped `output` or a
     leaked `ref` would still hash to the same key."""
-    resolved = _resolved(load_seed_fixtures(_FIXTURE_DIR)[0])[_COMPOSITE]
+    resolved = _resolved(_historical_reference_seeds())[_COMPOSITE]
     assert resolved.composes == _PRE_2B_COMPOSES
 
 
@@ -278,7 +296,7 @@ def test_the_extracted_child_carries_the_composites_casts_verbatim() -> None:
     terminal FULL OUTER JOIN (stable String join keys, stable Float64 measures). A
     child edit that dropped one would change the join's behaviour, not just its text —
     so pin that the child's SQL IS the pre-conversion node SQL, modulo the slot."""
-    child = {bp.id: bp for bp in load_seed_fixtures(_FIXTURE_DIR)[0]}[_CHILD]
+    child = {bp.id: bp for bp in _historical_reference_seeds()}[_CHILD]
     assert child.sql_template == _PRE_2B_COMPOSES[0]["sql_template"].replace(
         "{period_a}", "{period}"
     )

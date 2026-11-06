@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -116,7 +117,7 @@ async def _bind_sql(slot_bindings: dict[str, Any]) -> str:
         scripted={
             "runQuery": [
                 _rq(
-                    ["hires_in_window", "avg_monthly_hires", "projected_next_n_hires"],
+                    ["Hires In Window", "Average Monthly Hires", "Projected Hires"],
                     [[3, 0.5, 3]],
                 )
             ]
@@ -140,7 +141,7 @@ async def test_projection_binds_both_windows_as_number_literals() -> None:
     node_sql = await _bind_sql({"window_months": 6, "horizon_months": 6})
     assert "{window_months}" not in node_sql
     assert "{horizon_months}" not in node_sql
-    assert "INTERVAL 6 MONTH" in node_sql
+    assert re.search(r"INTERVAL \(?6\)? MONTH", node_sql)
     # NUMBER literal, not a string: no `INTERVAL '6'` and no quoted 6 anywhere.
     assert "INTERVAL '6'" not in node_sql
     assert "'6'" not in node_sql
@@ -156,13 +157,13 @@ async def test_projection_repeated_slot_binds_at_all_three_sites() -> None:
     # The window value lands at all three of its template sites; the horizon at its one.
     assert node_sql.count("12") == 3, node_sql
     assert node_sql.count("* 3") == 1, node_sql
-    assert "INTERVAL 12 MONTH" in node_sql
+    assert re.search(r"INTERVAL \(?12\)? MONTH", node_sql)
 
 
 async def test_projection_digit_string_binds_as_number() -> None:
     # A pure-digit string still binds as a NUMBER literal into the INTERVAL.
     node_sql = await _bind_sql({"window_months": "6", "horizon_months": "6"})
-    assert "INTERVAL 6 MONTH" in node_sql
+    assert re.search(r"INTERVAL \(?6\)? MONTH", node_sql)
     assert "'6'" not in node_sql
 
 
@@ -264,12 +265,12 @@ async def test_bound_sql_executes_on_seeded_warehouse() -> None:
 
     assert result["rows"] == 1, "run-rate projection is a single-row aggregate"
     cols = [c["name"] for c in result["meta"]]
-    assert cols == ["hires_in_window", "avg_monthly_hires", "projected_next_n_hires"]
+    assert cols == ["Hires In Window", "Average Monthly Hires", "Projected Hires"]
 
     row = result["data"][0]
-    hires = float(row["hires_in_window"])
-    avg_monthly = float(row["avg_monthly_hires"])
-    projected = float(row["projected_next_n_hires"])
+    hires = float(row["Hires In Window"])
+    avg_monthly = float(row["Average Monthly Hires"])
+    projected = float(row["Projected Hires"])
 
     # Well-formed + non-negative counts (a projection is never a negative headcount).
     assert hires >= 0

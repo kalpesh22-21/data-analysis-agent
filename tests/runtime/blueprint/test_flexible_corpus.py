@@ -3,8 +3,8 @@
 SQLite is a relational oracle for filters, joins and grouping, not a claim of
 ClickHouse/Trino type equivalence. Live dialect checks supplement these tests.
 """
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 
 import pytest
 import sqlglot
@@ -53,7 +53,7 @@ def db():
     con.create_function('TODATE', 1, lambda value: value[:10] if value else None)
     con.execute("ATTACH DATABASE ':memory:' AS dbpcm_warehouse")
     con.executescript('''
-    CREATE TABLE dbpcm_warehouse.employee(employee_code TEXT, department_code TEXT, department_name TEXT, employee_status TEXT, annual_salary REAL, employee_pay_type TEXT, hourly_salary REAL);
+    CREATE TABLE dbpcm_warehouse.employee(employee_code TEXT, department_code TEXT, department_name TEXT, employee_status TEXT, annual_salary REAL, pay_type TEXT, hourly_salary REAL);
     INSERT INTO dbpcm_warehouse.employee VALUES ('E1','D1','Engineering','Active',100,'Salary',NULL),('E2','D2','HR','Active',200,'Salary',NULL),('E3','D1','Engineering','Terminated',300,'Salary',NULL);
     CREATE TABLE dbpcm_warehouse.department(department_code TEXT, department_name TEXT);
     INSERT INTO dbpcm_warehouse.department VALUES ('D1','Engineering'),('D2','HR'),('D3','Empty');
@@ -64,6 +64,8 @@ def db():
     CREATE TABLE dbpcm_warehouse.time_off_request(employee_code TEXT, status TEXT, event_type TEXT, earn_code TEXT, request_date TEXT, hours REAL);
     INSERT INTO dbpcm_warehouse.time_off_request VALUES ('E1','Approved','Time Off Request','PTO','2026-09-01',8),('E1','Requested','Time Off Request','PTO','2026-09-02',4),('E2','Denied','Time Off Request','SICK','2026-09-03',6),('E9','Approved','Payout Request','PTO','2026-09-04',5),('E1','Approved','Time Off Request','PTO','2026-10-01',90);
     ''')
+    con.execute('ALTER TABLE dbpcm_warehouse.employee ADD COLUMN employee_name TEXT')
+    con.execute('UPDATE dbpcm_warehouse.employee SET employee_name=employee_code')
     yield con
     con.close()
 
@@ -77,9 +79,9 @@ def execute(db, bid, **args):
 PERIOD = {'start': '2026-09-01', 'end': '2026-10-01'}
 
 
-def test_fixed_active_blueprint_retains_zero_departments(db):
+def test_fixed_active_blueprint_counts_departments_with_active_employees(db):
     rows = execute(db, 'bp-active-headcount-by-department')
-    assert {r[1]: r[2] for r in rows} == {'Engineering': 1, 'HR': 1, 'Empty': 0}
+    assert {r[1]: r[2] for r in rows} == {'Engineering': 1, 'HR': 1}
 
 
 @pytest.mark.parametrize('status,count,total', [(None,2,300),('All',3,600),('Active',2,300),('Terminated',1,300)])
@@ -161,13 +163,13 @@ def test_salary_median_never_uses_approximation():
 
 
 @pytest.mark.parametrize('bid', ['bp-punch-pair-summary','bp-employee-day-clock-span','bp-timecard-earnings-summary'])
-def test_timecard_templates_require_source_and_final(bid):
+def test_timecard_templates_require_source_and_leave_final_to_mcp(bid):
     kwargs = {'period':PERIOD,'source':'synthetic'}
     if bid != 'bp-employee-day-clock-span':
         kwargs['group_by'] = 'company'
     sql = bound_sql(bid,**kwargs)
-    assert 'FINAL' in sql
-    assert "table_source = 'synthetic'" in sql
+    assert 'FINAL' not in sql
+    assert "table_source IN ('synthetic')" in sql
     assert '2026-09-01' in sql and '2026-10-01' in sql
     kwargs.pop('source')
     with pytest.raises(AssertionError):
@@ -176,14 +178,13 @@ def test_timecard_templates_require_source_and_final(bid):
 
 def test_punch_types_are_enums_but_hours_codes_are_entities():
     sql = bound_sql('bp-punch-pair-summary',group_by='employee',period=PERIOD,source='one',hours_type='XY',in_type='IL')
-    assert "hours_type = 'XY'" in sql and "in_punch_type = 'IL'" in sql
+    assert "hours_type IN ('XY')" in sql and "in_punch_type IN ('IL')" in sql
     with pytest.raises(AssertionError):
         bound_sql('bp-punch-pair-summary',group_by='employee',period=PERIOD,source='one',in_type='made-up')
 
 
 def test_latest_hires_uses_most_recent_date_and_current_population(db):
     db.executescript('''
-    ALTER TABLE dbpcm_warehouse.employee ADD COLUMN employee_name TEXT;
     ALTER TABLE dbpcm_warehouse.employee ADD COLUMN most_recent_hire_date TEXT;
     UPDATE dbpcm_warehouse.employee SET employee_name=employee_code;
     UPDATE dbpcm_warehouse.employee SET most_recent_hire_date='2020-01-01' WHERE employee_code='E1';
@@ -198,7 +199,6 @@ def test_latest_hires_uses_most_recent_date_and_current_population(db):
 
 def test_termination_directory_keeps_recorded_events_and_counts_before_limit(db):
     db.executescript('''
-    ALTER TABLE dbpcm_warehouse.employee ADD COLUMN employee_name TEXT;
     ALTER TABLE dbpcm_warehouse.employee ADD COLUMN termination_date TEXT;
     ALTER TABLE dbpcm_warehouse.employee ADD COLUMN most_recent_hire_date TEXT;
     UPDATE dbpcm_warehouse.employee SET employee_name=employee_code, termination_date='2026-09-15',most_recent_hire_date='2026-10-01';
@@ -209,11 +209,10 @@ def test_termination_directory_keeps_recorded_events_and_counts_before_limit(db)
 
 
 def test_compensation_rankings_keep_top_n_per_pay_type(db):
-    db.execute('ALTER TABLE dbpcm_warehouse.employee ADD COLUMN employee_name TEXT')
     db.execute("UPDATE dbpcm_warehouse.employee SET employee_name=employee_code")
     db.execute("INSERT INTO dbpcm_warehouse.employee VALUES ('H1','D1','Engineering','Active',0,'Hourly',25,'Hourly One')")
     rows = execute(db,'bp-compensation-ranking',top_n=1)
-    assert {r[0]: (r[2],r[5]) for r in rows} == {'Salary':('E2',200),'Hourly':('H1',52000)}
+    assert {r[0]: (r[2],r[5],r[6]) for r in rows} == {'Salary':('E2',200,None),'Hourly':('H1',None,25)}
 
 
 def test_timeoff_ranking_retains_ties_and_excludes_payouts_unapproved_and_outside_period(db):
@@ -224,4 +223,4 @@ def test_timeoff_ranking_retains_ties_and_excludes_payouts_unapproved_and_outsid
     ('E2','Approved','Time Off Request','PTO','2026-09-06',4);
     """)
     rows = execute(db, 'bp-approved-timeoff-ranking', period=PERIOD, top_n=1)
-    assert rows == [('E1',8,1,1),('E3',8,1,1)]
+    assert rows == [('E1','E1','Engineering',8,1,1),('E3','E3','Engineering',8,1,1)]

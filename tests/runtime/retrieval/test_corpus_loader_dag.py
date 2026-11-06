@@ -107,7 +107,7 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
             continue
         # result_grain round-trips as a JSON list; sql_template stored verbatim.
         expected_grain = (
-            ["department_code"]
+            ["Department Code"]
             if bp.id == "bp-active-headcount-by-department"
             else ["Department"]
         )

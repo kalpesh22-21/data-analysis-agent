@@ -32,3 +32,15 @@ def test_unsealed_canon_is_refused(tmp_path):
     (canon / "bp-a.yaml").write_text("id: bp-a\nintent: Edited without --write.\n")
     with pytest.raises(SystemExit, match="unsealed"):
         render(canon, today=dt.date(2026, 11, 2))
+
+
+def test_demo_seed_is_exact_selected_snapshot():
+    from pathlib import Path
+
+    from scripts.regen_corpus_snapshot import render_subset
+    root = Path(__file__).parents[1] / 'fixtures'
+    snapshot = (root / 'corpus_snapshot/blueprints.yaml').read_text()
+    ids = yaml.safe_load((root / 'corpus/blueprint_ids.yaml').read_text())
+    assert (root / 'corpus/blueprints.yaml').read_text() == render_subset(snapshot, ids)
+    with pytest.raises(ValueError, match='Unknown demo'):
+        render_subset(snapshot, ['missing-blueprint'])

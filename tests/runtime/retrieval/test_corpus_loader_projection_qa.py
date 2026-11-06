@@ -81,7 +81,7 @@ def test_projection_seed_template_references_both_window_slots() -> None:
     seed = _projection_seed()
     assert seed.sql_template is not None
     slot_names = {s["name"] for s in seed.slots}
-    assert slot_names == {"window_months", "horizon_months"}
+    assert slot_names == {"window_months", "horizon_months", "order_by"}
     for name in slot_names:
         assert "{" + name + "}" in seed.sql_template
 
