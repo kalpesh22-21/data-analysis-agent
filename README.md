@@ -1,6 +1,23 @@
 # data-analysis-agent
 
-HR data-analysis agent — Phase 0 walking skeleton (see `docs/decisions/DECISIONS.md` D68).
+A conversational HR analytics agent for a ClickHouse warehouse. It combines
+scope-aware SQL execution, reusable analysis blueprints, capability tools, and a
+reviewed learning pipeline with a streaming web interface.
+
+## What it does
+
+- Answers warehouse questions through a bounded agent loop with SQL validation,
+  column provenance, result verification, and clarification or approval pauses.
+- Retrieves and executes reusable blueprints, including multi-step analysis DAGs.
+- Produces structured answer documents with tables, charts, data-as-of context,
+  and snapshot-backed pagination and exports when configured.
+- Persists sessions in Couchbase and filters replay and retrieval by access scope.
+- Extracts learning candidates for reviewer approval and corpus promotion.
+- Emits OpenTelemetry traces for model, tool, retrieval, and learning activity.
+
+The online runtime and asynchronous learning services are separate deployment
+planes. See the [architecture](docs/01-architecture.md) and
+[documentation index](docs/README.md) for their contracts and design status.
 
 ## Getting started
 
@@ -14,8 +31,57 @@ uv sync --extra dev
 uv run pytest
 
 # Lint
-uv run ruff check
+uv run ruff check src/ tests/
 ```
+
+CI runs lint and the unit suite on Python 3.12 and 3.14. Some tests require
+additional services or opt-in flags; see [testing](docs/11-testing.md),
+[browser tests](tests/e2e/README.md), and [evaluations](tests/eval/README.md).
+CI also checks out the companion ClickHouse API repository for corpus canonical
+parity checks; local checks can locate it through `CLICKHOUSE_API_REPO`.
+
+## Run locally
+
+The development UI uses a runtime on port **8000** and a BFF on port **3000**.
+Both scripted and live modes verify JWTs against the development token service
+on port **19000**.
+
+The [integration Compose file](docker-compose.integration.yml) provides the local
+services. It currently contains absolute paths to the companion `clickhouse-api`
+checkout; update those paths for your machine before starting it.
+
+```bash
+docker compose -f docker-compose.integration.yml up -d --build
+bash scripts/couchbase-init.sh
+
+# Scripted model and warehouse responses; still requires the token service
+bash scripts/run_ui.sh
+
+# Alternatively, use the live model, MCP backend, and Couchbase sessions
+REAL=1 bash scripts/run_ui.sh
+```
+
+Open <http://localhost:3000>. Live mode requires `OPENAI_API_KEY` in the environment
+or root `.env`, plus the MCP, token, Couchbase, and Phoenix services. Set
+`OPENAI_MODEL` to choose a model; compatible providers also use `OPENAI_BASE_URL`
+and provider-appropriate model settings. See the
+[live launcher](scripts/run_ui_runtime_real.py) for the full configuration.
+
+The live development launcher defaults to retrieval off and `hints` mode.
+`REAL_RETRIEVAL=1` enables retrieval and selects `required_search`; it requires
+Neo4j and an appropriately seeded corpus. An explicit `RETRIEVAL_MODE` overrides
+that choice. The production runtime defaults to `required_search` as described below.
+
+For a configured standalone runtime API:
+
+```bash
+uv run python scripts/run_runtime_api.py --host 127.0.0.1 --port 8000
+```
+
+Production environment settings are defined in
+[`RuntimeSettings`](src/data_agent/runtime/config.py). Kubernetes installation,
+external secrets, and online/learning deployment configuration are documented in
+[the Helm guide](deploy/helm/README.md).
 
 ## Retrieval mode
 
@@ -49,28 +115,35 @@ states without recording query text.
 
 ## Project structure
 
-```
-src/data_agent/
-  catalog/       — Semantic Catalog loader (D42, D53): reads databaseSchemaDocs/*.yaml
-  sqlparse/      — ClickHouse-dialect SQL parser / column-provenance extractor (D52, D62)
+| Path | Purpose |
+| --- | --- |
+| `src/data_agent/runtime/` | Agent loop, HTTP API, tools, sessions, retrieval, and answer contracts |
+| `src/data_agent/learning/` | Candidate extraction, validation, review, and promotion |
+| `src/data_agent/catalog/` | Semantic catalog loading |
+| `src/data_agent/sqlparse/` | SQL parsing and column provenance |
+| `src/data_agent/corpus/` | Shared corpus models and utilities |
+| `databaseSchemaDocs/` | Curated warehouse table metadata |
+| `ui/` | Web BFF and static chat, review, and mint interfaces |
+| `scripts/` | Service entrypoints, local launchers, probes, and maintenance tools |
+| `tests/` | Unit, integration, deployment, evaluation, and browser tests |
+| `deploy/helm/` | Runtime, learning, and platform Helm charts |
+| `docs/` | Specifications, integration contracts, and decision records |
 
-tests/sqlparse/
-  test_column_provenance.py — 36 unit tests (D44, D52, D57, D62, D63, D64, D69)
+## Security and provenance
 
-databaseSchemaDocs/
-  *.yaml         — Semantic Catalog YAML files (one per table)
+JWT verification and backend scope enforcement constrain data access. Column
+provenance supports scope-aware history and blueprint filtering; live query
+provenance parsing fails closed on parse errors. See
+[security and governance](docs/06-security-and-governance.md),
+[query provenance](docs/api-query-provenance.md), and the
+[decision record](docs/decisions/DECISIONS.md).
 
-docs/
-  decisions/DECISIONS.md  — Locked architecture decisions
-  decisions/OPEN-QUESTIONS.md
-```
+## Integrations
 
-## Key decisions
-
-- D52/D62: ClickHouse-dialect parser uses `sqlglot` (pure-Python, in-process).
-- D63: parse failure on live query -> fail-closed + alert (never fail-open).
-- D69: column-provenance contract — fully-qualified (database.table, column) USES triples.
-
+- [Tools and API](docs/02-tools-and-api.md)
+- [Capability API](docs/capability-api-spec.md)
+- [Answer document and Ember/BFF handoff](docs/ui-answer-document-spec.md)
+- [Observability](docs/10-observability.md)
 
 ### Answer-snapshot REST proxy
 
